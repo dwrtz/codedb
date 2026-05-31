@@ -1,6 +1,6 @@
 # SPEC.md — CodeDB Proof of Concept
 
-Status: Draft 0.1  
+Status: Draft 0.2  
 Scope: first implementation / proof of concept  
 Working name: `codedb`
 
@@ -22,23 +22,46 @@ Where:
 - `migration_history_head` identifies the ordered/replayable history that produced that state.
 - SQLite stores the object DAG, migration log, indexes, and caches.
 - Agents write code through structural operations, not primarily through text files.
+- The target language is statically typed and does not require a managed runtime.
 
-## 2. First implementation goal
+## 2. Core design correction from Draft 0.1
 
-Build a minimal database-backed language runtime that can:
+Draft 0.1 recommended Python and a tree-walking interpreter because the first goal was to prove storage, migration, and diff mechanics quickly.
+
+Draft 0.2 changes the recommendation:
+
+```text
+Implementation language: Rust
+Target language:        statically typed, runtime-free core
+Primary execution:      reference evaluator + no-runtime compiled artifact
+Parser:                 optional; structural agent API is primary
+```
+
+Rationale:
+
+- The implementation itself benefits from Rust's strong types, enums, pattern matching, ownership model, and lack of garbage collection.
+- The target language's semantics should be modeled as typed objects from the beginning.
+- Agents are the expected authors, so the primary authoring API can be structural instead of text-first.
+- A reference evaluator may exist for testing, but generated programs should not depend on a VM, garbage collector, scheduler, exception system, or reflection runtime.
+
+## 3. First implementation goal
+
+Build a minimal database-backed, statically typed language implementation that can:
 
 1. Store a tiny program as a content-addressed DAG in SQLite.
 2. Represent the current program state as a `ProgramRoot` object hash.
 3. Apply idempotent semantic migrations that transform one root into another.
 4. Rebuild database state from genesis plus migration history.
-5. Generate readable source projections from the current root.
-6. Produce semantic diffs between two roots.
-7. Run a tiny interpreter directly from the database.
-8. Cache compilation/evaluation artifacts by content hash.
+5. Type-check definitions and expressions from the semantic DAG.
+6. Generate readable source projections from the current root.
+7. Produce semantic diffs between two roots.
+8. Evaluate a tiny program through a reference evaluator for tests.
+9. Emit a small no-runtime compiled artifact for the typed core language.
+10. Cache typed/lowered/compiled artifacts by content hash.
 
-The first implementation should prove the storage and migration model, not language richness.
+The first implementation should prove the storage, migration, type, diff, and no-runtime compilation model, not language richness.
 
-## 3. Non-goals for v0
+## 4. Non-goals for v0
 
 The first implementation does not attempt to provide:
 
@@ -47,33 +70,87 @@ The first implementation does not attempt to provide:
 - A full LSP.
 - A custom projectional editor.
 - A package manager.
-- A production type system.
-- A native-code backend.
 - Git-style merge support.
 - Perfect textual round-tripping.
 - Comment/whitespace preservation.
+- Heap allocation.
+- Garbage collection.
+- Exceptions.
+- Async/green-thread scheduling.
+- Dynamic reflection.
+- Dynamic dispatch.
+- A production optimizer.
+- A production native-code backend.
 
-LLVM, MLIR, Go generation, native compilation, and richer language features are explicitly post-v0.
+A minimal C or LLVM IR emission path is allowed in v0 only to demonstrate that the language core does not need a managed runtime.
 
-## 4. Implementation stack
+## 5. Implementation stack
 
 Recommended v0 stack:
 
 ```text
-Language:       Python 3.12+
+Language:       Rust
 Database:       SQLite
+SQLite access:  rusqlite or equivalent
 Hashing:        SHA-256 for v0, BLAKE3 later if desired
-Serialization:  canonical JSON
-CLI:            argparse or Typer
-Parser:         small handwritten parser or Lark
-Runtime:        tree-walking interpreter
+Serialization:  canonical JSON or canonical binary encoding
+CLI:            clap or equivalent
+Parser:         optional; structural API first
+Evaluator:      small reference evaluator for tests only
+Backend:        C projection or LLVM IR text for no-runtime artifact
 ```
 
-Python is recommended for the first proof of concept because the hard questions are data modeling, hashing, migrations, diffs, and invalidation. Native-code performance is not relevant yet.
+Rust is recommended for Draft 0.2 because the hard questions are now not only data modeling, hashing, migrations, diffs, and invalidation, but also static typing, typed IR invariants, and no-runtime compilation.
 
-## 5. Core concepts
+Python remains acceptable for a spike, but not for the main implementation if the goal is to build a real compiler-like system.
 
-### 5.1 Object
+Go remains acceptable for tooling, but generating Go as the target output is not aligned with the target language's no-runtime goal.
+
+## 6. Meaning of "no runtime"
+
+For this project, "no runtime" means generated programs do not require a language-managed runtime such as:
+
+```text
+VM
+bytecode interpreter
+garbage collector
+green-thread scheduler
+exception unwinder as a language feature
+reflection system
+implicit allocator
+large standard runtime library
+```
+
+This does not mean the compiler implementation cannot use libraries.
+
+This also does not mean that an operating-system executable has literally zero startup or ABI support. For v0, the compiled artifact can be an object file or C/LLVM function that is linked into a tiny external harness for testing.
+
+The generated language core should avoid:
+
+```text
+implicit heap allocation
+implicit panics
+exceptions
+runtime reflection
+closures requiring allocation
+dynamic trait/interface dispatch
+runtime type metadata
+```
+
+Allowed in v0:
+
+```text
+integer arithmetic
+boolean operations
+pure function calls
+conditionals
+static dispatch
+explicit machine-level traps if required
+```
+
+## 7. Core concepts
+
+### 7.1 Object
 
 An object is an immutable content-addressed record.
 
@@ -90,13 +167,13 @@ The object hash is computed from the object kind, schema version, and canonical 
 
 ```text
 object_hash = sha256(
-  "codedb/object/v1\0" || kind || "\0" || schema_version || "\0" || canonical_json(payload)
+  "codedb/object/v1\0" || kind || "\0" || schema_version || "\0" || canonical_payload
 )
 ```
 
 The exact hash algorithm may change later, but v0 must use one deterministic algorithm everywhere.
 
-### 5.2 Program root
+### 7.2 Program root
 
 A `ProgramRoot` object represents a complete program state.
 
@@ -105,11 +182,12 @@ It points to:
 - the current symbol-to-definition map,
 - name metadata,
 - module metadata,
+- type metadata,
 - optional projection metadata.
 
-Changing a definition, name, module assignment, or metadata object produces a new `ProgramRoot` hash.
+Changing a definition, name, module assignment, type binding, or metadata object produces a new `ProgramRoot` hash.
 
-### 5.3 Migration history
+### 7.3 Migration history
 
 A migration is a semantic operation that transforms one root into another.
 
@@ -119,6 +197,7 @@ Examples:
 create_function
 rename_symbol
 replace_function_body
+change_function_signature
 delete_symbol
 add_test
 set_metadata
@@ -146,49 +225,104 @@ history_hash = sha256(
 )
 ```
 
-### 5.4 Symbol identity
+### 7.4 Symbol identity
 
 Global symbol names are metadata.
 
-A symbol's stable identity is a content hash of an immutable `Symbol` object. The symbol object does not include the current display name and does not include the current function body.
+A symbol's stable identity is the content hash of an immutable `SymbolBirth` object. This object must not include the current display name, function body, function signature, or module path.
 
-Example `Symbol` payload:
+Example `SymbolBirth` payload:
 
 ```json
 {
   "symbol_kind": "function",
-  "birth_seed": "agent-supplied-or-deterministic-seed"
+  "birth_history_hash": "sha256:...",
+  "local_nonce": "00000001"
 }
 ```
 
-The symbol hash is stable across renames and implementation changes.
-
-This gives three separate concepts:
+This gives separate identities:
 
 ```text
-symbol_hash      stable identity of the symbol
-name             display metadata for humans/projections
-function_def     current implementation bound to that symbol in a specific root
+symbol_hash          stable identity of the symbol
+name                 display metadata for humans/projections
+function_sig_hash    current callable interface
+function_def_hash    current implementation bound to that symbol in a root
+body_expr_hash       current implementation body
 ```
 
-### 5.5 Definition identity
+Important rule:
 
-A function definition is also content-addressed.
+```text
+Renaming a symbol must not change its symbol_hash.
+Changing a function body must not change its symbol_hash.
+Changing a function signature must not change its symbol_hash, but must change its function_sig_hash.
+```
 
-A function definition hash changes when its semantic implementation changes.
+### 7.5 Type identity
 
-A `FunctionDef` object should contain:
+Types are content-addressed objects.
+
+Required v0 types:
+
+```text
+I64
+Bool
+Unit
+FunctionSignature
+```
+
+Optional post-v0 types:
+
+```text
+U64
+I32
+F64
+Pointer
+Record
+Enum
+Array
+Slice
+Result
+```
+
+A function signature object contains:
+
+```text
+parameter type hashes
+return type hash
+calling convention / ABI tag
+effect information, if any
+```
+
+Example `FunctionSignature` payload:
+
+```json
+{
+  "params": ["sha256:type-i64"],
+  "return": "sha256:type-i64",
+  "abi": "codedb-v0-internal",
+  "effects": []
+}
+```
+
+### 7.6 Definition identity
+
+A function definition is content-addressed.
+
+A function definition hash changes when its semantic implementation or signature binding changes.
+
+A `FunctionDef` object contains:
 
 ```text
 symbol_hash
-arity
-body_expr_hash
-optional interface/type hash
+function_sig_hash
+typed_body_expr_hash
 ```
 
 Display names for the function and parameters belong in metadata, not in the semantic definition.
 
-### 5.6 Expressions form a DAG
+### 7.7 Expressions form a DAG
 
 Expressions are immutable content-addressed objects.
 
@@ -203,30 +337,35 @@ This allows:
 - incremental compilation,
 - cached evaluation/lowering.
 
-## 6. v0 language
+## 8. v0 language
 
-The v0 language is deliberately tiny.
+The v0 language is deliberately tiny, statically typed, pure, and runtime-free.
 
-### 6.1 Top-level construct
-
-Only top-level functions are required.
+### 8.1 Projection syntax
 
 Example projection:
 
 ```text
-def tax(subtotal) = subtotal * 0.20
+fn tax(subtotal: i64) -> i64 = subtotal * 20 / 100
 
-def total(subtotal) = subtotal + tax(subtotal)
+fn total(subtotal: i64) -> i64 = subtotal + tax(subtotal)
 
-def main() = total(100)
+fn main() -> i64 = total(100)
 ```
 
-### 6.2 Expression forms
+Notes:
+
+- Use integer arithmetic in v0.
+- Avoid floating-point, strings, heap objects, and allocation in the first demo.
+- Parameter names are projection metadata.
+- Calls bind to symbol hashes after resolution.
+
+### 8.2 Expression forms
 
 Required v0 expression kinds:
 
 ```text
-literal_number
+literal_i64
 literal_bool
 param_ref
 call
@@ -234,24 +373,27 @@ binary
 if
 ```
 
+Each expression has a statically known type.
+
 Optional after the basic demo:
 
 ```text
-literal_string
 let
+unit
 record
 field_access
-list
+fixed_array
 ```
 
-### 6.3 Expression object examples
+### 8.3 Expression object examples
 
-Number literal:
+Integer literal:
 
 ```json
 {
-  "kind": "literal_number",
-  "value": "100"
+  "kind": "literal_i64",
+  "value": "100",
+  "type": "sha256:type-i64"
 }
 ```
 
@@ -260,7 +402,8 @@ Parameter reference:
 ```json
 {
   "kind": "param_ref",
-  "index": 0
+  "index": 0,
+  "type": "sha256:type-i64"
 }
 ```
 
@@ -269,8 +412,9 @@ Function call:
 ```json
 {
   "kind": "call",
-  "symbol": "sha256:...",
-  "args": ["sha256:..."]
+  "symbol": "sha256:symbol-hash",
+  "args": ["sha256:expr-arg"],
+  "type": "sha256:type-i64"
 }
 ```
 
@@ -280,8 +424,9 @@ Binary expression:
 {
   "kind": "binary",
   "op": "+",
-  "left": "sha256:...",
-  "right": "sha256:..."
+  "left": "sha256:expr-left",
+  "right": "sha256:expr-right",
+  "type": "sha256:type-i64"
 }
 ```
 
@@ -290,31 +435,45 @@ Conditional:
 ```json
 {
   "kind": "if",
-  "cond": "sha256:...",
-  "then": "sha256:...",
-  "else": "sha256:..."
+  "cond": "sha256:expr-cond",
+  "then": "sha256:expr-then",
+  "else": "sha256:expr-else",
+  "type": "sha256:type-i64"
 }
 ```
 
-### 6.4 Name resolution
+## 9. Type checking
 
-Text projections use names. The database uses symbol hashes.
+Type checking is mandatory in v0.
 
-During import from text:
-
-```text
-names -> symbol_hashes
-```
-
-During export to text:
+Inputs:
 
 ```text
-symbol_hashes -> preferred names
+root_hash
+symbol_hash
+candidate expression DAG
+function signature
 ```
 
-If two names point to the same symbol, export chooses the preferred name from root metadata.
+Required checks:
 
-## 7. SQLite schema
+```text
+literal_i64 has type I64
+literal_bool has type Bool
+param_ref index is in bounds and has the declared parameter type
+binary integer ops require I64 operands and return I64
+comparison ops require I64 operands and return Bool
+if condition must be Bool
+if branches must have the same type
+call arguments must match callee signature
+function body type must match function return type
+```
+
+The type checker produces or verifies typed expression objects.
+
+A failed type check must prevent creation of a new root unless the migration is explicitly marked as an invalid/staged edit. v0 does not need staged invalid edits.
+
+## 10. SQLite schema
 
 File: `schema.sql`
 
@@ -374,10 +533,12 @@ CREATE TABLE IF NOT EXISTS root_symbols (
     root_hash TEXT NOT NULL,
     symbol_hash TEXT NOT NULL,
     definition_hash TEXT NOT NULL,
+    signature_hash TEXT NOT NULL,
     PRIMARY KEY (root_hash, symbol_hash),
     FOREIGN KEY (root_hash) REFERENCES objects(hash) ON DELETE CASCADE,
     FOREIGN KEY (symbol_hash) REFERENCES objects(hash),
-    FOREIGN KEY (definition_hash) REFERENCES objects(hash)
+    FOREIGN KEY (definition_hash) REFERENCES objects(hash),
+    FOREIGN KEY (signature_hash) REFERENCES objects(hash)
 );
 
 CREATE TABLE IF NOT EXISTS root_names (
@@ -427,11 +588,11 @@ Notes:
 - `compile_cache` is disposable and can be invalidated/rebuilt.
 - `source_search` is a convenience index for projections and debugging.
 
-## 8. Canonical JSON
+## 11. Canonical encoding
 
-All object payloads must be serialized deterministically.
+All semantic object payloads must be serialized deterministically.
 
-Rules:
+Rules for v0 canonical JSON:
 
 ```text
 UTF-8 encoding
@@ -446,7 +607,9 @@ no host-specific paths inside semantic objects
 
 Timestamps, agent IDs, comments, and explanations belong in migrations or metadata, not semantic objects.
 
-## 9. Required CLI
+A canonical binary encoding may replace canonical JSON later, but the hash rules must remain deterministic and versioned.
+
+## 12. Required CLI
 
 The v0 CLI should expose these commands:
 
@@ -454,47 +617,52 @@ The v0 CLI should expose these commands:
 codedb init <db>
 codedb import <db> <file>
 codedb export <db> --branch main --out <file>
-codedb run <db> <function-name>
+codedb eval <db> <function-name>
+codedb emit-c <db> <function-name> --out <file>
+codedb emit-llvm <db> <function-name> --out <file>        # optional in v0
 codedb list <db>
 codedb show <db> <symbol-or-name>
 codedb callers <db> <symbol-or-name>
 codedb rename <db> <old-name> <new-name>
 codedb replace-body <db> <name> <expr>
+codedb change-signature <db> <name> <signature>
 codedb diff <db> <root-a> <root-b>
 codedb history <db>
 codedb replay <db> --from-genesis
 codedb verify <db>
 ```
 
-### 9.1 Demo command sequence
+### 12.1 Demo command sequence
 
 The first demo should work like this:
 
 ```bash
 codedb init demo.codedb.sqlite
 codedb import demo.codedb.sqlite examples/shop.cdb
-codedb run demo.codedb.sqlite main
+codedb eval demo.codedb.sqlite main
 codedb callers demo.codedb.sqlite tax
 codedb rename demo.codedb.sqlite tax vat
 codedb diff demo.codedb.sqlite <old-root> <new-root>
 codedb export demo.codedb.sqlite --branch main --out projection.cdb
+codedb emit-c demo.codedb.sqlite main --out projection.c
 codedb replay demo.codedb.sqlite --from-genesis
 codedb verify demo.codedb.sqlite
 ```
 
 Expected behavior:
 
-- `run main` returns the numeric result.
+- `eval main` returns `120`.
 - `callers tax` shows `total`.
 - `rename tax vat` creates a new root where the symbol hash is unchanged but the preferred name changed.
 - `diff` classifies the change as `rename_symbol`, not delete/add.
 - `export` renders `vat` everywhere.
+- `emit-c` emits a pure, allocation-free C projection of the current root.
 - `replay` rebuilds the same final `root_hash`.
-- `verify` confirms all object hashes, indexes, dependencies, and history links.
+- `verify` confirms all object hashes, indexes, dependencies, types, and history links.
 
-## 10. Migrations
+## 13. Migrations
 
-### 10.1 Migration structure
+### 13.1 Migration structure
 
 Example migration object:
 
@@ -542,7 +710,7 @@ Example migration object:
 }
 ```
 
-### 10.2 Idempotence rule
+### 13.2 Idempotence rule
 
 Every migration application must return one of three outcomes:
 
@@ -567,13 +735,15 @@ If neither preconditions nor postconditions hold:
 
 This makes migrations safe to retry.
 
-### 10.3 Required v0 migrations
+### 13.3 Required v0 migrations
 
 #### create_function
 
 Creates:
 
-- a new `Symbol`,
+- a new `SymbolBirth`,
+- a new `FunctionSignature`,
+- typed expression objects,
 - a new `FunctionDef`,
 - name metadata,
 - a new `ProgramRoot`.
@@ -586,12 +756,20 @@ Required operation fields:
   "module": "main",
   "name": "tax",
   "birth_seed": "deterministic-or-agent-provided-seed",
-  "params": ["subtotal"],
+  "params": [
+    { "name": "subtotal", "type": "i64" }
+  ],
+  "return_type": "i64",
   "body_expr": {
     "kind": "binary",
-    "op": "*",
-    "left": { "kind": "param_ref", "index": 0 },
-    "right": { "kind": "literal_number", "value": "0.20" }
+    "op": "/",
+    "left": {
+      "kind": "binary",
+      "op": "*",
+      "left": { "kind": "param_ref", "index": 0 },
+      "right": { "kind": "literal_i64", "value": "20" }
+    },
+    "right": { "kind": "literal_i64", "value": "100" }
   }
 }
 ```
@@ -603,6 +781,7 @@ Changes name metadata only.
 Must not change:
 
 - symbol hash,
+- signature hash,
 - definition hash,
 - expression hashes,
 - dependency graph.
@@ -612,14 +791,36 @@ Must not change:
 Creates:
 
 - new expression objects as needed,
+- a new typed expression DAG,
 - a new `FunctionDef`,
 - a new `ProgramRoot`,
 - refreshed dependency indexes.
 
+Must verify:
+
+- new body type matches the current function signature return type,
+- all calls match callee signatures,
+- all expression types are valid.
+
 Must not change:
 
 - symbol hash,
-- preferred name unless explicitly requested.
+- preferred name unless explicitly requested,
+- function signature unless explicitly requested.
+
+#### change_function_signature
+
+Creates:
+
+- a new `FunctionSignature`,
+- a new `FunctionDef`,
+- a new `ProgramRoot`,
+- refreshed dependency indexes.
+
+Must either:
+
+- update all call sites in the same migration, or
+- fail if existing calls become invalid.
 
 #### delete_symbol
 
@@ -629,11 +830,11 @@ Removes a symbol from the root only if no live definitions depend on it, unless 
 
 Adds an additional name for an existing symbol.
 
-## 11. Diff model
+## 14. Diff model
 
 The diff engine compares two root hashes.
 
-### 11.1 Hash-pruned traversal
+### 14.1 Hash-pruned traversal
 
 Algorithm:
 
@@ -648,7 +849,7 @@ else:
 
 Equal hashes prove equal subgraphs and should not be traversed.
 
-### 11.2 Semantic classification
+### 14.2 Semantic classification
 
 The diff engine should classify changes at the highest semantic level possible.
 
@@ -667,6 +868,9 @@ dependency_removed
 literal_changed
 call_target_changed
 expression_replaced
+type_changed
+interface_changed
+implementation_changed
 ```
 
 Examples:
@@ -677,25 +881,19 @@ Same symbol hash, different preferred name:
 symbol_renamed
 ```
 
-Same symbol hash, different definition hash:
-
-```text
-function_body_changed
-```
-
-Different body hashes but same interface hash:
+Same symbol hash, different definition hash, same signature hash:
 
 ```text
 implementation_changed
 ```
 
-Different interface hash:
+Same symbol hash, different signature hash:
 
 ```text
 interface_changed
 ```
 
-### 11.3 Human-readable diff projection
+### 14.3 Human-readable diff projection
 
 Example output:
 
@@ -709,9 +907,11 @@ Renamed symbol:
   main.tax -> main.vat
 
 Unchanged:
+  signature hash
   function body hash
   dependencies
   callers
+  compiled artifact cache key for implementation
 ```
 
 For a body change:
@@ -719,22 +919,25 @@ For a body change:
 ```text
 Changed function: main.total
   symbol: sha256:...
+  signature: unchanged
 
 Expression diff:
   literal changed:
-    0.20 -> 0.18
+    20 -> 18
 
 Dependency diff:
   no dependency changes
 
 Incremental compile impact:
   recompile main.total
-  callers do not require recompilation if interface hash unchanged
+  callers do not require recompilation because interface hash is unchanged
 ```
 
-## 12. Interpreter
+## 15. Reference evaluator and backend
 
-The interpreter runs from a root hash.
+### 15.1 Reference evaluator
+
+The reference evaluator runs from a root hash and exists for testing and debugging.
 
 Inputs:
 
@@ -749,19 +952,69 @@ Evaluation rules:
 ```text
 Resolve entry name to symbol hash in root_names.
 Resolve symbol hash to current FunctionDef in root_symbols.
+Verify or load typed body expression.
 Evaluate function body expression.
 Calls resolve target symbol through the same root.
 ```
 
-This means the same symbol call can evaluate differently under different roots if the target symbol is rebound to a different definition in those roots.
+The evaluator must not read source files.
 
-The interpreter must not read source files.
+The evaluator is not the target language runtime.
 
-## 13. Incremental compilation and caching
+### 15.2 No-runtime backend
 
-v0 does not need native compilation, but it should include the cache model.
+The v0 backend should emit a tiny no-runtime artifact.
 
-### 13.1 Cache key
+Acceptable v0 backend choices:
+
+```text
+C source projection with no allocation and no library calls
+LLVM IR text with no external runtime calls
+object file exposing a plain ABI function
+```
+
+Recommended first backend:
+
+```text
+emit C for pure i64/bool functions
+compile or inspect separately
+```
+
+Example generated C projection:
+
+```c
+long codedb_tax(long subtotal) {
+    return (subtotal * 20) / 100;
+}
+
+long codedb_total(long subtotal) {
+    return subtotal + codedb_tax(subtotal);
+}
+
+long codedb_main(void) {
+    return codedb_total(100);
+}
+```
+
+This generated code should not use:
+
+```text
+malloc
+free
+printf
+exceptions
+threads
+global runtime initialization
+reflection metadata
+```
+
+A separate test harness may call `codedb_main` and print the result. The harness is not part of the target language runtime.
+
+## 16. Incremental compilation and caching
+
+v0 should include the cache model.
+
+### 16.1 Cache key
 
 A cache key must include all inputs that affect an artifact.
 
@@ -780,34 +1033,41 @@ cache_key = sha256(
 )
 ```
 
-### 13.2 Required v0 cached artifacts
+For no-runtime output, `runtime_version` should be a sentinel such as:
+
+```text
+runtime:none
+```
+
+### 16.2 Required v0 cached artifacts
 
 Required:
 
 ```text
 rendered_source
 parsed_expression
+typed_expression
 function_dependency_set
 interface_hash
 implementation_hash
+c_projection
 ```
 
 Optional:
 
 ```text
-typed_expression
 normalized_ir
-bytecode
 llvm_ir
+object_file
 ```
 
-### 13.3 Invalidation
+### 16.3 Invalidation
 
 If an implementation hash changes but interface hash does not:
 
 ```text
 recompute the changed function artifact
-recompute whole-program run cache if any
+recompute whole-program artifact if needed
 callers may not need recompilation
 ```
 
@@ -818,24 +1078,25 @@ recompute direct dependents
 then recursively recompute affected dependents
 ```
 
-## 14. Projections
+## 17. Projections
 
 A projection is a readable rendering of a root.
 
-v0 only needs one projection:
+v0 needs two projections:
 
 ```text
 canonical_source
+c_backend_source
 ```
 
-Example:
+Example canonical source:
 
 ```text
-def vat(subtotal) = subtotal * 0.20
+fn vat(subtotal: i64) -> i64 = subtotal * 20 / 100
 
-def total(subtotal) = subtotal + vat(subtotal)
+fn total(subtotal: i64) -> i64 = subtotal + vat(subtotal)
 
-def main() = total(100)
+fn main() -> i64 = total(100)
 ```
 
 Projection rules:
@@ -844,6 +1105,7 @@ Projection rules:
 Use preferred names from root metadata.
 Render definitions in deterministic order.
 Use stable formatting.
+Include type annotations.
 Do not preserve original whitespace.
 Do not preserve comments in v0.
 Emit enough information to re-import the projection if possible.
@@ -861,7 +1123,7 @@ literate_markdown
 llvm_ir
 ```
 
-## 15. Import model
+## 18. Import model
 
 Import from text is allowed for bootstrapping, but agents should eventually use structural migrations directly.
 
@@ -872,12 +1134,13 @@ For v0, import can be implemented as:
 ```text
 empty root
 for each function in file:
-  create_function migration
+  create_function migration with signature and body
+  type-check before committing root
 ```
 
 A later importer can diff text against an existing root and synthesize migrations.
 
-## 16. Verification
+## 19. Verification
 
 `codedb verify` must check:
 
@@ -887,11 +1150,15 @@ all object_edges point to existing objects
 all branch roots exist
 all migration input/output roots exist
 all history hashes are correct
+all function signatures are valid
+all typed expressions are type-correct
+all function bodies match their declared return types
 materialized root_symbols can be rebuilt from root objects
 materialized root_names can be rebuilt from root objects
 materialized dependencies can be rebuilt from expression DAGs
 history replay produces the branch root hash
 no cache entries claim impossible inputs
+no no-runtime backend artifact contains forbidden runtime calls, where checkable
 ```
 
 Verification failure should distinguish:
@@ -903,10 +1170,13 @@ bad_hash
 bad_history_link
 bad_index
 bad_dependency_index
+bad_type
+bad_signature
 bad_cache_entry
+forbidden_runtime_dependency
 ```
 
-## 17. Rebuild from scratch
+## 20. Rebuild from scratch
 
 A fresh database can be rebuilt from:
 
@@ -935,7 +1205,7 @@ assert current_history == expected_history_head
 
 If migrations are exported as newline-delimited JSON, the system can rebuild without copying the original SQLite file.
 
-## 18. Branches and merge
+## 21. Branches and merge
 
 v0 supports branches only as named pointers:
 
@@ -954,16 +1224,17 @@ semantic conflict detection
 hash-pruned tree diff
 ```
 
-## 19. Agent write API
+## 22. Agent write API
 
 Agents should primarily modify the program through structural operations.
 
 Required v0 operation API:
 
 ```text
-create_function(module, name, params, body_ast)
+create_function(module, name, params_with_types, return_type, body_ast)
 rename_symbol(symbol_or_name, new_name)
 replace_function_body(symbol_or_name, body_ast)
+change_function_signature(symbol_or_name, new_signature, callsite_updates)
 delete_symbol(symbol_or_name)
 create_alias(symbol_or_name, alias)
 ```
@@ -978,6 +1249,8 @@ new_root_hash
 migration_hash
 history_hash
 semantic_summary
+typecheck_summary
+compile_impact_summary
 ```
 
 Example response:
@@ -993,21 +1266,23 @@ Example response:
     "kind": "rename_symbol",
     "symbol": "sha256:symbol-hash",
     "from": "main.tax",
-    "to": "main.vat"
+    "to": "main.vat",
+    "typecheck": "unchanged",
+    "compile_impact": "metadata_only"
   }
 }
 ```
 
-## 20. First demo program
+## 23. First demo program
 
 File: `examples/shop.cdb`
 
 ```text
-def tax(subtotal) = subtotal * 0.20
+fn tax(subtotal: i64) -> i64 = subtotal * 20 / 100
 
-def total(subtotal) = subtotal + tax(subtotal)
+fn total(subtotal: i64) -> i64 = subtotal + tax(subtotal)
 
-def main() = total(100)
+fn main() -> i64 = total(100)
 ```
 
 Demo assertions:
@@ -1017,20 +1292,24 @@ main() evaluates to 120
 callers(tax) returns total
 rename tax -> vat preserves symbol hash
 rename tax -> vat changes root hash
+rename tax -> vat does not change function signature hash
 rename tax -> vat does not change function body hash
 export renders vat in total body
+emit-c produces allocation-free C code
 replay produces identical root hash
 verify passes
 ```
 
-## 21. Suggested implementation milestones
+## 24. Suggested implementation milestones
 
-### Milestone 1 — Object store
+### Milestone 1 — Rust project skeleton and object store
 
 Deliver:
 
 ```text
-canonical_json
+Rust workspace
+SQLite schema setup
+canonical_json or canonical encoding
 hash_object
 insert_object
 get_object
@@ -1047,17 +1326,37 @@ objects are immutable
 verify catches tampered payload_json
 ```
 
-### Milestone 2 — Tiny AST and interpreter
+### Milestone 2 — Types and typed AST objects
 
 Deliver:
 
 ```text
-expression objects
-function definition objects
-program root object
+Type objects
+FunctionSignature objects
+Expression objects with type fields
+FunctionDef objects
+ProgramRoot object
 root_symbols index
 root_names index
-run command
+```
+
+Acceptance:
+
+```text
+type hashes are deterministic
+function signatures hash deterministically
+function definitions reference typed body expressions
+```
+
+### Milestone 3 — Type checker and reference evaluator
+
+Deliver:
+
+```text
+type_check_expr
+type_check_function
+reference evaluator
+eval command
 ```
 
 Acceptance:
@@ -1065,10 +1364,11 @@ Acceptance:
 ```text
 shop.cdb imports
 main evaluates to 120
-interpreter reads from SQLite, not source file
+type errors prevent root creation
+reference evaluator reads from SQLite, not source file
 ```
 
-### Milestone 3 — Migrations
+### Milestone 4 — Migrations
 
 Deliver:
 
@@ -1076,6 +1376,7 @@ Deliver:
 create_function
 rename_symbol
 replace_function_body
+change_function_signature
 migration table
 history table
 branch update
@@ -1086,11 +1387,31 @@ Acceptance:
 
 ```text
 rename is retry-safe
-replace-body creates new root
+replace-body creates new typed root
+invalid replacement body is rejected
 history chain verifies
 ```
 
-### Milestone 4 — Projection
+### Milestone 5 — No-runtime C backend
+
+Deliver:
+
+```text
+emit-c command
+C projection for i64/bool pure functions
+backend cache entries
+forbidden runtime call check where practical
+```
+
+Acceptance:
+
+```text
+emit-c produces deterministic C
+emitted C contains no malloc/free/printf/thread calls
+codedb_main returns 120 when called by an external harness
+```
+
+### Milestone 6 — Projection
 
 Deliver:
 
@@ -1098,6 +1419,7 @@ Deliver:
 canonical source export
 name rendering
 function ordering
+type annotation rendering
 ```
 
 Acceptance:
@@ -1105,9 +1427,10 @@ Acceptance:
 ```text
 export after rename shows new name everywhere
 export is deterministic
+export includes type annotations
 ```
 
-### Milestone 5 — Semantic diff
+### Milestone 7 — Semantic diff
 
 Deliver:
 
@@ -1115,6 +1438,7 @@ Deliver:
 root diff
 symbol rename classification
 function body change classification
+function signature change classification
 expression diff
 compile-impact summary
 ```
@@ -1124,10 +1448,11 @@ Acceptance:
 ```text
 rename is not shown as delete/add
 literal change is shown as literal change
-unchanged subtrees are skipped by hash
+signature change is shown as interface change
+unchanged subgraphs are skipped by hash
 ```
 
-### Milestone 6 — Replay and verify
+### Milestone 8 — Replay and verify
 
 Deliver:
 
@@ -1135,6 +1460,7 @@ Deliver:
 replay from genesis
 verify indexes
 verify dependencies
+verify types
 verify history
 ```
 
@@ -1146,7 +1472,7 @@ verify passes on clean DB
 verify fails on intentionally corrupted DB
 ```
 
-## 22. Post-v0 roadmap
+## 25. Post-v0 roadmap
 
 After the v0 demo works, likely next steps are:
 
@@ -1154,18 +1480,20 @@ After the v0 demo works, likely next steps are:
 richer expression language
 structural agent API over HTTP or MCP
 local variable identity
-type system
-interface hash / implementation hash distinction
+records and enums
+ownership / borrowing / region model
+explicit allocation model
+interface hash / implementation hash distinction refinements
 branch merge
 migration squashing
 semantic patch language
-bytecode backend
-MLIR or LLVM backend
-Go/Rust/C projection backend
+LLVM IR backend
+MLIR backend
+Wasm backend
 visual graph explorer
 ```
 
-## 23. Design principles
+## 26. Design principles
 
 1. Files are projections.
 2. Source truth is the object DAG.
@@ -1173,14 +1501,18 @@ visual graph explorer
 4. The explanation of the current state is `migration_history`.
 5. Names are metadata.
 6. Global references use symbol hashes, not names.
-7. Semantic changes are migrations, not line edits.
-8. Diffs should preserve intent when possible.
-9. Equal hashes prove equal subgraphs.
-10. Rebuild must be deterministic.
-11. Caches are disposable.
-12. Verification is mandatory.
+7. Symbol hashes must be stable across renames, body changes, and signature changes.
+8. Function signatures are typed, content-addressed interface objects.
+9. Semantic changes are migrations, not line edits.
+10. Diffs should preserve intent when possible.
+11. Equal hashes prove equal subgraphs.
+12. The target language core is statically typed.
+13. Generated programs do not require a managed runtime.
+14. Rebuild must be deterministic.
+15. Caches are disposable.
+16. Verification is mandatory.
 
-## 24. Open questions
+## 27. Open questions
 
 These do not block v0, but should be revisited:
 
@@ -1188,9 +1520,12 @@ These do not block v0, but should be revisited:
 2. Should migration logs be stored inside SQLite only, or also exported as NDJSON?
 3. Should symbol birth seeds be random, agent-provided, or deterministically derived from the creating migration?
 4. Should root metadata changes count as semantic root changes, or should there be separate semantic and presentation roots?
-5. Should function calls bind to symbol hashes or to exact definition hashes?
+5. Should function calls bind to symbol hashes or exact definition hashes?
 6. How should branch merge conflicts be represented?
 7. Should import from text be allowed to synthesize migrations against a non-empty root?
 8. How should comments/docstrings be modeled: metadata, semantic documentation objects, or projection-only text?
-9. Should the first native backend target LLVM IR, MLIR, WebAssembly, C, or Go?
+9. Should the first native backend target C, LLVM IR, MLIR, WebAssembly, or object code directly?
 10. Should the object store eventually support garbage collection of unreachable objects?
+11. What ownership/borrowing/allocation model should exist post-v0?
+12. Should integer overflow be defined, trapped, wrapping, or statically prevented?
+13. Should bounds checks be required, optional, or statically proven for future arrays/slices?
