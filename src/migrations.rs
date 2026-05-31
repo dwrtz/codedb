@@ -5,6 +5,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
+use crate::backend::ArtifactKind;
 use crate::expr::RawExpr;
 use crate::model::{
     BranchState, NameBinding, ParamNames, ProgramRootPayload, RootSymbolPayload, param_names,
@@ -71,13 +72,346 @@ impl Operation {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct MigrationOutcome {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MigrationStatus {
+    Applied,
+    AlreadyApplied,
+    Conflict,
+}
+
+impl MigrationStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            MigrationStatus::Applied => "applied",
+            MigrationStatus::AlreadyApplied => "already_applied",
+            MigrationStatus::Conflict => "conflict",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum MigrationOutcome {
+    Applied(MigrationReport),
+    AlreadyApplied(MigrationReport),
+    Conflict(MigrationConflict),
+}
+
+impl MigrationOutcome {
+    pub(crate) fn format_cli(&self) -> String {
+        match self {
+            MigrationOutcome::Applied(report) => report.format_cli(MigrationStatus::Applied),
+            MigrationOutcome::AlreadyApplied(report) => {
+                report.format_cli(MigrationStatus::AlreadyApplied)
+            }
+            MigrationOutcome::Conflict(conflict) => conflict.format_cli(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MigrationReport {
     pub(crate) old_root: String,
     pub(crate) new_root: String,
-    pub(crate) migration_hash: String,
-    pub(crate) history_hash: String,
-    pub(crate) summary: String,
+    pub(crate) migration_hash: Option<String>,
+    pub(crate) history_hash: Option<String>,
+    pub(crate) summary: MigrationSummary,
+}
+
+impl MigrationReport {
+    fn format_cli(&self, status: MigrationStatus) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "{} {} {}\n",
+            status.as_str(),
+            self.summary.operation_kind,
+            self.summary.display
+        ));
+        match status {
+            MigrationStatus::Applied => {
+                out.push_str(&format!("old_root {}\n", self.old_root));
+                out.push_str(&format!("new_root {}\n", self.new_root));
+                if let Some(migration_hash) = &self.migration_hash {
+                    out.push_str(&format!("migration {migration_hash}\n"));
+                }
+                if let Some(history_hash) = &self.history_hash {
+                    out.push_str(&format!("history {history_hash}\n"));
+                }
+            }
+            MigrationStatus::AlreadyApplied => {
+                out.push_str(&format!("root {}\n", self.new_root));
+                if let Some(history_hash) = &self.history_hash {
+                    out.push_str(&format!("history {history_hash}\n"));
+                }
+            }
+            MigrationStatus::Conflict => unreachable!("conflicts use MigrationConflict"),
+        }
+        self.summary.push_cli_lines(&mut out);
+        out
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MigrationConflict {
+    pub(crate) current_root: String,
+    pub(crate) expected_root: String,
+    pub(crate) summary: MigrationSummary,
+    pub(crate) failed_preconditions: Vec<Precondition>,
+    pub(crate) failed_postconditions: Vec<Postcondition>,
+}
+
+impl MigrationConflict {
+    fn format_cli(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "{} {} {}\n",
+            MigrationStatus::Conflict.as_str(),
+            self.summary.operation_kind,
+            self.summary.display
+        ));
+        out.push_str(&format!("root {}\n", self.current_root));
+        out.push_str(&format!("expected_root {}\n", self.expected_root));
+        out.push_str(&format!(
+            "failed_preconditions {}\n",
+            condition_names(&self.failed_preconditions)
+        ));
+        out.push_str(&format!(
+            "failed_postconditions {}\n",
+            condition_names(&self.failed_postconditions)
+        ));
+        self.summary.push_cli_lines(&mut out);
+        out
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MigrationSummary {
+    pub(crate) operation_kind: &'static str,
+    pub(crate) display: String,
+    pub(crate) semantic_impact: SemanticImpact,
+    pub(crate) typecheck: TypecheckImpact,
+    pub(crate) build_impact: BuildImpactSummary,
+}
+
+impl MigrationSummary {
+    fn push_cli_lines(&self, out: &mut String) {
+        out.push_str(&format!(
+            "semantic_impact {}\n",
+            self.semantic_impact.as_str()
+        ));
+        out.push_str(&format!("typecheck {}\n", self.typecheck.as_str()));
+        out.push_str(&format!(
+            "build_impact {}\n",
+            self.build_impact.kind.as_str()
+        ));
+        out.push_str(&format!(
+            "regenerate {}\n",
+            artifact_names(&self.build_impact.regenerate)
+        ));
+        out.push_str(&format!(
+            "recompile {}\n",
+            if self.build_impact.recompile.is_empty() {
+                "none".to_string()
+            } else {
+                self.build_impact.recompile.join(",")
+            }
+        ));
+        out.push_str(&format!("relink {}\n", self.build_impact.relink));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticImpact {
+    FunctionCreated,
+    SymbolRenamed,
+    ImplementationChanged,
+    InterfaceChanged,
+    SymbolDeleted,
+    AliasCreated,
+}
+
+impl SemanticImpact {
+    fn as_str(self) -> &'static str {
+        match self {
+            SemanticImpact::FunctionCreated => "function_created",
+            SemanticImpact::SymbolRenamed => "symbol_renamed",
+            SemanticImpact::ImplementationChanged => "implementation_changed",
+            SemanticImpact::InterfaceChanged => "interface_changed",
+            SemanticImpact::SymbolDeleted => "symbol_deleted",
+            SemanticImpact::AliasCreated => "alias_created",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypecheckImpact {
+    Checked,
+    Unchanged,
+    BodyRechecked,
+    RootRechecked,
+}
+
+impl TypecheckImpact {
+    fn as_str(self) -> &'static str {
+        match self {
+            TypecheckImpact::Checked => "checked",
+            TypecheckImpact::Unchanged => "unchanged",
+            TypecheckImpact::BodyRechecked => "body_rechecked",
+            TypecheckImpact::RootRechecked => "root_rechecked",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BuildImpactSummary {
+    pub(crate) kind: BuildImpactKind,
+    pub(crate) regenerate: Vec<ArtifactKind>,
+    pub(crate) recompile: Vec<String>,
+    pub(crate) relink: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum BuildImpactKind {
+    MetadataOnly,
+    RelinkOnly,
+    RecompileSymbols,
+    RecompileDependents,
+    FullRebuild,
+}
+
+impl BuildImpactKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            BuildImpactKind::MetadataOnly => "metadata_only",
+            BuildImpactKind::RelinkOnly => "relink_only",
+            BuildImpactKind::RecompileSymbols => "recompile_symbols",
+            BuildImpactKind::RecompileDependents => "recompile_dependents",
+            BuildImpactKind::FullRebuild => "full_rebuild",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum Precondition {
+    RootIsCurrent {
+        root: String,
+    },
+    NameIsAvailable {
+        module: String,
+        name: String,
+    },
+    NamePointsToSymbol {
+        module: String,
+        name: String,
+        symbol: String,
+    },
+}
+
+impl Precondition {
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Precondition::RootIsCurrent { .. } => "root_is_current",
+            Precondition::NameIsAvailable { .. } => "name_is_available",
+            Precondition::NamePointsToSymbol { .. } => "name_points_to_symbol",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum Postcondition {
+    RootExists {
+        root: String,
+    },
+    FunctionSourceMatches {
+        module: String,
+        name: String,
+        params: Vec<ParamSpec>,
+        return_type: String,
+        body: RawExpr,
+    },
+    NamePointsToSymbol {
+        module: String,
+        name: String,
+        symbol: String,
+    },
+    NameAbsent {
+        module: String,
+        name: String,
+    },
+    BodySourceMatches {
+        module: String,
+        name: String,
+        symbol: String,
+        body: RawExpr,
+    },
+    SignatureSourceMatches {
+        module: String,
+        name: String,
+        symbol: String,
+        params: Vec<ParamSpec>,
+        return_type: String,
+    },
+    SymbolAbsent {
+        symbol: String,
+    },
+}
+
+impl Postcondition {
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Postcondition::RootExists { .. } => "root_exists",
+            Postcondition::FunctionSourceMatches { .. } => "function_source_matches",
+            Postcondition::NamePointsToSymbol { .. } => "name_points_to_symbol",
+            Postcondition::NameAbsent { .. } => "name_absent",
+            Postcondition::BodySourceMatches { .. } => "body_source_matches",
+            Postcondition::SignatureSourceMatches { .. } => "signature_source_matches",
+            Postcondition::SymbolAbsent { .. } => "symbol_absent",
+        }
+    }
+}
+
+trait ConditionName {
+    fn condition_name(&self) -> &'static str;
+}
+
+impl ConditionName for Precondition {
+    fn condition_name(&self) -> &'static str {
+        self.kind_name()
+    }
+}
+
+impl ConditionName for Postcondition {
+    fn condition_name(&self) -> &'static str {
+        self.kind_name()
+    }
+}
+
+fn condition_names<T: ConditionName>(conditions: &[T]) -> String {
+    if conditions.is_empty() {
+        return "none".to_string();
+    }
+    conditions
+        .iter()
+        .map(ConditionName::condition_name)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn projection_artifacts() -> Vec<ArtifactKind> {
+    vec![ArtifactKind::CanonicalSource, ArtifactKind::CProjection]
+}
+
+fn artifact_names(artifacts: &[ArtifactKind]) -> String {
+    if artifacts.is_empty() {
+        return "none".to_string();
+    }
+    artifacts
+        .iter()
+        .map(|artifact| artifact.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 impl CodeDb {
@@ -86,19 +420,64 @@ impl CodeDb {
         branch: BranchState,
         op: Operation,
     ) -> Result<MigrationOutcome> {
+        let expected_root = branch.root_hash.clone();
+        self.apply_and_record_expected(branch, &expected_root, op)
+    }
+
+    pub(crate) fn apply_and_record_expected(
+        &mut self,
+        branch: BranchState,
+        expected_root: &str,
+        op: Operation,
+    ) -> Result<MigrationOutcome> {
         let old_root = branch.root_hash.clone();
+        let summary = self.migration_summary(&op);
+        let preconditions = self.preconditions_for(expected_root, &op);
+        let failed_preconditions = self.failed_preconditions(&old_root, &preconditions)?;
+        if !failed_preconditions.is_empty() {
+            let current_postconditions = self.postconditions_for(&old_root, &op);
+            let failed_postconditions =
+                self.failed_postconditions(&old_root, &current_postconditions)?;
+            if failed_postconditions.is_empty() {
+                return Ok(MigrationOutcome::AlreadyApplied(MigrationReport {
+                    old_root: old_root.clone(),
+                    new_root: old_root,
+                    migration_hash: None,
+                    history_hash: branch.history_hash,
+                    summary,
+                }));
+            }
+
+            return Ok(MigrationOutcome::Conflict(MigrationConflict {
+                current_root: old_root,
+                expected_root: expected_root.to_string(),
+                summary,
+                failed_preconditions,
+                failed_postconditions,
+            }));
+        }
+
         let new_root =
             self.apply_operation_to_root(&old_root, branch.history_hash.as_deref(), &op)?;
-        let preconditions = self.preconditions_for(&old_root, &op);
         let postconditions = self.postconditions_for(&new_root, &op);
+        let failed_postconditions = self.failed_postconditions(&new_root, &postconditions)?;
+        if !failed_postconditions.is_empty() {
+            bail!(
+                "postcondition failed for {}: {}",
+                op.kind_name(),
+                condition_names(&failed_postconditions)
+            );
+        }
         let operation_json = serde_json::to_value(&op)?;
+        let preconditions_json = serde_json::to_value(&preconditions)?;
+        let postconditions_json = serde_json::to_value(&postconditions)?;
         let migration_hash = migration_hash(
             branch.history_hash.as_deref(),
             &old_root,
             &new_root,
             &operation_json,
-            &preconditions,
-            &postconditions,
+            &preconditions_json,
+            &postconditions_json,
         );
         let history_hash = history_hash(branch.history_hash.as_deref(), &migration_hash, &new_root);
 
@@ -114,8 +493,8 @@ impl CodeDb {
                 new_root,
                 op.kind_name(),
                 canonical_json(&operation_json),
-                canonical_json(&preconditions),
-                canonical_json(&postconditions),
+                canonical_json(&preconditions_json),
+                canonical_json(&postconditions_json),
             ],
         )?;
         self.conn.execute(
@@ -125,31 +504,45 @@ impl CodeDb {
             params![history_hash, branch.history_hash, migration_hash, new_root],
         )?;
         self.update_branch(MAIN_BRANCH, &new_root, &history_hash)?;
-        Ok(MigrationOutcome {
+        Ok(MigrationOutcome::Applied(MigrationReport {
             old_root,
             new_root,
-            migration_hash,
-            history_hash,
-            summary: self.operation_summary(&op),
-        })
+            migration_hash: Some(migration_hash),
+            history_hash: Some(history_hash),
+            summary,
+        }))
     }
 
-    pub(crate) fn preconditions_for(&self, input_root: &str, op: &Operation) -> JsonValue {
+    pub(crate) fn preconditions_for(&self, input_root: &str, op: &Operation) -> Vec<Precondition> {
         match op {
-            Operation::CreateFunction { module, name, .. } => json!([
-                { "kind": "root_is_current", "root": input_root },
-                { "kind": "name_is_available", "module": module, "name": name },
-            ]),
+            Operation::CreateFunction { module, name, .. } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::NameIsAvailable {
+                    module: module.clone(),
+                    name: name.clone(),
+                },
+            ],
             Operation::RenameSymbol {
                 module,
                 symbol,
                 old_name,
                 new_name,
-            } => json!([
-                { "kind": "root_is_current", "root": input_root },
-                { "kind": "name_points_to_symbol", "module": module, "name": old_name, "symbol": symbol },
-                { "kind": "name_is_available", "module": module, "name": new_name },
-            ]),
+            } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::NamePointsToSymbol {
+                    module: module.clone(),
+                    name: old_name.clone(),
+                    symbol: symbol.clone(),
+                },
+                Precondition::NameIsAvailable {
+                    module: module.clone(),
+                    name: new_name.clone(),
+                },
+            ],
             Operation::ReplaceFunctionBody {
                 module,
                 symbol,
@@ -173,76 +566,369 @@ impl CodeDb {
                 symbol,
                 name,
                 ..
-            } => json!([
-                { "kind": "root_is_current", "root": input_root },
-                { "kind": "name_points_to_symbol", "module": module, "name": name, "symbol": symbol },
-            ]),
+            } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::NamePointsToSymbol {
+                    module: module.clone(),
+                    name: name.clone(),
+                    symbol: symbol.clone(),
+                },
+            ],
         }
     }
 
-    pub(crate) fn postconditions_for(&self, output_root: &str, op: &Operation) -> JsonValue {
+    pub(crate) fn postconditions_for(
+        &self,
+        output_root: &str,
+        op: &Operation,
+    ) -> Vec<Postcondition> {
         match op {
-            Operation::CreateFunction { module, name, .. } => json!([
-                { "kind": "root_exists", "root": output_root },
-                { "kind": "name_exists", "module": module, "name": name },
-            ]),
+            Operation::CreateFunction {
+                module,
+                name,
+                params,
+                return_type,
+                body,
+                ..
+            } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::FunctionSourceMatches {
+                    module: module.clone(),
+                    name: name.clone(),
+                    params: params.clone(),
+                    return_type: return_type.clone(),
+                    body: body.clone(),
+                },
+            ],
             Operation::RenameSymbol {
                 module,
                 symbol,
                 old_name,
                 new_name,
-            } => json!([
-                { "kind": "root_exists", "root": output_root },
-                { "kind": "name_points_to_symbol", "module": module, "name": new_name, "symbol": symbol },
-                { "kind": "name_absent", "module": module, "name": old_name },
-            ]),
-            Operation::ReplaceFunctionBody { symbol, .. } => json!([
-                { "kind": "root_exists", "root": output_root },
-                { "kind": "definition_changed", "symbol": symbol },
-            ]),
-            Operation::ChangeFunctionSignature { symbol, .. } => json!([
-                { "kind": "root_exists", "root": output_root },
-                { "kind": "signature_changed", "symbol": symbol },
-            ]),
-            Operation::DeleteSymbol { symbol, .. } => json!([
-                { "kind": "root_exists", "root": output_root },
-                { "kind": "symbol_absent", "symbol": symbol },
-            ]),
+            } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::NamePointsToSymbol {
+                    module: module.clone(),
+                    name: new_name.clone(),
+                    symbol: symbol.clone(),
+                },
+                Postcondition::NameAbsent {
+                    module: module.clone(),
+                    name: old_name.clone(),
+                },
+            ],
+            Operation::ReplaceFunctionBody {
+                module,
+                symbol,
+                name,
+                body,
+            } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::BodySourceMatches {
+                    module: module.clone(),
+                    name: name.clone(),
+                    symbol: symbol.clone(),
+                    body: body.clone(),
+                },
+            ],
+            Operation::ChangeFunctionSignature {
+                module,
+                symbol,
+                name,
+                params,
+                return_type,
+            } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::SignatureSourceMatches {
+                    module: module.clone(),
+                    name: name.clone(),
+                    symbol: symbol.clone(),
+                    params: params.clone(),
+                    return_type: return_type.clone(),
+                },
+            ],
+            Operation::DeleteSymbol { symbol, .. } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::SymbolAbsent {
+                    symbol: symbol.clone(),
+                },
+            ],
             Operation::CreateAlias {
                 module,
                 symbol,
                 alias,
                 ..
-            } => json!([
-                { "kind": "root_exists", "root": output_root },
-                { "kind": "name_points_to_symbol", "module": module, "name": alias, "symbol": symbol },
-            ]),
+            } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::NamePointsToSymbol {
+                    module: module.clone(),
+                    name: alias.clone(),
+                    symbol: symbol.clone(),
+                },
+            ],
         }
     }
 
-    pub(crate) fn operation_summary(&self, op: &Operation) -> String {
-        match op {
-            Operation::CreateFunction { module, name, .. } => format!("{module}.{name}"),
+    pub(crate) fn migration_summary(&self, op: &Operation) -> MigrationSummary {
+        let (display, semantic_impact, typecheck, build_impact) = match op {
+            Operation::CreateFunction { module, name, .. } => (
+                format!("{module}.{name}"),
+                SemanticImpact::FunctionCreated,
+                TypecheckImpact::Checked,
+                BuildImpactSummary {
+                    kind: BuildImpactKind::RecompileSymbols,
+                    regenerate: projection_artifacts(),
+                    recompile: vec![format!("{module}.{name}")],
+                    relink: true,
+                },
+            ),
             Operation::RenameSymbol {
                 module,
                 old_name,
                 new_name,
                 ..
-            } => format!("{module}.{old_name} -> {module}.{new_name}"),
-            Operation::ReplaceFunctionBody { module, name, .. } => {
-                format!("{module}.{name}")
-            }
-            Operation::ChangeFunctionSignature { module, name, .. } => {
-                format!("{module}.{name}")
-            }
-            Operation::DeleteSymbol { module, name, .. } => format!("{module}.{name}"),
+            } => (
+                format!("{module}.{old_name} -> {module}.{new_name}"),
+                SemanticImpact::SymbolRenamed,
+                TypecheckImpact::Unchanged,
+                BuildImpactSummary {
+                    kind: BuildImpactKind::MetadataOnly,
+                    regenerate: projection_artifacts(),
+                    recompile: vec![],
+                    relink: false,
+                },
+            ),
+            Operation::ReplaceFunctionBody { module, name, .. } => (
+                format!("{module}.{name}"),
+                SemanticImpact::ImplementationChanged,
+                TypecheckImpact::BodyRechecked,
+                BuildImpactSummary {
+                    kind: BuildImpactKind::RecompileSymbols,
+                    regenerate: projection_artifacts(),
+                    recompile: vec![format!("{module}.{name}")],
+                    relink: true,
+                },
+            ),
+            Operation::ChangeFunctionSignature { module, name, .. } => (
+                format!("{module}.{name}"),
+                SemanticImpact::InterfaceChanged,
+                TypecheckImpact::RootRechecked,
+                BuildImpactSummary {
+                    kind: BuildImpactKind::RecompileDependents,
+                    regenerate: projection_artifacts(),
+                    recompile: vec![format!("{module}.{name}")],
+                    relink: true,
+                },
+            ),
+            Operation::DeleteSymbol { module, name, .. } => (
+                format!("{module}.{name}"),
+                SemanticImpact::SymbolDeleted,
+                TypecheckImpact::RootRechecked,
+                BuildImpactSummary {
+                    kind: BuildImpactKind::RelinkOnly,
+                    regenerate: projection_artifacts(),
+                    recompile: vec![],
+                    relink: true,
+                },
+            ),
             Operation::CreateAlias {
                 module,
                 name,
                 alias,
                 ..
-            } => format!("{module}.{name} as {module}.{alias}"),
+            } => (
+                format!("{module}.{name} as {module}.{alias}"),
+                SemanticImpact::AliasCreated,
+                TypecheckImpact::Unchanged,
+                BuildImpactSummary {
+                    kind: BuildImpactKind::MetadataOnly,
+                    regenerate: projection_artifacts(),
+                    recompile: vec![],
+                    relink: false,
+                },
+            ),
+        };
+
+        MigrationSummary {
+            operation_kind: op.kind_name(),
+            display,
+            semantic_impact,
+            typecheck,
+            build_impact,
         }
+    }
+
+    pub(crate) fn failed_preconditions(
+        &self,
+        current_root: &str,
+        preconditions: &[Precondition],
+    ) -> Result<Vec<Precondition>> {
+        let root = self.load_root(current_root)?;
+        let mut failed = Vec::new();
+        for precondition in preconditions {
+            let holds = match precondition {
+                Precondition::RootIsCurrent { root } => root == current_root,
+                Precondition::NameIsAvailable { module, name } => !root
+                    .names
+                    .iter()
+                    .any(|binding| binding.module == *module && binding.display_name == *name),
+                Precondition::NamePointsToSymbol {
+                    module,
+                    name,
+                    symbol,
+                } => name_points_to_symbol(&root, module, name, symbol),
+            };
+            if !holds {
+                failed.push(precondition.clone());
+            }
+        }
+        Ok(failed)
+    }
+
+    pub(crate) fn failed_postconditions(
+        &self,
+        current_root: &str,
+        postconditions: &[Postcondition],
+    ) -> Result<Vec<Postcondition>> {
+        let root = self.load_root(current_root)?;
+        let mut failed = Vec::new();
+        for postcondition in postconditions {
+            if !self.postcondition_holds(current_root, &root, postcondition)? {
+                failed.push(postcondition.clone());
+            }
+        }
+        Ok(failed)
+    }
+
+    fn postcondition_holds(
+        &self,
+        current_root: &str,
+        root: &ProgramRootPayload,
+        postcondition: &Postcondition,
+    ) -> Result<bool> {
+        match postcondition {
+            Postcondition::RootExists { root } => {
+                if root == current_root {
+                    return Ok(true);
+                }
+                let exists: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM objects WHERE hash = ?1)",
+                    params![root],
+                    |row| row.get(0),
+                )?;
+                Ok(exists)
+            }
+            Postcondition::FunctionSourceMatches {
+                module,
+                name,
+                params,
+                return_type,
+                body,
+            } => {
+                let Some(symbol) = symbol_for_name(root, module, name) else {
+                    return Ok(false);
+                };
+                let param_names = params
+                    .iter()
+                    .map(|param| param.name.clone())
+                    .collect::<Vec<_>>();
+                Ok(
+                    self.function_signature_source_matches(root, &symbol, params, return_type)?
+                        && self.function_body_source_matches(root, &symbol, body, &param_names)?,
+                )
+            }
+            Postcondition::NamePointsToSymbol {
+                module,
+                name,
+                symbol,
+            } => Ok(name_points_to_symbol(root, module, name, symbol)),
+            Postcondition::NameAbsent { module, name } => Ok(!root
+                .names
+                .iter()
+                .any(|binding| binding.module == *module && binding.display_name == *name)),
+            Postcondition::BodySourceMatches {
+                module,
+                name,
+                symbol,
+                body,
+            } => {
+                if !name_points_to_symbol(root, module, name, symbol) {
+                    return Ok(false);
+                }
+                self.function_body_source_matches(root, symbol, body, &param_names(root, symbol))
+            }
+            Postcondition::SignatureSourceMatches {
+                module,
+                name,
+                symbol,
+                params,
+                return_type,
+            } => {
+                if !name_points_to_symbol(root, module, name, symbol) {
+                    return Ok(false);
+                }
+                self.function_signature_source_matches(root, symbol, params, return_type)
+            }
+            Postcondition::SymbolAbsent { symbol } => {
+                Ok(!root.symbols.iter().any(|entry| entry.symbol == *symbol)
+                    && !root.names.iter().any(|binding| binding.symbol == *symbol))
+            }
+        }
+    }
+
+    fn function_signature_source_matches(
+        &self,
+        root: &ProgramRootPayload,
+        symbol: &str,
+        params: &[ParamSpec],
+        return_type: &str,
+    ) -> Result<bool> {
+        let Some(entry) = self.root_symbol(root, symbol) else {
+            return Ok(false);
+        };
+        let (actual_params, actual_return_type) = self.signature_parts(&entry.signature)?;
+        let expected_params = params
+            .iter()
+            .map(|param| self.resolve_type(&param.ty))
+            .collect::<Result<Vec<_>>>()?;
+        let expected_return_type = self.resolve_type(return_type)?;
+        let expected_names = params
+            .iter()
+            .map(|param| param.name.clone())
+            .collect::<Vec<_>>();
+        Ok(actual_params == expected_params
+            && actual_return_type == expected_return_type
+            && param_names(root, symbol) == expected_names)
+    }
+
+    fn function_body_source_matches(
+        &self,
+        root: &ProgramRootPayload,
+        symbol: &str,
+        expected_body: &RawExpr,
+        local_params: &[String],
+    ) -> Result<bool> {
+        let Some(entry) = self.root_symbol(root, symbol) else {
+            return Ok(false);
+        };
+        let body = self.function_body_hash(&entry.definition)?;
+        let actual = self.typed_expr_to_raw(&body, root)?;
+        let expected = normalize_param_refs(expected_body, local_params);
+        Ok(actual == expected)
     }
 
     pub(crate) fn apply_operation_to_root(
@@ -589,11 +1275,43 @@ impl CodeDb {
                     current_root
                 );
             }
-            let produced = self.apply_operation_to_root(
-                &current_root,
-                current_history.as_deref(),
-                &item.operation,
-            )?;
+            let preconditions = self.preconditions_for(&current_root, &item.operation);
+            let failed_preconditions = self.failed_preconditions(&current_root, &preconditions)?;
+            let produced = if failed_preconditions.is_empty() {
+                let produced = self
+                    .apply_operation_to_root(
+                        &current_root,
+                        current_history.as_deref(),
+                        &item.operation,
+                    )
+                    .with_context(|| {
+                        format!("semantic_conflict: migration {}", item.migration_hash)
+                    })?;
+                let postconditions = self.postconditions_for(&produced, &item.operation);
+                let failed_postconditions =
+                    self.failed_postconditions(&produced, &postconditions)?;
+                if !failed_postconditions.is_empty() {
+                    bail!(
+                        "semantic_conflict: migration {} failed postconditions {}",
+                        item.migration_hash,
+                        condition_names(&failed_postconditions)
+                    );
+                }
+                produced
+            } else {
+                let postconditions = self.postconditions_for(&current_root, &item.operation);
+                let failed_postconditions =
+                    self.failed_postconditions(&current_root, &postconditions)?;
+                if failed_postconditions.is_empty() {
+                    current_root.clone()
+                } else {
+                    bail!(
+                        "semantic_conflict: migration {} failed preconditions {}",
+                        item.migration_hash,
+                        condition_names(&failed_preconditions)
+                    );
+                }
+            };
             if produced != item.output_root {
                 bail!(
                     "replay mismatch for {}: expected {}, produced {}",
@@ -682,6 +1400,60 @@ struct HistoryItem {
     output_root: String,
     operation_kind: String,
     operation: Operation,
+}
+
+fn name_points_to_symbol(
+    root: &ProgramRootPayload,
+    module: &str,
+    name: &str,
+    symbol: &str,
+) -> bool {
+    root.names.iter().any(|binding| {
+        binding.module == module && binding.display_name == name && binding.symbol == symbol
+    })
+}
+
+fn symbol_for_name(root: &ProgramRootPayload, module: &str, name: &str) -> Option<String> {
+    root.names
+        .iter()
+        .find(|binding| binding.module == module && binding.display_name == name)
+        .map(|binding| binding.symbol.clone())
+}
+
+fn normalize_param_refs(expr: &RawExpr, local_params: &[String]) -> RawExpr {
+    match expr {
+        RawExpr::LiteralI64 { value } => RawExpr::LiteralI64 {
+            value: value.clone(),
+        },
+        RawExpr::LiteralBool { value } => RawExpr::LiteralBool { value: *value },
+        RawExpr::ParamRef { index } => RawExpr::ParamRef { index: *index },
+        RawExpr::ParamName { name } => local_params
+            .iter()
+            .position(|candidate| candidate == name)
+            .map(|index| RawExpr::ParamRef { index })
+            .unwrap_or_else(|| RawExpr::ParamName { name: name.clone() }),
+        RawExpr::Call { name, args } => RawExpr::Call {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| normalize_param_refs(arg, local_params))
+                .collect(),
+        },
+        RawExpr::Binary { op, left, right } => RawExpr::Binary {
+            op: op.clone(),
+            left: Box::new(normalize_param_refs(left, local_params)),
+            right: Box::new(normalize_param_refs(right, local_params)),
+        },
+        RawExpr::If {
+            cond,
+            then_expr,
+            else_expr,
+        } => RawExpr::If {
+            cond: Box::new(normalize_param_refs(cond, local_params)),
+            then_expr: Box::new(normalize_param_refs(then_expr, local_params)),
+            else_expr: Box::new(normalize_param_refs(else_expr, local_params)),
+        },
+    }
 }
 
 pub(crate) fn migration_hash(

@@ -807,11 +807,11 @@ codedb emit-c <db> <function-name> --out <file>
 codedb list <db>
 codedb show <db> <symbol-or-name>
 codedb callers <db> <symbol-or-name>
-codedb rename <db> <old-name> <new-name>
-codedb replace-body <db> <name> <expr>
-codedb change-signature <db> <name> <signature>
-codedb delete-symbol <db> <name> [--force]
-codedb create-alias <db> <name> <alias>
+codedb rename <db> <old-name> <new-name> [--expect-root <root>]
+codedb replace-body <db> <name> <expr> [--expect-root <root>]
+codedb change-signature <db> <name> <signature> [--expect-root <root>]
+codedb delete-symbol <db> <name> [--force] [--expect-root <root>]
+codedb create-alias <db> <name> <alias> [--expect-root <root>]
 codedb diff <db> <root-a> <root-b>
 codedb history <db>
 codedb replay <db> --from-genesis
@@ -835,6 +835,11 @@ emit-c emits a C projection.
 emit-object emits a compiler artifact.
 build/link-native operate on object artifacts and link plans.
 ```
+
+Structural mutation commands accept `--expect-root` so agents can bind an
+operation to the root they inspected. If the branch has moved and the requested
+postconditions do not already hold, the command returns `conflict` without
+recording a migration or moving the branch pointer.
 
 ### 13.1 Demo command sequence
 

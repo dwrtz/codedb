@@ -17,3 +17,7 @@ cargo run -- verify demo.codedb.sqlite
 ```
 
 Expected `eval main` result for `examples/shop.cdb` is `120`. After `rename tax vat`, the exported projection renders `vat` at both the definition and call site while preserving the original symbol hash and function body hash.
+
+Structural mutation commands return `applied`, `already_applied`, or `conflict`.
+Use `--expect-root <root>` on mutation commands when an agent needs to reject
+stale writes instead of applying against a branch that has moved.

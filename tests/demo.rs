@@ -53,6 +53,13 @@ fn shop_demo_flow_preserves_symbol_identity_across_rename() {
     assert!(diff.contains("main.tax -> main.vat"));
     assert!(diff.contains("function body hash: unchanged"));
 
+    let branch_before_retry = branch_state(&db);
+    let migrations_before_retry = row_count(&db, "migrations");
+    let retry = run(&["rename", db.to_str().unwrap(), "tax", "vat"]);
+    assert!(retry.contains("already_applied rename_symbol main.tax -> main.vat"));
+    assert_eq!(branch_state(&db), branch_before_retry);
+    assert_eq!(row_count(&db, "migrations"), migrations_before_retry);
+
     run(&[
         "export",
         db.to_str().unwrap(),
@@ -180,6 +187,40 @@ fn conditionals_and_booleans_import_and_evaluate() {
         .success();
 }
 
+#[test]
+fn stale_expected_root_returns_conflict_without_writes() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("conflict.sqlite");
+
+    run(&["init", db.to_str().unwrap()]);
+    let import = run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    let expected_root = parse_line_value(&import, "root ");
+
+    run(&["create-alias", db.to_str().unwrap(), "tax", "sales_tax"]);
+    let branch_before_conflict = branch_state(&db);
+    let counts_before_conflict = mutation_guard_counts(&db);
+
+    let conflict = run(&[
+        "rename",
+        db.to_str().unwrap(),
+        "tax",
+        "vat",
+        "--expect-root",
+        expected_root,
+    ]);
+    assert!(conflict.contains("conflict rename_symbol main.tax -> main.vat"));
+    assert!(conflict.contains(&format!("expected_root {expected_root}")));
+    assert!(conflict.contains("failed_preconditions root_is_current"));
+    assert_eq!(branch_state(&db), branch_before_conflict);
+    assert_eq!(mutation_guard_counts(&db), counts_before_conflict);
+
+    bin()
+        .args(["verify", db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+}
+
 fn cache_rows(db: &Path) -> Vec<(String, String, String)> {
     let conn = Connection::open(db).unwrap();
     let mut stmt = conn
@@ -189,6 +230,40 @@ fn cache_rows(db: &Path) -> Vec<(String, String, String)> {
         .unwrap()
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap()
+}
+
+fn row_count(db: &Path, table: &str) -> i64 {
+    let conn = Connection::open(db).unwrap();
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+fn branch_state(db: &Path) -> (String, Option<String>) {
+    let conn = Connection::open(db).unwrap();
+    conn.query_row(
+        "SELECT root_hash, history_hash FROM branches WHERE name = 'main'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap()
+}
+
+fn mutation_guard_counts(db: &Path) -> Vec<(String, i64)> {
+    [
+        "objects",
+        "migrations",
+        "histories",
+        "root_symbols",
+        "root_names",
+        "dependencies",
+        "compile_cache",
+        "source_search",
+    ]
+    .into_iter()
+    .map(|table| (table.to_string(), row_count(db, table)))
+    .collect()
 }
 
 fn compile_and_run_c_if_available(c_file: &Path) {

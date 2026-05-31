@@ -58,14 +58,7 @@ impl CodeDb {
                 body: function.body,
             };
             let outcome = self.apply_and_record(branch, op)?;
-            report.push_str(&format!(
-                "applied create_function {}\nold_root {}\nnew_root {}\nmigration {}\nhistory {}\n",
-                outcome.summary,
-                outcome.old_root,
-                outcome.new_root,
-                outcome.migration_hash,
-                outcome.history_hash
-            ));
+            report.push_str(&outcome.format_cli());
         }
 
         let branch = self.branch(MAIN_BRANCH)?;
@@ -193,46 +186,49 @@ impl CodeDb {
     }
 
     pub fn rename_main_branch(&mut self, old_name: &str, new_name: &str) -> Result<String> {
+        self.rename_main_branch_expected(old_name, new_name, None)
+    }
+
+    pub fn rename_main_branch_expected(
+        &mut self,
+        old_name: &str,
+        new_name: &str,
+        expected_root: Option<&str>,
+    ) -> Result<String> {
         self.ensure_initialized()?;
         let branch = self.branch(MAIN_BRANCH)?;
-        let root = self.load_root(&branch.root_hash)?;
-        if self
-            .resolve_name(&branch.root_hash, "main", old_name)
-            .is_err()
-            && self
+        let operation_root = expected_root.unwrap_or(&branch.root_hash).to_string();
+        let symbol = match self.resolve_name(&operation_root, "main", old_name) {
+            Ok(symbol) => symbol,
+            Err(err) if expected_root.is_none() => self
                 .resolve_name(&branch.root_hash, "main", new_name)
-                .is_ok()
-        {
-            return Ok(format!(
-                "already_applied rename_symbol main.{old_name} -> main.{new_name}\nroot {}\n",
-                branch.root_hash
-            ));
-        }
-        let symbol = self.resolve_name(&branch.root_hash, "main", old_name)?;
-        let old_binding = self
-            .preferred_binding(&root, &symbol)
-            .ok_or_else(|| anyhow!("symbol has no preferred name {symbol}"))?;
+                .map_err(|_| err)?,
+            Err(err) => return Err(err),
+        };
         let op = Operation::RenameSymbol {
-            module: old_binding.module.clone(),
+            module: "main".to_string(),
             symbol,
             old_name: old_name.to_string(),
             new_name: new_name.to_string(),
         };
-        let outcome = self.apply_and_record(branch, op)?;
-        Ok(format!(
-            "applied rename_symbol {}\nold_root {}\nnew_root {}\nmigration {}\nhistory {}\n",
-            outcome.summary,
-            outcome.old_root,
-            outcome.new_root,
-            outcome.migration_hash,
-            outcome.history_hash
-        ))
+        let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
+        Ok(outcome.format_cli())
     }
 
     pub fn replace_body_main_branch(&mut self, name: &str, expr: &str) -> Result<String> {
+        self.replace_body_main_branch_expected(name, expr, None)
+    }
+
+    pub fn replace_body_main_branch_expected(
+        &mut self,
+        name: &str,
+        expr: &str,
+        expected_root: Option<&str>,
+    ) -> Result<String> {
         self.ensure_initialized()?;
         let branch = self.branch(MAIN_BRANCH)?;
-        let symbol = self.resolve_name(&branch.root_hash, "main", name)?;
+        let operation_root = expected_root.unwrap_or(&branch.root_hash).to_string();
+        let symbol = self.resolve_name(&operation_root, "main", name)?;
         let body = parse_expr_source(expr)?;
         let op = Operation::ReplaceFunctionBody {
             module: "main".to_string(),
@@ -240,21 +236,24 @@ impl CodeDb {
             name: name.to_string(),
             body,
         };
-        let outcome = self.apply_and_record(branch, op)?;
-        Ok(format!(
-            "applied replace_function_body {}\nold_root {}\nnew_root {}\nmigration {}\nhistory {}\n",
-            outcome.summary,
-            outcome.old_root,
-            outcome.new_root,
-            outcome.migration_hash,
-            outcome.history_hash
-        ))
+        let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
+        Ok(outcome.format_cli())
     }
 
     pub fn change_signature_main_branch(&mut self, name: &str, signature: &str) -> Result<String> {
+        self.change_signature_main_branch_expected(name, signature, None)
+    }
+
+    pub fn change_signature_main_branch_expected(
+        &mut self,
+        name: &str,
+        signature: &str,
+        expected_root: Option<&str>,
+    ) -> Result<String> {
         self.ensure_initialized()?;
         let branch = self.branch(MAIN_BRANCH)?;
-        let symbol = self.resolve_name(&branch.root_hash, "main", name)?;
+        let operation_root = expected_root.unwrap_or(&branch.root_hash).to_string();
+        let symbol = self.resolve_name(&operation_root, "main", name)?;
         let (params, return_type) = parse_signature_source(signature)?;
         let op = Operation::ChangeFunctionSignature {
             module: "main".to_string(),
@@ -263,56 +262,55 @@ impl CodeDb {
             params,
             return_type,
         };
-        let outcome = self.apply_and_record(branch, op)?;
-        Ok(format!(
-            "applied change_function_signature {}\nold_root {}\nnew_root {}\nmigration {}\nhistory {}\n",
-            outcome.summary,
-            outcome.old_root,
-            outcome.new_root,
-            outcome.migration_hash,
-            outcome.history_hash
-        ))
+        let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
+        Ok(outcome.format_cli())
     }
 
     pub fn delete_symbol_main_branch(&mut self, name: &str, force: bool) -> Result<String> {
+        self.delete_symbol_main_branch_expected(name, force, None)
+    }
+
+    pub fn delete_symbol_main_branch_expected(
+        &mut self,
+        name: &str,
+        force: bool,
+        expected_root: Option<&str>,
+    ) -> Result<String> {
         self.ensure_initialized()?;
         let branch = self.branch(MAIN_BRANCH)?;
-        let symbol = self.resolve_name(&branch.root_hash, "main", name)?;
+        let operation_root = expected_root.unwrap_or(&branch.root_hash).to_string();
+        let symbol = self.resolve_name(&operation_root, "main", name)?;
         let op = Operation::DeleteSymbol {
             module: "main".to_string(),
             symbol,
             name: name.to_string(),
             force,
         };
-        let outcome = self.apply_and_record(branch, op)?;
-        Ok(format!(
-            "applied delete_symbol {}\nold_root {}\nnew_root {}\nmigration {}\nhistory {}\n",
-            outcome.summary,
-            outcome.old_root,
-            outcome.new_root,
-            outcome.migration_hash,
-            outcome.history_hash
-        ))
+        let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
+        Ok(outcome.format_cli())
     }
 
     pub fn create_alias_main_branch(&mut self, name: &str, alias: &str) -> Result<String> {
+        self.create_alias_main_branch_expected(name, alias, None)
+    }
+
+    pub fn create_alias_main_branch_expected(
+        &mut self,
+        name: &str,
+        alias: &str,
+        expected_root: Option<&str>,
+    ) -> Result<String> {
         self.ensure_initialized()?;
         let branch = self.branch(MAIN_BRANCH)?;
-        let symbol = self.resolve_name(&branch.root_hash, "main", name)?;
+        let operation_root = expected_root.unwrap_or(&branch.root_hash).to_string();
+        let symbol = self.resolve_name(&operation_root, "main", name)?;
         let op = Operation::CreateAlias {
             module: "main".to_string(),
             symbol,
             name: name.to_string(),
             alias: alias.to_string(),
         };
-        let outcome = self.apply_and_record(branch, op)?;
-        Ok(format!(
-            "applied create_alias {}\nold_root {}\nnew_root {}\nmigration {}\nhistory {}\n",
-            outcome.summary,
-            outcome.old_root,
-            outcome.new_root,
-            outcome.migration_hash,
-            outcome.history_hash
-        ))
+        let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
+        Ok(outcome.format_cli())
     }
 }

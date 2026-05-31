@@ -54,27 +54,37 @@ enum Command {
         db: PathBuf,
         old_name: String,
         new_name: String,
+        #[arg(long)]
+        expect_root: Option<String>,
     },
     ReplaceBody {
         db: PathBuf,
         name: String,
         expr: String,
+        #[arg(long)]
+        expect_root: Option<String>,
     },
     ChangeSignature {
         db: PathBuf,
         name: String,
         signature: String,
+        #[arg(long)]
+        expect_root: Option<String>,
     },
     DeleteSymbol {
         db: PathBuf,
         name: String,
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        expect_root: Option<String>,
     },
     CreateAlias {
         db: PathBuf,
         name: String,
         alias: String,
+        #[arg(long)]
+        expect_root: Option<String>,
     },
     Diff {
         db: PathBuf,
@@ -154,32 +164,65 @@ fn main() -> Result<()> {
             db,
             old_name,
             new_name,
+            expect_root,
         } => {
             let mut codedb = codedb::CodeDb::open(db)?;
-            print!("{}", codedb.rename_main_branch(&old_name, &new_name)?);
+            print!(
+                "{}",
+                codedb.rename_main_branch_expected(&old_name, &new_name, expect_root.as_deref())?
+            );
         }
-        Command::ReplaceBody { db, name, expr } => {
+        Command::ReplaceBody {
+            db,
+            name,
+            expr,
+            expect_root,
+        } => {
             let mut codedb = codedb::CodeDb::open(db)?;
-            print!("{}", codedb.replace_body_main_branch(&name, &expr)?);
+            print!(
+                "{}",
+                codedb.replace_body_main_branch_expected(&name, &expr, expect_root.as_deref())?
+            );
         }
         Command::ChangeSignature {
             db,
             name,
             signature,
+            expect_root,
         } => {
             let mut codedb = codedb::CodeDb::open(db)?;
             print!(
                 "{}",
-                codedb.change_signature_main_branch(&name, &signature)?
+                codedb.change_signature_main_branch_expected(
+                    &name,
+                    &signature,
+                    expect_root.as_deref()
+                )?
             );
         }
-        Command::DeleteSymbol { db, name, force } => {
+        Command::DeleteSymbol {
+            db,
+            name,
+            force,
+            expect_root,
+        } => {
             let mut codedb = codedb::CodeDb::open(db)?;
-            print!("{}", codedb.delete_symbol_main_branch(&name, force)?);
+            print!(
+                "{}",
+                codedb.delete_symbol_main_branch_expected(&name, force, expect_root.as_deref())?
+            );
         }
-        Command::CreateAlias { db, name, alias } => {
+        Command::CreateAlias {
+            db,
+            name,
+            alias,
+            expect_root,
+        } => {
             let mut codedb = codedb::CodeDb::open(db)?;
-            print!("{}", codedb.create_alias_main_branch(&name, &alias)?);
+            print!(
+                "{}",
+                codedb.create_alias_main_branch_expected(&name, &alias, expect_root.as_deref())?
+            );
         }
         Command::Diff { db, root_a, root_b } => {
             let codedb = codedb::CodeDb::open(db)?;

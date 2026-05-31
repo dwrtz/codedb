@@ -22,7 +22,12 @@ impl CodeDb {
         self.verify_roots(&mut errors)?;
         self.verify_caches(&mut errors)?;
         if let Err(err) = self.replay_main_branch() {
-            errors.push(format!("bad_history_link: {err:#}"));
+            let message = format!("{err:#}");
+            if message.starts_with("bad_history_link") || message.starts_with("semantic_conflict") {
+                errors.push(message);
+            } else {
+                errors.push(format!("bad_history_link: {message}"));
+            }
         }
 
         if errors.is_empty() {
