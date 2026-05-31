@@ -380,13 +380,12 @@ Artifacts are derived products. They are disposable and can be regenerated from 
 Required artifact kinds:
 
 ```text
-rendered_source
-parsed_expression
+canonical_source
+c_projection
 typed_expression
 function_dependency_set
 interface_hash
 implementation_hash
-c_projection
 lowered_ir
 object_file
 link_plan
@@ -766,6 +765,8 @@ USING fts5(root_hash, symbol_hash, rendered_source);
 Expected cache use:
 
 ```text
+artifact_kind is the typed artifact discriminator.
+backend stores the producer ID; projection artifacts use projection, while compiler artifacts use a backend ID.
 artifact_json stores deterministic metadata.
 artifact_bytes stores native object or executable bytes.
 artifact_hash hashes either canonical artifact_json, artifact_bytes, or both depending on artifact kind.

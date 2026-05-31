@@ -6,6 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 
+use crate::backend::ArtifactKind;
 use crate::model::{
     BranchState, NameBinding, ProgramRootPayload, RootSymbolPayload, normalize_root, param_names,
     preferred_names, resolve_name_in_root,
@@ -191,14 +192,14 @@ impl CodeDb {
                 &entry.signature,
                 "typechecker",
                 "interface",
-                "interface_hash",
+                ArtifactKind::InterfaceHash,
                 &json!({ "symbol": entry.symbol, "signature": entry.signature }),
             )?;
             self.write_cache_json(
                 &entry.definition,
                 "lowering",
                 "implementation",
-                "implementation_hash",
+                ArtifactKind::ImplementationHash,
                 &json!({ "symbol": entry.symbol, "definition": entry.definition }),
             )?;
         }
@@ -224,7 +225,7 @@ impl CodeDb {
                 &entry.definition,
                 "analysis",
                 "dependencies",
-                "function_dependency_set",
+                ArtifactKind::FunctionDependencySet,
                 &json!({ "dependencies": deps.iter().cloned().collect::<Vec<_>>() }),
             )?;
             for dep in deps {
@@ -334,11 +335,11 @@ impl CodeDb {
         input_hash: &str,
         backend: &str,
         target: &str,
-        artifact_kind: &str,
+        artifact_kind: ArtifactKind,
         text: &str,
     ) -> Result<()> {
         let artifact_hash = hash_bytes(BYTES_DOMAIN, text.as_bytes());
-        let artifact_json = json!({ "text": text });
+        let artifact_json = json!({ "artifact_kind": artifact_kind.as_str(), "text": text });
         self.write_cache(
             input_hash,
             backend,
@@ -355,7 +356,7 @@ impl CodeDb {
         input_hash: &str,
         backend: &str,
         target: &str,
-        artifact_kind: &str,
+        artifact_kind: ArtifactKind,
         artifact_json: &JsonValue,
     ) -> Result<()> {
         let artifact_hash = hash_bytes(BYTES_DOMAIN, canonical_json(artifact_json).as_bytes());
@@ -376,13 +377,18 @@ impl CodeDb {
         input_hash: &str,
         backend: &str,
         target: &str,
-        artifact_kind: &str,
+        artifact_kind: ArtifactKind,
         artifact_hash: &str,
         artifact_json: Option<&JsonValue>,
         artifact_bytes: Option<&[u8]>,
     ) -> Result<()> {
+        debug_assert!(
+            !artifact_kind.is_compiler_artifact() || backend != "projection",
+            "compiler artifacts must be emitted by a compiler backend"
+        );
         let key_payload = format!(
-            "{input_hash}\0{backend}\0{target}\0{COMPILER_VERSION}\0runtime:none\0{PIPELINE_VERSION}\0{artifact_kind}"
+            "{input_hash}\0{backend}\0{target}\0{COMPILER_VERSION}\0runtime:none\0{PIPELINE_VERSION}\0{}",
+            artifact_kind.as_str()
         );
         let cache_key = hash_bytes(CACHE_DOMAIN, key_payload.as_bytes());
         self.conn.execute(
@@ -396,7 +402,7 @@ impl CodeDb {
                 backend,
                 target,
                 COMPILER_VERSION,
-                artifact_kind,
+                artifact_kind.as_str(),
                 artifact_hash,
                 artifact_json.map(canonical_json),
                 artifact_bytes,

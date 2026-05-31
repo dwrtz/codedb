@@ -3,6 +3,7 @@ use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use rusqlite::Connection;
 use tempfile::tempdir;
 
 fn bin() -> Command {
@@ -78,6 +79,23 @@ fn shop_demo_flow_preserves_symbol_identity_across_rename() {
     for forbidden in ["malloc", "free", "printf", "pthread_"] {
         assert!(!c_source.contains(forbidden));
     }
+
+    let cache_rows = cache_rows(&db);
+    assert!(cache_rows.contains(&(
+        "projection".to_string(),
+        "canonical_source".to_string(),
+        "canonical_source".to_string()
+    )));
+    assert!(cache_rows.contains(&(
+        "projection".to_string(),
+        "c_source".to_string(),
+        "c_projection".to_string()
+    )));
+    assert!(
+        cache_rows
+            .iter()
+            .all(|(_, _, artifact_kind)| artifact_kind != "rendered_source")
+    );
 
     compile_and_run_c_if_available(&temp.path().join("projection.c"));
 
@@ -160,6 +178,17 @@ fn conditionals_and_booleans_import_and_evaluate() {
         .args(["verify", bool_db.to_str().unwrap()])
         .assert()
         .success();
+}
+
+fn cache_rows(db: &Path) -> Vec<(String, String, String)> {
+    let conn = Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT backend, target, artifact_kind FROM compile_cache ORDER BY artifact_kind")
+        .unwrap();
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap()
 }
 
 fn compile_and_run_c_if_available(c_file: &Path) {

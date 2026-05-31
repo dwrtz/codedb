@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
+use crate::backend::ArtifactKind;
 use crate::expr::RawExpr;
 use crate::model::{ProgramRootPayload, TypeCheckResult, resolve_name_in_root};
 use crate::store::{CodeDb, canonical_json, hash_object_canonical};
@@ -155,7 +156,7 @@ impl CodeDb {
                     &expr_hash,
                     "typechecker",
                     "typed-dag",
-                    "typed_expression",
+                    ArtifactKind::TypedExpression,
                     &json!({ "type": type_hash }),
                 )?;
                 Ok(TypeCheckResult {
@@ -177,7 +178,7 @@ impl CodeDb {
                     &expr_hash,
                     "typechecker",
                     "typed-dag",
-                    "typed_expression",
+                    ArtifactKind::TypedExpression,
                     &json!({ "type": type_hash }),
                 )?;
                 Ok(TypeCheckResult {
@@ -202,7 +203,7 @@ impl CodeDb {
                     &expr_hash,
                     "typechecker",
                     "typed-dag",
-                    "typed_expression",
+                    ArtifactKind::TypedExpression,
                     &json!({ "type": type_hash }),
                 )?;
                 Ok(TypeCheckResult {
@@ -257,7 +258,7 @@ impl CodeDb {
                     &expr_hash,
                     "typechecker",
                     "typed-dag",
-                    "typed_expression",
+                    ArtifactKind::TypedExpression,
                     &json!({ "type": return_type }),
                 )?;
                 Ok(TypeCheckResult {
@@ -302,7 +303,7 @@ impl CodeDb {
                     &expr_hash,
                     "typechecker",
                     "typed-dag",
-                    "typed_expression",
+                    ArtifactKind::TypedExpression,
                     &json!({ "type": result_type }),
                 )?;
                 Ok(TypeCheckResult {
@@ -341,7 +342,7 @@ impl CodeDb {
                     &expr_hash,
                     "typechecker",
                     "typed-dag",
-                    "typed_expression",
+                    ArtifactKind::TypedExpression,
                     &json!({ "type": then_expr.type_hash }),
                 )?;
                 Ok(TypeCheckResult {

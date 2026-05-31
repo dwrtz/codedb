@@ -1,3 +1,4 @@
+mod backend;
 mod backend_c;
 mod diff;
 mod expr;
@@ -16,6 +17,7 @@ pub use expr::{FunctionSource, RawExpr, Value};
 pub use store::CodeDb;
 pub use types::ParamSpec;
 
+use backend::ArtifactKind;
 use expr::{parse_expr_source, parse_program, parse_signature_source};
 use migrations::Operation;
 use model::{param_names, preferred_names};
@@ -82,7 +84,7 @@ impl CodeDb {
             &root_hash,
             "projection",
             "canonical_source",
-            "rendered_source",
+            ArtifactKind::CanonicalSource,
             &source,
         )?;
         Ok(source)
@@ -101,9 +103,9 @@ impl CodeDb {
         let source = self.render_c(&branch.root_hash)?;
         self.write_cache_text(
             &branch.root_hash,
-            "c",
-            "freestanding-c",
-            "c_projection",
+            "projection",
+            "c_source",
+            ArtifactKind::CProjection,
             &source,
         )?;
         Ok(source)

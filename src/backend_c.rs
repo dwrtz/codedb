@@ -1,3 +1,5 @@
+//! C source projection, not the compiler backend boundary.
+
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value as JsonValue;
 

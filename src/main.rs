@@ -32,6 +32,7 @@ enum Command {
         function_name: String,
         args: Vec<String>,
     },
+    #[command(about = "Emit a deterministic C projection for debugging and inspection")]
     EmitC {
         db: PathBuf,
         function_name: String,
@@ -135,7 +136,7 @@ fn main() -> Result<()> {
             let mut codedb = codedb::CodeDb::open(db)?;
             let source = codedb.emit_c_main_branch(&function_name)?;
             std::fs::write(&out, source)?;
-            println!("emitted {}", out.display());
+            println!("emitted C projection {}", out.display());
         }
         Command::List { db } => {
             let codedb = codedb::CodeDb::open(db)?;

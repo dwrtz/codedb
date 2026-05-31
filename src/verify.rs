@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 use rusqlite::params;
 use serde_json::Value as JsonValue;
 
+use crate::backend::ArtifactKind;
 use crate::backend_c::ensure_no_forbidden_runtime_calls;
 use crate::diff::dependency_pairs;
 use crate::migrations::{history_hash, migration_hash};
@@ -321,7 +322,13 @@ impl CodeDb {
                     "bad_cache_entry: {cache_key} references missing input {input_hash}"
                 ));
             }
-            if artifact_kind == "c_projection"
+            let Some(artifact_kind) = ArtifactKind::from_str(&artifact_kind) else {
+                errors.push(format!(
+                    "bad_cache_entry: {cache_key} has unknown artifact kind {artifact_kind}"
+                ));
+                continue;
+            };
+            if artifact_kind == ArtifactKind::CProjection
                 && let Some(artifact_json) = artifact_json
             {
                 match serde_json::from_str::<JsonValue>(&artifact_json) {
