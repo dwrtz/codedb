@@ -1,7 +1,7 @@
 # SPEC.md — CodeDB Proof of Concept
 
-Status: Draft 0.2  
-Scope: first implementation / proof of concept  
+Status: Draft 0.3  
+Scope: Rust proof of concept plus the next native-artifact architecture  
 Working name: `codedb`
 
 ## 1. Thesis
@@ -19,30 +19,46 @@ root_hash + migration_history_head
 Where:
 
 - `root_hash` identifies the complete current program state.
-- `migration_history_head` identifies the ordered/replayable history that produced that state.
-- SQLite stores the object DAG, migration log, indexes, and caches.
+- `migration_history_head` identifies the ordered and replayable history that produced that state.
+- SQLite stores the object DAG, migration log, indexes, and disposable caches.
 - Agents write code through structural operations, not primarily through text files.
-- The target language is statically typed and does not require a managed runtime.
+- The target language core is statically typed and does not require a managed runtime.
+- Compilation artifacts are derived from typed semantic objects, not from source files.
 
-## 2. Core design correction from Draft 0.1
+## 2. Core design correction from Draft 0.2
 
-Draft 0.1 recommended Python and a tree-walking interpreter because the first goal was to prove storage, migration, and diff mechanics quickly.
+Draft 0.2 allowed a C or LLVM IR emission path as the no-runtime artifact. That was useful for the first proof of concept, but the wording left a dangerous ambiguity: it made the C emitter sound like the compiler backend.
 
-Draft 0.2 changes the recommendation:
+Draft 0.3 makes the backend boundary explicit:
 
 ```text
-Implementation language: Rust
-Target language:        statically typed, runtime-free core
-Primary execution:      reference evaluator + no-runtime compiled artifact
-Parser:                 optional; structural agent API is primary
+Primary compiler path:
+  typed semantic DAG
+    -> lowered IR
+    -> per-function / per-codegen-unit object artifacts
+    -> link plan
+    -> executable / ELF / shared object
+
+Projection path:
+  ProgramRoot
+    -> canonical source projection
+    -> C source projection
 ```
 
-Rationale:
+The C output is useful for inspection, testing, debugging, bootstrap demonstrations, and proving that the language core does not require a managed runtime. It is not the long-term compiler architecture.
 
-- The implementation itself benefits from Rust's strong types, enums, pattern matching, ownership model, and lack of garbage collection.
-- The target language's semantics should be modeled as typed objects from the beginning.
-- Agents are the expected authors, so the primary authoring API can be structural instead of text-first.
-- A reference evaluator may exist for testing, but generated programs should not depend on a VM, garbage collector, scheduler, exception system, or reflection runtime.
+The compiler architecture should be object-artifact first:
+
+```text
+FunctionDef + dependency interfaces + target options
+  -> object_file bytes
+
+object_file hashes + export map + entry symbol + link options
+  -> LinkPlan
+
+LinkPlan
+  -> executable / ELF / shared object
+```
 
 ## 3. First implementation goal
 
@@ -56,10 +72,12 @@ Build a minimal database-backed, statically typed language implementation that c
 6. Generate readable source projections from the current root.
 7. Produce semantic diffs between two roots.
 8. Evaluate a tiny program through a reference evaluator for tests.
-9. Emit a small no-runtime compiled artifact for the typed core language.
-10. Cache typed/lowered/compiled artifacts by content hash.
+9. Emit a C source projection for no-runtime inspection.
+10. Produce native object artifacts from typed/lowered functions.
+11. Link object artifacts through explicit link plans.
+12. Cache typed, lowered, object, and link artifacts by complete content-derived keys.
 
-The first implementation should prove the storage, migration, type, diff, and no-runtime compilation model, not language richness.
+The first implementation should prove the storage, migration, type, diff, incremental compilation, and no-runtime artifact model. It should not prioritize language richness.
 
 ## 4. Non-goals for v0
 
@@ -72,39 +90,37 @@ The first implementation does not attempt to provide:
 - A package manager.
 - Git-style merge support.
 - Perfect textual round-tripping.
-- Comment/whitespace preservation.
+- Comment or whitespace preservation.
 - Heap allocation.
 - Garbage collection.
 - Exceptions.
-- Async/green-thread scheduling.
+- Async or green-thread scheduling.
 - Dynamic reflection.
 - Dynamic dispatch.
 - A production optimizer.
-- A production native-code backend.
+- A production multi-target native-code backend.
 
-A minimal C or LLVM IR emission path is allowed in v0 only to demonstrate that the language core does not need a managed runtime.
+A minimal C projection is allowed in v0 to demonstrate no-runtime semantics. A minimal native object backend is allowed in v0 to prove the real compiler architecture. The native backend may support only a tiny language subset and one target at first.
 
 ## 5. Implementation stack
 
 Recommended v0 stack:
 
 ```text
-Language:       Rust
-Database:       SQLite
-SQLite access:  rusqlite or equivalent
-Hashing:        SHA-256 for v0, BLAKE3 later if desired
-Serialization:  canonical JSON or canonical binary encoding
-CLI:            clap or equivalent
-Parser:         optional; structural API first
-Evaluator:      small reference evaluator for tests only
-Backend:        C projection or LLVM IR text for no-runtime artifact
+Implementation language: Rust
+Database:                SQLite
+SQLite access:           rusqlite or equivalent
+Hashing:                 SHA-256 for v0, BLAKE3 later if desired
+Serialization:           canonical JSON or canonical binary encoding
+CLI:                     clap or equivalent
+Parser:                  optional; structural API first
+Evaluator:               small reference evaluator for tests only
+Projection outputs:      canonical source, C source projection
+Compiler backend:        typed DAG -> lowered IR -> object file -> link plan
+Initial object target:   Linux x86-64 ELF relocatable object, or equivalent narrow target
 ```
 
-Rust is recommended for Draft 0.2 because the hard questions are now not only data modeling, hashing, migrations, diffs, and invalidation, but also static typing, typed IR invariants, and no-runtime compilation.
-
-Python remains acceptable for a spike, but not for the main implementation if the goal is to build a real compiler-like system.
-
-Go remains acceptable for tooling, but generating Go as the target output is not aligned with the target language's no-runtime goal.
+LLVM, Cranelift, or a custom object writer are implementation choices behind the same artifact interface. The important boundary is that the compiler backend consumes typed/lowered semantic objects and emits object artifacts. It should not depend on a whole-program C file as the primary unit of compilation.
 
 ## 6. Meaning of "no runtime"
 
@@ -123,7 +139,15 @@ large standard runtime library
 
 This does not mean the compiler implementation cannot use libraries.
 
-This also does not mean that an operating-system executable has literally zero startup or ABI support. For v0, the compiled artifact can be an object file or C/LLVM function that is linked into a tiny external harness for testing.
+This also does not mean that an operating-system executable has literally zero startup or ABI support. For v0, an artifact can be:
+
+```text
+relocatable object file
+linked executable
+shared object
+C projection linked into an external harness for testing
+LLVM/Cranelift-produced object bytes behind the backend interface
+```
 
 The generated language core should avoid:
 
@@ -146,6 +170,7 @@ pure function calls
 conditionals
 static dispatch
 explicit machine-level traps if required
+external linker or platform loader support
 ```
 
 ## 7. Core concepts
@@ -183,7 +208,8 @@ It points to:
 - name metadata,
 - module metadata,
 - type metadata,
-- optional projection metadata.
+- optional projection metadata,
+- optional export metadata.
 
 Changing a definition, name, module assignment, type binding, or metadata object produces a new `ProgramRoot` hash.
 
@@ -199,7 +225,9 @@ rename_symbol
 replace_function_body
 change_function_signature
 delete_symbol
-add_test
+create_alias
+set_export
+remove_export
 set_metadata
 ```
 
@@ -244,19 +272,23 @@ Example `SymbolBirth` payload:
 This gives separate identities:
 
 ```text
-symbol_hash          stable identity of the symbol
-name                 display metadata for humans/projections
-function_sig_hash    current callable interface
-function_def_hash    current implementation bound to that symbol in a root
-body_expr_hash       current implementation body
+symbol_hash              stable identity of the symbol
+name                     display metadata for humans/projections
+function_sig_hash        current callable type-level interface
+function_def_hash        current implementation bound to that symbol in a root
+body_expr_hash           current implementation body
+internal_abi_symbol      stable native symbol name derived from symbol identity
+exported_abi_symbol      optional public ABI name from explicit export metadata
 ```
 
-Important rule:
+Important rules:
 
 ```text
 Renaming a symbol must not change its symbol_hash.
+Renaming a symbol must not change its internal native ABI symbol.
 Changing a function body must not change its symbol_hash.
 Changing a function signature must not change its symbol_hash, but must change its function_sig_hash.
+Changing a public exported ABI name is an explicit export-map change, not a normal rename.
 ```
 
 ### 7.5 Type identity
@@ -334,14 +366,158 @@ This allows:
 - shared subexpressions,
 - cheap equality checks,
 - hash-pruned diffs,
-- incremental compilation,
-- cached evaluation/lowering.
+- incremental lowering,
+- cached type checking,
+- cached evaluation,
+- cached object-code generation.
 
-## 8. v0 language
+## 8. Artifact model
+
+### 8.1 Artifact kinds
+
+Artifacts are derived products. They are disposable and can be regenerated from objects, migrations, and target options.
+
+Required artifact kinds:
+
+```text
+rendered_source
+parsed_expression
+typed_expression
+function_dependency_set
+interface_hash
+implementation_hash
+c_projection
+lowered_ir
+object_file
+link_plan
+executable
+```
+
+`c_projection` is a projection artifact. `object_file`, `link_plan`, and `executable` are compiler artifacts.
+
+### 8.2 Interface hash
+
+An interface hash describes the callable surface that a caller depends on.
+
+A dependency interface should include:
+
+```text
+callee symbol_hash
+callee function_sig_hash
+callee internal ABI symbol
+calling convention / ABI tag
+effects relevant to caller codegen
+```
+
+Example:
+
+```text
+interface_hash = sha256(
+  "codedb/interface/v1\0" ||
+  symbol_hash || "\0" ||
+  function_sig_hash || "\0" ||
+  internal_abi_symbol || "\0" ||
+  abi_tag || "\0" ||
+  effects_hash
+)
+```
+
+A body-only callee change must not change the callee interface hash.
+
+### 8.3 Implementation hash
+
+An implementation hash describes the function body and all direct codegen-relevant interfaces.
+
+A function implementation hash should include:
+
+```text
+symbol_hash
+function_def_hash
+typed_body_expr_hash
+own function_sig_hash
+direct dependency interface hashes
+semantic lowering version
+```
+
+It should not include:
+
+```text
+preferred display name
+parameter display names
+callee implementation hashes
+source projection text
+```
+
+This lets caller objects survive callee body-only changes.
+
+### 8.4 Lowered function IR
+
+Lowered IR is a compiler-facing representation derived from typed expression DAGs.
+
+For v0, it can be tiny:
+
+```text
+function symbol hash
+signature hash
+parameter slots
+literal operations
+binary operations
+conditional branches or select operations
+static calls by symbol hash
+return operation
+trap operation where semantics require it
+```
+
+Lowered IR must not contain display names.
+
+### 8.5 Object artifact
+
+An object artifact is binary output for one function or one deterministic codegen unit.
+
+Object artifact metadata should include:
+
+```text
+artifact_kind: object_file
+object_format: elf-relocatable / mach-o / coff / wasm-object / ...
+target_triple
+symbol_hashes included
+internal ABI symbols defined
+external/internal ABI symbols referenced
+relocations
+implementation hashes
+interface hashes for dependencies
+codegen options
+artifact bytes hash
+```
+
+For v0, one object per function is preferred because it makes incremental behavior obvious.
+
+### 8.6 Link plan
+
+A link plan is a deterministic artifact that explains how object artifacts become a final binary.
+
+A `LinkPlan` contains:
+
+```text
+entry symbol hash
+entry internal ABI symbol
+target triple
+object artifact hashes
+symbol definitions
+symbol references
+export map
+external symbols
+linker options
+output kind: executable / shared_object / static_library
+```
+
+A link plan should be cached separately from object files.
+
+## 9. v0 language
 
 The v0 language is deliberately tiny, statically typed, pure, and runtime-free.
 
-### 8.1 Projection syntax
+### 9.1 Projection syntax
 
 Example projection:
 
@@ -359,8 +535,9 @@ Notes:
 - Avoid floating-point, strings, heap objects, and allocation in the first demo.
 - Parameter names are projection metadata.
 - Calls bind to symbol hashes after resolution.
+- Projection names may change on rename; symbol hashes do not.
 
-### 8.2 Expression forms
+### 9.2 Expression forms
 
 Required v0 expression kinds:
 
@@ -380,12 +557,13 @@ Optional after the basic demo:
 ```text
 let
 unit
+unary
 record
 field_access
 fixed_array
 ```
 
-### 8.3 Expression object examples
+### 9.3 Expression object examples
 
 Integer literal:
 
@@ -442,7 +620,7 @@ Conditional:
 }
 ```
 
-## 9. Type checking
+## 10. Type checking
 
 Type checking is mandatory in v0.
 
@@ -463,6 +641,7 @@ literal_bool has type Bool
 param_ref index is in bounds and has the declared parameter type
 binary integer ops require I64 operands and return I64
 comparison ops require I64 operands and return Bool
+boolean ops require Bool operands and return Bool
 if condition must be Bool
 if branches must have the same type
 call arguments must match callee signature
@@ -471,11 +650,15 @@ function body type must match function return type
 
 The type checker produces or verifies typed expression objects.
 
-A failed type check must prevent creation of a new root unless the migration is explicitly marked as an invalid/staged edit. v0 does not need staged invalid edits.
+A failed type check must prevent creation of a new root unless the migration is explicitly marked as an invalid or staged edit. v0 does not need staged invalid edits.
 
-## 10. SQLite schema
+## 11. SQLite schema
 
 File: `schema.sql`
+
+The current schema can support the v0 compiler model without immediately adding native-specific tables because `compile_cache` already stores structured JSON and optional bytes. Dedicated artifact tables may be added later if cache queries become too complex.
+
+Core tables:
 
 ```sql
 PRAGMA foreign_keys = ON;
@@ -580,15 +763,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS source_search
 USING fts5(root_hash, symbol_hash, rendered_source);
 ```
 
-Notes:
+Expected cache use:
 
-- `objects` is canonical storage.
-- `object_edges` supports graph traversal and garbage collection.
-- `root_symbols`, `root_names`, and `dependencies` are materialized indexes. They can be rebuilt from `objects` and the current root.
-- `compile_cache` is disposable and can be invalidated/rebuilt.
-- `source_search` is a convenience index for projections and debugging.
+```text
+artifact_json stores deterministic metadata.
+artifact_bytes stores native object or executable bytes.
+artifact_hash hashes either canonical artifact_json, artifact_bytes, or both depending on artifact kind.
+cache_key hashes every input that affects the artifact.
+```
 
-## 11. Canonical encoding
+## 12. Canonical encoding
 
 All semantic object payloads must be serialized deterministically.
 
@@ -609,7 +793,7 @@ Timestamps, agent IDs, comments, and explanations belong in migrations or metada
 
 A canonical binary encoding may replace canonical JSON later, but the hash rules must remain deterministic and versioned.
 
-## 12. Required CLI
+## 13. Required CLI
 
 The v0 CLI should expose these commands:
 
@@ -619,20 +803,39 @@ codedb import <db> <file>
 codedb export <db> --branch main --out <file>
 codedb eval <db> <function-name>
 codedb emit-c <db> <function-name> --out <file>
-codedb emit-llvm <db> <function-name> --out <file>        # optional in v0
 codedb list <db>
 codedb show <db> <symbol-or-name>
 codedb callers <db> <symbol-or-name>
 codedb rename <db> <old-name> <new-name>
 codedb replace-body <db> <name> <expr>
 codedb change-signature <db> <name> <signature>
+codedb delete-symbol <db> <name> [--force]
+codedb create-alias <db> <name> <alias>
 codedb diff <db> <root-a> <root-b>
 codedb history <db>
 codedb replay <db> --from-genesis
 codedb verify <db>
 ```
 
-### 12.1 Demo command sequence
+Near-term compiler commands:
+
+```text
+codedb emit-ir <db> <function-name> --out <file>
+codedb build-plan <db> <entry-name> --target <triple> --json
+codedb emit-object <db> <function-name> --target <triple> --out <file>
+codedb link-native <db> <entry-name> --target <triple> --out <file>
+codedb build <db> <entry-name> --target <triple> --out <file>
+```
+
+Important naming rule:
+
+```text
+emit-c emits a C projection.
+emit-object emits a compiler artifact.
+build/link-native operate on object artifacts and link plans.
+```
+
+### 13.1 Demo command sequence
 
 The first demo should work like this:
 
@@ -658,11 +861,25 @@ Expected behavior:
 - `export` renders `vat` everywhere.
 - `emit-c` emits a pure, allocation-free C projection of the current root.
 - `replay` rebuilds the same final `root_hash`.
-- `verify` confirms all object hashes, indexes, dependencies, types, and history links.
+- `verify` confirms all object hashes, indexes, dependencies, types, history links, and cache invariants.
 
-## 13. Migrations
+Native artifact demo after the backend exists:
 
-### 13.1 Migration structure
+```bash
+codedb build-plan demo.codedb.sqlite main --target x86_64-unknown-linux-gnu --json
+codedb emit-object demo.codedb.sqlite main --target x86_64-unknown-linux-gnu --out main.o
+codedb build demo.codedb.sqlite main --target x86_64-unknown-linux-gnu --out demo
+```
+
+Expected native behavior:
+
+- Rename does not regenerate object files.
+- Body-only change regenerates the changed function object and relinks affected binaries.
+- Signature change regenerates the changed function and affected dependents.
+
+## 14. Migrations
+
+### 14.1 Migration structure
 
 Example migration object:
 
@@ -710,7 +927,7 @@ Example migration object:
 }
 ```
 
-### 13.2 Idempotence rule
+### 14.2 Idempotence rule
 
 Every migration application must return one of three outcomes:
 
@@ -735,7 +952,7 @@ If neither preconditions nor postconditions hold:
 
 This makes migrations safe to retry.
 
-### 13.3 Required v0 migrations
+### 14.3 Required v0 migrations
 
 #### create_function
 
@@ -746,6 +963,7 @@ Creates:
 - typed expression objects,
 - a new `FunctionDef`,
 - name metadata,
+- optional export metadata,
 - a new `ProgramRoot`.
 
 Required operation fields:
@@ -784,7 +1002,11 @@ Must not change:
 - signature hash,
 - definition hash,
 - expression hashes,
-- dependency graph.
+- dependency graph,
+- internal ABI symbol,
+- native object artifact keys.
+
+The C projection may change because it is a human-readable projection.
 
 #### replace_function_body
 
@@ -806,7 +1028,16 @@ Must not change:
 
 - symbol hash,
 - preferred name unless explicitly requested,
-- function signature unless explicitly requested.
+- function signature unless explicitly requested,
+- internal ABI symbol.
+
+Build impact:
+
+```text
+recompile changed function object
+relink binaries containing that object
+callers do not recompile if dependency interface hashes are unchanged
+```
 
 #### change_function_signature
 
@@ -822,19 +1053,53 @@ Must either:
 - update all call sites in the same migration, or
 - fail if existing calls become invalid.
 
+Build impact:
+
+```text
+recompile changed function object
+recompute direct and transitive dependent function objects
+relink affected binaries
+```
+
 #### delete_symbol
 
 Removes a symbol from the root only if no live definitions depend on it, unless forced.
 
+Build impact:
+
+```text
+relink binaries that previously included the symbol
+recompile dependents only when forced deletion also updates call sites or interfaces
+```
+
 #### create_alias
 
-Adds an additional name for an existing symbol.
+Adds an additional projection name for an existing symbol.
 
-## 14. Diff model
+Build impact:
+
+```text
+metadata_only
+```
+
+#### set_export / remove_export
+
+Changes public ABI export metadata.
+
+Build impact depends on representation:
+
+```text
+internal ABI unchanged: relink or regenerate export metadata only
+internal ABI changed: recompile affected objects and relink
+```
+
+The preferred rule is that internal ABI names never change and export-map changes are handled at link time.
+
+## 15. Diff model
 
 The diff engine compares two root hashes.
 
-### 14.1 Hash-pruned traversal
+### 15.1 Hash-pruned traversal
 
 Algorithm:
 
@@ -849,7 +1114,7 @@ else:
 
 Equal hashes prove equal subgraphs and should not be traversed.
 
-### 14.2 Semantic classification
+### 15.2 Semantic classification
 
 The diff engine should classify changes at the highest semantic level possible.
 
@@ -871,6 +1136,8 @@ expression_replaced
 type_changed
 interface_changed
 implementation_changed
+export_changed
+abi_changed
 ```
 
 Examples:
@@ -879,23 +1146,26 @@ Same symbol hash, different preferred name:
 
 ```text
 symbol_renamed
+build impact: metadata_only
 ```
 
 Same symbol hash, different definition hash, same signature hash:
 
 ```text
 implementation_changed
+build impact: recompile changed function object, relink affected outputs
 ```
 
 Same symbol hash, different signature hash:
 
 ```text
 interface_changed
+build impact: recompile changed function and dependents, relink affected outputs
 ```
 
-### 14.3 Human-readable diff projection
+### 15.3 Human-readable diff projection
 
-Example output:
+Example rename output:
 
 ```text
 Root changed:
@@ -911,7 +1181,13 @@ Unchanged:
   function body hash
   dependencies
   callers
-  compiled artifact cache key for implementation
+  native object artifact keys
+
+Incremental build impact:
+  metadata_only
+  regenerate source projections
+  no object recompilation
+  no relink unless export map changed
 ```
 
 For a body change:
@@ -928,14 +1204,15 @@ Expression diff:
 Dependency diff:
   no dependency changes
 
-Incremental compile impact:
-  recompile main.total
-  callers do not require recompilation because interface hash is unchanged
+Incremental build impact:
+  recompile object for main.total
+  relink outputs that include main.total
+  callers do not require recompilation because dependency interface hashes are unchanged
 ```
 
-## 15. Reference evaluator and backend
+## 16. Reference evaluator and compiler backend
 
-### 15.1 Reference evaluator
+### 16.1 Reference evaluator
 
 The reference evaluator runs from a root hash and exists for testing and debugging.
 
@@ -961,24 +1238,19 @@ The evaluator must not read source files.
 
 The evaluator is not the target language runtime.
 
-### 15.2 No-runtime backend
+### 16.2 C projection
 
-The v0 backend should emit a tiny no-runtime artifact.
+The C projection emits readable C source from a `ProgramRoot`.
 
-Acceptable v0 backend choices:
+Acceptable properties:
 
-```text
-C source projection with no allocation and no library calls
-LLVM IR text with no external runtime calls
-object file exposing a plain ABI function
-```
+- Uses preferred display names for readability.
+- Renders deterministic declarations and definitions.
+- Is allocation-free for the v0 language subset.
+- Can be compiled by an external C compiler in tests.
+- Can be scanned for forbidden runtime calls.
 
-Recommended first backend:
-
-```text
-emit C for pure i64/bool functions
-compile or inspect separately
-```
+It is acceptable for a rename to change C projection function names, because the C projection is human-facing text.
 
 Example generated C projection:
 
@@ -1010,36 +1282,77 @@ reflection metadata
 
 A separate test harness may call `codedb_main` and print the result. The harness is not part of the target language runtime.
 
-## 16. Incremental compilation and caching
+### 16.3 Native backend
+
+The native backend consumes lowered IR and emits object artifacts.
+
+Required v0 native backend behavior:
+
+```text
+input:  one FunctionDef or deterministic codegen unit
+output: relocatable object artifact bytes + metadata
+calls:  references stable internal ABI symbols derived from symbol_hash
+cache:  keyed by implementation hash, dependency interface hashes, target, ABI, and codegen options
+```
+
+The backend must not use display names for internal native symbol identity.
+
+For v0, a native backend may support only:
+
+```text
+i64 parameters and returns
+bool values represented as target integer values
+unit returns
+arithmetic and comparison ops
+conditionals
+static direct calls
+one target triple
+```
+
+## 17. Incremental compilation and caching
 
 v0 should include the cache model.
 
-### 16.1 Cache key
+### 17.1 Cache key
 
 A cache key must include all inputs that affect an artifact.
 
-Example:
+Example typed key payload:
 
-```text
-cache_key = sha256(
-  "codedb/cache/v1\0" ||
-  input_hash ||
-  dependency_interface_hash ||
-  backend ||
-  target ||
-  compiler_version ||
-  runtime_version ||
-  pipeline_version
-)
+```json
+{
+  "schema": "codedb/cache-key/v1",
+  "artifact_kind": "object_file",
+  "input_hash": "sha256:function-def-or-lowered-ir",
+  "backend": "native-elf-v0",
+  "target": "x86_64-unknown-linux-gnu",
+  "compiler_version": "codedb-0.1.0",
+  "pipeline_version": "pipeline:v0",
+  "runtime_version": "runtime:none",
+  "abi": "codedb-v0-internal",
+  "codegen_options": {
+    "opt_level": "none",
+    "relocation_model": "static-or-pic"
+  },
+  "dependency_interface_hashes": [
+    "sha256:callee-interface"
+  ]
+}
 ```
 
-For no-runtime output, `runtime_version` should be a sentinel such as:
+The cache key is:
+
+```text
+cache_key = sha256("codedb/cache/v1\0" || canonical_key_payload)
+```
+
+For no-runtime output, `runtime_version` should be:
 
 ```text
 runtime:none
 ```
 
-### 16.2 Required v0 cached artifacts
+### 17.2 Required cached artifacts
 
 Required:
 
@@ -1051,42 +1364,117 @@ function_dependency_set
 interface_hash
 implementation_hash
 c_projection
+lowered_ir
+object_file
+link_plan
 ```
 
 Optional:
 
 ```text
-normalized_ir
 llvm_ir
-object_file
+cranelift_ir
+assembly
+executable
+source_map
+debug_info
 ```
 
-### 16.3 Invalidation
+### 17.3 Invalidation
+
+If only display metadata changes:
+
+```text
+regenerate projections
+native object artifacts remain valid
+link artifacts remain valid unless export map changed
+```
 
 If an implementation hash changes but interface hash does not:
 
 ```text
-recompute the changed function artifact
-recompute whole-program artifact if needed
-callers may not need recompilation
+recompute the changed function lowered IR if needed
+recompile the changed function object artifact
+relink final binaries that include that object
+callers do not need recompilation
 ```
 
-If interface hash changes:
+If an interface hash changes:
 
 ```text
+recompile the changed function
 recompute direct dependents
 then recursively recompute affected dependents
+relink final binaries
 ```
 
-## 17. Projections
+If target/codegen options change:
+
+```text
+object cache miss for that target/options set
+link cache miss for that target/options set
+semantic objects remain unchanged
+```
+
+## 18. Build planning
+
+A build plan is a computed description of required artifact work between roots or for a target output.
+
+Build impact categories:
+
+```text
+metadata_only
+projection_only
+relink_only
+recompile_symbols
+recompile_dependents
+full_rebuild
+```
+
+Inputs:
+
+```text
+old_root_hash, optional
+new_root_hash
+target triple
+entry symbol
+requested output kind
+cache state
+```
+
+Output:
+
+```json
+{
+  "impact": "recompile_symbols",
+  "projection_artifacts": ["canonical_source", "c_projection"],
+  "recompile": ["sha256:symbol-total"],
+  "relink": true,
+  "unchanged_objects": ["sha256:object-tax"],
+  "reason": "implementation_hash_changed"
+}
+```
+
+Rules:
+
+```text
+Names affect projections.
+Internal ABI symbols derive from symbol identity.
+Callee body changes affect callee object and final link products.
+Callee interface changes affect callers.
+Export-map changes affect link products.
+Target/codegen changes affect object and link products for that target only.
+```
+
+## 19. Projections
 
 A projection is a readable rendering of a root.
 
-v0 needs two projections:
+v0 needs:
 
 ```text
 canonical_source
-c_backend_source
+c_projection
 ```
 
 Example canonical source:
@@ -1109,6 +1497,7 @@ Include type annotations.
 Do not preserve original whitespace.
 Do not preserve comments in v0.
 Emit enough information to re-import the projection if possible.
+Never treat projection text as the source of truth.
 ```
 
 Post-v0 projections:
@@ -1120,10 +1509,11 @@ dependency_order
 callers_of_symbol
 tests_only
 literate_markdown
-llvm_ir
+lowered_ir
+assembly
 ```
 
-## 18. Import model
+## 20. Import model
 
 Import from text is allowed for bootstrapping, but agents should eventually use structural migrations directly.
 
@@ -1140,7 +1530,9 @@ for each function in file:
 
 A later importer can diff text against an existing root and synthesize migrations.
 
-## 19. Verification
+Importing text must not give text source higher authority than the object DAG.
+
+## 21. Verification
 
 `codedb verify` must check:
 
@@ -1158,7 +1550,11 @@ materialized root_names can be rebuilt from root objects
 materialized dependencies can be rebuilt from expression DAGs
 history replay produces the branch root hash
 no cache entries claim impossible inputs
-no no-runtime backend artifact contains forbidden runtime calls, where checkable
+cache keys match structured artifact metadata where checkable
+object artifact bytes match artifact hashes
+link plans reference existing object artifacts
+internal ABI names are stable and derived from symbol identity
+no no-runtime projection/backend artifact contains forbidden runtime calls, where checkable
 ```
 
 Verification failure should distinguish:
@@ -1173,10 +1569,13 @@ bad_dependency_index
 bad_type
 bad_signature
 bad_cache_entry
+bad_artifact_bytes
+bad_link_plan
+bad_abi_symbol
 forbidden_runtime_dependency
 ```
 
-## 20. Rebuild from scratch
+## 22. Rebuild from scratch
 
 A fresh database can be rebuilt from:
 
@@ -1203,9 +1602,11 @@ assert current_root == expected_branch_root
 assert current_history == expected_history_head
 ```
 
+Cached artifacts are not source truth. They may be exported for convenience, but a correct system must be able to regenerate them from roots, migrations, target options, and compiler version.
+
 If migrations are exported as newline-delimited JSON, the system can rebuild without copying the original SQLite file.
 
-## 21. Branches and merge
+## 23. Branches and merge
 
 v0 supports branches only as named pointers:
 
@@ -1222,9 +1623,10 @@ common ancestor root
 migration replay
 semantic conflict detection
 hash-pruned tree diff
+build impact recomputation
 ```
 
-## 22. Agent write API
+## 24. Agent write API
 
 Agents should primarily modify the program through structural operations.
 
@@ -1237,6 +1639,8 @@ replace_function_body(symbol_or_name, body_ast)
 change_function_signature(symbol_or_name, new_signature, callsite_updates)
 delete_symbol(symbol_or_name)
 create_alias(symbol_or_name, alias)
+set_export(symbol_or_name, exported_name)
+remove_export(symbol_or_name, exported_name)
 ```
 
 Each API call must produce a migration.
@@ -1250,7 +1654,7 @@ migration_hash
 history_hash
 semantic_summary
 typecheck_summary
-compile_impact_summary
+build_impact_summary
 ```
 
 Example response:
@@ -1268,12 +1672,17 @@ Example response:
     "from": "main.tax",
     "to": "main.vat",
     "typecheck": "unchanged",
-    "compile_impact": "metadata_only"
+    "build_impact": {
+      "kind": "metadata_only",
+      "regenerate": ["canonical_source", "c_projection"],
+      "recompile": [],
+      "relink": false
+    }
   }
 }
 ```
 
-## 23. First demo program
+## 25. First demo program
 
 File: `examples/shop.cdb`
 
@@ -1294,13 +1703,17 @@ rename tax -> vat preserves symbol hash
 rename tax -> vat changes root hash
 rename tax -> vat does not change function signature hash
 rename tax -> vat does not change function body hash
+rename tax -> vat does not change internal native ABI symbol
+rename tax -> vat does not invalidate native object artifacts
 export renders vat in total body
-emit-c produces allocation-free C code
+emit-c produces allocation-free C projection
+body replacement invalidates only the changed function object and affected links
+signature change invalidates affected dependents
 replay produces identical root hash
 verify passes
 ```
 
-## 24. Suggested implementation milestones
+## 26. Suggested implementation milestones
 
 ### Milestone 1 — Rust project skeleton and object store
 
@@ -1392,67 +1805,111 @@ invalid replacement body is rejected
 history chain verifies
 ```
 
-### Milestone 5 — No-runtime C backend
-
-Deliver:
-
-```text
-emit-c command
-C projection for i64/bool pure functions
-backend cache entries
-forbidden runtime call check where practical
-```
-
-Acceptance:
-
-```text
-emit-c produces deterministic C
-emitted C contains no malloc/free/printf/thread calls
-codedb_main returns 120 when called by an external harness
-```
-
-### Milestone 6 — Projection
+### Milestone 5 — Projection Boundary
 
 Deliver:
 
 ```text
 canonical source export
-name rendering
-function ordering
-type annotation rendering
+C projection emit command
+artifact kind names that distinguish projection from compiler backend
+forbidden runtime call scan for C projection
 ```
 
 Acceptance:
 
 ```text
-export after rename shows new name everywhere
-export is deterministic
-export includes type annotations
+emit-c produces deterministic C projection
+emitted C contains no malloc/free/printf/thread calls
+rename may change C projection names
+rename does not change semantic symbol identity
 ```
 
-### Milestone 7 — Semantic diff
+### Milestone 6 — Build Planner and Cache Keys
 
 Deliver:
 
 ```text
-root diff
-symbol rename classification
-function body change classification
-function signature change classification
-expression diff
-compile-impact summary
+interface hash
+implementation hash
+structured cache key payload
+build impact planner
+dependency interface hashing
+cache lookup helpers
 ```
 
 Acceptance:
 
 ```text
-rename is not shown as delete/add
-literal change is shown as literal change
-signature change is shown as interface change
-unchanged subgraphs are skipped by hash
+rename is metadata_only
+body change recompiles one symbol object
+signature change identifies transitive dependents
+cache key includes target and ABI options
 ```
 
-### Milestone 8 — Replay and verify
+### Milestone 7 — Lowered IR
+
+Deliver:
+
+```text
+lowered function IR
+lowering from typed expression DAG
+lowered_ir cache artifacts
+emit-ir command
+IR verification
+```
+
+Acceptance:
+
+```text
+renames do not change lowered IR
+body changes change lowered IR only for affected functions
+calls use symbol hashes or stable ABI symbols, not display names
+```
+
+### Milestone 8 — Native Object Artifacts
+
+Deliver:
+
+```text
+backend trait
+object_file artifact metadata
+object bytes in compile_cache.artifact_bytes
+stable internal ABI names
+one-function object emission for v0
+```
+
+Acceptance:
+
+```text
+unchanged functions reuse object artifacts
+body-only change recompiles changed object only
+rename does not recompile objects
+object artifact hash matches bytes
+```
+
+### Milestone 9 — Link Plans and Executables
+
+Deliver:
+
+```text
+LinkPlan artifact
+link-native command
+build command
+explicit export map handling
+relink planning
+```
+
+Acceptance:
+
+```text
+link plan is deterministic
+relink reuses unchanged objects
+export-map changes do not require recompiling function bodies
+built executable returns the same value as reference evaluator for demo programs
+```
+
+### Milestone 10 — Replay and Verify
 
 Deliver:
 
@@ -1462,6 +1919,9 @@ verify indexes
 verify dependencies
 verify types
 verify history
+verify cache metadata
+verify object artifacts
+verify link plans
 ```
 
 Acceptance:
@@ -1472,9 +1932,9 @@ verify passes on clean DB
 verify fails on intentionally corrupted DB
 ```
 
-## 25. Post-v0 roadmap
+## 27. Post-v0 roadmap
 
-After the v0 demo works, likely next steps are:
+After the v0 demo and native artifact path work, likely next steps are:
 
 ```text
 richer expression language
@@ -1483,36 +1943,43 @@ local variable identity
 records and enums
 ownership / borrowing / region model
 explicit allocation model
-interface hash / implementation hash distinction refinements
 branch merge
 migration squashing
 semantic patch language
-LLVM IR backend
-MLIR backend
+multi-target object emission
+LLVM backend adapter
+Cranelift backend adapter
+MLIR backend adapter
 Wasm backend
 visual graph explorer
+source maps and debug info
+incremental test selection
 ```
 
-## 26. Design principles
+## 28. Design principles
 
 1. Files are projections.
-2. Source truth is the object DAG.
-3. The current state is identified by `root_hash`.
-4. The explanation of the current state is `migration_history`.
-5. Names are metadata.
-6. Global references use symbol hashes, not names.
-7. Symbol hashes must be stable across renames, body changes, and signature changes.
-8. Function signatures are typed, content-addressed interface objects.
-9. Semantic changes are migrations, not line edits.
-10. Diffs should preserve intent when possible.
-11. Equal hashes prove equal subgraphs.
-12. The target language core is statically typed.
-13. Generated programs do not require a managed runtime.
-14. Rebuild must be deterministic.
-15. Caches are disposable.
-16. Verification is mandatory.
+2. C output is a projection/debug artifact, not the primary compiler backend.
+3. Source truth is the object DAG.
+4. The current state is identified by `root_hash`.
+5. The explanation of the current state is `migration_history`.
+6. Names are metadata.
+7. Global references use symbol hashes, not names.
+8. Internal native ABI symbols derive from stable symbol identity.
+9. Symbol hashes must be stable across renames, body changes, and signature changes.
+10. Function signatures are typed, content-addressed interface objects.
+11. Semantic changes are migrations, not line edits.
+12. Diffs should preserve intent when possible.
+13. Equal hashes prove equal subgraphs.
+14. The target language core is statically typed.
+15. Generated programs do not require a managed runtime.
+16. Compilation goes from typed/lowered semantic objects to object artifacts.
+17. Linking is explicit and cached through link plans.
+18. Rebuild must be deterministic.
+19. Caches are disposable.
+20. Verification is mandatory.
 
-## 27. Open questions
+## 29. Open questions
 
 These do not block v0, but should be revisited:
 
@@ -1520,12 +1987,15 @@ These do not block v0, but should be revisited:
 2. Should migration logs be stored inside SQLite only, or also exported as NDJSON?
 3. Should symbol birth seeds be random, agent-provided, or deterministically derived from the creating migration?
 4. Should root metadata changes count as semantic root changes, or should there be separate semantic and presentation roots?
-5. Should function calls bind to symbol hashes or exact definition hashes?
+5. Should function calls bind to symbol hashes, exact definition hashes, or both at different compiler stages?
 6. How should branch merge conflicts be represented?
 7. Should import from text be allowed to synthesize migrations against a non-empty root?
 8. How should comments/docstrings be modeled: metadata, semantic documentation objects, or projection-only text?
-9. Should the first native backend target C, LLVM IR, MLIR, WebAssembly, or object code directly?
+9. Should the first native backend use a direct ELF writer, Cranelift, LLVM, or another object-emission strategy?
 10. Should the object store eventually support garbage collection of unreachable objects?
 11. What ownership/borrowing/allocation model should exist post-v0?
 12. Should integer overflow be defined, trapped, wrapping, or statically prevented?
 13. Should bounds checks be required, optional, or statically proven for future arrays/slices?
+14. Should public ABI export names be root metadata, module metadata, or separate export objects?
+15. Should link plans be semantic objects or disposable cache artifacts?
+16. How much debug info should be generated from semantic objects and projection metadata?
