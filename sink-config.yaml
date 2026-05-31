@@ -1,0 +1,34 @@
+# Sink Configuration File
+
+# Output settings
+output: code.md  # Output file path
+
+# File filtering
+filter-patterns:
+exclude-patterns:
+  - package-lock.json
+  - node_modules/**/*
+  - docs/archive/**/*
+case-sensitive: false
+
+# Processing options
+no-codeblock: false
+line-numbers: false
+strip-comments: false
+
+# Token settings
+show-tokens: true
+token-encoding: cl100k_base
+
+# Price estimation
+show-price: false
+provider: openai
+model: gpt-3.5-turbo
+output-tokens: 1000
+
+# Syntax highlighting mappings
+syntax-map:
+  ".md": "markdown"
+
+# Template settings
+template-path: ""  # Path to custom template file
