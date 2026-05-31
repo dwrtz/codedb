@@ -1,5 +1,6 @@
 mod backend;
 mod backend_c;
+mod build_plan;
 mod diff;
 mod expr;
 mod migrations;
@@ -195,6 +196,16 @@ impl CodeDb {
         new_name: &str,
         expected_root: Option<&str>,
     ) -> Result<String> {
+        self.rename_main_branch_expected_format(old_name, new_name, expected_root, false)
+    }
+
+    pub fn rename_main_branch_expected_format(
+        &mut self,
+        old_name: &str,
+        new_name: &str,
+        expected_root: Option<&str>,
+        json: bool,
+    ) -> Result<String> {
         self.ensure_initialized()?;
         let branch = self.branch(MAIN_BRANCH)?;
         let operation_root = expected_root.unwrap_or(&branch.root_hash).to_string();
@@ -212,7 +223,7 @@ impl CodeDb {
             new_name: new_name.to_string(),
         };
         let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
-        Ok(outcome.format_cli())
+        Ok(format_outcome(outcome, json))
     }
 
     pub fn replace_body_main_branch(&mut self, name: &str, expr: &str) -> Result<String> {
@@ -224,6 +235,16 @@ impl CodeDb {
         name: &str,
         expr: &str,
         expected_root: Option<&str>,
+    ) -> Result<String> {
+        self.replace_body_main_branch_expected_format(name, expr, expected_root, false)
+    }
+
+    pub fn replace_body_main_branch_expected_format(
+        &mut self,
+        name: &str,
+        expr: &str,
+        expected_root: Option<&str>,
+        json: bool,
     ) -> Result<String> {
         self.ensure_initialized()?;
         let branch = self.branch(MAIN_BRANCH)?;
@@ -237,7 +258,7 @@ impl CodeDb {
             body,
         };
         let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
-        Ok(outcome.format_cli())
+        Ok(format_outcome(outcome, json))
     }
 
     pub fn change_signature_main_branch(&mut self, name: &str, signature: &str) -> Result<String> {
@@ -249,6 +270,16 @@ impl CodeDb {
         name: &str,
         signature: &str,
         expected_root: Option<&str>,
+    ) -> Result<String> {
+        self.change_signature_main_branch_expected_format(name, signature, expected_root, false)
+    }
+
+    pub fn change_signature_main_branch_expected_format(
+        &mut self,
+        name: &str,
+        signature: &str,
+        expected_root: Option<&str>,
+        json: bool,
     ) -> Result<String> {
         self.ensure_initialized()?;
         let branch = self.branch(MAIN_BRANCH)?;
@@ -263,7 +294,7 @@ impl CodeDb {
             return_type,
         };
         let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
-        Ok(outcome.format_cli())
+        Ok(format_outcome(outcome, json))
     }
 
     pub fn delete_symbol_main_branch(&mut self, name: &str, force: bool) -> Result<String> {
@@ -276,6 +307,16 @@ impl CodeDb {
         force: bool,
         expected_root: Option<&str>,
     ) -> Result<String> {
+        self.delete_symbol_main_branch_expected_format(name, force, expected_root, false)
+    }
+
+    pub fn delete_symbol_main_branch_expected_format(
+        &mut self,
+        name: &str,
+        force: bool,
+        expected_root: Option<&str>,
+        json: bool,
+    ) -> Result<String> {
         self.ensure_initialized()?;
         let branch = self.branch(MAIN_BRANCH)?;
         let operation_root = expected_root.unwrap_or(&branch.root_hash).to_string();
@@ -287,7 +328,7 @@ impl CodeDb {
             force,
         };
         let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
-        Ok(outcome.format_cli())
+        Ok(format_outcome(outcome, json))
     }
 
     pub fn create_alias_main_branch(&mut self, name: &str, alias: &str) -> Result<String> {
@@ -300,6 +341,16 @@ impl CodeDb {
         alias: &str,
         expected_root: Option<&str>,
     ) -> Result<String> {
+        self.create_alias_main_branch_expected_format(name, alias, expected_root, false)
+    }
+
+    pub fn create_alias_main_branch_expected_format(
+        &mut self,
+        name: &str,
+        alias: &str,
+        expected_root: Option<&str>,
+        json: bool,
+    ) -> Result<String> {
         self.ensure_initialized()?;
         let branch = self.branch(MAIN_BRANCH)?;
         let operation_root = expected_root.unwrap_or(&branch.root_hash).to_string();
@@ -311,6 +362,14 @@ impl CodeDb {
             alias: alias.to_string(),
         };
         let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
-        Ok(outcome.format_cli())
+        Ok(format_outcome(outcome, json))
+    }
+}
+
+fn format_outcome(outcome: migrations::MigrationOutcome, json: bool) -> String {
+    if json {
+        outcome.format_json()
+    } else {
+        outcome.format_cli()
     }
 }

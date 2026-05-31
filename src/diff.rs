@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
-use serde_json::Value as JsonValue;
+use serde_json::{Value as JsonValue, json};
 
 use crate::model::{ProgramRootPayload, aliases_for};
 use crate::store::{CodeDb, canonical_json};
@@ -11,6 +11,7 @@ impl CodeDb {
     pub fn diff_roots(&self, root_a: &str, root_b: &str) -> Result<String> {
         let a = self.load_root(root_a)?;
         let b = self.load_root(root_b)?;
+        let build_impact = self.plan_build_impact(root_a, root_b)?;
         let mut out = String::new();
         out.push_str("Root changed:\n");
         out.push_str(&format!("  from {root_a}\n"));
@@ -92,14 +93,14 @@ impl CodeDb {
                         emitted = true;
                         out.push_str("interface_changed:\n");
                         out.push_str(&format!(
-                            "  function: main.{b_name}\n  symbol: {symbol}\n  from: {}\n  to:   {}\n  compile impact: recompile dependents\n\n",
+                            "  function: main.{b_name}\n  symbol: {symbol}\n  from: {}\n  to:   {}\n  compile impact: recompile_dependents\n\n",
                             a_entry.signature, b_entry.signature
                         ));
                     } else if a_entry.definition != b_entry.definition {
                         emitted = true;
                         out.push_str("implementation_changed:\n");
                         out.push_str(&format!(
-                            "  function: main.{b_name}\n  symbol: {symbol}\n  signature: unchanged\n  compile impact: recompile function only\n"
+                            "  function: main.{b_name}\n  symbol: {symbol}\n  signature: unchanged\n  compile impact: recompile_symbols\n"
                         ));
                         let a_body = self.function_body_hash(&a_entry.definition)?;
                         let b_body = self.function_body_hash(&b_entry.definition)?;
@@ -127,7 +128,129 @@ impl CodeDb {
         if !emitted {
             out.push_str("Only root metadata or ordering changed.\n");
         }
+        if root_a != root_b {
+            out.push_str("Incremental build impact:\n");
+            build_impact.push_cli_lines(&mut out);
+        }
         Ok(out)
+    }
+
+    pub fn diff_roots_json(&self, root_a: &str, root_b: &str) -> Result<String> {
+        let changes = self.diff_change_json(root_a, root_b)?;
+        let build_impact = self.plan_build_impact(root_a, root_b)?;
+        let payload = json!({
+            "old_root_hash": root_a,
+            "new_root_hash": root_b,
+            "changes": changes,
+            "build_impact": build_impact.to_json(),
+        });
+        Ok(format!("{}\n", canonical_json(&payload)))
+    }
+
+    fn diff_change_json(&self, root_a: &str, root_b: &str) -> Result<Vec<JsonValue>> {
+        let a = self.load_root(root_a)?;
+        let b = self.load_root(root_b)?;
+        let a_symbols = a
+            .symbols
+            .iter()
+            .map(|entry| (entry.symbol.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let b_symbols = b
+            .symbols
+            .iter()
+            .map(|entry| (entry.symbol.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let all_symbols = a_symbols
+            .keys()
+            .chain(b_symbols.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut changes = Vec::new();
+
+        for symbol in all_symbols {
+            match (a_symbols.get(&symbol), b_symbols.get(&symbol)) {
+                (None, Some(_)) => changes.push(json!({
+                    "kind": "symbol_added",
+                    "symbol": &symbol,
+                    "name": self.symbol_display(&b, &symbol)?,
+                })),
+                (Some(_), None) => changes.push(json!({
+                    "kind": "symbol_removed",
+                    "symbol": &symbol,
+                    "name": self.symbol_display(&a, &symbol)?,
+                })),
+                (Some(a_entry), Some(b_entry)) => {
+                    let a_name = self.symbol_display(&a, &symbol)?;
+                    let b_name = self.symbol_display(&b, &symbol)?;
+                    if a_name != b_name {
+                        changes.push(json!({
+                            "kind": "symbol_renamed",
+                            "symbol": &symbol,
+                            "from": format!("main.{a_name}"),
+                            "to": format!("main.{b_name}"),
+                            "signature_hash_unchanged": a_entry.signature == b_entry.signature,
+                            "body_hash_unchanged": self.function_body_hash(&a_entry.definition)?
+                                == self.function_body_hash(&b_entry.definition)?,
+                        }));
+                    }
+
+                    let a_aliases = aliases_for(&a, &symbol);
+                    let b_aliases = aliases_for(&b, &symbol);
+                    for alias in b_aliases.difference(&a_aliases) {
+                        changes.push(json!({
+                            "kind": "alias_added",
+                            "symbol": &symbol,
+                            "alias": format!("main.{alias}"),
+                        }));
+                    }
+                    for alias in a_aliases.difference(&b_aliases) {
+                        changes.push(json!({
+                            "kind": "alias_removed",
+                            "symbol": &symbol,
+                            "alias": format!("main.{alias}"),
+                        }));
+                    }
+
+                    if a_entry.signature != b_entry.signature {
+                        changes.push(json!({
+                            "kind": "interface_changed",
+                            "symbol": &symbol,
+                            "function": format!("main.{b_name}"),
+                            "from": &a_entry.signature,
+                            "to": &b_entry.signature,
+                        }));
+                    } else if a_entry.definition != b_entry.definition {
+                        changes.push(json!({
+                            "kind": "implementation_changed",
+                            "symbol": &symbol,
+                            "function": format!("main.{b_name}"),
+                            "signature_hash_unchanged": true,
+                            "from_body": self.function_body_hash(&a_entry.definition)?,
+                            "to_body": self.function_body_hash(&b_entry.definition)?,
+                        }));
+                    }
+                }
+                (None, None) => unreachable!(),
+            }
+        }
+
+        let deps_a = dependency_pairs(&self.conn, root_a)?;
+        let deps_b = dependency_pairs(&self.conn, root_b)?;
+        for dep in deps_b.difference(&deps_a) {
+            changes.push(json!({
+                "kind": "dependency_added",
+                "from": &dep.0,
+                "to": &dep.1,
+            }));
+        }
+        for dep in deps_a.difference(&deps_b) {
+            changes.push(json!({
+                "kind": "dependency_removed",
+                "from": &dep.0,
+                "to": &dep.1,
+            }));
+        }
+        Ok(changes)
     }
 
     fn diff_exprs(

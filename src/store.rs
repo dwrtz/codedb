@@ -272,6 +272,42 @@ impl CodeDb {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    pub(crate) fn direct_dependents_for_symbol(
+        &self,
+        root_hash: &str,
+        symbol: &str,
+    ) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT from_symbol_hash FROM dependencies
+             WHERE root_hash = ?1 AND to_symbol_hash = ?2 ORDER BY from_symbol_hash",
+        )?;
+        Ok(stmt
+            .query_map(params![root_hash, symbol], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn transitive_dependents_for_symbol(
+        &self,
+        root_hash: &str,
+        symbol: &str,
+    ) -> Result<Vec<String>> {
+        let mut seen = BTreeSet::new();
+        let mut frontier = self.direct_dependents_for_symbol(root_hash, symbol)?;
+        frontier.sort();
+        while let Some(dependent) = frontier.pop() {
+            if !seen.insert(dependent.clone()) {
+                continue;
+            }
+            for next in self.direct_dependents_for_symbol(root_hash, &dependent)? {
+                if !seen.contains(&next) {
+                    frontier.push(next);
+                }
+            }
+            frontier.sort();
+        }
+        Ok(seen.into_iter().collect())
+    }
+
     pub(crate) fn reverse_dependencies_for_root(
         &self,
         root: &ProgramRootPayload,

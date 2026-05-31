@@ -4,6 +4,7 @@ use std::process::Command as StdCommand;
 use assert_cmd::Command;
 use predicates::prelude::*;
 use rusqlite::Connection;
+use serde_json::Value as JsonValue;
 use tempfile::tempdir;
 
 fn bin() -> Command {
@@ -52,11 +53,16 @@ fn shop_demo_flow_preserves_symbol_identity_across_rename() {
     let rename = run(&["rename", db.to_str().unwrap(), "tax", "vat"]);
     let old_root = parse_line_value(&rename, "old_root ");
     let new_root = parse_line_value(&rename, "new_root ");
+    assert!(rename.contains("build_impact metadata_only"));
+    assert!(rename.contains("recompile none"));
+    assert!(rename.contains("relink false"));
 
     let diff = run(&["diff", db.to_str().unwrap(), old_root, new_root]);
     assert!(diff.contains("symbol_renamed"));
     assert!(diff.contains("main.tax -> main.vat"));
     assert!(diff.contains("function body hash: unchanged"));
+    assert!(diff.contains("Incremental build impact"));
+    assert!(diff.contains("build_impact metadata_only"));
 
     let branch_before_retry = branch_state(&db);
     let migrations_before_retry = row_count(&db, "migrations");
@@ -139,6 +145,11 @@ fn replace_body_updates_only_implementation_and_literal_diff() {
     ]);
     let old_root = parse_line_value(&replace, "old_root ");
     let new_root = parse_line_value(&replace, "new_root ");
+    assert!(replace.contains("build_impact recompile_symbols"));
+    assert!(replace.contains("relink true"));
+    let recompile = parse_line_value(&replace, "recompile ");
+    assert!(recompile.starts_with("sha256:"));
+    assert!(!recompile.contains(','));
 
     bin()
         .args(["eval", db.to_str().unwrap(), "main"])
@@ -150,11 +161,41 @@ fn replace_body_updates_only_implementation_and_literal_diff() {
     assert!(diff.contains("implementation_changed"));
     assert!(diff.contains("signature: unchanged"));
     assert!(diff.contains("literal_changed: 20 -> 18"));
+    assert!(diff.contains("compile impact: recompile_symbols"));
 
     bin()
         .args(["verify", db.to_str().unwrap()])
         .assert()
         .success();
+}
+
+#[test]
+fn build_impact_is_available_as_json() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("json.sqlite");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    let rename = run(&["rename", db.to_str().unwrap(), "tax", "vat", "--json"]);
+    let value: JsonValue = serde_json::from_str(&rename).unwrap();
+
+    assert_eq!(value["status"], "applied");
+    assert_eq!(value["summary"]["build_impact"]["kind"], "metadata_only");
+    assert_eq!(value["summary"]["build_impact"]["relink"], false);
+    assert_eq!(
+        value["summary"]["build_impact"]["recompile"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    let old_root = value["old_root_hash"].as_str().unwrap();
+    let new_root = value["new_root_hash"].as_str().unwrap();
+    let diff = run(&["diff", db.to_str().unwrap(), old_root, new_root, "--json"]);
+    let diff: JsonValue = serde_json::from_str(&diff).unwrap();
+    assert_eq!(diff["build_impact"]["kind"], "metadata_only");
+    assert_eq!(diff["changes"][0]["kind"], "symbol_renamed");
 }
 
 #[test]
@@ -255,6 +296,7 @@ fn structural_operations_retry_with_expected_root_return_already_applied() {
         "subtotal * 18 / 100",
     ]);
     let replace_expected_root = parse_line_value(&replace, "old_root ");
+    assert!(replace.contains("build_impact recompile_symbols"));
     let branch_before_replace_retry = branch_state(&replace_db);
     let counts_before_replace_retry = mutation_guard_counts(&replace_db);
     let replace_retry = run(&[
@@ -292,6 +334,7 @@ fn structural_operations_retry_with_expected_root_return_already_applied() {
         "(y: i64) -> i64",
     ]);
     let signature_expected_root = parse_line_value(&signature, "old_root ");
+    assert!(signature.contains("build_impact metadata_only"));
     let branch_before_signature_retry = branch_state(&signature_db);
     let counts_before_signature_retry = mutation_guard_counts(&signature_db);
     let signature_retry = run(&[
@@ -324,6 +367,7 @@ fn structural_operations_retry_with_expected_root_return_already_applied() {
     ]);
     let delete = run(&["delete-symbol", delete_db.to_str().unwrap(), "unused"]);
     let delete_expected_root = parse_line_value(&delete, "old_root ");
+    assert!(delete.contains("build_impact relink_only"));
     let branch_before_delete_retry = branch_state(&delete_db);
     let counts_before_delete_retry = mutation_guard_counts(&delete_db);
     let delete_retry = run(&[
@@ -350,6 +394,7 @@ fn structural_operations_retry_with_expected_root_return_already_applied() {
         "sales_tax",
     ]);
     let alias_expected_root = parse_line_value(&alias, "old_root ");
+    assert!(alias.contains("build_impact metadata_only"));
     let branch_before_alias_retry = branch_state(&alias_db);
     let counts_before_alias_retry = mutation_guard_counts(&alias_db);
     let alias_retry = run(&[

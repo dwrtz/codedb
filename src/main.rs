@@ -56,6 +56,8 @@ enum Command {
         new_name: String,
         #[arg(long)]
         expect_root: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     ReplaceBody {
         db: PathBuf,
@@ -63,6 +65,8 @@ enum Command {
         expr: String,
         #[arg(long)]
         expect_root: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     ChangeSignature {
         db: PathBuf,
@@ -70,6 +74,8 @@ enum Command {
         signature: String,
         #[arg(long)]
         expect_root: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     DeleteSymbol {
         db: PathBuf,
@@ -78,6 +84,8 @@ enum Command {
         force: bool,
         #[arg(long)]
         expect_root: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     CreateAlias {
         db: PathBuf,
@@ -85,11 +93,15 @@ enum Command {
         alias: String,
         #[arg(long)]
         expect_root: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     Diff {
         db: PathBuf,
         root_a: String,
         root_b: String,
+        #[arg(long)]
+        json: bool,
     },
     History {
         db: PathBuf,
@@ -165,11 +177,17 @@ fn main() -> Result<()> {
             old_name,
             new_name,
             expect_root,
+            json,
         } => {
             let mut codedb = codedb::CodeDb::open(db)?;
             print!(
                 "{}",
-                codedb.rename_main_branch_expected(&old_name, &new_name, expect_root.as_deref())?
+                codedb.rename_main_branch_expected_format(
+                    &old_name,
+                    &new_name,
+                    expect_root.as_deref(),
+                    json
+                )?
             );
         }
         Command::ReplaceBody {
@@ -177,11 +195,17 @@ fn main() -> Result<()> {
             name,
             expr,
             expect_root,
+            json,
         } => {
             let mut codedb = codedb::CodeDb::open(db)?;
             print!(
                 "{}",
-                codedb.replace_body_main_branch_expected(&name, &expr, expect_root.as_deref())?
+                codedb.replace_body_main_branch_expected_format(
+                    &name,
+                    &expr,
+                    expect_root.as_deref(),
+                    json
+                )?
             );
         }
         Command::ChangeSignature {
@@ -189,14 +213,16 @@ fn main() -> Result<()> {
             name,
             signature,
             expect_root,
+            json,
         } => {
             let mut codedb = codedb::CodeDb::open(db)?;
             print!(
                 "{}",
-                codedb.change_signature_main_branch_expected(
+                codedb.change_signature_main_branch_expected_format(
                     &name,
                     &signature,
-                    expect_root.as_deref()
+                    expect_root.as_deref(),
+                    json
                 )?
             );
         }
@@ -205,11 +231,17 @@ fn main() -> Result<()> {
             name,
             force,
             expect_root,
+            json,
         } => {
             let mut codedb = codedb::CodeDb::open(db)?;
             print!(
                 "{}",
-                codedb.delete_symbol_main_branch_expected(&name, force, expect_root.as_deref())?
+                codedb.delete_symbol_main_branch_expected_format(
+                    &name,
+                    force,
+                    expect_root.as_deref(),
+                    json
+                )?
             );
         }
         Command::CreateAlias {
@@ -217,16 +249,31 @@ fn main() -> Result<()> {
             name,
             alias,
             expect_root,
+            json,
         } => {
             let mut codedb = codedb::CodeDb::open(db)?;
             print!(
                 "{}",
-                codedb.create_alias_main_branch_expected(&name, &alias, expect_root.as_deref())?
+                codedb.create_alias_main_branch_expected_format(
+                    &name,
+                    &alias,
+                    expect_root.as_deref(),
+                    json
+                )?
             );
         }
-        Command::Diff { db, root_a, root_b } => {
+        Command::Diff {
+            db,
+            root_a,
+            root_b,
+            json,
+        } => {
             let codedb = codedb::CodeDb::open(db)?;
-            print!("{}", codedb.diff_roots(&root_a, &root_b)?);
+            if json {
+                print!("{}", codedb.diff_roots_json(&root_a, &root_b)?);
+            } else {
+                print!("{}", codedb.diff_roots(&root_a, &root_b)?);
+            }
         }
         Command::History { db } => {
             let codedb = codedb::CodeDb::open(db)?;

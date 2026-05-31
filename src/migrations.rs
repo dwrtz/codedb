@@ -5,7 +5,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
-use crate::backend::ArtifactKind;
+use crate::build_plan::{BuildImpact, BuildImpactKind, BuildImpactReason, projection_artifacts};
 use crate::expr::RawExpr;
 use crate::model::{
     BranchState, NameBinding, ParamNames, ProgramRootPayload, RootSymbolPayload, param_names,
@@ -106,6 +106,17 @@ impl MigrationOutcome {
             MigrationOutcome::Conflict(conflict) => conflict.format_cli(),
         }
     }
+
+    pub(crate) fn format_json(&self) -> String {
+        let payload = match self {
+            MigrationOutcome::Applied(report) => report.to_json(MigrationStatus::Applied),
+            MigrationOutcome::AlreadyApplied(report) => {
+                report.to_json(MigrationStatus::AlreadyApplied)
+            }
+            MigrationOutcome::Conflict(conflict) => conflict.to_json(),
+        };
+        format!("{}\n", canonical_json(&payload))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +159,17 @@ impl MigrationReport {
         self.summary.push_cli_lines(&mut out);
         out
     }
+
+    fn to_json(&self, status: MigrationStatus) -> JsonValue {
+        json!({
+            "status": status.as_str(),
+            "old_root_hash": &self.old_root,
+            "new_root_hash": &self.new_root,
+            "migration_hash": &self.migration_hash,
+            "history_hash": &self.history_hash,
+            "summary": self.summary.to_json(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +203,23 @@ impl MigrationConflict {
         self.summary.push_cli_lines(&mut out);
         out
     }
+
+    fn to_json(&self) -> JsonValue {
+        json!({
+            "status": MigrationStatus::Conflict.as_str(),
+            "current_root_hash": &self.current_root,
+            "expected_root_hash": &self.expected_root,
+            "failed_preconditions": self.failed_preconditions
+                .iter()
+                .map(Precondition::kind_name)
+                .collect::<Vec<_>>(),
+            "failed_postconditions": self.failed_postconditions
+                .iter()
+                .map(Postcondition::kind_name)
+                .collect::<Vec<_>>(),
+            "summary": self.summary.to_json(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -189,7 +228,7 @@ pub(crate) struct MigrationSummary {
     pub(crate) display: String,
     pub(crate) semantic_impact: SemanticImpact,
     pub(crate) typecheck: TypecheckImpact,
-    pub(crate) build_impact: BuildImpactSummary,
+    pub(crate) build_impact: BuildImpact,
 }
 
 impl MigrationSummary {
@@ -199,23 +238,17 @@ impl MigrationSummary {
             self.semantic_impact.as_str()
         ));
         out.push_str(&format!("typecheck {}\n", self.typecheck.as_str()));
-        out.push_str(&format!(
-            "build_impact {}\n",
-            self.build_impact.kind.as_str()
-        ));
-        out.push_str(&format!(
-            "regenerate {}\n",
-            artifact_names(&self.build_impact.regenerate)
-        ));
-        out.push_str(&format!(
-            "recompile {}\n",
-            if self.build_impact.recompile.is_empty() {
-                "none".to_string()
-            } else {
-                self.build_impact.recompile.join(",")
-            }
-        ));
-        out.push_str(&format!("relink {}\n", self.build_impact.relink));
+        self.build_impact.push_cli_lines(out);
+    }
+
+    fn to_json(&self) -> JsonValue {
+        json!({
+            "kind": self.operation_kind,
+            "display": &self.display,
+            "semantic_impact": self.semantic_impact.as_str(),
+            "typecheck": self.typecheck.as_str(),
+            "build_impact": self.build_impact.to_json(),
+        })
     }
 }
 
@@ -257,36 +290,6 @@ impl TypecheckImpact {
             TypecheckImpact::Unchanged => "unchanged",
             TypecheckImpact::BodyRechecked => "body_rechecked",
             TypecheckImpact::RootRechecked => "root_rechecked",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct BuildImpactSummary {
-    pub(crate) kind: BuildImpactKind,
-    pub(crate) regenerate: Vec<ArtifactKind>,
-    pub(crate) recompile: Vec<String>,
-    pub(crate) relink: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum BuildImpactKind {
-    MetadataOnly,
-    RelinkOnly,
-    RecompileSymbols,
-    RecompileDependents,
-    FullRebuild,
-}
-
-impl BuildImpactKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            BuildImpactKind::MetadataOnly => "metadata_only",
-            BuildImpactKind::RelinkOnly => "relink_only",
-            BuildImpactKind::RecompileSymbols => "recompile_symbols",
-            BuildImpactKind::RecompileDependents => "recompile_dependents",
-            BuildImpactKind::FullRebuild => "full_rebuild",
         }
     }
 }
@@ -399,19 +402,122 @@ fn condition_names<T: ConditionName>(conditions: &[T]) -> String {
         .join(",")
 }
 
-fn projection_artifacts() -> Vec<ArtifactKind> {
-    vec![ArtifactKind::CanonicalSource, ArtifactKind::CProjection]
+fn operation_summary_parts(op: &Operation) -> (String, SemanticImpact, TypecheckImpact) {
+    match op {
+        Operation::CreateFunction { module, name, .. } => (
+            format!("{module}.{name}"),
+            SemanticImpact::FunctionCreated,
+            TypecheckImpact::Checked,
+        ),
+        Operation::RenameSymbol {
+            module,
+            old_name,
+            new_name,
+            ..
+        } => (
+            format!("{module}.{old_name} -> {module}.{new_name}"),
+            SemanticImpact::SymbolRenamed,
+            TypecheckImpact::Unchanged,
+        ),
+        Operation::ReplaceFunctionBody { module, name, .. } => (
+            format!("{module}.{name}"),
+            SemanticImpact::ImplementationChanged,
+            TypecheckImpact::BodyRechecked,
+        ),
+        Operation::ChangeFunctionSignature { module, name, .. } => (
+            format!("{module}.{name}"),
+            SemanticImpact::InterfaceChanged,
+            TypecheckImpact::RootRechecked,
+        ),
+        Operation::DeleteSymbol { module, name, .. } => (
+            format!("{module}.{name}"),
+            SemanticImpact::SymbolDeleted,
+            TypecheckImpact::RootRechecked,
+        ),
+        Operation::CreateAlias {
+            module,
+            name,
+            alias,
+            ..
+        } => (
+            format!("{module}.{name} as {module}.{alias}"),
+            SemanticImpact::AliasCreated,
+            TypecheckImpact::Unchanged,
+        ),
+    }
 }
 
-fn artifact_names(artifacts: &[ArtifactKind]) -> String {
-    if artifacts.is_empty() {
-        return "none".to_string();
+fn fallback_build_impact(op: &Operation) -> BuildImpact {
+    let (kind, recompile_symbols, relink, changed_symbols, reasons) = match op {
+        Operation::CreateFunction { .. } => (
+            BuildImpactKind::RecompileSymbols,
+            vec![],
+            true,
+            vec![],
+            vec![BuildImpactReason::SymbolAdded],
+        ),
+        Operation::RenameSymbol { .. } | Operation::CreateAlias { .. } => (
+            BuildImpactKind::MetadataOnly,
+            vec![],
+            false,
+            vec![],
+            vec![BuildImpactReason::MetadataChanged],
+        ),
+        Operation::ReplaceFunctionBody { symbol, .. } => (
+            BuildImpactKind::RecompileSymbols,
+            vec![symbol.clone()],
+            true,
+            vec![symbol.clone()],
+            vec![
+                BuildImpactReason::ImplementationHashChanged,
+                BuildImpactReason::BodyExpressionHashChanged,
+            ],
+        ),
+        Operation::ChangeFunctionSignature { symbol, .. } => (
+            BuildImpactKind::RecompileDependents,
+            vec![symbol.clone()],
+            true,
+            vec![symbol.clone()],
+            vec![BuildImpactReason::InterfaceHashChanged],
+        ),
+        Operation::DeleteSymbol { symbol, .. } => (
+            BuildImpactKind::RelinkOnly,
+            vec![],
+            true,
+            vec![symbol.clone()],
+            vec![BuildImpactReason::SymbolRemoved],
+        ),
+    };
+    let projection_artifacts = projection_artifacts();
+    let mut artifact_kinds = projection_artifacts.clone();
+    if matches!(
+        kind,
+        BuildImpactKind::RecompileSymbols
+            | BuildImpactKind::RecompileDependents
+            | BuildImpactKind::FullRebuild
+    ) {
+        artifact_kinds.push(crate::backend::ArtifactKind::LoweredIr);
+        artifact_kinds.push(crate::backend::ArtifactKind::ObjectFile);
     }
-    artifacts
-        .iter()
-        .map(|artifact| artifact.as_str())
-        .collect::<Vec<_>>()
-        .join(",")
+    if relink {
+        artifact_kinds.push(crate::backend::ArtifactKind::LinkPlan);
+        artifact_kinds.push(crate::backend::ArtifactKind::Executable);
+    }
+    artifact_kinds.sort();
+    artifact_kinds.dedup();
+
+    BuildImpact {
+        kind,
+        artifact_kinds,
+        projection_artifacts,
+        recompile_symbols,
+        relink,
+        changed_symbols,
+        unchanged_objects: vec![],
+        direct_dependents: BTreeMap::new(),
+        transitive_dependents: BTreeMap::new(),
+        reasons,
+    }
 }
 
 impl CodeDb {
@@ -431,7 +537,7 @@ impl CodeDb {
         op: Operation,
     ) -> Result<MigrationOutcome> {
         let old_root = branch.root_hash.clone();
-        let summary = self.migration_summary(&op);
+        let fallback_summary = self.migration_summary(&op);
         let preconditions = self.preconditions_for(expected_root, &op);
         let failed_preconditions = self.failed_preconditions(&old_root, &preconditions)?;
         if !failed_preconditions.is_empty() {
@@ -439,6 +545,7 @@ impl CodeDb {
             let failed_postconditions =
                 self.failed_postconditions(&old_root, &current_postconditions)?;
             if failed_postconditions.is_empty() {
+                let summary = self.migration_summary_for_roots(&op, &old_root, &old_root)?;
                 return Ok(MigrationOutcome::AlreadyApplied(MigrationReport {
                     old_root: old_root.clone(),
                     new_root: old_root,
@@ -451,7 +558,7 @@ impl CodeDb {
             return Ok(MigrationOutcome::Conflict(MigrationConflict {
                 current_root: old_root,
                 expected_root: expected_root.to_string(),
-                summary,
+                summary: fallback_summary,
                 failed_preconditions,
                 failed_postconditions,
             }));
@@ -483,6 +590,7 @@ impl CodeDb {
             );
             let history_hash =
                 history_hash(branch.history_hash.as_deref(), &migration_hash, &new_root);
+            let summary = self.migration_summary_for_roots(&op, &old_root, &new_root)?;
 
             self.conn.execute(
                 "INSERT OR IGNORE INTO migrations
@@ -714,84 +822,8 @@ impl CodeDb {
     }
 
     pub(crate) fn migration_summary(&self, op: &Operation) -> MigrationSummary {
-        let (display, semantic_impact, typecheck, build_impact) = match op {
-            Operation::CreateFunction { module, name, .. } => (
-                format!("{module}.{name}"),
-                SemanticImpact::FunctionCreated,
-                TypecheckImpact::Checked,
-                BuildImpactSummary {
-                    kind: BuildImpactKind::RecompileSymbols,
-                    regenerate: projection_artifacts(),
-                    recompile: vec![format!("{module}.{name}")],
-                    relink: true,
-                },
-            ),
-            Operation::RenameSymbol {
-                module,
-                old_name,
-                new_name,
-                ..
-            } => (
-                format!("{module}.{old_name} -> {module}.{new_name}"),
-                SemanticImpact::SymbolRenamed,
-                TypecheckImpact::Unchanged,
-                BuildImpactSummary {
-                    kind: BuildImpactKind::MetadataOnly,
-                    regenerate: projection_artifacts(),
-                    recompile: vec![],
-                    relink: false,
-                },
-            ),
-            Operation::ReplaceFunctionBody { module, name, .. } => (
-                format!("{module}.{name}"),
-                SemanticImpact::ImplementationChanged,
-                TypecheckImpact::BodyRechecked,
-                BuildImpactSummary {
-                    kind: BuildImpactKind::RecompileSymbols,
-                    regenerate: projection_artifacts(),
-                    recompile: vec![format!("{module}.{name}")],
-                    relink: true,
-                },
-            ),
-            Operation::ChangeFunctionSignature { module, name, .. } => (
-                format!("{module}.{name}"),
-                SemanticImpact::InterfaceChanged,
-                TypecheckImpact::RootRechecked,
-                BuildImpactSummary {
-                    kind: BuildImpactKind::RecompileDependents,
-                    regenerate: projection_artifacts(),
-                    recompile: vec![format!("{module}.{name}")],
-                    relink: true,
-                },
-            ),
-            Operation::DeleteSymbol { module, name, .. } => (
-                format!("{module}.{name}"),
-                SemanticImpact::SymbolDeleted,
-                TypecheckImpact::RootRechecked,
-                BuildImpactSummary {
-                    kind: BuildImpactKind::RelinkOnly,
-                    regenerate: projection_artifacts(),
-                    recompile: vec![],
-                    relink: true,
-                },
-            ),
-            Operation::CreateAlias {
-                module,
-                name,
-                alias,
-                ..
-            } => (
-                format!("{module}.{name} as {module}.{alias}"),
-                SemanticImpact::AliasCreated,
-                TypecheckImpact::Unchanged,
-                BuildImpactSummary {
-                    kind: BuildImpactKind::MetadataOnly,
-                    regenerate: projection_artifacts(),
-                    recompile: vec![],
-                    relink: false,
-                },
-            ),
-        };
+        let (display, semantic_impact, typecheck) = operation_summary_parts(op);
+        let build_impact = fallback_build_impact(op);
 
         MigrationSummary {
             operation_kind: op.kind_name(),
@@ -800,6 +832,23 @@ impl CodeDb {
             typecheck,
             build_impact,
         }
+    }
+
+    pub(crate) fn migration_summary_for_roots(
+        &self,
+        op: &Operation,
+        old_root: &str,
+        new_root: &str,
+    ) -> Result<MigrationSummary> {
+        let (display, semantic_impact, typecheck) = operation_summary_parts(op);
+        let build_impact = self.plan_build_impact(old_root, new_root)?;
+        Ok(MigrationSummary {
+            operation_kind: op.kind_name(),
+            display,
+            semantic_impact,
+            typecheck,
+            build_impact,
+        })
     }
 
     pub(crate) fn failed_preconditions(
