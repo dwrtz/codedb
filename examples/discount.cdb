@@ -1,0 +1,7 @@
+fn tax(subtotal: i64) -> i64 = subtotal * 20 / 100
+
+fn discount(subtotal: i64) -> i64 = if subtotal > 100 then subtotal * 10 / 100 else 0
+
+fn total(subtotal: i64) -> i64 = subtotal + tax(subtotal) - discount(subtotal)
+
+fn main() -> i64 = total(150)

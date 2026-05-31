@@ -1,0 +1,5 @@
+fn tax(subtotal: i64) -> i64 = subtotal * 20 / 100
+
+fn total(subtotal: i64) -> i64 = subtotal + tax(subtotal)
+
+fn main() -> i64 = total(100)

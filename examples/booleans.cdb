@@ -1,0 +1,5 @@
+fn is_large(subtotal: i64) -> bool = subtotal >= 100
+
+fn fee(subtotal: i64) -> i64 = if is_large(subtotal) then 0 else 5
+
+fn main() -> i64 = fee(80)
