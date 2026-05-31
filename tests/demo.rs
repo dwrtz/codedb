@@ -15,6 +15,11 @@ fn run(args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("utf8 stdout")
 }
 
+fn run_failure(args: &[&str]) -> String {
+    let output = bin().args(args).assert().failure().get_output().clone();
+    String::from_utf8(output.stderr).expect("utf8 stderr")
+}
+
 fn parse_line_value<'a>(text: &'a str, key: &str) -> &'a str {
     text.lines()
         .find_map(|line| line.strip_prefix(key))
@@ -213,6 +218,302 @@ fn stale_expected_root_returns_conflict_without_writes() {
     assert!(conflict.contains("failed_preconditions root_is_current"));
     assert_eq!(branch_state(&db), branch_before_conflict);
     assert_eq!(mutation_guard_counts(&db), counts_before_conflict);
+
+    bin()
+        .args(["verify", db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+}
+
+#[test]
+fn structural_operations_retry_with_expected_root_return_already_applied() {
+    let temp = tempdir().unwrap();
+
+    let import_db = temp.path().join("import.sqlite");
+    run(&["init", import_db.to_str().unwrap()]);
+    run(&["import", import_db.to_str().unwrap(), "examples/shop.cdb"]);
+    let branch_before_import_retry = branch_state(&import_db);
+    let counts_before_import_retry = mutation_guard_counts(&import_db);
+    let import_retry = run(&["import", import_db.to_str().unwrap(), "examples/shop.cdb"]);
+    assert!(import_retry.contains("already_applied create_function main.tax"));
+    assert!(import_retry.contains("already_applied create_function main.total"));
+    assert!(import_retry.contains("already_applied create_function main.main"));
+    assert_eq!(branch_state(&import_db), branch_before_import_retry);
+    assert_eq!(
+        mutation_guard_counts(&import_db),
+        counts_before_import_retry
+    );
+
+    let replace_db = temp.path().join("replace-retry.sqlite");
+    run(&["init", replace_db.to_str().unwrap()]);
+    run(&["import", replace_db.to_str().unwrap(), "examples/shop.cdb"]);
+    let replace = run(&[
+        "replace-body",
+        replace_db.to_str().unwrap(),
+        "tax",
+        "subtotal * 18 / 100",
+    ]);
+    let replace_expected_root = parse_line_value(&replace, "old_root ");
+    let branch_before_replace_retry = branch_state(&replace_db);
+    let counts_before_replace_retry = mutation_guard_counts(&replace_db);
+    let replace_retry = run(&[
+        "replace-body",
+        replace_db.to_str().unwrap(),
+        "tax",
+        "subtotal * 18 / 100",
+        "--expect-root",
+        replace_expected_root,
+    ]);
+    assert!(replace_retry.contains("already_applied replace_function_body main.tax"));
+    assert_eq!(branch_state(&replace_db), branch_before_replace_retry);
+    assert_eq!(
+        mutation_guard_counts(&replace_db),
+        counts_before_replace_retry
+    );
+
+    let signature_db = temp.path().join("signature-retry.sqlite");
+    let signature_source = temp.path().join("signature.cdb");
+    std::fs::write(
+        &signature_source,
+        "fn ignore(x: i64) -> i64 = 1\n\nfn main() -> i64 = ignore(5)\n",
+    )
+    .unwrap();
+    run(&["init", signature_db.to_str().unwrap()]);
+    run(&[
+        "import",
+        signature_db.to_str().unwrap(),
+        signature_source.to_str().unwrap(),
+    ]);
+    let signature = run(&[
+        "change-signature",
+        signature_db.to_str().unwrap(),
+        "ignore",
+        "(y: i64) -> i64",
+    ]);
+    let signature_expected_root = parse_line_value(&signature, "old_root ");
+    let branch_before_signature_retry = branch_state(&signature_db);
+    let counts_before_signature_retry = mutation_guard_counts(&signature_db);
+    let signature_retry = run(&[
+        "change-signature",
+        signature_db.to_str().unwrap(),
+        "ignore",
+        "(y: i64) -> i64",
+        "--expect-root",
+        signature_expected_root,
+    ]);
+    assert!(signature_retry.contains("already_applied change_function_signature main.ignore"));
+    assert_eq!(branch_state(&signature_db), branch_before_signature_retry);
+    assert_eq!(
+        mutation_guard_counts(&signature_db),
+        counts_before_signature_retry
+    );
+
+    let delete_db = temp.path().join("delete-retry.sqlite");
+    let delete_source = temp.path().join("delete.cdb");
+    std::fs::write(
+        &delete_source,
+        "fn unused() -> i64 = 1\n\nfn main() -> i64 = 2\n",
+    )
+    .unwrap();
+    run(&["init", delete_db.to_str().unwrap()]);
+    run(&[
+        "import",
+        delete_db.to_str().unwrap(),
+        delete_source.to_str().unwrap(),
+    ]);
+    let delete = run(&["delete-symbol", delete_db.to_str().unwrap(), "unused"]);
+    let delete_expected_root = parse_line_value(&delete, "old_root ");
+    let branch_before_delete_retry = branch_state(&delete_db);
+    let counts_before_delete_retry = mutation_guard_counts(&delete_db);
+    let delete_retry = run(&[
+        "delete-symbol",
+        delete_db.to_str().unwrap(),
+        "unused",
+        "--expect-root",
+        delete_expected_root,
+    ]);
+    assert!(delete_retry.contains("already_applied delete_symbol main.unused"));
+    assert_eq!(branch_state(&delete_db), branch_before_delete_retry);
+    assert_eq!(
+        mutation_guard_counts(&delete_db),
+        counts_before_delete_retry
+    );
+
+    let alias_db = temp.path().join("alias-retry.sqlite");
+    run(&["init", alias_db.to_str().unwrap()]);
+    run(&["import", alias_db.to_str().unwrap(), "examples/shop.cdb"]);
+    let alias = run(&[
+        "create-alias",
+        alias_db.to_str().unwrap(),
+        "tax",
+        "sales_tax",
+    ]);
+    let alias_expected_root = parse_line_value(&alias, "old_root ");
+    let branch_before_alias_retry = branch_state(&alias_db);
+    let counts_before_alias_retry = mutation_guard_counts(&alias_db);
+    let alias_retry = run(&[
+        "create-alias",
+        alias_db.to_str().unwrap(),
+        "tax",
+        "sales_tax",
+        "--expect-root",
+        alias_expected_root,
+    ]);
+    assert!(alias_retry.contains("already_applied create_alias main.tax as main.sales_tax"));
+    assert_eq!(branch_state(&alias_db), branch_before_alias_retry);
+    assert_eq!(mutation_guard_counts(&alias_db), counts_before_alias_retry);
+}
+
+#[test]
+fn stale_expected_root_conflicts_across_structural_operations() {
+    let temp = tempdir().unwrap();
+
+    let replace_db = temp.path().join("replace-conflict.sqlite");
+    run(&["init", replace_db.to_str().unwrap()]);
+    let replace_import = run(&["import", replace_db.to_str().unwrap(), "examples/shop.cdb"]);
+    let replace_expected_root = parse_line_value(&replace_import, "root ");
+    run(&[
+        "create-alias",
+        replace_db.to_str().unwrap(),
+        "tax",
+        "sales_tax",
+    ]);
+    let branch_before_replace_conflict = branch_state(&replace_db);
+    let counts_before_replace_conflict = mutation_guard_counts(&replace_db);
+    let replace_conflict = run(&[
+        "replace-body",
+        replace_db.to_str().unwrap(),
+        "tax",
+        "subtotal * 18 / 100",
+        "--expect-root",
+        replace_expected_root,
+    ]);
+    assert!(replace_conflict.contains("conflict replace_function_body main.tax"));
+    assert_eq!(branch_state(&replace_db), branch_before_replace_conflict);
+    assert_eq!(
+        mutation_guard_counts(&replace_db),
+        counts_before_replace_conflict
+    );
+
+    let signature_db = temp.path().join("signature-conflict.sqlite");
+    let signature_source = temp.path().join("signature-conflict.cdb");
+    std::fs::write(
+        &signature_source,
+        "fn ignore(x: i64) -> i64 = 1\n\nfn main() -> i64 = ignore(5)\n",
+    )
+    .unwrap();
+    run(&["init", signature_db.to_str().unwrap()]);
+    let signature_import = run(&[
+        "import",
+        signature_db.to_str().unwrap(),
+        signature_source.to_str().unwrap(),
+    ]);
+    let signature_expected_root = parse_line_value(&signature_import, "root ");
+    run(&[
+        "create-alias",
+        signature_db.to_str().unwrap(),
+        "ignore",
+        "ignored",
+    ]);
+    let branch_before_signature_conflict = branch_state(&signature_db);
+    let counts_before_signature_conflict = mutation_guard_counts(&signature_db);
+    let signature_conflict = run(&[
+        "change-signature",
+        signature_db.to_str().unwrap(),
+        "ignore",
+        "(y: i64) -> i64",
+        "--expect-root",
+        signature_expected_root,
+    ]);
+    assert!(signature_conflict.contains("conflict change_function_signature main.ignore"));
+    assert_eq!(
+        branch_state(&signature_db),
+        branch_before_signature_conflict
+    );
+    assert_eq!(
+        mutation_guard_counts(&signature_db),
+        counts_before_signature_conflict
+    );
+
+    let delete_db = temp.path().join("delete-conflict.sqlite");
+    let delete_source = temp.path().join("delete-conflict.cdb");
+    std::fs::write(
+        &delete_source,
+        "fn unused() -> i64 = 1\n\nfn main() -> i64 = 2\n",
+    )
+    .unwrap();
+    run(&["init", delete_db.to_str().unwrap()]);
+    let delete_import = run(&[
+        "import",
+        delete_db.to_str().unwrap(),
+        delete_source.to_str().unwrap(),
+    ]);
+    let delete_expected_root = parse_line_value(&delete_import, "root ");
+    run(&[
+        "create-alias",
+        delete_db.to_str().unwrap(),
+        "unused",
+        "still_here",
+    ]);
+    let branch_before_delete_conflict = branch_state(&delete_db);
+    let counts_before_delete_conflict = mutation_guard_counts(&delete_db);
+    let delete_conflict = run(&[
+        "delete-symbol",
+        delete_db.to_str().unwrap(),
+        "unused",
+        "--expect-root",
+        delete_expected_root,
+    ]);
+    assert!(delete_conflict.contains("conflict delete_symbol main.unused"));
+    assert_eq!(branch_state(&delete_db), branch_before_delete_conflict);
+    assert_eq!(
+        mutation_guard_counts(&delete_db),
+        counts_before_delete_conflict
+    );
+
+    let alias_db = temp.path().join("alias-conflict.sqlite");
+    run(&["init", alias_db.to_str().unwrap()]);
+    let alias_import = run(&["import", alias_db.to_str().unwrap(), "examples/shop.cdb"]);
+    let alias_expected_root = parse_line_value(&alias_import, "root ");
+    run(&[
+        "replace-body",
+        alias_db.to_str().unwrap(),
+        "tax",
+        "subtotal * 18 / 100",
+    ]);
+    let branch_before_alias_conflict = branch_state(&alias_db);
+    let counts_before_alias_conflict = mutation_guard_counts(&alias_db);
+    let alias_conflict = run(&[
+        "create-alias",
+        alias_db.to_str().unwrap(),
+        "tax",
+        "sales_tax",
+        "--expect-root",
+        alias_expected_root,
+    ]);
+    assert!(alias_conflict.contains("conflict create_alias main.tax as main.sales_tax"));
+    assert_eq!(branch_state(&alias_db), branch_before_alias_conflict);
+    assert_eq!(
+        mutation_guard_counts(&alias_db),
+        counts_before_alias_conflict
+    );
+}
+
+#[test]
+fn failed_applied_migration_rolls_back_partial_writes() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("rollback.sqlite");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    let branch_before_failure = branch_state(&db);
+    let counts_before_failure = mutation_guard_counts(&db);
+
+    let stderr = run_failure(&["replace-body", db.to_str().unwrap(), "tax", "true"]);
+    assert!(stderr.contains("replacement body type bool does not match return type i64"));
+    assert_eq!(branch_state(&db), branch_before_failure);
+    assert_eq!(mutation_guard_counts(&db), counts_before_failure);
 
     bin()
         .args(["verify", db.to_str().unwrap()])

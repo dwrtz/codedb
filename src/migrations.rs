@@ -457,60 +457,77 @@ impl CodeDb {
             }));
         }
 
-        let new_root =
-            self.apply_operation_to_root(&old_root, branch.history_hash.as_deref(), &op)?;
-        let postconditions = self.postconditions_for(&new_root, &op);
-        let failed_postconditions = self.failed_postconditions(&new_root, &postconditions)?;
-        if !failed_postconditions.is_empty() {
-            bail!(
-                "postcondition failed for {}: {}",
-                op.kind_name(),
-                condition_names(&failed_postconditions)
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            let new_root =
+                self.apply_operation_to_root(&old_root, branch.history_hash.as_deref(), &op)?;
+            let postconditions = self.postconditions_for(&new_root, &op);
+            let failed_postconditions = self.failed_postconditions(&new_root, &postconditions)?;
+            if !failed_postconditions.is_empty() {
+                bail!(
+                    "postcondition failed for {}: {}",
+                    op.kind_name(),
+                    condition_names(&failed_postconditions)
+                );
+            }
+            let operation_json = serde_json::to_value(&op)?;
+            let preconditions_json = serde_json::to_value(&preconditions)?;
+            let postconditions_json = serde_json::to_value(&postconditions)?;
+            let migration_hash = migration_hash(
+                branch.history_hash.as_deref(),
+                &old_root,
+                &new_root,
+                &operation_json,
+                &preconditions_json,
+                &postconditions_json,
             );
-        }
-        let operation_json = serde_json::to_value(&op)?;
-        let preconditions_json = serde_json::to_value(&preconditions)?;
-        let postconditions_json = serde_json::to_value(&postconditions)?;
-        let migration_hash = migration_hash(
-            branch.history_hash.as_deref(),
-            &old_root,
-            &new_root,
-            &operation_json,
-            &preconditions_json,
-            &postconditions_json,
-        );
-        let history_hash = history_hash(branch.history_hash.as_deref(), &migration_hash, &new_root);
+            let history_hash =
+                history_hash(branch.history_hash.as_deref(), &migration_hash, &new_root);
 
-        self.conn.execute(
-            "INSERT OR IGNORE INTO migrations
-             (hash, parent_history_hash, input_root_hash, output_root_hash,
-              operation_kind, operation_json, preconditions_json, postconditions_json, agent_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '{}')",
-            params![
-                migration_hash,
-                branch.history_hash,
+            self.conn.execute(
+                "INSERT OR IGNORE INTO migrations
+                 (hash, parent_history_hash, input_root_hash, output_root_hash,
+                  operation_kind, operation_json, preconditions_json, postconditions_json, agent_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '{}')",
+                params![
+                    migration_hash,
+                    branch.history_hash,
+                    old_root,
+                    new_root,
+                    op.kind_name(),
+                    canonical_json(&operation_json),
+                    canonical_json(&preconditions_json),
+                    canonical_json(&postconditions_json),
+                ],
+            )?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO histories
+                 (history_hash, parent_history_hash, migration_hash, output_root_hash)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![history_hash, branch.history_hash, migration_hash, new_root],
+            )?;
+            self.update_branch(MAIN_BRANCH, &new_root, &history_hash)?;
+            Ok(MigrationOutcome::Applied(MigrationReport {
                 old_root,
                 new_root,
-                op.kind_name(),
-                canonical_json(&operation_json),
-                canonical_json(&preconditions_json),
-                canonical_json(&postconditions_json),
-            ],
-        )?;
-        self.conn.execute(
-            "INSERT OR IGNORE INTO histories
-             (history_hash, parent_history_hash, migration_hash, output_root_hash)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![history_hash, branch.history_hash, migration_hash, new_root],
-        )?;
-        self.update_branch(MAIN_BRANCH, &new_root, &history_hash)?;
-        Ok(MigrationOutcome::Applied(MigrationReport {
-            old_root,
-            new_root,
-            migration_hash: Some(migration_hash),
-            history_hash: Some(history_hash),
-            summary,
-        }))
+                migration_hash: Some(migration_hash),
+                history_hash: Some(history_hash),
+                summary,
+            }))
+        })();
+
+        match result {
+            Ok(outcome) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(outcome)
+            }
+            Err(err) => {
+                if let Err(rollback_err) = self.conn.execute_batch("ROLLBACK") {
+                    return Err(err).context(format!("rollback failed: {rollback_err}"));
+                }
+                Err(err)
+            }
+        }
     }
 
     pub(crate) fn preconditions_for(&self, input_root: &str, op: &Operation) -> Vec<Precondition> {
@@ -560,12 +577,6 @@ impl CodeDb {
                 symbol,
                 name,
                 ..
-            }
-            | Operation::CreateAlias {
-                module,
-                symbol,
-                name,
-                ..
             } => vec![
                 Precondition::RootIsCurrent {
                     root: input_root.to_string(),
@@ -574,6 +585,25 @@ impl CodeDb {
                     module: module.clone(),
                     name: name.clone(),
                     symbol: symbol.clone(),
+                },
+            ],
+            Operation::CreateAlias {
+                module,
+                symbol,
+                name,
+                alias,
+            } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::NamePointsToSymbol {
+                    module: module.clone(),
+                    name: name.clone(),
+                    symbol: symbol.clone(),
+                },
+                Precondition::NameIsAvailable {
+                    module: module.clone(),
+                    name: alias.clone(),
                 },
             ],
         }
