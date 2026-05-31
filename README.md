@@ -1,6 +1,6 @@
 # codedb
 
-`codedb` is a Rust proof of concept for the model in [SPEC.md](SPEC.md): programs are stored as immutable, content-addressed semantic objects in SQLite, and source files are projections.
+`codedb` is a Rust proof of concept for the model in [docs/SPEC.md](docs/SPEC.md): programs are stored as immutable, content-addressed semantic objects in SQLite, and source files are projections.
 
 ## Demo
 
