@@ -70,7 +70,7 @@ pub(crate) struct BuildImpact {
     pub(crate) recompile_symbols: Vec<String>,
     pub(crate) relink: bool,
     pub(crate) changed_symbols: Vec<String>,
-    pub(crate) unchanged_objects: Vec<String>,
+    pub(crate) unchanged_function_defs: Vec<String>,
     pub(crate) direct_dependents: BTreeMap<String, Vec<String>>,
     pub(crate) transitive_dependents: BTreeMap<String, Vec<String>>,
     pub(crate) reasons: Vec<BuildImpactReason>,
@@ -85,7 +85,7 @@ impl BuildImpact {
             recompile_symbols: vec![],
             relink: false,
             changed_symbols: vec![],
-            unchanged_objects: vec![],
+            unchanged_function_defs: vec![],
             direct_dependents: BTreeMap::new(),
             transitive_dependents: BTreeMap::new(),
             reasons: vec![BuildImpactReason::RootUnchanged],
@@ -100,7 +100,7 @@ impl BuildImpact {
             "recompile": &self.recompile_symbols,
             "relink": self.relink,
             "changed_symbols": &self.changed_symbols,
-            "unchanged_objects": &self.unchanged_objects,
+            "unchanged_function_defs": &self.unchanged_function_defs,
             "direct_dependents": &self.direct_dependents,
             "transitive_dependents": &self.transitive_dependents,
             "reasons": self.reasons.iter().map(|reason| reason.as_str()).collect::<Vec<_>>(),
@@ -199,7 +199,7 @@ impl CodeDb {
         let mut kind = BuildImpactKind::MetadataOnly;
         let mut recompile_symbols = BTreeSet::new();
         let mut changed_symbols = BTreeSet::new();
-        let mut unchanged_objects = BTreeSet::new();
+        let mut unchanged_function_defs = BTreeSet::new();
         let mut direct_dependents = BTreeMap::new();
         let mut transitive_dependents = BTreeMap::new();
         let mut relink = false;
@@ -226,7 +226,7 @@ impl CodeDb {
                     changed_symbols.insert(symbol.clone());
                     recompile_symbols.insert(symbol.clone());
                     reasons.insert(BuildImpactReason::SymbolAdded);
-                    unchanged_objects.remove(&entry.definition);
+                    unchanged_function_defs.remove(&entry.definition);
                 }
                 (Some(_entry), None) => {
                     raise_kind(&mut kind, BuildImpactKind::RelinkOnly);
@@ -280,7 +280,7 @@ impl CodeDb {
                             reasons.insert(BuildImpactReason::DependencySetChanged);
                         }
                     } else {
-                        unchanged_objects.insert(new_entry.definition.clone());
+                        unchanged_function_defs.insert(new_entry.definition.clone());
                     }
                 }
                 (None, None) => unreachable!(),
@@ -320,7 +320,7 @@ impl CodeDb {
             recompile_symbols,
             relink,
             changed_symbols: changed_symbols.into_iter().collect(),
-            unchanged_objects: unchanged_objects.into_iter().collect(),
+            unchanged_function_defs: unchanged_function_defs.into_iter().collect(),
             direct_dependents,
             transitive_dependents,
             reasons,

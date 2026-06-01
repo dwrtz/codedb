@@ -10,7 +10,7 @@ use crate::build_plan::{BuildImpact, BuildImpactKind, BuildImpactReason, project
 use crate::expr::RawExpr;
 use crate::model::{
     BranchState, ExportBinding, NameBinding, ParamNames, ProgramRootPayload, RootSymbolPayload,
-    param_names, root_symbol_index, upsert_param_names,
+    param_names, root_symbol_index, upsert_param_names, validate_projection_identifier,
 };
 use crate::store::{CodeDb, canonical_json, hash_bytes};
 use crate::types::ParamSpec;
@@ -610,7 +610,7 @@ fn fallback_build_impact(op: &Operation) -> BuildImpact {
         recompile_symbols,
         relink,
         changed_symbols,
-        unchanged_objects: vec![],
+        unchanged_function_defs: vec![],
         direct_dependents: BTreeMap::new(),
         transitive_dependents: BTreeMap::new(),
         reasons,
@@ -1363,6 +1363,8 @@ impl CodeDb {
         return_type: &str,
         body: &RawExpr,
     ) -> Result<String> {
+        validate_projection_identifier("function name", name)?;
+        validate_param_names(params)?;
         let mut root = self.load_root(input_root)?;
         if root
             .names
@@ -1422,6 +1424,7 @@ impl CodeDb {
         old_name: &str,
         new_name: &str,
     ) -> Result<String> {
+        validate_projection_identifier("function name", new_name)?;
         let mut root = self.load_root(input_root)?;
         if root
             .names
@@ -1488,6 +1491,7 @@ impl CodeDb {
         params: &[ParamSpec],
         return_type: &str,
     ) -> Result<String> {
+        validate_param_names(params)?;
         let mut root = self.load_root(input_root)?;
         self.assert_name_points(&root, module, name, symbol)?;
         let idx = root_symbol_index(&root, symbol)?;
@@ -1562,6 +1566,7 @@ impl CodeDb {
         name: &str,
         alias: &str,
     ) -> Result<String> {
+        validate_projection_identifier("alias", alias)?;
         let mut root = self.load_root(input_root)?;
         self.assert_name_points(&root, module, name, symbol)?;
         if root
@@ -1923,6 +1928,17 @@ fn export_points_to_symbol(root: &ProgramRootPayload, name: &str, symbol: &str) 
     root.exports
         .iter()
         .any(|binding| binding.exported_name == name && binding.symbol == symbol)
+}
+
+fn validate_param_names(params: &[ParamSpec]) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for param in params {
+        validate_projection_identifier("parameter name", &param.name)?;
+        if !seen.insert(param.name.clone()) {
+            bail!("duplicate parameter name {:?}", param.name);
+        }
+    }
+    Ok(())
 }
 
 fn normalize_param_refs(expr: &RawExpr, local_params: &[String]) -> RawExpr {

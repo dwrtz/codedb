@@ -138,3 +138,65 @@ pub(crate) fn resolve_name_in_root(
         .find(|binding| binding.module == module && binding.display_name == name)
         .map(|binding| binding.symbol.clone())
 }
+
+pub(crate) fn validate_projection_identifier(label: &str, name: &str) -> Result<()> {
+    if !is_projection_identifier(name) {
+        anyhow::bail!("{label} must be a projection-safe identifier: {name:?}");
+    }
+    Ok(())
+}
+
+pub(crate) fn is_projection_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first != '_' && !first.is_ascii_alphabetic() {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) && !reserved_projection_identifier(name)
+}
+
+fn reserved_projection_identifier(name: &str) -> bool {
+    matches!(
+        name,
+        "fn" | "if"
+            | "then"
+            | "else"
+            | "true"
+            | "false"
+            | "i64"
+            | "bool"
+            | "unit"
+            | "auto"
+            | "break"
+            | "case"
+            | "char"
+            | "const"
+            | "continue"
+            | "default"
+            | "do"
+            | "double"
+            | "enum"
+            | "extern"
+            | "float"
+            | "for"
+            | "goto"
+            | "int"
+            | "long"
+            | "register"
+            | "return"
+            | "short"
+            | "signed"
+            | "sizeof"
+            | "static"
+            | "struct"
+            | "switch"
+            | "typedef"
+            | "union"
+            | "unsigned"
+            | "void"
+            | "volatile"
+            | "while"
+    )
+}

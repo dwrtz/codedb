@@ -1652,6 +1652,50 @@ fn failed_applied_migration_rolls_back_partial_writes() {
 }
 
 #[test]
+fn projection_unsafe_rename_is_rejected_before_root_creation() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("unsafe-rename.sqlite");
+    let source = temp.path().join("unsafe-rename.cdb");
+
+    std::fs::write(&source, "fn a_b() -> i64 = 1\n\nfn other() -> i64 = 2\n").unwrap();
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), source.to_str().unwrap()]);
+    let branch_before = branch_state(&db);
+    let counts_before = mutation_guard_counts(&db);
+
+    let stderr = run_failure(&["rename", db.to_str().unwrap(), "other", "a-b"]);
+    assert!(stderr.contains("projection-safe identifier"));
+    assert_eq!(branch_state(&db), branch_before);
+    assert_eq!(mutation_guard_counts(&db), counts_before);
+
+    bin()
+        .args(["verify", db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+}
+
+#[test]
+fn verify_replay_does_not_repair_corrupt_indexes() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("verify-readonly.sqlite");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "DELETE FROM root_symbols WHERE rowid = (SELECT rowid FROM root_symbols LIMIT 1)",
+        [],
+    )
+    .unwrap();
+
+    let first = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(first.contains("bad_index: root_symbols mismatch"));
+    let second = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(second.contains("bad_index: root_symbols mismatch"));
+}
+
+#[test]
 fn c_projection_allows_generated_identifiers_that_contain_runtime_names() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("c-runtime-name-substring.sqlite");

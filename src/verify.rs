@@ -11,7 +11,7 @@ use crate::backend::ArtifactKind;
 use crate::backend_c::ensure_no_forbidden_runtime_calls;
 use crate::diff::dependency_pairs;
 use crate::migrations::{history_hash, migration_hash};
-use crate::model::ProgramRootPayload;
+use crate::model::{ProgramRootPayload, validate_projection_identifier};
 use crate::store::{
     CodeDb, cache_key_for_input, canonical_json, hash_bytes, hash_object_canonical,
 };
@@ -26,14 +26,7 @@ impl CodeDb {
         self.verify_migrations_and_histories(&mut errors)?;
         self.verify_roots(&mut errors)?;
         self.verify_caches(&mut errors)?;
-        if let Err(err) = self.replay_main_branch() {
-            let message = format!("{err:#}");
-            if message.starts_with("bad_history_link") || message.starts_with("semantic_conflict") {
-                errors.push(message);
-            } else {
-                errors.push(format!("bad_history_link: {message}"));
-            }
-        }
+        self.verify_history_replay_readonly(&mut errors)?;
 
         if errors.is_empty() {
             Ok("verify ok\n".to_string())
@@ -68,6 +61,26 @@ impl CodeDb {
                     }
                 }
                 Err(err) => errors.push(format!("corrupt_object: {hash}: {err}")),
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_history_replay_readonly(&mut self, errors: &mut Vec<String>) -> Result<()> {
+        self.conn.execute_batch("SAVEPOINT verify_replay")?;
+        let replay_result = self.replay_main_branch();
+        let rollback_result = self
+            .conn
+            .execute_batch("ROLLBACK TO verify_replay; RELEASE verify_replay");
+        if let Err(err) = rollback_result {
+            bail!("verify replay rollback failed: {err}");
+        }
+        if let Err(err) = replay_result {
+            let message = format!("{err:#}");
+            if message.starts_with("bad_history_link") || message.starts_with("semantic_conflict") {
+                errors.push(message);
+            } else {
+                errors.push(format!("bad_history_link: {message}"));
             }
         }
         Ok(())
@@ -292,6 +305,7 @@ impl CodeDb {
         if expected_names != actual_names {
             errors.push(format!("bad_index: root_names mismatch for {root_hash}"));
         }
+        self.verify_projection_names(root_hash, root, errors);
 
         let root_symbols = root
             .symbols
@@ -355,6 +369,40 @@ impl CodeDb {
             ));
         }
         Ok(())
+    }
+
+    fn verify_projection_names(
+        &self,
+        root_hash: &str,
+        root: &ProgramRootPayload,
+        errors: &mut Vec<String>,
+    ) {
+        for binding in &root.names {
+            if let Err(err) = validate_projection_identifier("display name", &binding.display_name)
+            {
+                errors.push(format!(
+                    "bad_index: invalid display name for {} in {root_hash}: {err:#}",
+                    binding.symbol
+                ));
+            }
+        }
+        for entry in &root.param_names {
+            let mut seen = BTreeSet::new();
+            for name in &entry.names {
+                if let Err(err) = validate_projection_identifier("parameter name", name) {
+                    errors.push(format!(
+                        "bad_index: invalid parameter name for {} in {root_hash}: {err:#}",
+                        entry.symbol
+                    ));
+                }
+                if !seen.insert(name.clone()) {
+                    errors.push(format!(
+                        "bad_index: duplicate parameter name {name:?} for {} in {root_hash}",
+                        entry.symbol
+                    ));
+                }
+            }
+        }
     }
 
     fn verify_caches(&self, errors: &mut Vec<String>) -> Result<()> {

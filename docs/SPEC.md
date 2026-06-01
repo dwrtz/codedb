@@ -1486,7 +1486,7 @@ Output:
   "projection_artifacts": ["canonical_source", "c_projection"],
   "recompile": ["sha256:symbol-total"],
   "relink": true,
-  "unchanged_objects": ["sha256:object-tax"],
+  "unchanged_function_defs": ["sha256:function-def-tax"],
   "reason": "implementation_hash_changed"
 }
 ```
