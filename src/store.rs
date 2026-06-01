@@ -230,22 +230,24 @@ impl CodeDb {
                 ArtifactKind::InterfaceHash,
                 &interface_metadata,
             )?;
-            self.write_cache_json(
+            let implementation_metadata = json!({
+                "symbol_hash": entry.symbol,
+                "definition_hash": entry.definition,
+                "function_sig_hash": entry.signature,
+                "typed_body_expr_hash": body_hash,
+                "internal_abi_symbol": internal_abi_symbol(&entry.symbol)?,
+                "direct_dependency_symbols": direct_dependencies.iter().cloned().collect::<Vec<_>>(),
+                "direct_dependency_interface_hashes": direct_dependency_interface_hashes,
+                "semantic_lowering_version": crate::lowering::LOWERED_IR_SCHEMA,
+            });
+            let implementation_key = CacheKeyInput::new(
+                ArtifactKind::ImplementationHash,
                 &entry.definition,
                 "lowering",
                 "implementation",
-                ArtifactKind::ImplementationHash,
-                &json!({
-                    "symbol_hash": entry.symbol,
-                    "definition_hash": entry.definition,
-                    "function_sig_hash": entry.signature,
-                    "typed_body_expr_hash": body_hash,
-                    "internal_abi_symbol": internal_abi_symbol(&entry.symbol)?,
-                    "direct_dependency_symbols": direct_dependencies.iter().cloned().collect::<Vec<_>>(),
-                    "direct_dependency_interface_hashes": direct_dependency_interface_hashes,
-                    "semantic_lowering_version": crate::lowering::LOWERED_IR_SCHEMA,
-                }),
-            )?;
+            )
+            .with_dependency_interface_hashes(direct_dependency_interface_hashes.clone());
+            self.write_cache_json_for_key(implementation_key, &implementation_metadata)?;
         }
 
         for binding in &root.names {

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use anyhow::{Result, bail};
 use rusqlite::params;
-use serde_json::Value as JsonValue;
+use serde_json::{Value as JsonValue, json};
 
 use crate::BYTES_DOMAIN;
 use crate::abi::{export_map, internal_abi_symbol, validate_exported_abi_name};
@@ -928,7 +928,113 @@ impl CodeDb {
                 )),
             }
         }
+        self.verify_link_plan_recomputes_from_indexed_root(errors, cache_key, plan)?;
         Ok(())
+    }
+
+    fn verify_link_plan_recomputes_from_indexed_root(
+        &self,
+        errors: &mut Vec<String>,
+        cache_key: &str,
+        plan: &JsonValue,
+    ) -> Result<()> {
+        let Some(entry_symbol) = plan.get("entry_symbol_hash").and_then(JsonValue::as_str) else {
+            return Ok(());
+        };
+        let candidates = {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT root_hash FROM root_symbols
+                 WHERE symbol_hash = ?1 ORDER BY root_hash",
+            )?;
+            stmt.query_map(params![entry_symbol], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if candidates.is_empty() {
+            errors.push(format!(
+                "bad_link_plan: {cache_key} cannot be recomputed: entry symbol is in no indexed root"
+            ));
+            return Ok(());
+        }
+
+        let mut last_error = None;
+        for root_hash in candidates {
+            match self.link_plan_matches_indexed_root(&root_hash, plan) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(err) => last_error = Some(err),
+            }
+        }
+        if let Some(err) = last_error {
+            errors.push(format!(
+                "bad_link_plan: {cache_key} cannot be recomputed from any indexed root: {err:#}"
+            ));
+        } else {
+            errors.push(format!(
+                "bad_link_plan: {cache_key} cannot be recomputed from any indexed root"
+            ));
+        }
+        Ok(())
+    }
+
+    fn link_plan_matches_indexed_root(&self, root_hash: &str, plan: &JsonValue) -> Result<bool> {
+        let Some(entry_symbol) = plan.get("entry_symbol_hash").and_then(JsonValue::as_str) else {
+            return Ok(false);
+        };
+        let Some(entry_abi_symbol) = plan.get("entry_abi_symbol").and_then(JsonValue::as_str)
+        else {
+            return Ok(false);
+        };
+        if entry_abi_symbol != internal_abi_symbol(entry_symbol)? {
+            return Ok(false);
+        }
+        let planned_symbols = link_plan_object_symbols(plan);
+        if planned_symbols.is_empty() {
+            return Ok(false);
+        }
+        if self.reachable_symbols(root_hash, entry_symbol)? != planned_symbols {
+            return Ok(false);
+        }
+
+        let root = self.load_root(root_hash)?;
+        for object in plan
+            .get("objects")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(symbol) = object.get("symbol_hash").and_then(JsonValue::as_str) else {
+                return Ok(false);
+            };
+            let Some(entry) = self.root_symbol(&root, symbol) else {
+                return Ok(false);
+            };
+            let expected_internal_abi = internal_abi_symbol(symbol)?;
+            if object.get("definition_hash").and_then(JsonValue::as_str)
+                != Some(entry.definition.as_str())
+                || object.get("signature_hash").and_then(JsonValue::as_str)
+                    != Some(entry.signature.as_str())
+                || object
+                    .get("internal_abi_symbol")
+                    .and_then(JsonValue::as_str)
+                    != Some(expected_internal_abi.as_str())
+            {
+                return Ok(false);
+            }
+        }
+
+        let linked_symbols = planned_symbols.into_iter().collect::<BTreeSet<_>>();
+        let expected_exports = export_map(&root)?
+            .into_iter()
+            .filter(|export| linked_symbols.contains(&export.symbol))
+            .map(|export| {
+                json!({
+                    "symbol_hash": export.symbol,
+                    "internal_abi_symbol": export.internal_abi_symbol,
+                    "exported_abi_symbol": export.exported_name,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(plan.get("export_map") == Some(&json!(expected_exports)))
     }
 
     fn verify_executable_artifact(
@@ -1181,6 +1287,16 @@ fn json_string_set(value: Option<&JsonValue>) -> BTreeSet<String> {
         .into_iter()
         .flatten()
         .filter_map(JsonValue::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn link_plan_object_symbols(plan: &JsonValue) -> Vec<String> {
+    plan.get("objects")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|object| object.get("symbol_hash").and_then(JsonValue::as_str))
         .map(str::to_string)
         .collect()
 }

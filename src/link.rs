@@ -214,7 +214,11 @@ impl CodeDb {
         })
     }
 
-    fn reachable_symbols(&self, root_hash: &str, entry_symbol: &str) -> Result<Vec<String>> {
+    pub(crate) fn reachable_symbols(
+        &self,
+        root_hash: &str,
+        entry_symbol: &str,
+    ) -> Result<Vec<String>> {
         let mut seen = BTreeSet::new();
         let mut ordered = Vec::new();
         self.visit_reachable_symbol(root_hash, entry_symbol, &mut seen, &mut ordered)?;

@@ -675,6 +675,35 @@ fn interface_cache_is_per_symbol_even_when_signatures_match() {
 }
 
 #[test]
+fn implementation_cache_key_records_direct_dependency_interfaces() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("implementation-keys.sqlite");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    let total_definition = parse_line_value(
+        &run(&["show", db.to_str().unwrap(), "total"]),
+        "definition ",
+    )
+    .to_string();
+
+    let key_jsons = cache_key_json_values_by_kind(&db, "implementation_hash");
+    let total_key = key_jsons
+        .iter()
+        .find(|value| value["input_hash"].as_str() == Some(total_definition.as_str()))
+        .expect("total implementation cache key");
+
+    assert_eq!(total_key["artifact_kind"], "implementation_hash");
+    assert_eq!(
+        total_key["dependency_interface_hashes"]
+            .as_array()
+            .expect("dependency interface hashes")
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn shop_demo_flow_preserves_symbol_identity_across_rename() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("demo.sqlite");
@@ -1135,6 +1164,25 @@ fn stale_expected_root_returns_conflict_without_writes() {
         .assert()
         .success()
         .stdout("verify ok\n");
+}
+
+#[test]
+fn rename_alias_returns_conflict_instead_of_hard_error() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("rename-alias-conflict.sqlite");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    run(&["create-alias", db.to_str().unwrap(), "tax", "sales_tax"]);
+    let branch_before_conflict = branch_state(&db);
+    let counts_before_conflict = mutation_guard_counts(&db);
+
+    let conflict = run(&["rename", db.to_str().unwrap(), "sales_tax", "vat"]);
+
+    assert!(conflict.contains("conflict rename_symbol main.sales_tax -> main.vat"));
+    assert!(conflict.contains("failed_preconditions preferred_name_points_to_symbol"));
+    assert_eq!(branch_state(&db), branch_before_conflict);
+    assert_eq!(mutation_guard_counts(&db), counts_before_conflict);
 }
 
 #[test]
@@ -1637,6 +1685,49 @@ fn verify_rejects_cached_link_plan_metadata_mismatch() {
     let stderr = run_failure(&["verify", db.to_str().unwrap()]);
     assert!(stderr.contains("bad_link_plan"));
     assert!(stderr.contains("external symbols"));
+}
+
+#[test]
+fn verify_rejects_link_plan_that_cannot_be_recomputed_from_a_root() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("link-plan-root-mismatch.sqlite");
+    let plan_path = temp.path().join("main.link.json");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_path.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'link_plan'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    value["metadata"]["objects"][0]["definition_hash"] = JsonValue::String(
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+    );
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (serde_json::to_string(&value).unwrap(), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_link_plan"));
+    assert!(stderr.contains("cannot be recomputed from any indexed root"));
 }
 
 fn cache_rows(db: &Path) -> Vec<(String, String, String)> {

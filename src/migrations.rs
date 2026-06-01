@@ -328,6 +328,11 @@ pub(crate) enum Precondition {
         name: String,
         symbol: String,
     },
+    PreferredNamePointsToSymbol {
+        module: String,
+        name: String,
+        symbol: String,
+    },
     ExportNameIsAvailable {
         name: String,
     },
@@ -343,6 +348,7 @@ impl Precondition {
             Precondition::RootIsCurrent { .. } => "root_is_current",
             Precondition::NameIsAvailable { .. } => "name_is_available",
             Precondition::NamePointsToSymbol { .. } => "name_points_to_symbol",
+            Precondition::PreferredNamePointsToSymbol { .. } => "preferred_name_points_to_symbol",
             Precondition::ExportNameIsAvailable { .. } => "export_name_is_available",
             Precondition::ExportPointsToSymbol { .. } => "export_points_to_symbol",
         }
@@ -596,54 +602,64 @@ impl CodeDb {
 
     pub(crate) fn apply_and_record_expected(
         &mut self,
-        branch: BranchState,
+        _branch: BranchState,
         expected_root: &str,
         op: Operation,
     ) -> Result<MigrationOutcome> {
-        let old_root = branch.root_hash.clone();
         let fallback_summary = self.migration_summary(&op);
-        let preconditions = self.preconditions_for(expected_root, &op);
-        let failed_preconditions = self.failed_preconditions(&old_root, &preconditions)?;
-        if !failed_preconditions.is_empty() {
-            let current_postconditions = self.postconditions_for(&old_root, &op);
-            let failed_postconditions =
-                self.failed_postconditions(&old_root, &current_postconditions)?;
-            if failed_postconditions.is_empty() {
-                let stale_expected_root = failed_preconditions
-                    .iter()
-                    .any(|precondition| matches!(precondition, Precondition::RootIsCurrent { .. }));
-                if stale_expected_root
-                    && !self.recorded_operation_output_matches(expected_root, &old_root, &op)?
-                {
-                    return Ok(MigrationOutcome::Conflict(MigrationConflict {
-                        current_root: old_root,
-                        expected_root: expected_root.to_string(),
-                        summary: fallback_summary,
-                        failed_preconditions,
-                        failed_postconditions,
-                    }));
-                }
-                let summary = self.migration_summary_for_roots(&op, &old_root, &old_root)?;
-                return Ok(MigrationOutcome::AlreadyApplied(MigrationReport {
-                    old_root: old_root.clone(),
-                    new_root: old_root,
-                    migration_hash: None,
-                    history_hash: branch.history_hash,
-                    summary,
-                }));
-            }
-
-            return Ok(MigrationOutcome::Conflict(MigrationConflict {
-                current_root: old_root,
-                expected_root: expected_root.to_string(),
-                summary: fallback_summary,
-                failed_preconditions,
-                failed_postconditions,
-            }));
-        }
-
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| {
+            let branch = self.branch(MAIN_BRANCH)?;
+            let old_root = branch.root_hash.clone();
+            let preconditions = self.preconditions_for(expected_root, &op);
+            let failed_preconditions = self.failed_preconditions(&old_root, &preconditions)?;
+            if !failed_preconditions.is_empty() {
+                let current_postconditions = self.postconditions_for(&old_root, &op);
+                let failed_postconditions =
+                    self.failed_postconditions(&old_root, &current_postconditions)?;
+                if failed_postconditions.is_empty() {
+                    let stale_expected_root = failed_preconditions.iter().any(|precondition| {
+                        matches!(precondition, Precondition::RootIsCurrent { .. })
+                    });
+                    if stale_expected_root
+                        && !self.recorded_operation_output_matches(expected_root, &old_root, &op)?
+                    {
+                        return Ok((
+                            MigrationOutcome::Conflict(MigrationConflict {
+                                current_root: old_root,
+                                expected_root: expected_root.to_string(),
+                                summary: fallback_summary.clone(),
+                                failed_preconditions,
+                                failed_postconditions,
+                            }),
+                            false,
+                        ));
+                    }
+                    let summary = self.migration_summary_for_roots(&op, &old_root, &old_root)?;
+                    return Ok((
+                        MigrationOutcome::AlreadyApplied(MigrationReport {
+                            old_root: old_root.clone(),
+                            new_root: old_root,
+                            migration_hash: None,
+                            history_hash: branch.history_hash,
+                            summary,
+                        }),
+                        false,
+                    ));
+                }
+
+                return Ok((
+                    MigrationOutcome::Conflict(MigrationConflict {
+                        current_root: old_root,
+                        expected_root: expected_root.to_string(),
+                        summary: fallback_summary.clone(),
+                        failed_preconditions,
+                        failed_postconditions,
+                    }),
+                    false,
+                ));
+            }
+
             let new_root =
                 self.apply_operation_to_root(&old_root, branch.history_hash.as_deref(), &op)?;
             let postconditions = self.postconditions_for(&new_root, &op);
@@ -756,7 +772,7 @@ impl CodeDb {
                 Precondition::RootIsCurrent {
                     root: input_root.to_string(),
                 },
-                Precondition::NamePointsToSymbol {
+                Precondition::PreferredNamePointsToSymbol {
                     module: module.clone(),
                     name: old_name.clone(),
                     symbol: symbol.clone(),
@@ -1026,6 +1042,11 @@ impl CodeDb {
                     name,
                     symbol,
                 } => name_points_to_symbol(&root, module, name, symbol),
+                Precondition::PreferredNamePointsToSymbol {
+                    module,
+                    name,
+                    symbol,
+                } => preferred_name_points_to_symbol(&root, module, name, symbol),
                 Precondition::ExportNameIsAvailable { name } => !root
                     .exports
                     .iter()
@@ -1743,6 +1764,20 @@ fn name_points_to_symbol(
 ) -> bool {
     root.names.iter().any(|binding| {
         binding.module == module && binding.display_name == name && binding.symbol == symbol
+    })
+}
+
+fn preferred_name_points_to_symbol(
+    root: &ProgramRootPayload,
+    module: &str,
+    name: &str,
+    symbol: &str,
+) -> bool {
+    root.names.iter().any(|binding| {
+        binding.module == module
+            && binding.display_name == name
+            && binding.symbol == symbol
+            && binding.is_preferred
     })
 }
 
