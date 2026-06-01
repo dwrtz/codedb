@@ -434,6 +434,18 @@ fn host_linker_identity_for_target(target_triple: &str) -> Result<String> {
 
 fn export_wrapper_source(plan: &JsonValue) -> Result<String> {
     let mut out = String::new();
+    let linked_internal_symbols = plan
+        .get("objects")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|object| {
+            object
+                .get("internal_abi_symbol")
+                .and_then(JsonValue::as_str)
+        })
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
     for export in plan
         .get("export_map")
         .and_then(JsonValue::as_array)
@@ -453,6 +465,9 @@ fn export_wrapper_source(plan: &JsonValue) -> Result<String> {
             .and_then(JsonValue::as_str)
             .ok_or_else(|| anyhow!("link plan export missing exported_abi_symbol"))?;
         validate_exported_abi_name(exported)?;
+        if exported != internal && linked_internal_symbols.contains(exported) {
+            bail!("exported ABI symbol {exported} conflicts with a linked internal ABI symbol");
+        }
         if exported == internal {
             continue;
         }

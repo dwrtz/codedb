@@ -346,12 +346,17 @@ impl CodeDb {
                     .get("else")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("if missing else"))?;
-                format!(
+                let expr = format!(
                     "if {} then {} else {}",
                     self.expr_to_source(cond, root, local_params, 0)?,
                     self.expr_to_source(then_hash, root, local_params, 0)?,
                     self.expr_to_source(else_hash, root, local_params, 0)?
-                )
+                );
+                if parent_prec > 0 {
+                    format!("({expr})")
+                } else {
+                    expr
+                }
             }
             other => bail!("unknown expression kind {other}"),
         };

@@ -5,7 +5,9 @@ use rusqlite::{OptionalExtension, params};
 use serde_json::{Value as JsonValue, json};
 
 use crate::BYTES_DOMAIN;
-use crate::abi::{export_map, internal_abi_symbol, validate_exported_abi_name};
+use crate::abi::{
+    export_map, internal_abi_symbol, validate_export_map, validate_exported_abi_name,
+};
 use crate::artifact::{ARTIFACT_METADATA_SCHEMA, CacheKeyInput};
 use crate::backend::ArtifactKind;
 use crate::backend_c::ensure_no_forbidden_runtime_calls;
@@ -333,7 +335,7 @@ impl CodeDb {
                 ));
             }
         }
-        if let Err(err) = export_map(root) {
+        if let Err(err) = validate_export_map(root) {
             errors.push(format!("bad_abi_symbol: root {root_hash}: {err:#}"));
         }
 

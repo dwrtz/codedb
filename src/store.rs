@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 
-use crate::abi::internal_abi_symbol;
+use crate::abi::{internal_abi_symbol, validate_export_map};
 use crate::artifact::{ARTIFACT_METADATA_SCHEMA, CacheKeyInput};
 use crate::backend::ArtifactKind;
 use crate::model::{
@@ -169,6 +169,7 @@ impl CodeDb {
 
     pub(crate) fn put_program_root(&mut self, root: &ProgramRootPayload) -> Result<String> {
         let normalized = normalize_root(root.clone());
+        validate_export_map(&normalized)?;
         let payload = serde_json::to_value(normalized)?;
         self.put_object("ProgramRoot", &payload)
     }

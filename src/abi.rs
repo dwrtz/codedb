@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +32,9 @@ pub(crate) fn validate_exported_abi_name(name: &str) -> Result<()> {
     if !is_valid_abi_identifier(name) {
         bail!("bad ABI export name {name:?}");
     }
+    if is_reserved_native_export_name(name) {
+        bail!("reserved native ABI export name {name:?}");
+    }
     Ok(())
 }
 
@@ -37,7 +42,51 @@ pub(crate) fn exported_abi_names(root: &ProgramRootPayload, symbol: &str) -> Vec
     exports_for(root, symbol).into_iter().collect()
 }
 
+pub(crate) fn validate_export_map(root: &ProgramRootPayload) -> Result<()> {
+    let root_symbols = root
+        .symbols
+        .iter()
+        .map(|entry| entry.symbol.clone())
+        .collect::<BTreeSet<_>>();
+    let mut internal_symbols = BTreeMap::new();
+    for entry in &root.symbols {
+        let internal = internal_abi_symbol(&entry.symbol)?;
+        if let Some(existing) = internal_symbols.insert(internal.clone(), entry.symbol.clone()) {
+            bail!(
+                "internal ABI symbol {internal} is shared by symbols {existing} and {}",
+                entry.symbol
+            );
+        }
+    }
+
+    let mut exported_names = BTreeSet::new();
+    for binding in &root.exports {
+        if !root_symbols.contains(&binding.symbol) {
+            bail!(
+                "export {} points to missing symbol {}",
+                binding.exported_name,
+                binding.symbol
+            );
+        }
+        validate_exported_abi_name(&binding.exported_name)?;
+        if !exported_names.insert(binding.exported_name.clone()) {
+            bail!("duplicate exported ABI name {}", binding.exported_name);
+        }
+        if let Some(owner) = internal_symbols.get(&binding.exported_name)
+            && owner != &binding.symbol
+        {
+            bail!(
+                "exported ABI name {} conflicts with internal ABI symbol for {}",
+                binding.exported_name,
+                owner
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn export_map(root: &ProgramRootPayload) -> Result<Vec<AbiExport>> {
+    validate_export_map(root)?;
     root.exports
         .iter()
         .map(|binding| {
@@ -61,9 +110,14 @@ fn is_valid_abi_identifier(name: &str) -> bool {
     chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+fn is_reserved_native_export_name(name: &str) -> bool {
+    matches!(name, "main")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ExportBinding, RootSymbolPayload};
 
     #[test]
     fn internal_abi_symbol_uses_stable_hash_prefix() {
@@ -80,5 +134,36 @@ mod tests {
         validate_exported_abi_name("_start").unwrap();
         assert!(validate_exported_abi_name("9tax").is_err());
         assert!(validate_exported_abi_name("sales-tax").is_err());
+        assert!(validate_exported_abi_name("main").is_err());
+    }
+
+    #[test]
+    fn export_map_rejects_names_that_collide_with_other_internal_symbols() {
+        let first = symbol_hash("1111111111111111");
+        let second = symbol_hash("2222222222222222");
+        let root = ProgramRootPayload {
+            symbols: vec![root_symbol(&first), root_symbol(&second)],
+            names: vec![],
+            param_names: vec![],
+            exports: vec![ExportBinding {
+                symbol: first,
+                exported_name: internal_abi_symbol(&second).unwrap(),
+            }],
+            metadata: Default::default(),
+        };
+
+        assert!(validate_export_map(&root).is_err());
+    }
+
+    fn root_symbol(symbol: &str) -> RootSymbolPayload {
+        RootSymbolPayload {
+            symbol: symbol.to_string(),
+            definition: symbol_hash("aaaaaaaaaaaaaaaa"),
+            signature: symbol_hash("bbbbbbbbbbbbbbbb"),
+        }
+    }
+
+    fn symbol_hash(prefix: &str) -> String {
+        format!("sha256:{prefix}{}", "0".repeat(64 - prefix.len()))
     }
 }

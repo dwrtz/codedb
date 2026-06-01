@@ -952,6 +952,53 @@ fn shop_demo_flow_preserves_symbol_identity_across_rename() {
 }
 
 #[test]
+fn source_projection_parenthesizes_if_inside_binary_expressions() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("if-precedence.sqlite");
+    let source = temp.path().join("if-precedence.cdb");
+    let projection = temp.path().join("projection.cdb");
+    let reimport_db = temp.path().join("if-precedence-reimport.sqlite");
+
+    std::fs::write(
+        &source,
+        "fn a_pick(c: bool) -> i64 = (if c then 1 else 2) + 3\n\nfn main() -> i64 = a_pick(true)\n",
+    )
+    .unwrap();
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), source.to_str().unwrap()]);
+    run(&[
+        "export",
+        db.to_str().unwrap(),
+        "--branch",
+        "main",
+        "--out",
+        projection.to_str().unwrap(),
+    ]);
+
+    let projected = std::fs::read_to_string(&projection).unwrap();
+    assert!(projected.contains("fn a_pick(c: bool) -> i64 = (if c then 1 else 2) + 3"));
+
+    bin()
+        .args(["eval", db.to_str().unwrap(), "main"])
+        .assert()
+        .success()
+        .stdout("4\n");
+
+    run(&["init", reimport_db.to_str().unwrap()]);
+    run(&[
+        "import",
+        reimport_db.to_str().unwrap(),
+        projection.to_str().unwrap(),
+    ]);
+    bin()
+        .args(["eval", reimport_db.to_str().unwrap(), "main"])
+        .assert()
+        .success()
+        .stdout("4\n");
+}
+
+#[test]
 fn export_map_changes_are_explicit_relink_only_operations() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("exports.sqlite");
@@ -1029,6 +1076,41 @@ fn export_map_changes_are_explicit_relink_only_operations() {
 
     let show_unexported_vat = run(&["show", db.to_str().unwrap(), "vat"]);
     assert!(show_unexported_vat.contains("exported_abi_symbols none"));
+
+    bin()
+        .args(["verify", db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+}
+
+#[test]
+fn export_names_cannot_collide_with_native_internal_or_harness_symbols() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("export-collisions.sqlite");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+
+    let total_show = run(&["show", db.to_str().unwrap(), "total"]);
+    let total_internal_abi = parse_line_value(&total_show, "internal_abi_symbol ").to_string();
+
+    let branch_before_collision = branch_state(&db);
+    let counts_before_collision = mutation_guard_counts(&db);
+    let collision = run_failure(&[
+        "set-export",
+        db.to_str().unwrap(),
+        "tax",
+        &total_internal_abi,
+    ]);
+    assert!(collision.contains("conflicts with internal ABI symbol"));
+    assert_eq!(branch_state(&db), branch_before_collision);
+    assert_eq!(mutation_guard_counts(&db), counts_before_collision);
+
+    let reserved = run_failure(&["set-export", db.to_str().unwrap(), "tax", "main"]);
+    assert!(reserved.contains("reserved native ABI export name"));
+    assert_eq!(branch_state(&db), branch_before_collision);
+    assert_eq!(mutation_guard_counts(&db), counts_before_collision);
 
     bin()
         .args(["verify", db.to_str().unwrap()])
