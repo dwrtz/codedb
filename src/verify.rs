@@ -4,7 +4,6 @@ use anyhow::{Result, anyhow, bail};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value as JsonValue, json};
 
-use crate::BYTES_DOMAIN;
 use crate::abi::{
     export_map, internal_abi_symbol, validate_export_map, validate_exported_abi_name,
 };
@@ -15,8 +14,10 @@ use crate::diff::dependency_pairs;
 use crate::migrations::{history_hash, migration_hash};
 use crate::model::{ProgramRootPayload, validate_projection_identifier};
 use crate::store::{
-    CodeDb, cache_key_for_input, canonical_json, hash_bytes, hash_object_canonical,
+    CodeDb, cache_key_for_input, canonical_json, function_interface_metadata, hash_bytes,
+    hash_object_canonical,
 };
+use crate::{BYTES_DOMAIN, SCHEMA_VERSION};
 
 impl CodeDb {
     pub fn verify(&mut self) -> Result<String> {
@@ -602,6 +603,24 @@ impl CodeDb {
                 (parsed_key_input.as_ref(), artifact_value.as_ref())
             {
                 match artifact_kind {
+                    ArtifactKind::TypedExpression => {
+                        self.verify_typed_expression_artifact(
+                            errors, &cache_key, key_input, value,
+                        )?;
+                    }
+                    ArtifactKind::FunctionDependencySet => {
+                        self.verify_function_dependency_set_artifact(
+                            errors, &cache_key, key_input, value,
+                        )?;
+                    }
+                    ArtifactKind::InterfaceHash => {
+                        self.verify_interface_hash_artifact(errors, &cache_key, key_input, value)?;
+                    }
+                    ArtifactKind::ImplementationHash => {
+                        self.verify_implementation_hash_artifact(
+                            errors, &cache_key, key_input, value,
+                        )?;
+                    }
                     ArtifactKind::ObjectFile => {
                         self.verify_object_artifact(
                             errors,
@@ -622,6 +641,303 @@ impl CodeDb {
             }
         }
         Ok(())
+    }
+
+    fn verify_typed_expression_artifact(
+        &self,
+        errors: &mut Vec<String>,
+        cache_key: &str,
+        key_input: &CacheKeyInput,
+        artifact_json: &JsonValue,
+    ) -> Result<()> {
+        let Some(metadata) = artifact_inner_metadata(artifact_json) else {
+            errors.push(format!(
+                "bad_typed_expression: {cache_key} missing expression metadata"
+            ));
+            return Ok(());
+        };
+        if !key_input.dependency_interface_hashes.is_empty()
+            || !key_input.dependency_implementation_hashes.is_empty()
+        {
+            errors.push(format!(
+                "bad_typed_expression: {cache_key} cache key should not record dependencies"
+            ));
+        }
+        let payload = self.get_payload(&key_input.input_hash)?;
+        if payload.get("type").and_then(JsonValue::as_str)
+            != metadata.get("type").and_then(JsonValue::as_str)
+        {
+            errors.push(format!(
+                "bad_typed_expression: {cache_key} type metadata does not match expression"
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_function_dependency_set_artifact(
+        &self,
+        errors: &mut Vec<String>,
+        cache_key: &str,
+        key_input: &CacheKeyInput,
+        artifact_json: &JsonValue,
+    ) -> Result<()> {
+        let Some(metadata) = artifact_inner_metadata(artifact_json) else {
+            errors.push(format!(
+                "bad_function_dependency_set: {cache_key} missing dependency metadata"
+            ));
+            return Ok(());
+        };
+        if !key_input.dependency_interface_hashes.is_empty()
+            || !key_input.dependency_implementation_hashes.is_empty()
+        {
+            errors.push(format!(
+                "bad_function_dependency_set: {cache_key} cache key should not record dependencies"
+            ));
+        }
+        let Some(metadata_dependencies) = json_string_vec(metadata.get("dependencies")) else {
+            errors.push(format!(
+                "bad_function_dependency_set: {cache_key} dependencies must be a string array"
+            ));
+            return Ok(());
+        };
+        let indexed_dependencies =
+            self.dependency_symbols_for_indexed_roots(&key_input.input_hash)?;
+        if indexed_dependencies.is_empty() {
+            errors.push(format!(
+                "bad_function_dependency_set: {cache_key} definition is not indexed by any root"
+            ));
+        } else if !indexed_dependencies
+            .iter()
+            .any(|(_, dependencies)| dependencies == &metadata_dependencies)
+        {
+            errors.push(format!(
+                "bad_function_dependency_set: {cache_key} dependency metadata does not match any indexed root"
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_interface_hash_artifact(
+        &self,
+        errors: &mut Vec<String>,
+        cache_key: &str,
+        key_input: &CacheKeyInput,
+        artifact_json: &JsonValue,
+    ) -> Result<()> {
+        let Some(metadata) = artifact_inner_metadata(artifact_json) else {
+            errors.push(format!(
+                "bad_interface_hash: {cache_key} missing interface metadata"
+            ));
+            return Ok(());
+        };
+        if !key_input.dependency_interface_hashes.is_empty()
+            || !key_input.dependency_implementation_hashes.is_empty()
+        {
+            errors.push(format!(
+                "bad_interface_hash: {cache_key} cache key should not record dependencies"
+            ));
+        }
+        let recomputed_input = hash_object_canonical(
+            "FunctionInterface",
+            SCHEMA_VERSION,
+            &canonical_json(metadata),
+        );
+        if recomputed_input != key_input.input_hash {
+            errors.push(format!(
+                "bad_interface_hash: {cache_key} metadata does not match cache key input"
+            ));
+        }
+        let Some(symbol_hash) = metadata.get("symbol_hash").and_then(JsonValue::as_str) else {
+            errors.push(format!(
+                "bad_interface_hash: {cache_key} missing symbol_hash"
+            ));
+            return Ok(());
+        };
+        let Some(signature_hash) = metadata.get("signature_hash").and_then(JsonValue::as_str)
+        else {
+            errors.push(format!(
+                "bad_interface_hash: {cache_key} missing signature_hash"
+            ));
+            return Ok(());
+        };
+        let expected = function_interface_metadata(symbol_hash, signature_hash)?;
+        if &expected != metadata {
+            errors.push(format!(
+                "bad_interface_hash: {cache_key} interface metadata is not canonical for symbol/signature"
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_implementation_hash_artifact(
+        &self,
+        errors: &mut Vec<String>,
+        cache_key: &str,
+        key_input: &CacheKeyInput,
+        artifact_json: &JsonValue,
+    ) -> Result<()> {
+        let Some(metadata) = artifact_inner_metadata(artifact_json) else {
+            errors.push(format!(
+                "bad_implementation_hash: {cache_key} missing implementation metadata"
+            ));
+            return Ok(());
+        };
+        if !key_input.dependency_implementation_hashes.is_empty() {
+            errors.push(format!(
+                "bad_implementation_hash: {cache_key} cache key should not record implementation dependencies"
+            ));
+        }
+        if metadata.get("definition_hash").and_then(JsonValue::as_str)
+            != Some(key_input.input_hash.as_str())
+        {
+            errors.push(format!(
+                "bad_implementation_hash: {cache_key} definition metadata does not match cache key input"
+            ));
+        }
+        let definition = self.get_payload(&key_input.input_hash)?;
+        verify_json_field_matches(
+            errors,
+            "bad_implementation_hash",
+            cache_key,
+            metadata,
+            "symbol_hash",
+            &definition,
+            "symbol",
+        );
+        verify_json_field_matches(
+            errors,
+            "bad_implementation_hash",
+            cache_key,
+            metadata,
+            "function_sig_hash",
+            &definition,
+            "function_sig_hash",
+        );
+        verify_json_field_matches(
+            errors,
+            "bad_implementation_hash",
+            cache_key,
+            metadata,
+            "typed_body_expr_hash",
+            &definition,
+            "typed_body_expr_hash",
+        );
+        if metadata
+            .get("semantic_lowering_version")
+            .and_then(JsonValue::as_str)
+            != Some(crate::lowering::LOWERED_IR_SCHEMA)
+        {
+            errors.push(format!(
+                "bad_implementation_hash: {cache_key} semantic lowering version mismatch"
+            ));
+        }
+        if let Some(symbol_hash) = metadata.get("symbol_hash").and_then(JsonValue::as_str) {
+            let expected_internal = internal_abi_symbol(symbol_hash)?;
+            if metadata
+                .get("internal_abi_symbol")
+                .and_then(JsonValue::as_str)
+                != Some(expected_internal.as_str())
+            {
+                errors.push(format!(
+                    "bad_implementation_hash: {cache_key} internal ABI symbol mismatch"
+                ));
+            }
+        }
+
+        let Some(metadata_dependency_symbols) =
+            json_string_vec(metadata.get("direct_dependency_symbols"))
+        else {
+            errors.push(format!(
+                "bad_implementation_hash: {cache_key} direct_dependency_symbols must be a string array"
+            ));
+            return Ok(());
+        };
+        let Some(metadata_dependency_interfaces) =
+            json_string_vec(metadata.get("direct_dependency_interface_hashes"))
+        else {
+            errors.push(format!(
+                "bad_implementation_hash: {cache_key} direct_dependency_interface_hashes must be a string array"
+            ));
+            return Ok(());
+        };
+
+        if metadata_dependency_interfaces != key_input.dependency_interface_hashes {
+            errors.push(format!(
+                "bad_implementation_hash: {cache_key} dependency interface metadata does not match cache key"
+            ));
+        }
+
+        let indexed_roots = self.dependency_symbols_for_indexed_roots(&key_input.input_hash)?;
+        if indexed_roots.is_empty() {
+            errors.push(format!(
+                "bad_implementation_hash: {cache_key} definition is not indexed by any root"
+            ));
+            return Ok(());
+        }
+        let matching_root = indexed_roots
+            .iter()
+            .find(|(_, dependencies)| dependencies == &metadata_dependency_symbols);
+        let Some((root_hash, _)) = matching_root else {
+            errors.push(format!(
+                "bad_implementation_hash: {cache_key} dependency metadata does not match any indexed root"
+            ));
+            return Ok(());
+        };
+
+        let root = self.load_root(root_hash)?;
+        let expected_dependency_interfaces =
+            self.interface_hashes_for_symbols(&root, &metadata_dependency_symbols)?;
+        if metadata_dependency_interfaces != expected_dependency_interfaces {
+            errors.push(format!(
+                "bad_implementation_hash: {cache_key} dependency interface metadata does not match indexed root"
+            ));
+        }
+        Ok(())
+    }
+
+    fn dependency_symbols_for_indexed_roots(
+        &self,
+        definition_hash: &str,
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT root_hash
+             FROM root_symbols
+             WHERE definition_hash = ?1
+             ORDER BY root_hash",
+        )?;
+        let rows = stmt.query_map([definition_hash], |row| row.get::<_, String>(0))?;
+        let mut dependency_sets = Vec::new();
+        for row in rows {
+            let root_hash = row?;
+            let root = self.load_root(&root_hash)?;
+            let dependencies = self
+                .dependencies_for_definition(&root, definition_hash)?
+                .into_iter()
+                .collect::<Vec<_>>();
+            dependency_sets.push((root_hash, dependencies));
+        }
+        Ok(dependency_sets)
+    }
+
+    fn interface_hashes_for_symbols(
+        &self,
+        root: &ProgramRootPayload,
+        symbols: &[String],
+    ) -> Result<Vec<String>> {
+        let mut hashes = Vec::new();
+        for symbol in symbols {
+            let Some(entry) = self.root_symbol(root, symbol) else {
+                bail!("dependency symbol is not in indexed root: {symbol}");
+            };
+            let interface = function_interface_metadata(&entry.symbol, &entry.signature)?;
+            hashes.push(hash_bytes(
+                BYTES_DOMAIN,
+                canonical_json(&interface).as_bytes(),
+            ));
+        }
+        hashes.sort();
+        hashes.dedup();
+        Ok(hashes)
     }
 
     fn verify_object_artifact(
@@ -1443,6 +1759,24 @@ fn verify_link_plan_object_matches_object_metadata(
     if plan_object_symbols != metadata_object_symbols {
         errors.push(format!(
             "bad_link_plan: {plan_cache_key} object symbols do not match object artifact metadata"
+        ));
+    }
+}
+
+fn verify_json_field_matches(
+    errors: &mut Vec<String>,
+    label: &str,
+    cache_key: &str,
+    left: &JsonValue,
+    left_field: &str,
+    right: &JsonValue,
+    right_field: &str,
+) {
+    if left.get(left_field).and_then(JsonValue::as_str)
+        != right.get(right_field).and_then(JsonValue::as_str)
+    {
+        errors.push(format!(
+            "{label}: {cache_key} {left_field} metadata mismatch"
         ));
     }
 }

@@ -15,7 +15,7 @@ mod verify;
 
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::params;
 
 pub use expr::{FunctionSource, RawExpr, Value};
@@ -44,6 +44,25 @@ pub const DEFAULT_NATIVE_TARGET: &str = LINUX_X86_64_TARGET;
 pub(crate) const ABI_TAG: &str = "codedb-v0-internal";
 pub(crate) const COMPILER_VERSION: &str = concat!("codedb-", env!("CARGO_PKG_VERSION"));
 pub(crate) const PIPELINE_VERSION: &str = "pipeline:v0";
+
+fn parse_eval_arg(arg: &str, type_name: &str, idx: usize) -> Result<Value> {
+    match type_name {
+        "i64" => arg
+            .parse::<i64>()
+            .map(Value::I64)
+            .with_context(|| format!("argument {idx} must be i64, got {arg:?}")),
+        "bool" => match arg {
+            "true" => Ok(Value::Bool(true)),
+            "false" => Ok(Value::Bool(false)),
+            _ => bail!("argument {idx} must be bool literal true or false, got {arg:?}"),
+        },
+        "unit" => match arg {
+            "()" | "unit" => Ok(Value::Unit),
+            _ => bail!("argument {idx} must be unit literal () or unit, got {arg:?}"),
+        },
+        other => bail!("unsupported parameter type {other}"),
+    }
+}
 
 impl CodeDb {
     pub fn init(&mut self) -> Result<String> {
@@ -97,6 +116,35 @@ impl CodeDb {
     pub fn eval_main_branch(&self, function_name: &str, args: Vec<Value>) -> Result<Value> {
         let branch = self.branch(MAIN_BRANCH)?;
         self.eval_name(&branch.root_hash, function_name, args)
+    }
+
+    pub fn eval_main_branch_text_args(
+        &self,
+        function_name: &str,
+        args: &[String],
+    ) -> Result<Value> {
+        let branch = self.branch(MAIN_BRANCH)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let symbol = self.resolve_name(&branch.root_hash, "main", function_name)?;
+        let root_symbol = self
+            .root_symbol(&root, &symbol)
+            .ok_or_else(|| anyhow!("missing symbol {symbol}"))?;
+        let (param_types, _) = self.signature_parts(&root_symbol.signature)?;
+        if param_types.len() != args.len() {
+            bail!(
+                "{function_name} expects {} args, got {}",
+                param_types.len(),
+                args.len()
+            );
+        }
+
+        let parsed_args = args
+            .iter()
+            .zip(param_types.iter())
+            .enumerate()
+            .map(|(idx, (arg, type_hash))| parse_eval_arg(arg, self.type_name(type_hash)?, idx))
+            .collect::<Result<Vec<_>>>()?;
+        self.eval_name(&branch.root_hash, function_name, parsed_args)
     }
 
     pub fn emit_c_main_branch(&mut self, function_name: &str) -> Result<String> {

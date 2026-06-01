@@ -5,6 +5,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use rusqlite::Connection;
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 fn bin() -> Command {
@@ -1453,6 +1454,37 @@ fn conditionals_and_booleans_import_and_evaluate() {
 }
 
 #[test]
+fn eval_cli_parses_boolean_arguments_by_signature() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("bool-args.sqlite");
+    let source = temp.path().join("bool-args.cdb");
+
+    std::fs::write(
+        &source,
+        "fn id_bool(x: bool) -> bool = x\n\nfn choose(flag: bool, value: i64) -> i64 = if flag then value else 0\n",
+    )
+    .unwrap();
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), source.to_str().unwrap()]);
+
+    bin()
+        .args(["eval", db.to_str().unwrap(), "id_bool", "true"])
+        .assert()
+        .success()
+        .stdout("true\n");
+    bin()
+        .args(["eval", db.to_str().unwrap(), "choose", "false", "9"])
+        .assert()
+        .success()
+        .stdout("0\n");
+    bin()
+        .args(["eval", db.to_str().unwrap(), "choose", "true", "9"])
+        .assert()
+        .success()
+        .stdout("9\n");
+}
+
+#[test]
 fn stale_expected_root_returns_conflict_without_writes() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("conflict.sqlite");
@@ -2004,6 +2036,56 @@ fn verify_rejects_cache_key_payload_mismatch() {
 }
 
 #[test]
+fn verify_rejects_implementation_hash_metadata_mismatch() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("implementation-metadata-mismatch.sqlite");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+
+    let conn = Connection::open(&db).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'implementation_hash'
+             ORDER BY cache_key",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap();
+    let (cache_key, mut value) = rows
+        .map(|row| {
+            let (cache_key, artifact_json) = row.unwrap();
+            let value = serde_json::from_str::<JsonValue>(&artifact_json).unwrap();
+            (cache_key, value)
+        })
+        .find(|(_, value)| {
+            value["metadata"]["direct_dependency_interface_hashes"]
+                .as_array()
+                .is_some_and(|hashes| !hashes.is_empty())
+        })
+        .expect("implementation cache entry with dependencies");
+
+    value["metadata"]["direct_dependency_interface_hashes"] = serde_json::json!([]);
+    let metadata_hash = test_metadata_hash(&value["metadata"]);
+    value["metadata_hash"] = JsonValue::String(metadata_hash.clone());
+    conn.execute(
+        "UPDATE compile_cache
+         SET artifact_json = ?1, artifact_hash = ?2
+         WHERE cache_key = ?3",
+        (test_canonical_json(&value), metadata_hash, cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_implementation_hash"));
+    assert!(stderr.contains("dependency interface metadata does not match cache key"));
+}
+
+#[test]
 fn verify_rejects_artifact_metadata_backend_mismatch() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("artifact-metadata-mismatch.sqlite");
@@ -2306,6 +2388,46 @@ fn cache_key_json_values_by_kind(db: &Path, artifact_kind: &str) -> Vec<JsonValu
         .unwrap()
         .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
         .collect()
+}
+
+fn test_metadata_hash(value: &JsonValue) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codedb/bytes/v1\0");
+    hasher.update(test_canonical_json(value).as_bytes());
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn test_canonical_json(value: &JsonValue) -> String {
+    match value {
+        JsonValue::Null => "null".to_string(),
+        JsonValue::Bool(value) => value.to_string(),
+        JsonValue::Number(value) => value.to_string(),
+        JsonValue::String(value) => serde_json::to_string(value).expect("string serialization"),
+        JsonValue::Array(values) => {
+            let inner = values
+                .iter()
+                .map(test_canonical_json)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{inner}]")
+        }
+        JsonValue::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let inner = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).expect("key serialization"),
+                        test_canonical_json(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{inner}}}")
+        }
+    }
 }
 
 fn row_count(db: &Path, table: &str) -> i64 {

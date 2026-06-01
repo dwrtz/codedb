@@ -216,11 +216,7 @@ fn main() -> Result<()> {
             args,
         } => {
             let codedb = codedb::CodeDb::open(db)?;
-            let parsed_args = args
-                .iter()
-                .map(|arg| arg.parse::<i64>().map(codedb::Value::I64))
-                .collect::<Result<Vec<_>, _>>()?;
-            let value = codedb.eval_main_branch(&function_name, parsed_args)?;
+            let value = codedb.eval_main_branch_text_args(&function_name, &args)?;
             println!("{value}");
         }
         Command::EmitC {
