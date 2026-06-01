@@ -5,11 +5,12 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
+use crate::abi::validate_exported_abi_name;
 use crate::build_plan::{BuildImpact, BuildImpactKind, BuildImpactReason, projection_artifacts};
 use crate::expr::RawExpr;
 use crate::model::{
-    BranchState, NameBinding, ParamNames, ProgramRootPayload, RootSymbolPayload, param_names,
-    root_symbol_index, upsert_param_names,
+    BranchState, ExportBinding, NameBinding, ParamNames, ProgramRootPayload, RootSymbolPayload,
+    param_names, root_symbol_index, upsert_param_names,
 };
 use crate::store::{CodeDb, canonical_json, hash_bytes};
 use crate::types::ParamSpec;
@@ -57,6 +58,18 @@ pub(crate) enum Operation {
         name: String,
         alias: String,
     },
+    SetExport {
+        module: String,
+        symbol: String,
+        name: String,
+        exported_name: String,
+    },
+    RemoveExport {
+        module: String,
+        symbol: String,
+        name: String,
+        exported_name: String,
+    },
 }
 
 impl Operation {
@@ -68,6 +81,8 @@ impl Operation {
             Operation::ChangeFunctionSignature { .. } => "change_function_signature",
             Operation::DeleteSymbol { .. } => "delete_symbol",
             Operation::CreateAlias { .. } => "create_alias",
+            Operation::SetExport { .. } => "set_export",
+            Operation::RemoveExport { .. } => "remove_export",
         }
     }
 }
@@ -260,6 +275,8 @@ pub(crate) enum SemanticImpact {
     InterfaceChanged,
     SymbolDeleted,
     AliasCreated,
+    ExportSet,
+    ExportRemoved,
 }
 
 impl SemanticImpact {
@@ -271,6 +288,8 @@ impl SemanticImpact {
             SemanticImpact::InterfaceChanged => "interface_changed",
             SemanticImpact::SymbolDeleted => "symbol_deleted",
             SemanticImpact::AliasCreated => "alias_created",
+            SemanticImpact::ExportSet => "export_set",
+            SemanticImpact::ExportRemoved => "export_removed",
         }
     }
 }
@@ -309,6 +328,13 @@ pub(crate) enum Precondition {
         name: String,
         symbol: String,
     },
+    ExportNameIsAvailable {
+        name: String,
+    },
+    ExportPointsToSymbol {
+        name: String,
+        symbol: String,
+    },
 }
 
 impl Precondition {
@@ -317,6 +343,8 @@ impl Precondition {
             Precondition::RootIsCurrent { .. } => "root_is_current",
             Precondition::NameIsAvailable { .. } => "name_is_available",
             Precondition::NamePointsToSymbol { .. } => "name_points_to_symbol",
+            Precondition::ExportNameIsAvailable { .. } => "export_name_is_available",
+            Precondition::ExportPointsToSymbol { .. } => "export_points_to_symbol",
         }
     }
 }
@@ -359,6 +387,13 @@ pub(crate) enum Postcondition {
     SymbolAbsent {
         symbol: String,
     },
+    ExportPointsToSymbol {
+        name: String,
+        symbol: String,
+    },
+    ExportAbsent {
+        name: String,
+    },
 }
 
 impl Postcondition {
@@ -371,6 +406,8 @@ impl Postcondition {
             Postcondition::BodySourceMatches { .. } => "body_source_matches",
             Postcondition::SignatureSourceMatches { .. } => "signature_source_matches",
             Postcondition::SymbolAbsent { .. } => "symbol_absent",
+            Postcondition::ExportPointsToSymbol { .. } => "export_points_to_symbol",
+            Postcondition::ExportAbsent { .. } => "export_absent",
         }
     }
 }
@@ -444,6 +481,26 @@ fn operation_summary_parts(op: &Operation) -> (String, SemanticImpact, Typecheck
             SemanticImpact::AliasCreated,
             TypecheckImpact::Unchanged,
         ),
+        Operation::SetExport {
+            module,
+            name,
+            exported_name,
+            ..
+        } => (
+            format!("{module}.{name} as {exported_name}"),
+            SemanticImpact::ExportSet,
+            TypecheckImpact::Unchanged,
+        ),
+        Operation::RemoveExport {
+            module,
+            name,
+            exported_name,
+            ..
+        } => (
+            format!("{module}.{name} as {exported_name}"),
+            SemanticImpact::ExportRemoved,
+            TypecheckImpact::Unchanged,
+        ),
     }
 }
 
@@ -486,6 +543,13 @@ fn fallback_build_impact(op: &Operation) -> BuildImpact {
             true,
             vec![symbol.clone()],
             vec![BuildImpactReason::SymbolRemoved],
+        ),
+        Operation::SetExport { symbol, .. } | Operation::RemoveExport { symbol, .. } => (
+            BuildImpactKind::RelinkOnly,
+            vec![],
+            true,
+            vec![symbol.clone()],
+            vec![BuildImpactReason::ExportMapChanged],
         ),
     };
     let projection_artifacts = projection_artifacts();
@@ -714,6 +778,43 @@ impl CodeDb {
                     name: alias.clone(),
                 },
             ],
+            Operation::SetExport {
+                module,
+                symbol,
+                name,
+                exported_name,
+            } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::NamePointsToSymbol {
+                    module: module.clone(),
+                    name: name.clone(),
+                    symbol: symbol.clone(),
+                },
+                Precondition::ExportNameIsAvailable {
+                    name: exported_name.clone(),
+                },
+            ],
+            Operation::RemoveExport {
+                module,
+                symbol,
+                name,
+                exported_name,
+            } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::NamePointsToSymbol {
+                    module: module.clone(),
+                    name: name.clone(),
+                    symbol: symbol.clone(),
+                },
+                Precondition::ExportPointsToSymbol {
+                    name: exported_name.clone(),
+                    symbol: symbol.clone(),
+                },
+            ],
         }
     }
 
@@ -818,6 +919,27 @@ impl CodeDb {
                     symbol: symbol.clone(),
                 },
             ],
+            Operation::SetExport {
+                symbol,
+                exported_name,
+                ..
+            } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::ExportPointsToSymbol {
+                    name: exported_name.clone(),
+                    symbol: symbol.clone(),
+                },
+            ],
+            Operation::RemoveExport { exported_name, .. } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::ExportAbsent {
+                    name: exported_name.clone(),
+                },
+            ],
         }
     }
 
@@ -870,6 +992,13 @@ impl CodeDb {
                     name,
                     symbol,
                 } => name_points_to_symbol(&root, module, name, symbol),
+                Precondition::ExportNameIsAvailable { name } => !root
+                    .exports
+                    .iter()
+                    .any(|binding| binding.exported_name == *name),
+                Precondition::ExportPointsToSymbol { name, symbol } => {
+                    export_points_to_symbol(&root, name, symbol)
+                }
             };
             if !holds {
                 failed.push(precondition.clone());
@@ -964,8 +1093,16 @@ impl CodeDb {
             }
             Postcondition::SymbolAbsent { symbol } => {
                 Ok(!root.symbols.iter().any(|entry| entry.symbol == *symbol)
-                    && !root.names.iter().any(|binding| binding.symbol == *symbol))
+                    && !root.names.iter().any(|binding| binding.symbol == *symbol)
+                    && !root.exports.iter().any(|binding| binding.symbol == *symbol))
             }
+            Postcondition::ExportPointsToSymbol { name, symbol } => {
+                Ok(export_points_to_symbol(root, name, symbol))
+            }
+            Postcondition::ExportAbsent { name } => Ok(!root
+                .exports
+                .iter()
+                .any(|binding| binding.exported_name == *name)),
         }
     }
 
@@ -1065,6 +1202,18 @@ impl CodeDb {
                 name,
                 alias,
             } => self.apply_create_alias(input_root, module, symbol, name, alias),
+            Operation::SetExport {
+                module,
+                symbol,
+                name,
+                exported_name,
+            } => self.apply_set_export(input_root, module, symbol, name, exported_name),
+            Operation::RemoveExport {
+                module,
+                symbol,
+                name,
+                exported_name,
+            } => self.apply_remove_export(input_root, module, symbol, name, exported_name),
         }
     }
 
@@ -1264,6 +1413,7 @@ impl CodeDb {
         root.symbols.retain(|entry| entry.symbol != symbol);
         root.names.retain(|binding| binding.symbol != symbol);
         root.param_names.retain(|entry| entry.symbol != symbol);
+        root.exports.retain(|binding| binding.symbol != symbol);
         let new_root = self.put_program_root(&root)?;
         self.index_root(&new_root)?;
         self.type_check_root(&new_root)?;
@@ -1293,6 +1443,55 @@ impl CodeDb {
             symbol: symbol.to_string(),
             is_preferred: false,
         });
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    pub(crate) fn apply_set_export(
+        &mut self,
+        input_root: &str,
+        module: &str,
+        symbol: &str,
+        name: &str,
+        exported_name: &str,
+    ) -> Result<String> {
+        validate_exported_abi_name(exported_name)?;
+        let mut root = self.load_root(input_root)?;
+        self.assert_name_points(&root, module, name, symbol)?;
+        if root
+            .exports
+            .iter()
+            .any(|binding| binding.exported_name == exported_name)
+        {
+            bail!("export already exists: {exported_name}");
+        }
+        root.exports.push(ExportBinding {
+            symbol: symbol.to_string(),
+            exported_name: exported_name.to_string(),
+        });
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    pub(crate) fn apply_remove_export(
+        &mut self,
+        input_root: &str,
+        module: &str,
+        symbol: &str,
+        name: &str,
+        exported_name: &str,
+    ) -> Result<String> {
+        let mut root = self.load_root(input_root)?;
+        self.assert_name_points(&root, module, name, symbol)?;
+        let original_len = root.exports.len();
+        root.exports.retain(|binding| {
+            !(binding.exported_name == exported_name && binding.symbol == symbol)
+        });
+        if root.exports.len() == original_len {
+            bail!("export {exported_name} does not point to {symbol}");
+        }
         let new_root = self.put_program_root(&root)?;
         self.index_root(&new_root)?;
         Ok(new_root)
@@ -1341,6 +1540,7 @@ impl CodeDb {
             symbols: vec![],
             names: vec![],
             param_names: vec![],
+            exports: vec![],
             metadata: BTreeMap::new(),
         })?;
         let mut current_history: Option<String> = None;
@@ -1497,6 +1697,12 @@ fn symbol_for_name(root: &ProgramRootPayload, module: &str, name: &str) -> Optio
         .iter()
         .find(|binding| binding.module == module && binding.display_name == name)
         .map(|binding| binding.symbol.clone())
+}
+
+fn export_points_to_symbol(root: &ProgramRootPayload, name: &str, symbol: &str) -> bool {
+    root.exports
+        .iter()
+        .any(|binding| binding.exported_name == name && binding.symbol == symbol)
 }
 
 fn normalize_param_refs(expr: &RawExpr, local_params: &[String]) -> RawExpr {

@@ -9,6 +9,8 @@ pub(crate) struct ProgramRootPayload {
     pub(crate) symbols: Vec<RootSymbolPayload>,
     pub(crate) names: Vec<NameBinding>,
     pub(crate) param_names: Vec<ParamNames>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) exports: Vec<ExportBinding>,
     pub(crate) metadata: BTreeMap<String, JsonValue>,
 }
 
@@ -31,6 +33,12 @@ pub(crate) struct NameBinding {
 pub(crate) struct ParamNames {
     pub(crate) symbol: String,
     pub(crate) names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExportBinding {
+    pub(crate) symbol: String,
+    pub(crate) exported_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +64,8 @@ pub(crate) fn normalize_root(mut root: ProgramRootPayload) -> ProgramRootPayload
         ))
     });
     root.param_names.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    root.exports
+        .sort_by(|a, b| (&a.exported_name, &a.symbol).cmp(&(&b.exported_name, &b.symbol)));
     root
 }
 
@@ -107,6 +117,14 @@ pub(crate) fn aliases_for(root: &ProgramRootPayload, symbol: &str) -> BTreeSet<S
         .iter()
         .filter(|binding| binding.symbol == symbol && !binding.is_preferred)
         .map(|binding| binding.display_name.clone())
+        .collect()
+}
+
+pub(crate) fn exports_for(root: &ProgramRootPayload, symbol: &str) -> BTreeSet<String> {
+    root.exports
+        .iter()
+        .filter(|binding| binding.symbol == symbol)
+        .map(|binding| binding.exported_name.clone())
         .collect()
 }
 

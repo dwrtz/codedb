@@ -183,6 +183,14 @@ Acceptance checks:
 
 Goal: decouple native symbol names from human display names.
 
+Initial implementation status:
+
+- `ProgramRoot` has an explicit `exports` map from symbol identity to public ABI names.
+- Internal ABI symbols are derived from stable symbol hashes as `codedb_<short_symbol_hash>`.
+- `set-export` and `remove-export` migrations update export metadata without renaming symbols.
+- Build impact classifies export-map changes as `relink_only` and includes link artifacts.
+- `show` and `export-map` expose internal ABI names and explicit public exports for inspection.
+
 Deliverables:
 
 - Define internal ABI symbol names from stable identity, for example `codedb_<short_symbol_hash>`.

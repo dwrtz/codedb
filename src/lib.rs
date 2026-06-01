@@ -1,3 +1,4 @@
+mod abi;
 mod artifact;
 mod backend;
 mod backend_c;
@@ -148,6 +149,16 @@ impl CodeDb {
         out.push_str(&format!("signature {}\n", root_symbol.signature));
         out.push_str(&format!("definition {}\n", root_symbol.definition));
         out.push_str(&format!("body {body_hash}\n"));
+        out.push_str(&format!(
+            "internal_abi_symbol {}\n",
+            abi::internal_abi_symbol(&symbol)?
+        ));
+        let exports = abi::exported_abi_names(&root, &symbol);
+        if exports.is_empty() {
+            out.push_str("exported_abi_symbols none\n");
+        } else {
+            out.push_str(&format!("exported_abi_symbols {}\n", exports.join(",")));
+        }
         out.push_str(&format!(
             "source fn {}{}\n",
             binding.display_name,
@@ -364,6 +375,96 @@ impl CodeDb {
         };
         let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
         Ok(format_outcome(outcome, json))
+    }
+
+    pub fn set_export_main_branch(&mut self, name: &str, exported_name: &str) -> Result<String> {
+        self.set_export_main_branch_expected(name, exported_name, None)
+    }
+
+    pub fn set_export_main_branch_expected(
+        &mut self,
+        name: &str,
+        exported_name: &str,
+        expected_root: Option<&str>,
+    ) -> Result<String> {
+        self.set_export_main_branch_expected_format(name, exported_name, expected_root, false)
+    }
+
+    pub fn set_export_main_branch_expected_format(
+        &mut self,
+        name: &str,
+        exported_name: &str,
+        expected_root: Option<&str>,
+        json: bool,
+    ) -> Result<String> {
+        self.ensure_initialized()?;
+        let branch = self.branch(MAIN_BRANCH)?;
+        let operation_root = expected_root.unwrap_or(&branch.root_hash).to_string();
+        let symbol = self.resolve_name(&operation_root, "main", name)?;
+        let op = Operation::SetExport {
+            module: "main".to_string(),
+            symbol,
+            name: name.to_string(),
+            exported_name: exported_name.to_string(),
+        };
+        let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
+        Ok(format_outcome(outcome, json))
+    }
+
+    pub fn remove_export_main_branch(&mut self, name: &str, exported_name: &str) -> Result<String> {
+        self.remove_export_main_branch_expected(name, exported_name, None)
+    }
+
+    pub fn remove_export_main_branch_expected(
+        &mut self,
+        name: &str,
+        exported_name: &str,
+        expected_root: Option<&str>,
+    ) -> Result<String> {
+        self.remove_export_main_branch_expected_format(name, exported_name, expected_root, false)
+    }
+
+    pub fn remove_export_main_branch_expected_format(
+        &mut self,
+        name: &str,
+        exported_name: &str,
+        expected_root: Option<&str>,
+        json: bool,
+    ) -> Result<String> {
+        self.ensure_initialized()?;
+        let branch = self.branch(MAIN_BRANCH)?;
+        let operation_root = expected_root.unwrap_or(&branch.root_hash).to_string();
+        let symbol = self.resolve_name(&operation_root, "main", name)?;
+        let op = Operation::RemoveExport {
+            module: "main".to_string(),
+            symbol,
+            name: name.to_string(),
+            exported_name: exported_name.to_string(),
+        };
+        let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
+        Ok(format_outcome(outcome, json))
+    }
+
+    pub fn export_map_main_branch(&self) -> Result<String> {
+        let branch = self.branch(MAIN_BRANCH)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let mut out = String::new();
+        for binding in preferred_names(&root) {
+            let exports = abi::exported_abi_names(&root, &binding.symbol);
+            out.push_str(&format!(
+                "{}.{} {} internal_abi_symbol {} exported_abi_symbols {}\n",
+                binding.module,
+                binding.display_name,
+                binding.symbol,
+                abi::internal_abi_symbol(&binding.symbol)?,
+                if exports.is_empty() {
+                    "none".to_string()
+                } else {
+                    exports.join(",")
+                }
+            ));
+        }
+        Ok(out)
     }
 }
 

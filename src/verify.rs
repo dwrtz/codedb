@@ -5,6 +5,7 @@ use rusqlite::params;
 use serde_json::Value as JsonValue;
 
 use crate::BYTES_DOMAIN;
+use crate::abi::{export_map, validate_exported_abi_name};
 use crate::artifact::{ARTIFACT_METADATA_SCHEMA, CacheKeyInput};
 use crate::backend::ArtifactKind;
 use crate::backend_c::ensure_no_forbidden_runtime_calls;
@@ -290,6 +291,55 @@ impl CodeDb {
         };
         if expected_names != actual_names {
             errors.push(format!("bad_index: root_names mismatch for {root_hash}"));
+        }
+
+        let root_symbols = root
+            .symbols
+            .iter()
+            .map(|entry| entry.symbol.clone())
+            .collect::<BTreeSet<_>>();
+        let mut seen_exported_names = BTreeSet::new();
+        for export in &root.exports {
+            if !root_symbols.contains(&export.symbol) {
+                errors.push(format!(
+                    "bad_abi_symbol: export {} points to missing symbol {} in {root_hash}",
+                    export.exported_name, export.symbol
+                ));
+            }
+            if let Err(err) = validate_exported_abi_name(&export.exported_name) {
+                errors.push(format!(
+                    "bad_abi_symbol: invalid export {} in {root_hash}: {err:#}",
+                    export.exported_name
+                ));
+            }
+            if !seen_exported_names.insert(export.exported_name.clone()) {
+                errors.push(format!(
+                    "bad_abi_symbol: duplicate export {} in {root_hash}",
+                    export.exported_name
+                ));
+            }
+        }
+        if let Err(err) = export_map(root) {
+            errors.push(format!("bad_abi_symbol: root {root_hash}: {err:#}"));
+        }
+
+        let expected_exports = root
+            .exports
+            .iter()
+            .map(|binding| (binding.exported_name.clone(), binding.symbol.clone()))
+            .collect::<BTreeSet<_>>();
+        let actual_exports = {
+            let mut stmt = self.conn.prepare(
+                "SELECT exported_name, symbol_hash FROM root_exports
+                 WHERE root_hash = ?1 ORDER BY exported_name",
+            )?;
+            stmt.query_map(params![root_hash], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?
+        };
+        if expected_exports != actual_exports {
+            errors.push(format!("bad_index: root_exports mismatch for {root_hash}"));
         }
 
         let mut expected_deps = BTreeSet::new();

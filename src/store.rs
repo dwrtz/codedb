@@ -6,6 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 
+use crate::abi::internal_abi_symbol;
 use crate::artifact::{ARTIFACT_METADATA_SCHEMA, CacheKeyInput};
 use crate::backend::ArtifactKind;
 use crate::model::{
@@ -43,6 +44,7 @@ impl CodeDb {
             symbols: vec![],
             names: vec![],
             param_names: vec![],
+            exports: vec![],
             metadata: BTreeMap::new(),
         })?;
         self.index_root(&root_hash)?;
@@ -182,6 +184,10 @@ impl CodeDb {
             params![root_hash],
         )?;
         self.conn.execute(
+            "DELETE FROM root_exports WHERE root_hash = ?1",
+            params![root_hash],
+        )?;
+        self.conn.execute(
             "DELETE FROM dependencies WHERE root_hash = ?1",
             params![root_hash],
         )?;
@@ -202,14 +208,22 @@ impl CodeDb {
                 "typechecker",
                 "interface",
                 ArtifactKind::InterfaceHash,
-                &json!({ "symbol": entry.symbol, "signature": entry.signature }),
+                &json!({
+                    "symbol_hash": entry.symbol,
+                    "signature_hash": entry.signature,
+                    "internal_abi_symbol": internal_abi_symbol(&entry.symbol)?,
+                }),
             )?;
             self.write_cache_json(
                 &entry.definition,
                 "lowering",
                 "implementation",
                 ArtifactKind::ImplementationHash,
-                &json!({ "symbol": entry.symbol, "definition": entry.definition }),
+                &json!({
+                    "symbol_hash": entry.symbol,
+                    "definition_hash": entry.definition,
+                    "internal_abi_symbol": internal_abi_symbol(&entry.symbol)?,
+                }),
             )?;
         }
 
@@ -225,6 +239,15 @@ impl CodeDb {
                     binding.symbol,
                     if binding.is_preferred { 1 } else { 0 }
                 ],
+            )?;
+        }
+
+        for binding in &root.exports {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO root_exports
+                 (root_hash, exported_name, symbol_hash)
+                 VALUES (?1, ?2, ?3)",
+                params![root_hash, binding.exported_name, binding.symbol],
             )?;
         }
 

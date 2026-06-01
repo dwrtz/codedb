@@ -96,6 +96,27 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    SetExport {
+        db: PathBuf,
+        name: String,
+        exported_name: String,
+        #[arg(long)]
+        expect_root: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    RemoveExport {
+        db: PathBuf,
+        name: String,
+        exported_name: String,
+        #[arg(long)]
+        expect_root: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    ExportMap {
+        db: PathBuf,
+    },
     Diff {
         db: PathBuf,
         root_a: String,
@@ -261,6 +282,46 @@ fn main() -> Result<()> {
                     json
                 )?
             );
+        }
+        Command::SetExport {
+            db,
+            name,
+            exported_name,
+            expect_root,
+            json,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            print!(
+                "{}",
+                codedb.set_export_main_branch_expected_format(
+                    &name,
+                    &exported_name,
+                    expect_root.as_deref(),
+                    json
+                )?
+            );
+        }
+        Command::RemoveExport {
+            db,
+            name,
+            exported_name,
+            expect_root,
+            json,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            print!(
+                "{}",
+                codedb.remove_export_main_branch_expected_format(
+                    &name,
+                    &exported_name,
+                    expect_root.as_deref(),
+                    json
+                )?
+            );
+        }
+        Command::ExportMap { db } => {
+            let codedb = codedb::CodeDb::open(db)?;
+            print!("{}", codedb.export_map_main_branch()?);
         }
         Command::Diff {
             db,

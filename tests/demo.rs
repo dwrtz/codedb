@@ -50,12 +50,25 @@ fn shop_demo_flow_preserves_symbol_identity_across_rename() {
         .success()
         .stdout(predicate::str::contains("total"));
 
+    let show_tax = run(&["show", db.to_str().unwrap(), "tax"]);
+    let tax_internal_abi = parse_line_value(&show_tax, "internal_abi_symbol ");
+    assert!(tax_internal_abi.starts_with("codedb_"));
+    assert!(!tax_internal_abi.contains("tax"));
+    assert!(show_tax.contains("exported_abi_symbols none"));
+
     let rename = run(&["rename", db.to_str().unwrap(), "tax", "vat"]);
     let old_root = parse_line_value(&rename, "old_root ");
     let new_root = parse_line_value(&rename, "new_root ");
     assert!(rename.contains("build_impact metadata_only"));
     assert!(rename.contains("recompile none"));
     assert!(rename.contains("relink false"));
+
+    let show_vat = run(&["show", db.to_str().unwrap(), "vat"]);
+    assert_eq!(
+        parse_line_value(&show_vat, "internal_abi_symbol "),
+        tax_internal_abi
+    );
+    assert!(show_vat.contains("exported_abi_symbols none"));
 
     let diff = run(&["diff", db.to_str().unwrap(), old_root, new_root]);
     assert!(diff.contains("symbol_renamed"));
@@ -122,6 +135,92 @@ fn shop_demo_flow_preserves_symbol_identity_across_rename() {
         .assert()
         .success()
         .stdout(predicate::str::contains("replay ok"));
+
+    bin()
+        .args(["verify", db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+}
+
+#[test]
+fn export_map_changes_are_explicit_relink_only_operations() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("exports.sqlite");
+    let c_file = temp.path().join("exports_projection.c");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+
+    let show_tax = run(&["show", db.to_str().unwrap(), "tax"]);
+    let tax_internal_abi = parse_line_value(&show_tax, "internal_abi_symbol ");
+
+    let set_export = run(&["set-export", db.to_str().unwrap(), "tax", "public_tax"]);
+    let old_root = parse_line_value(&set_export, "old_root ");
+    let new_root = parse_line_value(&set_export, "new_root ");
+    assert!(set_export.contains("applied set_export main.tax as public_tax"));
+    assert!(set_export.contains("semantic_impact export_set"));
+    assert!(set_export.contains("build_impact relink_only"));
+    assert!(set_export.contains("recompile none"));
+    assert!(set_export.contains("relink true"));
+    assert!(set_export.contains("link_plan"));
+    assert!(set_export.contains("export_map_changed"));
+
+    let diff = run(&["diff", db.to_str().unwrap(), old_root, new_root]);
+    assert!(diff.contains("export_added"));
+    assert!(diff.contains("exported_abi_symbol: public_tax"));
+    assert!(diff.contains("compile impact: relink_only"));
+    assert!(diff.contains("build_impact relink_only"));
+
+    let show_exported_tax = run(&["show", db.to_str().unwrap(), "tax"]);
+    assert_eq!(
+        parse_line_value(&show_exported_tax, "internal_abi_symbol "),
+        tax_internal_abi
+    );
+    assert!(show_exported_tax.contains("exported_abi_symbols public_tax"));
+
+    let branch_before_retry = branch_state(&db);
+    let counts_before_retry = mutation_guard_counts(&db);
+    let retry = run(&["set-export", db.to_str().unwrap(), "tax", "public_tax"]);
+    assert!(retry.contains("already_applied set_export main.tax as public_tax"));
+    assert_eq!(branch_state(&db), branch_before_retry);
+    assert_eq!(mutation_guard_counts(&db), counts_before_retry);
+
+    let rename = run(&["rename", db.to_str().unwrap(), "tax", "vat"]);
+    assert!(rename.contains("build_impact metadata_only"));
+    assert!(rename.contains("relink false"));
+
+    let show_vat = run(&["show", db.to_str().unwrap(), "vat"]);
+    assert_eq!(
+        parse_line_value(&show_vat, "internal_abi_symbol "),
+        tax_internal_abi
+    );
+    assert!(show_vat.contains("exported_abi_symbols public_tax"));
+
+    let export_map = run(&["export-map", db.to_str().unwrap()]);
+    assert!(export_map.contains("main.vat"));
+    assert!(export_map.contains(tax_internal_abi));
+    assert!(export_map.contains("exported_abi_symbols public_tax"));
+
+    run(&[
+        "emit-c",
+        db.to_str().unwrap(),
+        "main",
+        "--out",
+        c_file.to_str().unwrap(),
+    ]);
+    let c_source = std::fs::read_to_string(&c_file).unwrap();
+    assert!(c_source.contains("long codedb_vat(long subtotal)"));
+    assert!(c_source.contains("return subtotal + codedb_vat(subtotal);"));
+    assert!(!c_source.contains("public_tax"));
+
+    let remove_export = run(&["remove-export", db.to_str().unwrap(), "vat", "public_tax"]);
+    assert!(remove_export.contains("applied remove_export main.vat as public_tax"));
+    assert!(remove_export.contains("semantic_impact export_removed"));
+    assert!(remove_export.contains("build_impact relink_only"));
+
+    let show_unexported_vat = run(&["show", db.to_str().unwrap(), "vat"]);
+    assert!(show_unexported_vat.contains("exported_abi_symbols none"));
 
     bin()
         .args(["verify", db.to_str().unwrap()])
@@ -635,6 +734,7 @@ fn mutation_guard_counts(db: &Path) -> Vec<(String, i64)> {
         "histories",
         "root_symbols",
         "root_names",
+        "root_exports",
         "dependencies",
         "compile_cache",
         "source_search",

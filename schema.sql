@@ -72,6 +72,15 @@ CREATE TABLE IF NOT EXISTS root_names (
     FOREIGN KEY (symbol_hash) REFERENCES objects(hash)
 );
 
+CREATE TABLE IF NOT EXISTS root_exports (
+    root_hash TEXT NOT NULL,
+    exported_name TEXT NOT NULL,
+    symbol_hash TEXT NOT NULL,
+    PRIMARY KEY (root_hash, exported_name),
+    FOREIGN KEY (root_hash) REFERENCES objects(hash) ON DELETE CASCADE,
+    FOREIGN KEY (symbol_hash) REFERENCES objects(hash)
+);
+
 CREATE TABLE IF NOT EXISTS dependencies (
     root_hash TEXT NOT NULL,
     from_symbol_hash TEXT NOT NULL,

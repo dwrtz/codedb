@@ -291,6 +291,17 @@ Changing a function signature must not change its symbol_hash, but must change i
 Changing a public exported ABI name is an explicit export-map change, not a normal rename.
 ```
 
+V0 stores the public export map in `ProgramRoot.exports` as explicit symbol-to-name bindings:
+
+```json
+{
+  "symbol": "sha256:...",
+  "exported_name": "public_tax"
+}
+```
+
+The internal ABI symbol is derived from stable symbol identity as `codedb_<first 16 hex chars of symbol_hash>`. This name is for native object identity and call relocation. It must not include the preferred display name, aliases, parameter names, or C projection name.
+
 ### 7.5 Type identity
 
 Types are content-addressed objects.
@@ -1094,6 +1105,8 @@ metadata_only
 
 Changes public ABI export metadata.
 
+`set_export(symbol_or_name, exported_name)` adds an explicit public ABI name for a symbol. `remove_export(symbol_or_name, exported_name)` removes that explicit binding. These operations do not rename the symbol and do not change the internal ABI symbol derived from symbol identity.
+
 Build impact depends on representation:
 
 ```text
@@ -1253,6 +1266,8 @@ The C projection emits readable C source from a `ProgramRoot`.
 Acceptable properties:
 
 - Uses preferred display names for readability.
+- Does not define native object identity.
+- Does not consult the explicit public ABI export map.
 - Renders deterministic declarations and definitions.
 - Is allocation-free for the v0 language subset.
 - Can be compiled by an external C compiler in tests.

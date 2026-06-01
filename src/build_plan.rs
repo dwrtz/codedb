@@ -41,6 +41,7 @@ pub(crate) enum BuildImpactReason {
     ImplementationHashChanged,
     BodyExpressionHashChanged,
     DependencySetChanged,
+    ExportMapChanged,
     UnclassifiedRootChange,
 }
 
@@ -55,6 +56,7 @@ impl BuildImpactReason {
             BuildImpactReason::ImplementationHashChanged => "implementation_hash_changed",
             BuildImpactReason::BodyExpressionHashChanged => "body_expression_hash_changed",
             BuildImpactReason::DependencySetChanged => "dependency_set_changed",
+            BuildImpactReason::ExportMapChanged => "export_map_changed",
             BuildImpactReason::UnclassifiedRootChange => "unclassified_root_change",
         }
     }
@@ -207,6 +209,14 @@ impl CodeDb {
         if metadata_changed {
             reasons.insert(BuildImpactReason::MetadataChanged);
         }
+        if old_root.exports != new_root.exports {
+            raise_kind(&mut kind, BuildImpactKind::RelinkOnly);
+            relink = true;
+            reasons.insert(BuildImpactReason::ExportMapChanged);
+            for symbol in export_changed_symbols(&old_root, &new_root) {
+                changed_symbols.insert(symbol);
+            }
+        }
 
         for symbol in all_symbols {
             match (old_symbols.get(&symbol), new_symbols.get(&symbol)) {
@@ -341,6 +351,35 @@ fn root_metadata_changed(old_root: &ProgramRootPayload, new_root: &ProgramRootPa
         || old_root.metadata != new_root.metadata
         || aliases_changed(old_root, new_root)
         || param_names_changed(old_root, new_root)
+}
+
+fn export_changed_symbols(
+    old_root: &ProgramRootPayload,
+    new_root: &ProgramRootPayload,
+) -> Vec<String> {
+    let symbols = old_root
+        .exports
+        .iter()
+        .map(|entry| entry.symbol.clone())
+        .chain(new_root.exports.iter().map(|entry| entry.symbol.clone()))
+        .collect::<BTreeSet<_>>();
+    symbols
+        .into_iter()
+        .filter(|symbol| {
+            old_root
+                .exports
+                .iter()
+                .filter(|entry| entry.symbol == *symbol)
+                .map(|entry| entry.exported_name.clone())
+                .collect::<BTreeSet<_>>()
+                != new_root
+                    .exports
+                    .iter()
+                    .filter(|entry| entry.symbol == *symbol)
+                    .map(|entry| entry.exported_name.clone())
+                    .collect::<BTreeSet<_>>()
+        })
+        .collect()
 }
 
 fn aliases_changed(old_root: &ProgramRootPayload, new_root: &ProgramRootPayload) -> bool {
@@ -496,6 +535,7 @@ mod tests {
                     name("root", &root_symbol),
                 ],
                 param_names: vec![],
+                exports: vec![],
                 metadata: BTreeMap::new(),
             })
             .unwrap();
@@ -524,6 +564,7 @@ mod tests {
                     name("root", &root_symbol),
                 ],
                 param_names: vec![],
+                exports: vec![],
                 metadata: BTreeMap::new(),
             })
             .unwrap();

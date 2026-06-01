@@ -9,6 +9,9 @@ cargo run -- init demo.codedb.sqlite
 cargo run -- import demo.codedb.sqlite examples/shop.cdb
 cargo run -- eval demo.codedb.sqlite main
 cargo run -- callers demo.codedb.sqlite tax
+cargo run -- show demo.codedb.sqlite tax
+cargo run -- set-export demo.codedb.sqlite tax public_tax
+cargo run -- export-map demo.codedb.sqlite
 cargo run -- rename demo.codedb.sqlite tax vat
 cargo run -- export demo.codedb.sqlite --branch main --out projection.cdb
 cargo run -- emit-c demo.codedb.sqlite main --out projection.c
@@ -17,6 +20,8 @@ cargo run -- verify demo.codedb.sqlite
 ```
 
 Expected `eval main` result for `examples/shop.cdb` is `120`. After `rename tax vat`, the exported projection renders `vat` at both the definition and call site while preserving the original symbol hash and function body hash.
+
+Native ABI identity is separate from display names. `show` prints the stable internal ABI symbol derived from the symbol hash, while `set-export` and `remove-export` manage explicit public ABI names. Renaming `tax` to `vat` does not change either the internal ABI symbol or an explicit export such as `public_tax`.
 
 Structural mutation commands return `applied`, `already_applied`, or `conflict`.
 Use `--expect-root <root>` on mutation commands when an agent needs to reject

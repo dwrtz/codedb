@@ -4,6 +4,7 @@ use anyhow::Result;
 use rusqlite::{Connection, params};
 use serde_json::{Value as JsonValue, json};
 
+use crate::abi::internal_abi_symbol;
 use crate::model::{ProgramRootPayload, aliases_for};
 use crate::store::{CodeDb, canonical_json};
 
@@ -123,6 +124,29 @@ impl CodeDb {
             emitted = true;
             out.push_str("dependency_removed:\n");
             out.push_str(&format!("  {} -> {}\n\n", dep.0, dep.1));
+        }
+
+        let exports_a = export_pairs(&a);
+        let exports_b = export_pairs(&b);
+        for export in exports_b.difference(&exports_a) {
+            emitted = true;
+            out.push_str("export_added:\n");
+            out.push_str(&format!(
+                "  symbol: {}\n  internal_abi_symbol: {}\n  exported_abi_symbol: {}\n  compile impact: relink_only\n\n",
+                export.0,
+                internal_abi_symbol(&export.0)?,
+                export.1
+            ));
+        }
+        for export in exports_a.difference(&exports_b) {
+            emitted = true;
+            out.push_str("export_removed:\n");
+            out.push_str(&format!(
+                "  symbol: {}\n  internal_abi_symbol: {}\n  exported_abi_symbol: {}\n  compile impact: relink_only\n\n",
+                export.0,
+                internal_abi_symbol(&export.0)?,
+                export.1
+            ));
         }
 
         if !emitted {
@@ -248,6 +272,24 @@ impl CodeDb {
                 "kind": "dependency_removed",
                 "from": &dep.0,
                 "to": &dep.1,
+            }));
+        }
+        let exports_a = export_pairs(&a);
+        let exports_b = export_pairs(&b);
+        for export in exports_b.difference(&exports_a) {
+            changes.push(json!({
+                "kind": "export_added",
+                "symbol": &export.0,
+                "internal_abi_symbol": internal_abi_symbol(&export.0)?,
+                "exported_abi_symbol": &export.1,
+            }));
+        }
+        for export in exports_a.difference(&exports_b) {
+            changes.push(json!({
+                "kind": "export_removed",
+                "symbol": &export.0,
+                "internal_abi_symbol": internal_abi_symbol(&export.0)?,
+                "exported_abi_symbol": &export.1,
             }));
         }
         Ok(changes)
@@ -390,6 +432,13 @@ pub(crate) fn dependency_pairs(
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<std::result::Result<BTreeSet<_>, _>>()?)
+}
+
+fn export_pairs(root: &ProgramRootPayload) -> BTreeSet<(String, String)> {
+    root.exports
+        .iter()
+        .map(|binding| (binding.symbol.clone(), binding.exported_name.clone()))
+        .collect()
 }
 
 fn short_json(value: &JsonValue) -> String {
