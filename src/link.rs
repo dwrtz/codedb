@@ -1,0 +1,388 @@
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::process::Command;
+
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Value as JsonValue, json};
+
+use crate::abi::{export_map, internal_abi_symbol};
+use crate::artifact::CacheKeyInput;
+use crate::backend::ArtifactKind;
+use crate::backend::native::NativeObjectArtifact;
+use crate::model::ProgramRootPayload;
+use crate::store::{CodeDb, canonical_json, hash_bytes};
+use crate::types::type_hash_for;
+use crate::{
+    APPLE_ARM64_TARGET, BYTES_DOMAIN, DEFAULT_NATIVE_TARGET, LINUX_X86_64_TARGET, MAIN_BRANCH,
+};
+
+const LINK_PLAN_SCHEMA: &str = "codedb/link-plan/v1";
+const LINK_INPUT_SCHEMA: &str = "codedb/link-input/v1";
+const EXECUTABLE_METADATA_SCHEMA: &str = "codedb/executable/v1";
+const LINK_PLAN_BACKEND_ID: &str = "native-link-plan-v0";
+const EXTERNAL_CC_LINKER_BACKEND_ID: &str = "external-cc-linker-v0";
+
+pub struct NativeBuild {
+    pub executable: Vec<u8>,
+}
+
+struct PreparedLink {
+    input_hash: String,
+    plan: JsonValue,
+    plan_hash: String,
+    objects: Vec<PreparedObject>,
+}
+
+struct PreparedObject {
+    artifact_hash: String,
+    bytes: Vec<u8>,
+}
+
+impl CodeDb {
+    pub fn link_plan_main_branch(
+        &mut self,
+        entry_name: &str,
+        target_triple: &str,
+    ) -> Result<String> {
+        let prepared = self.prepare_link_plan_main_branch(entry_name, target_triple)?;
+        Ok(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&prepared.plan)?
+        ))
+    }
+
+    pub fn build_main_branch(
+        &mut self,
+        entry_name: &str,
+        target_triple: &str,
+    ) -> Result<NativeBuild> {
+        let prepared = self.prepare_link_plan_main_branch(entry_name, target_triple)?;
+        self.ensure_executable_entry(&prepared.plan)?;
+
+        let key_input = executable_cache_key(&prepared);
+        if let Some(cache_entry) = self.lookup_cache(&key_input)?
+            && let Some(bytes) = cache_entry.artifact_bytes
+        {
+            return Ok(NativeBuild { executable: bytes });
+        }
+
+        ensure_host_linker_for_target(target_triple)?;
+        let executable = link_with_cc(&prepared)?;
+        let metadata = json!({
+            "schema": EXECUTABLE_METADATA_SCHEMA,
+            "target_triple": target_triple,
+            "entry_symbol_hash": prepared.plan["entry_symbol_hash"].clone(),
+            "entry_abi_symbol": prepared.plan["entry_abi_symbol"].clone(),
+            "link_plan_hash": prepared.plan_hash,
+            "linker": "cc",
+            "object_artifact_hashes": prepared.objects
+                .iter()
+                .map(|object| object.artifact_hash.clone())
+                .collect::<Vec<_>>(),
+        });
+        self.write_cache_bytes(key_input, &metadata, &executable)?;
+        Ok(NativeBuild { executable })
+    }
+
+    fn prepare_link_plan_main_branch(
+        &mut self,
+        entry_name: &str,
+        target_triple: &str,
+    ) -> Result<PreparedLink> {
+        self.ensure_initialized()?;
+        let branch = self.branch(MAIN_BRANCH)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let entry_symbol = self
+            .resolve_name(&branch.root_hash, "main", entry_name)
+            .map_err(|err| anyhow!("unknown entry function {entry_name}: {err}"))?;
+        self.prepare_link_plan(&branch.root_hash, &root, &entry_symbol, target_triple)
+    }
+
+    fn prepare_link_plan(
+        &mut self,
+        root_hash: &str,
+        root: &ProgramRootPayload,
+        entry_symbol: &str,
+        target_triple: &str,
+    ) -> Result<PreparedLink> {
+        let symbols = self.reachable_symbols(root_hash, entry_symbol)?;
+        let mut objects = Vec::new();
+        let mut object_entries = Vec::new();
+        for symbol in symbols {
+            let root_entry = self
+                .root_symbol(root, &symbol)
+                .ok_or_else(|| anyhow!("link plan symbol missing from root {symbol}"))?;
+            let object = self.emit_object_for_symbol(root_hash, &symbol, target_triple)?;
+            let internal_abi = internal_abi_symbol(&symbol)?;
+            let relocations = self
+                .dependencies_for_symbol(root_hash, &symbol)?
+                .into_iter()
+                .filter(|dep| self.root_symbol(root, dep).is_some())
+                .map(|target| {
+                    Ok(json!({
+                        "kind": relocation_kind(target_triple)?,
+                        "target_symbol_hash": &target,
+                        "target_abi_symbol": internal_abi_symbol(&target)?,
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            object_entries.push(json!({
+                "symbol_hash": &symbol,
+                "definition_hash": &root_entry.definition,
+                "signature_hash": &root_entry.signature,
+                "internal_abi_symbol": &internal_abi,
+                "object_format": object_format(target_triple)?,
+                "object_artifact_hash": &object.artifact_hash,
+                "relocations": relocations,
+            }));
+            objects.push(prepared_object(object));
+        }
+
+        let exports = export_map(root)?
+            .into_iter()
+            .map(|export| {
+                json!({
+                    "symbol_hash": export.symbol,
+                    "internal_abi_symbol": export.internal_abi_symbol,
+                    "exported_abi_symbol": export.exported_name,
+                })
+            })
+            .collect::<Vec<_>>();
+        let input = json!({
+            "schema": LINK_INPUT_SCHEMA,
+            "target_triple": target_triple,
+            "entry_symbol_hash": entry_symbol,
+            "entry_abi_symbol": internal_abi_symbol(entry_symbol)?,
+            "object_artifact_hashes": objects
+                .iter()
+                .map(|object| object.artifact_hash.clone())
+                .collect::<Vec<_>>(),
+            "export_map": exports,
+            "link_options": link_options(target_triple)?,
+        });
+        let input_hash = self.put_object("LinkPlanInput", &input)?;
+        let mut plan = json!({
+            "schema": LINK_PLAN_SCHEMA,
+            "input_hash": &input_hash,
+            "target_triple": target_triple,
+            "entry_symbol_hash": entry_symbol,
+            "entry_abi_symbol": internal_abi_symbol(entry_symbol)?,
+            "objects": object_entries,
+            "export_map": input["export_map"].clone(),
+            "external_symbols": [],
+            "link_options": input["link_options"].clone(),
+        });
+        let object_hashes = objects
+            .iter()
+            .map(|object| object.artifact_hash.clone())
+            .collect::<Vec<_>>();
+        let key_input = CacheKeyInput::new(
+            ArtifactKind::LinkPlan,
+            &input_hash,
+            LINK_PLAN_BACKEND_ID,
+            target_triple,
+        )
+        .with_dependency_implementation_hashes(object_hashes);
+        let plan_hash = hash_bytes(BYTES_DOMAIN, canonical_json(&plan).as_bytes());
+        if let Some(cache_entry) = self.lookup_cache(&key_input)?
+            && let Some(artifact_json) = cache_entry.artifact_json
+        {
+            plan = json_metadata(&artifact_json)?;
+        } else {
+            self.write_cache_json(
+                &input_hash,
+                LINK_PLAN_BACKEND_ID,
+                target_triple,
+                ArtifactKind::LinkPlan,
+                &plan,
+            )?;
+        }
+
+        Ok(PreparedLink {
+            input_hash,
+            plan,
+            plan_hash,
+            objects,
+        })
+    }
+
+    fn reachable_symbols(&self, root_hash: &str, entry_symbol: &str) -> Result<Vec<String>> {
+        let mut seen = BTreeSet::new();
+        let mut ordered = Vec::new();
+        self.visit_reachable_symbol(root_hash, entry_symbol, &mut seen, &mut ordered)?;
+        Ok(ordered)
+    }
+
+    fn visit_reachable_symbol(
+        &self,
+        root_hash: &str,
+        symbol: &str,
+        seen: &mut BTreeSet<String>,
+        ordered: &mut Vec<String>,
+    ) -> Result<()> {
+        if !seen.insert(symbol.to_string()) {
+            return Ok(());
+        }
+        for dep in self.dependencies_for_symbol(root_hash, symbol)? {
+            self.visit_reachable_symbol(root_hash, &dep, seen, ordered)?;
+        }
+        ordered.push(symbol.to_string());
+        Ok(())
+    }
+
+    fn ensure_executable_entry(&self, plan: &JsonValue) -> Result<()> {
+        let entry = plan
+            .get("entry_symbol_hash")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("link plan missing entry symbol"))?;
+        let root_hash = self.branch(MAIN_BRANCH)?.root_hash;
+        let root = self.load_root(&root_hash)?;
+        let root_entry = self
+            .root_symbol(&root, entry)
+            .ok_or_else(|| anyhow!("entry symbol missing from root {entry}"))?;
+        let (params, return_type) = self.signature_parts(&root_entry.signature)?;
+        if !params.is_empty() {
+            bail!("native executable entry must not take parameters");
+        }
+        if return_type != type_hash_for("I64") && return_type != type_hash_for("Bool") {
+            bail!("native executable entry must return i64 or bool");
+        }
+        Ok(())
+    }
+}
+
+fn prepared_object(object: NativeObjectArtifact) -> PreparedObject {
+    PreparedObject {
+        artifact_hash: object.artifact_hash,
+        bytes: object.bytes,
+    }
+}
+
+fn json_metadata(artifact_json: &JsonValue) -> Result<JsonValue> {
+    if artifact_json.get("schema").and_then(JsonValue::as_str) == Some(LINK_PLAN_SCHEMA) {
+        return Ok(artifact_json.clone());
+    }
+    artifact_json
+        .get("metadata")
+        .cloned()
+        .ok_or_else(|| anyhow!("cached link plan missing metadata"))
+}
+
+fn executable_cache_key(prepared: &PreparedLink) -> CacheKeyInput {
+    CacheKeyInput::new(
+        ArtifactKind::Executable,
+        &prepared.input_hash,
+        EXTERNAL_CC_LINKER_BACKEND_ID,
+        prepared.plan["target_triple"]
+            .as_str()
+            .unwrap_or(DEFAULT_NATIVE_TARGET),
+    )
+    .with_dependency_implementation_hashes(
+        prepared
+            .objects
+            .iter()
+            .map(|object| object.artifact_hash.clone())
+            .chain(std::iter::once(prepared.plan_hash.clone()))
+            .collect(),
+    )
+}
+
+fn link_with_cc(prepared: &PreparedLink) -> Result<Vec<u8>> {
+    let temp_dir = build_temp_dir(&prepared.plan_hash)?;
+    std::fs::create_dir_all(&temp_dir)
+        .with_context(|| format!("failed to create {}", temp_dir.display()))?;
+    let mut object_paths = Vec::new();
+    for (idx, object) in prepared.objects.iter().enumerate() {
+        let path = temp_dir.join(format!("{idx}.o"));
+        std::fs::write(&path, &object.bytes)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        object_paths.push(path);
+    }
+    let entry = prepared
+        .plan
+        .get("entry_abi_symbol")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| anyhow!("link plan missing entry ABI symbol"))?;
+    let harness = temp_dir.join("codedb_main.c");
+    std::fs::write(
+        &harness,
+        format!("long {entry}(void);\nint main(void) {{ return (int){entry}(); }}\n"),
+    )
+    .with_context(|| format!("failed to write {}", harness.display()))?;
+    let executable = temp_dir.join("codedb_executable");
+    let mut command = Command::new("cc");
+    for object in &object_paths {
+        command.arg(object);
+    }
+    let output = command
+        .arg(&harness)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .context("failed to invoke cc linker")?;
+    if !output.status.success() {
+        bail!(
+            "cc linker failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let bytes = std::fs::read(&executable)
+        .with_context(|| format!("failed to read {}", executable.display()))?;
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    Ok(bytes)
+}
+
+fn build_temp_dir(plan_hash: &str) -> Result<PathBuf> {
+    let digest = plan_hash
+        .strip_prefix("sha256:")
+        .ok_or_else(|| anyhow!("plan hash must use sha256: prefix"))?;
+    Ok(std::env::temp_dir().join(format!(
+        "codedb-build-{}-{}",
+        std::process::id(),
+        &digest[..16]
+    )))
+}
+
+fn ensure_host_linker_for_target(target_triple: &str) -> Result<()> {
+    let supported = match target_triple {
+        APPLE_ARM64_TARGET => cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        LINUX_X86_64_TARGET => cfg!(all(target_os = "linux", target_arch = "x86_64")),
+        _ => false,
+    };
+    if !supported {
+        bail!(
+            "cannot build executable for {target_triple} on this host with the external cc linker"
+        );
+    }
+    if Command::new("cc").arg("--version").output().is_err() {
+        bail!("cannot build executable: cc linker is not available");
+    }
+    Ok(())
+}
+
+fn object_format(target_triple: &str) -> Result<&'static str> {
+    match target_triple {
+        LINUX_X86_64_TARGET => Ok("elf64-x86-64-relocatable"),
+        APPLE_ARM64_TARGET => Ok("macho64-arm64-relocatable"),
+        other => bail!("unsupported native link target {other}"),
+    }
+}
+
+fn relocation_kind(target_triple: &str) -> Result<&'static str> {
+    match target_triple {
+        LINUX_X86_64_TARGET => Ok("R_X86_64_PLT32"),
+        APPLE_ARM64_TARGET => Ok("ARM64_RELOC_BRANCH26"),
+        other => bail!("unsupported native link target {other}"),
+    }
+}
+
+fn link_options(target_triple: &str) -> Result<JsonValue> {
+    match target_triple {
+        LINUX_X86_64_TARGET | APPLE_ARM64_TARGET => Ok(json!({
+            "linker": "cc",
+            "entry_harness": "c-main-return-entry-value",
+        })),
+        other => bail!("unsupported native link target {other}"),
+    }
+}

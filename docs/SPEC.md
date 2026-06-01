@@ -1,6 +1,6 @@
 # SPEC.md — CodeDB Proof of Concept
 
-Status: Draft 0.3  
+Status: Draft 0.4
 Scope: Rust proof of concept plus the next native-artifact architecture  
 Working name: `codedb`
 
@@ -57,7 +57,7 @@ object_file hashes + export map + entry symbol + link options
   -> LinkPlan
 
 LinkPlan
-  -> executable / ELF / shared object
+  -> executable / ELF / Mach-O / shared object
 ```
 
 ## 3. First implementation goal
@@ -117,10 +117,11 @@ Parser:                  optional; structural API first
 Evaluator:               small reference evaluator for tests only
 Projection outputs:      canonical source, C source projection
 Compiler backend:        typed DAG -> lowered IR -> object file -> link plan
-Initial object target:   Linux x86-64 ELF relocatable object, or equivalent narrow target
+Initial object targets:  Linux x86-64 ELF relocatable object
+                         Apple Silicon arm64 Mach-O relocatable object
 ```
 
-LLVM, Cranelift, or a custom object writer are implementation choices behind the same artifact interface. The important boundary is that the compiler backend consumes typed/lowered semantic objects and emits object artifacts. It should not depend on a whole-program C file as the primary unit of compilation.
+LLVM, Cranelift, or a custom object writer are implementation choices behind the same artifact interface. The current v0 native path uses small custom object writers for Linux x86-64 ELF and Apple Silicon arm64 Mach-O. The important boundary is that the compiler backend consumes typed/lowered semantic objects and emits object artifacts. It should not depend on a whole-program C file as the primary unit of compilation.
 
 ## 6. Meaning of "no runtime"
 
@@ -145,6 +146,7 @@ This also does not mean that an operating-system executable has literally zero s
 relocatable object file
 linked executable
 shared object
+Mach-O object or executable on Apple platforms
 C projection linked into an external harness for testing
 LLVM/Cranelift-produced object bytes behind the backend interface
 ```

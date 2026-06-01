@@ -1,6 +1,6 @@
 use serde_json::Value as JsonValue;
 
-pub(crate) mod elf;
+pub(crate) mod native;
 
 pub(crate) use crate::artifact::ArtifactKind;
 use crate::lowering::LoweredFunctionIr;

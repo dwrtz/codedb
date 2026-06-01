@@ -322,6 +322,106 @@ fn native_object_backend_links_default_target_on_apple_silicon() {
 }
 
 #[test]
+fn native_link_plan_is_deterministic_and_reused_across_rename() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("native-link-plan.sqlite");
+    let plan_before = temp.path().join("before.link.json");
+    let plan_again = temp.path().join("again.link.json");
+    let plan_after_rename = temp.path().join("after-rename.link.json");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_before.to_str().unwrap(),
+    ]);
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_again.to_str().unwrap(),
+    ]);
+    let before = std::fs::read_to_string(&plan_before).unwrap();
+    let again = std::fs::read_to_string(&plan_again).unwrap();
+    assert_eq!(before, again);
+    assert_eq!(cache_row_count_by_kind(&db, "object_file"), 3);
+    assert_eq!(cache_row_count_by_kind(&db, "link_plan"), 1);
+    assert!(!before.contains("tax"));
+    assert!(!before.contains("total"));
+
+    let plan_json: JsonValue = serde_json::from_str(&before).unwrap();
+    assert_eq!(plan_json["schema"], "codedb/link-plan/v1");
+    assert_eq!(plan_json["target_triple"], codedb::LINUX_X86_64_TARGET);
+    assert_eq!(plan_json["objects"].as_array().unwrap().len(), 3);
+    assert_eq!(plan_json["external_symbols"].as_array().unwrap().len(), 0);
+
+    run(&["rename", db.to_str().unwrap(), "tax", "vat"]);
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_after_rename.to_str().unwrap(),
+    ]);
+    assert_eq!(std::fs::read_to_string(&plan_after_rename).unwrap(), before);
+    assert_eq!(cache_row_count_by_kind(&db, "object_file"), 3);
+    assert_eq!(cache_row_count_by_kind(&db, "link_plan"), 1);
+}
+
+#[test]
+fn native_build_emits_apple_executable_and_caches_it() {
+    if !is_apple_silicon() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("native-build.sqlite");
+    let exe = temp.path().join("discount");
+    let exe_again = temp.path().join("discount-again");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/discount.cdb"]);
+    run(&[
+        "build",
+        db.to_str().unwrap(),
+        "main",
+        "--out",
+        exe.to_str().unwrap(),
+    ]);
+
+    let bytes = std::fs::read(&exe).unwrap();
+    assert_eq!(&bytes[..4], &[0xcf, 0xfa, 0xed, 0xfe]);
+    let status = StdCommand::new(&exe)
+        .status()
+        .expect("run built executable");
+    assert_eq!(status.code(), Some(165));
+    assert_eq!(cache_row_count_by_kind(&db, "object_file"), 4);
+    assert_eq!(cache_row_count_by_kind(&db, "link_plan"), 1);
+    assert_eq!(cache_row_count_by_kind(&db, "executable"), 1);
+
+    run(&[
+        "build",
+        db.to_str().unwrap(),
+        "main",
+        "--out",
+        exe_again.to_str().unwrap(),
+    ]);
+    assert_eq!(std::fs::read(&exe_again).unwrap(), bytes);
+    assert_eq!(cache_row_count_by_kind(&db, "executable"), 1);
+}
+
+#[test]
 fn shop_demo_flow_preserves_symbol_identity_across_rename() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("demo.sqlite");

@@ -15,7 +15,7 @@ ProgramRoot
   -> LoweredFunctionIR
   -> per-function or per-codegen-unit object artifact
   -> LinkPlan
-  -> executable / ELF / shared object
+  -> executable / ELF / Mach-O / shared object
 ```
 
 The C emitter remains useful, but it should be treated as:
@@ -37,8 +37,9 @@ The repository currently has:
 - A small typed expression language with integer, boolean, call, binary, and conditional expressions.
 - A reference evaluator for tests and debugging.
 - A C projection emitter for pure `i64` / `bool` / `unit` functions.
-- Cache entries for rendered sources, typed expressions, dependency sets, interface hashes, implementation hashes, and C projection text.
-- `artifact_bytes` support in the cache schema, although the current C path mostly writes text artifacts.
+- Cache entries for rendered sources, typed expressions, dependency sets, interface hashes, implementation hashes, C projection text, lowered IR, native object bytes, link plans, and executable bytes where the host linker is available.
+- Native object backends for Linux x86-64 ELF relocatable objects and Apple Silicon arm64 Mach-O relocatable objects.
+- A deterministic link-plan path and a host-linked executable build path for Apple Silicon.
 
 ## Phase 1: Name the Backend Boundary Correctly
 
@@ -247,20 +248,28 @@ Acceptance checks:
 
 Goal: compile typed/lowered functions into binary object artifacts without routing through whole-program C source.
 
+Initial implementation status:
+
+- `src/backend/native.rs` contains target-specific object writers behind the native object artifact boundary.
+- Linux x86-64 emits ELF relocatable objects with `R_X86_64_PLT32` call relocations.
+- Apple Silicon emits arm64 Mach-O relocatable objects with `ARM64_RELOC_BRANCH26` call relocations.
+- The default native target is `aarch64-apple-darwin` on Apple Silicon hosts and `x86_64-unknown-linux-gnu` otherwise.
+- Object bytes are cached in `compile_cache.artifact_bytes` with target-specific cache keys.
+
 Deliverables:
 
 - Add a backend trait that can produce an `object_file` artifact from a lowered function or codegen unit.
 - Choose an initial implementation route:
   - direct ELF relocatable object writer for the tiny v0 instruction set, or
   - Cranelift/LLVM-backed object emission behind the same artifact interface.
-- Support at least Linux x86-64 ELF relocatable object files for pure `i64` / `bool` functions.
+- Support at least Linux x86-64 ELF relocatable object files for pure `i64` / `bool` functions; Apple Silicon arm64 Mach-O is supported in the current implementation.
 - Generate one object per function or one deterministic codegen unit per small dependency cluster.
 - Emit relocations for calls between CodeDB symbols.
 - Cache object bytes in `compile_cache.artifact_bytes`.
 
 Files likely touched:
 
-- new `src/backend_native.rs` or `src/backend/elf.rs`
+- new `src/backend_native.rs` or `src/backend/native.rs`
 - new `src/artifact.rs`
 - `src/store.rs`
 - `src/main.rs`
@@ -274,9 +283,16 @@ Acceptance checks:
 - Object artifacts expose stable ABI symbols derived from symbol identity.
 - Object cache entries are reusable across branch roots when the function implementation and target inputs are identical.
 
-## Phase 8: Link Plan and ELF Output
+## Phase 8: Link Plan and ELF/Mach-O Output
 
 Goal: make linking explicit, cached, and incremental.
+
+Initial implementation status:
+
+- `codedb link-native <db> <entry-name> --target <triple> --out <file>` emits a deterministic JSON `LinkPlan` and caches it as a `link_plan` artifact.
+- `codedb build <db> <entry-name> --target <triple> --out <file>` emits cached native objects, reuses the cached link plan, invokes the host `cc` linker where supported, and caches executable bytes as an `executable` artifact.
+- Apple Silicon builds produce runnable Mach-O executables on Apple Silicon hosts.
+- Linux x86-64 link plans and object metadata remain available from non-Linux hosts; executable linking is currently delegated to the host linker and therefore only runs where that target is native.
 
 Deliverables:
 
@@ -461,13 +477,13 @@ Acceptance checks:
 
 ## Near-Term Recommendation
 
-Do Phases 1 through 4 next. They are smaller than the full native backend, but they lock in the crucial architecture:
+The next useful phase is Phase 9. The prototype now has native objects, link plans, and host executable builds, so verification needs to become stricter about binary artifacts:
 
 ```text
-C projection is a projection.
-Native object artifacts are compiler outputs.
-Incremental build impact is structured data.
-Cache keys are exact enough for binary artifacts.
+object bytes hash matches metadata
+link plans reference existing cached objects
+executable cache entries match their link inputs
+Apple Silicon and Linux target metadata is well-formed
 ```
 
-After that, build the lowered IR scaffold before expanding the language surface. A richer language before a real artifact boundary will make the eventual native backend harder to reason about.
+After that, Phase 10 can expose structural operations through a stable JSON API without relying on projection text.

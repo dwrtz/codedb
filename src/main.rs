@@ -46,10 +46,28 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
-    #[command(about = "Emit a native ELF relocatable object artifact for one lowered function")]
+    #[command(about = "Emit a native relocatable object artifact for one lowered function")]
     EmitObject {
         db: PathBuf,
         function_name: String,
+        #[arg(long, default_value = codedb::DEFAULT_NATIVE_TARGET)]
+        target: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    #[command(about = "Emit and cache a deterministic native link plan for an entry function")]
+    LinkNative {
+        db: PathBuf,
+        entry_name: String,
+        #[arg(long, default_value = codedb::DEFAULT_NATIVE_TARGET)]
+        target: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    #[command(about = "Build a native executable for an entry function through a cached link plan")]
+    Build {
+        db: PathBuf,
+        entry_name: String,
         #[arg(long, default_value = codedb::DEFAULT_NATIVE_TARGET)]
         target: String,
         #[arg(long)]
@@ -217,6 +235,29 @@ fn main() -> Result<()> {
             let object = codedb.emit_object_main_branch(&function_name, &target)?;
             std::fs::write(&out, object)?;
             println!("emitted native object {}", out.display());
+        }
+        Command::LinkNative {
+            db,
+            entry_name,
+            target,
+            out,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            let plan = codedb.link_plan_main_branch(&entry_name, &target)?;
+            std::fs::write(&out, plan)?;
+            println!("emitted native link plan {}", out.display());
+        }
+        Command::Build {
+            db,
+            entry_name,
+            target,
+            out,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            let build = codedb.build_main_branch(&entry_name, &target)?;
+            std::fs::write(&out, build.executable)?;
+            make_executable(&out)?;
+            println!("built native executable {}", out.display());
         }
         Command::List { db } => {
             let codedb = codedb::CodeDb::open(db)?;
@@ -390,5 +431,20 @@ fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_executable(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
