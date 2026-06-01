@@ -34,7 +34,12 @@ pub(crate) const CACHE_DOMAIN: &[u8] = b"codedb/cache/v1\0";
 pub(crate) const BYTES_DOMAIN: &[u8] = b"codedb/bytes/v1\0";
 pub(crate) const SCHEMA_VERSION: i64 = 1;
 pub(crate) const MAIN_BRANCH: &str = "main";
-pub const DEFAULT_NATIVE_TARGET: &str = "x86_64-unknown-linux-gnu";
+pub const LINUX_X86_64_TARGET: &str = "x86_64-unknown-linux-gnu";
+pub const APPLE_ARM64_TARGET: &str = "aarch64-apple-darwin";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub const DEFAULT_NATIVE_TARGET: &str = APPLE_ARM64_TARGET;
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub const DEFAULT_NATIVE_TARGET: &str = LINUX_X86_64_TARGET;
 pub(crate) const ABI_TAG: &str = "codedb-v0-internal";
 pub(crate) const COMPILER_VERSION: &str = concat!("codedb-", env!("CARGO_PKG_VERSION"));
 pub(crate) const PIPELINE_VERSION: &str = "pipeline:v0";

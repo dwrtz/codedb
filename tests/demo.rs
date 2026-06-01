@@ -53,6 +53,8 @@ fn native_object_backend_emits_elf_and_reuses_cache_across_rename() {
         "emit-object",
         db.to_str().unwrap(),
         "tax",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
         "--out",
         tax_obj.to_str().unwrap(),
     ]);
@@ -60,6 +62,8 @@ fn native_object_backend_emits_elf_and_reuses_cache_across_rename() {
         "emit-object",
         db.to_str().unwrap(),
         "total",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
         "--out",
         total_obj.to_str().unwrap(),
     ]);
@@ -67,6 +71,8 @@ fn native_object_backend_emits_elf_and_reuses_cache_across_rename() {
         "emit-object",
         db.to_str().unwrap(),
         "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
         "--out",
         main_obj.to_str().unwrap(),
     ]);
@@ -88,7 +94,7 @@ fn native_object_backend_emits_elf_and_reuses_cache_across_rename() {
     );
     assert_eq!(
         tax_cache_json["metadata"]["target_triple"],
-        codedb::DEFAULT_NATIVE_TARGET
+        codedb::LINUX_X86_64_TARGET
     );
     assert_eq!(
         tax_cache_json["metadata"]["defined_symbols"][0],
@@ -117,6 +123,8 @@ fn native_object_backend_emits_elf_and_reuses_cache_across_rename() {
         "emit-object",
         db.to_str().unwrap(),
         "total",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
         "--out",
         total_after_rename_obj.to_str().unwrap(),
     ]);
@@ -124,6 +132,8 @@ fn native_object_backend_emits_elf_and_reuses_cache_across_rename() {
         "emit-object",
         db.to_str().unwrap(),
         "vat",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
         "--out",
         vat_obj.to_str().unwrap(),
     ]);
@@ -153,6 +163,8 @@ fn native_object_backend_reuses_unchanged_objects_after_body_change() {
         "emit-object",
         db.to_str().unwrap(),
         "tax",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
         "--out",
         tax_before.to_str().unwrap(),
     ]);
@@ -160,6 +172,8 @@ fn native_object_backend_reuses_unchanged_objects_after_body_change() {
         "emit-object",
         db.to_str().unwrap(),
         "total",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
         "--out",
         total_before.to_str().unwrap(),
     ]);
@@ -175,6 +189,8 @@ fn native_object_backend_reuses_unchanged_objects_after_body_change() {
         "emit-object",
         db.to_str().unwrap(),
         "total",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
         "--out",
         total_after.to_str().unwrap(),
     ]);
@@ -188,6 +204,8 @@ fn native_object_backend_reuses_unchanged_objects_after_body_change() {
         "emit-object",
         db.to_str().unwrap(),
         "tax",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
         "--out",
         tax_after.to_str().unwrap(),
     ]);
@@ -218,6 +236,8 @@ fn native_object_backend_handles_bool_calls_and_conditionals() {
             "emit-object",
             db.to_str().unwrap(),
             name,
+            "--target",
+            codedb::LINUX_X86_64_TARGET,
             "--out",
             out.to_str().unwrap(),
         ]);
@@ -232,6 +252,72 @@ fn native_object_backend_handles_bool_calls_and_conditionals() {
         &[&is_large_obj, &fee_obj, &main_obj],
         &main_internal_abi,
         5,
+    );
+}
+
+#[test]
+fn native_object_backend_links_default_target_on_apple_silicon() {
+    if !is_apple_silicon() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("native-apple.sqlite");
+    let tax_obj = temp.path().join("tax.o");
+    let discount_obj = temp.path().join("discount.o");
+    let total_obj = temp.path().join("total.o");
+    let main_obj = temp.path().join("main.o");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/discount.cdb"]);
+
+    for (name, out) in [
+        ("tax", &tax_obj),
+        ("discount", &discount_obj),
+        ("total", &total_obj),
+        ("main", &main_obj),
+    ] {
+        run(&[
+            "emit-object",
+            db.to_str().unwrap(),
+            name,
+            "--out",
+            out.to_str().unwrap(),
+        ]);
+        let bytes = std::fs::read(out).unwrap();
+        assert_eq!(&bytes[..4], &[0xcf, 0xfa, 0xed, 0xfe]);
+    }
+
+    let show_main = run(&["show", db.to_str().unwrap(), "main"]);
+    let main_internal_abi = parse_line_value(&show_main, "internal_abi_symbol ").to_string();
+    let main_definition = parse_line_value(&show_main, "definition ").to_string();
+    let main_bytes = std::fs::read(&main_obj).unwrap();
+    assert!(bytes_contain(
+        &main_bytes,
+        format!("_{main_internal_abi}").as_bytes()
+    ));
+
+    let (main_cache_json, main_cache_bytes) =
+        object_cache_entry_by_definition(&db, &main_definition);
+    assert_eq!(main_cache_bytes, main_bytes);
+    assert_eq!(
+        main_cache_json["metadata"]["object_format"],
+        "macho64-arm64-relocatable"
+    );
+    assert_eq!(
+        main_cache_json["metadata"]["target_triple"],
+        codedb::APPLE_ARM64_TARGET
+    );
+    assert_eq!(
+        main_cache_json["metadata"]["defined_symbols"][0],
+        main_internal_abi
+    );
+
+    link_and_run_native_if_apple_silicon(
+        temp.path(),
+        &[&tax_obj, &discount_obj, &total_obj, &main_obj],
+        &main_internal_abi,
+        165,
     );
 }
 
@@ -1081,6 +1167,22 @@ fn link_and_run_native_if_linux(dir: &Path, objects: &[&Path], entry_symbol: &st
     if std::env::consts::OS != "linux" {
         return;
     }
+    link_and_run_native(dir, objects, entry_symbol, expected);
+}
+
+fn link_and_run_native_if_apple_silicon(
+    dir: &Path,
+    objects: &[&Path],
+    entry_symbol: &str,
+    expected: i64,
+) {
+    if !is_apple_silicon() {
+        return;
+    }
+    link_and_run_native(dir, objects, entry_symbol, expected);
+}
+
+fn link_and_run_native(dir: &Path, objects: &[&Path], entry_symbol: &str, expected: i64) {
     if StdCommand::new("cc").arg("--version").output().is_err() {
         return;
     }
@@ -1106,4 +1208,8 @@ fn link_and_run_native_if_linux(dir: &Path, objects: &[&Path], entry_symbol: &st
     assert!(status.success());
     let status = StdCommand::new(&exe).status().expect("run native harness");
     assert!(status.success());
+}
+
+fn is_apple_silicon() -> bool {
+    std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64"
 }

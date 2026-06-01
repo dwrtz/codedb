@@ -1,3 +1,5 @@
+//! Native object backends for the v0 lowered IR targets.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, anyhow, bail};
@@ -10,14 +12,18 @@ use crate::lowering::{LoweredBlock, LoweredFunctionIr, LoweredOp};
 use crate::model::ProgramRootPayload;
 use crate::store::{CodeDb, canonical_json, hash_bytes};
 use crate::types::type_hash_for;
-use crate::{BYTES_DOMAIN, DEFAULT_NATIVE_TARGET, MAIN_BRANCH};
+use crate::{APPLE_ARM64_TARGET, BYTES_DOMAIN, LINUX_X86_64_TARGET, MAIN_BRANCH};
 
-pub(crate) const BACKEND_ID: &str = "native-elf-x86_64-v0";
+pub(crate) const ELF_BACKEND_ID: &str = "native-elf-x86_64-v0";
+pub(crate) const MACHO_BACKEND_ID: &str = "native-macho-arm64-v0";
 const OBJECT_METADATA_SCHEMA: &str = "codedb/native-object/v1";
-const OBJECT_FORMAT: &str = "elf64-x86-64-relocatable";
+const ELF_OBJECT_FORMAT: &str = "elf64-x86-64-relocatable";
+const MACHO_OBJECT_FORMAT: &str = "macho64-arm64-relocatable";
 const R_X86_64_PLT32: u32 = 4;
+const ARM64_RELOC_BRANCH26: u32 = 2;
 
 pub(crate) struct ElfObjectBackend;
+pub(crate) struct MachOArm64ObjectBackend;
 
 pub(crate) struct NativeObjectArtifact {
     pub(crate) artifact_hash: String,
@@ -27,20 +33,17 @@ pub(crate) struct NativeObjectArtifact {
 
 impl ObjectBackend for ElfObjectBackend {
     fn backend_id(&self) -> &'static str {
-        BACKEND_ID
+        ELF_BACKEND_ID
     }
 
     fn emit_object(&self, input: ObjectBackendInput<'_>) -> Result<ObjectBackendArtifact> {
-        if input.target_triple != DEFAULT_NATIVE_TARGET {
-            bail!(
-                "{BACKEND_ID} only supports target {}",
-                DEFAULT_NATIVE_TARGET
-            );
+        if input.target_triple != LINUX_X86_64_TARGET {
+            bail!("{ELF_BACKEND_ID} only supports target {LINUX_X86_64_TARGET}");
         }
 
         validate_native_ir(input.ir)?;
         let function_symbol = internal_abi_symbol(&input.ir.symbol_hash)?;
-        let compiled = compile_function(input.ir, &function_symbol)?;
+        let compiled = compile_x86_64_function(input.ir, &function_symbol)?;
         let bytes = write_elf_object(&function_symbol, &compiled.text, &compiled.relocations);
         let artifact_hash = hash_bytes(BYTES_DOMAIN, &bytes);
         let relocations = compiled
@@ -64,8 +67,8 @@ impl ObjectBackend for ElfObjectBackend {
             .collect::<Vec<_>>();
         let metadata = json!({
             "schema": OBJECT_METADATA_SCHEMA,
-            "backend_id": BACKEND_ID,
-            "object_format": OBJECT_FORMAT,
+            "backend_id": ELF_BACKEND_ID,
+            "object_format": ELF_OBJECT_FORMAT,
             "target_triple": input.target_triple,
             "symbol_hash": &input.ir.symbol_hash,
             "function_def_hash": &input.ir.function_def_hash,
@@ -73,6 +76,67 @@ impl ObjectBackend for ElfObjectBackend {
             "typed_body_expr_hash": &input.ir.typed_body_expr_hash,
             "lowered_ir_schema": &input.ir.schema,
             "defined_symbols": [function_symbol],
+            "exported_abi_names": input.exported_abi_names,
+            "called_symbols": called_symbols,
+            "relocations": relocations,
+        });
+
+        Ok(ObjectBackendArtifact {
+            artifact_hash,
+            metadata,
+            bytes,
+        })
+    }
+}
+
+impl ObjectBackend for MachOArm64ObjectBackend {
+    fn backend_id(&self) -> &'static str {
+        MACHO_BACKEND_ID
+    }
+
+    fn emit_object(&self, input: ObjectBackendInput<'_>) -> Result<ObjectBackendArtifact> {
+        if input.target_triple != APPLE_ARM64_TARGET {
+            bail!("{MACHO_BACKEND_ID} only supports target {APPLE_ARM64_TARGET}");
+        }
+
+        validate_native_ir(input.ir)?;
+        let function_symbol = internal_abi_symbol(&input.ir.symbol_hash)?;
+        let object_symbol = macho_symbol_name(&function_symbol);
+        let compiled = compile_arm64_function(input.ir, &object_symbol)?;
+        let bytes = write_macho_object(&object_symbol, &compiled.text, &compiled.relocations);
+        let artifact_hash = hash_bytes(BYTES_DOMAIN, &bytes);
+        let relocations = compiled
+            .relocations
+            .iter()
+            .map(|relocation| {
+                json!({
+                    "offset": relocation.offset,
+                    "kind": "ARM64_RELOC_BRANCH26",
+                    "target_symbol_hash": &relocation.target_symbol_hash,
+                    "target_abi_symbol": strip_macho_symbol_prefix(&relocation.target_abi_symbol),
+                    "target_object_symbol": &relocation.target_abi_symbol,
+                })
+            })
+            .collect::<Vec<_>>();
+        let called_symbols = compiled
+            .relocations
+            .iter()
+            .map(|relocation| relocation.target_symbol_hash.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let metadata = json!({
+            "schema": OBJECT_METADATA_SCHEMA,
+            "backend_id": MACHO_BACKEND_ID,
+            "object_format": MACHO_OBJECT_FORMAT,
+            "target_triple": input.target_triple,
+            "symbol_hash": &input.ir.symbol_hash,
+            "function_def_hash": &input.ir.function_def_hash,
+            "function_sig_hash": &input.ir.function_sig_hash,
+            "typed_body_expr_hash": &input.ir.typed_body_expr_hash,
+            "lowered_ir_schema": &input.ir.schema,
+            "defined_symbols": [function_symbol],
+            "object_symbols": [object_symbol],
             "exported_abi_names": input.exported_abi_names,
             "called_symbols": called_symbols,
             "relocations": relocations,
@@ -117,20 +181,14 @@ impl CodeDb {
         symbol: &str,
         target_triple: &str,
     ) -> Result<NativeObjectArtifact> {
-        if target_triple != DEFAULT_NATIVE_TARGET {
-            bail!(
-                "{BACKEND_ID} only supports target {}",
-                DEFAULT_NATIVE_TARGET
-            );
-        }
         let root = self.load_root(root_hash)?;
         let lowered = self.lower_symbol(root_hash, symbol)?;
         let dependency_interface_hashes = self.dependency_interface_hashes(&root, &lowered.ir)?;
-        let backend = ElfObjectBackend;
+        let backend_id = backend_id_for_target(target_triple)?;
         let key_input = CacheKeyInput::new(
             ArtifactKind::ObjectFile,
             &lowered.ir.function_def_hash,
-            backend.backend_id(),
+            backend_id,
             target_triple,
         )
         .with_dependency_interface_hashes(dependency_interface_hashes);
@@ -149,11 +207,16 @@ impl CodeDb {
             });
         }
 
-        let emitted = backend.emit_object(ObjectBackendInput {
+        let input = ObjectBackendInput {
             ir: &lowered.ir,
             target_triple,
             exported_abi_names: exported_abi_names(&root, symbol),
-        })?;
+        };
+        let emitted = match target_triple {
+            LINUX_X86_64_TARGET => ElfObjectBackend.emit_object(input)?,
+            APPLE_ARM64_TARGET => MachOArm64ObjectBackend.emit_object(input)?,
+            _ => unreachable!("unsupported target was checked by backend_id_for_target"),
+        };
         self.write_cache_bytes(key_input, &emitted.metadata, &emitted.bytes)?;
         Ok(NativeObjectArtifact {
             artifact_hash: emitted.artifact_hash,
@@ -186,6 +249,16 @@ impl CodeDb {
                 ))
             })
             .collect()
+    }
+}
+
+fn backend_id_for_target(target_triple: &str) -> Result<&'static str> {
+    match target_triple {
+        LINUX_X86_64_TARGET => Ok(ElfObjectBackend.backend_id()),
+        APPLE_ARM64_TARGET => Ok(MachOArm64ObjectBackend.backend_id()),
+        other => bail!(
+            "unsupported native object target {other}; supported targets: {LINUX_X86_64_TARGET}, {APPLE_ARM64_TARGET}"
+        ),
     }
 }
 
@@ -279,7 +352,10 @@ struct StackLayout {
     stack_size: i32,
 }
 
-fn compile_function(ir: &LoweredFunctionIr, function_symbol: &str) -> Result<CompiledFunction> {
+fn compile_x86_64_function(
+    ir: &LoweredFunctionIr,
+    function_symbol: &str,
+) -> Result<CompiledFunction> {
     let layout = StackLayout::new(ir)?;
     let mut emitter = FunctionEmitter {
         layout,
@@ -639,6 +715,390 @@ impl FunctionEmitter {
     }
 }
 
+#[derive(Debug)]
+struct Arm64StackLayout {
+    param_offsets: Vec<u32>,
+    value_offsets: BTreeMap<String, u32>,
+    stack_size: u32,
+}
+
+fn compile_arm64_function(
+    ir: &LoweredFunctionIr,
+    function_symbol: &str,
+) -> Result<CompiledFunction> {
+    let layout = Arm64StackLayout::new(ir)?;
+    let mut emitter = Arm64Emitter {
+        layout,
+        text: Vec::new(),
+        relocations: Vec::new(),
+    };
+
+    emitter.emit_prologue(ir.params.len())?;
+    let (last, body) = ir
+        .operations
+        .split_last()
+        .ok_or_else(|| anyhow!("lowered function has no return"))?;
+    emitter.emit_ops(body)?;
+    match last {
+        LoweredOp::Return { value, .. } => {
+            let offset = emitter.value_offset(value)?;
+            emitter.ldr_stack(0, offset)?;
+            emitter.emit_epilogue()?;
+        }
+        _ => bail!("lowered function must end with return"),
+    }
+
+    if function_symbol.is_empty() {
+        bail!("native object function symbol is empty");
+    }
+
+    Ok(CompiledFunction {
+        text: emitter.text,
+        relocations: emitter.relocations,
+    })
+}
+
+impl Arm64StackLayout {
+    fn new(ir: &LoweredFunctionIr) -> Result<Self> {
+        let mut ids = Vec::new();
+        collect_value_ids(&ir.operations, &mut ids)?;
+        let mut value_offsets = BTreeMap::new();
+        let mut next_slot = ir.params.len();
+        for id in ids {
+            let offset = 8 * next_slot as u32;
+            value_offsets.insert(id, offset);
+            next_slot += 1;
+        }
+        let param_offsets = (0..ir.params.len())
+            .map(|idx| 8 * idx as u32)
+            .collect::<Vec<_>>();
+        let raw_size = next_slot as u32 * 8;
+        let stack_size = if raw_size == 0 {
+            0
+        } else {
+            raw_size.div_ceil(16) * 16
+        };
+        if stack_size > 4095 {
+            bail!("native arm64 backend v0 stack frame is too large");
+        }
+        Ok(Self {
+            param_offsets,
+            value_offsets,
+            stack_size,
+        })
+    }
+}
+
+struct Arm64Emitter {
+    layout: Arm64StackLayout,
+    text: Vec<u8>,
+    relocations: Vec<TextRelocation>,
+}
+
+impl Arm64Emitter {
+    fn emit_prologue(&mut self, param_count: usize) -> Result<()> {
+        self.emit_u32(0xa9bf7bfd);
+        self.emit_u32(0x910003fd);
+        if self.layout.stack_size > 0 {
+            self.sub_sp_imm(self.layout.stack_size)?;
+        }
+        for slot in 0..param_count {
+            self.str_stack(slot as u8, self.layout.param_offsets[slot])?;
+        }
+        Ok(())
+    }
+
+    fn emit_epilogue(&mut self) -> Result<()> {
+        if self.layout.stack_size > 0 {
+            self.add_sp_imm(self.layout.stack_size)?;
+        }
+        self.emit_u32(0xa8c17bfd);
+        self.emit_u32(0xd65f03c0);
+        Ok(())
+    }
+
+    fn emit_ops(&mut self, operations: &[LoweredOp]) -> Result<()> {
+        for op in operations {
+            self.emit_op(op)?;
+        }
+        Ok(())
+    }
+
+    fn emit_op(&mut self, op: &LoweredOp) -> Result<()> {
+        match op {
+            LoweredOp::Param { id, slot, .. } => {
+                let param = *self
+                    .layout
+                    .param_offsets
+                    .get(*slot)
+                    .ok_or_else(|| anyhow!("parameter slot out of bounds {slot}"))?;
+                self.ldr_stack(0, param)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::ConstI64 { id, value, .. } => {
+                self.mov_u64(0, value.parse::<i64>()? as u64);
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::ConstBool { id, value, .. } => {
+                self.mov_u64(0, if *value { 1 } else { 0 });
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::Binary {
+                id,
+                kind,
+                left,
+                right,
+                ..
+            } => {
+                self.emit_binary(kind, left, right)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::Call {
+                id,
+                target_symbol_hash,
+                args,
+                ..
+            } => {
+                if args.len() > 8 {
+                    bail!("native arm64 backend v0 supports at most 8 call arguments");
+                }
+                for (idx, arg) in args.iter().enumerate() {
+                    self.ldr_stack(idx as u8, self.value_offset(arg)?)?;
+                }
+                let target_abi_symbol =
+                    macho_symbol_name(&internal_abi_symbol(target_symbol_hash)?);
+                let offset = self.text.len();
+                self.emit_u32(0x94000000);
+                self.relocations.push(TextRelocation {
+                    offset: offset as u64,
+                    target_symbol_hash: target_symbol_hash.clone(),
+                    target_abi_symbol,
+                });
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::If {
+                id,
+                cond,
+                then_block,
+                else_block,
+                ..
+            } => {
+                self.emit_if(id, cond, then_block, else_block)?;
+            }
+            LoweredOp::Return { .. } => {
+                bail!("return is only valid as the final lowered operation");
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_binary(&mut self, kind: &str, left: &str, right: &str) -> Result<()> {
+        self.ldr_stack(0, self.value_offset(left)?)?;
+        self.ldr_stack(1, self.value_offset(right)?)?;
+        match kind {
+            "add_i64" => self.add_reg(0, 0, 1),
+            "sub_i64" => self.sub_reg(0, 0, 1),
+            "mul_i64" => self.mul_reg(0, 0, 1),
+            "div_i64" => {
+                let skip_trap = self.emit_cbnz_placeholder(1);
+                self.emit_u32(0xd4200000);
+                self.patch_imm19(skip_trap)?;
+                self.sdiv_reg(0, 0, 1);
+            }
+            "eq_i64" | "ne_i64" | "lt_i64" | "le_i64" | "gt_i64" | "ge_i64" => {
+                self.cmp_reg(0, 1);
+                let cond = match kind {
+                    "eq_i64" => 0,
+                    "ne_i64" => 1,
+                    "lt_i64" => 11,
+                    "le_i64" => 13,
+                    "gt_i64" => 12,
+                    "ge_i64" => 10,
+                    _ => unreachable!(),
+                };
+                self.cset(0, cond);
+            }
+            "and_bool" => self.and_reg(0, 0, 1),
+            "or_bool" => self.orr_reg(0, 0, 1),
+            other => bail!("unsupported lowered binary op for native arm64 backend: {other}"),
+        }
+        Ok(())
+    }
+
+    fn emit_if(
+        &mut self,
+        id: &str,
+        cond: &str,
+        then_block: &LoweredBlock,
+        else_block: &LoweredBlock,
+    ) -> Result<()> {
+        self.ldr_stack(0, self.value_offset(cond)?)?;
+        let else_patch = self.emit_cbz_placeholder(0);
+        self.emit_ops(&then_block.operations)?;
+        self.ldr_stack(0, self.value_offset(&then_block.result)?)?;
+        let end_patch = self.emit_b_placeholder();
+        self.patch_imm19(else_patch)?;
+        self.emit_ops(&else_block.operations)?;
+        self.ldr_stack(0, self.value_offset(&else_block.result)?)?;
+        self.patch_imm26(end_patch)?;
+        self.str_stack(0, self.value_offset(id)?)?;
+        Ok(())
+    }
+
+    fn value_offset(&self, id: &str) -> Result<u32> {
+        self.layout
+            .value_offsets
+            .get(id)
+            .copied()
+            .ok_or_else(|| anyhow!("unknown lowered value id {id}"))
+    }
+
+    fn sub_sp_imm(&mut self, imm: u32) -> Result<()> {
+        if imm > 4095 {
+            bail!("arm64 stack adjustment too large");
+        }
+        self.emit_u32(0xd10003ff | (imm << 10));
+        Ok(())
+    }
+
+    fn add_sp_imm(&mut self, imm: u32) -> Result<()> {
+        if imm > 4095 {
+            bail!("arm64 stack adjustment too large");
+        }
+        self.emit_u32(0x910003ff | (imm << 10));
+        Ok(())
+    }
+
+    fn str_stack(&mut self, reg: u8, offset: u32) -> Result<()> {
+        self.stack_mem_op(0xf90003e0, reg, offset)
+    }
+
+    fn ldr_stack(&mut self, reg: u8, offset: u32) -> Result<()> {
+        self.stack_mem_op(0xf94003e0, reg, offset)
+    }
+
+    fn stack_mem_op(&mut self, base: u32, reg: u8, offset: u32) -> Result<()> {
+        if reg > 30 {
+            bail!("invalid arm64 general register x{reg}");
+        }
+        if !offset.is_multiple_of(8) || offset / 8 > 4095 {
+            bail!("arm64 stack offset cannot be encoded");
+        }
+        self.emit_u32(base | ((offset / 8) << 10) | u32::from(reg));
+        Ok(())
+    }
+
+    fn mov_u64(&mut self, reg: u8, value: u64) {
+        let chunk0 = (value & 0xffff) as u32;
+        self.emit_u32(0xd2800000 | (chunk0 << 5) | u32::from(reg));
+        for hw in 1..4 {
+            let chunk = ((value >> (hw * 16)) & 0xffff) as u32;
+            if chunk != 0 {
+                self.emit_u32(0xf2800000 | ((hw as u32) << 21) | (chunk << 5) | u32::from(reg));
+            }
+        }
+    }
+
+    fn add_reg(&mut self, rd: u8, rn: u8, rm: u8) {
+        self.emit_u32(0x8b000000 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rd));
+    }
+
+    fn sub_reg(&mut self, rd: u8, rn: u8, rm: u8) {
+        self.emit_u32(0xcb000000 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rd));
+    }
+
+    fn mul_reg(&mut self, rd: u8, rn: u8, rm: u8) {
+        self.emit_u32(
+            0x9b000000 | (u32::from(rm) << 16) | (31 << 10) | (u32::from(rn) << 5) | u32::from(rd),
+        );
+    }
+
+    fn sdiv_reg(&mut self, rd: u8, rn: u8, rm: u8) {
+        self.emit_u32(0x9ac00c00 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rd));
+    }
+
+    fn cmp_reg(&mut self, rn: u8, rm: u8) {
+        self.emit_u32(0xeb00001f | (u32::from(rm) << 16) | (u32::from(rn) << 5));
+    }
+
+    fn cset(&mut self, rd: u8, cond: u8) {
+        let inverted = u32::from(cond ^ 1);
+        self.emit_u32(0x9a9f07e0 | (inverted << 12) | u32::from(rd));
+    }
+
+    fn and_reg(&mut self, rd: u8, rn: u8, rm: u8) {
+        self.emit_u32(0x8a000000 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rd));
+    }
+
+    fn orr_reg(&mut self, rd: u8, rn: u8, rm: u8) {
+        self.emit_u32(0xaa000000 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rd));
+    }
+
+    fn emit_cbz_placeholder(&mut self, reg: u8) -> usize {
+        let patch = self.text.len();
+        self.emit_u32(0xb4000000 | u32::from(reg));
+        patch
+    }
+
+    fn emit_cbnz_placeholder(&mut self, reg: u8) -> usize {
+        let patch = self.text.len();
+        self.emit_u32(0xb5000000 | u32::from(reg));
+        patch
+    }
+
+    fn emit_b_placeholder(&mut self) -> usize {
+        let patch = self.text.len();
+        self.emit_u32(0x14000000);
+        patch
+    }
+
+    fn patch_imm19(&mut self, patch_offset: usize) -> Result<()> {
+        let disp = self.branch_disp_words(patch_offset)?;
+        if !(-(1 << 18)..(1 << 18)).contains(&disp) {
+            bail!("arm64 conditional branch target out of range");
+        }
+        let encoded = (disp as i32 as u32) & 0x7ffff;
+        let mut instruction = u32::from_le_bytes(
+            self.text[patch_offset..patch_offset + 4]
+                .try_into()
+                .expect("instruction bytes"),
+        );
+        instruction = (instruction & !(0x7ffff << 5)) | (encoded << 5);
+        self.text[patch_offset..patch_offset + 4].copy_from_slice(&instruction.to_le_bytes());
+        Ok(())
+    }
+
+    fn patch_imm26(&mut self, patch_offset: usize) -> Result<()> {
+        let disp = self.branch_disp_words(patch_offset)?;
+        if !(-(1 << 25)..(1 << 25)).contains(&disp) {
+            bail!("arm64 branch target out of range");
+        }
+        let encoded = (disp as i32 as u32) & 0x03ff_ffff;
+        let mut instruction = u32::from_le_bytes(
+            self.text[patch_offset..patch_offset + 4]
+                .try_into()
+                .expect("instruction bytes"),
+        );
+        instruction = (instruction & !0x03ff_ffff) | encoded;
+        self.text[patch_offset..patch_offset + 4].copy_from_slice(&instruction.to_le_bytes());
+        Ok(())
+    }
+
+    fn branch_disp_words(&self, patch_offset: usize) -> Result<i64> {
+        let target = self.text.len() as i64;
+        let source = patch_offset as i64;
+        let bytes = target - source;
+        if bytes % 4 != 0 {
+            bail!("arm64 branch target is not instruction-aligned");
+        }
+        Ok(bytes / 4)
+    }
+
+    fn emit_u32(&mut self, value: u32) {
+        self.text.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Section {
     name: &'static str,
@@ -788,6 +1248,220 @@ fn write_elf_object(function_symbol: &str, text: &[u8], relocations: &[TextReloc
         ));
     }
     out
+}
+
+fn write_macho_object(
+    function_symbol: &str,
+    text: &[u8],
+    relocations: &[TextRelocation],
+) -> Vec<u8> {
+    let mut strtab = StringTable::default();
+    let function_name = strtab.insert(function_symbol);
+    let external_symbols = relocations
+        .iter()
+        .map(|relocation| relocation.target_abi_symbol.clone())
+        .filter(|symbol| symbol != function_symbol)
+        .collect::<BTreeSet<_>>();
+
+    let mut symbols = Vec::new();
+    let mut symbol_indexes = BTreeMap::new();
+    symbols.push(MachOSymbolEntry {
+        name: function_name,
+        ty: 0x0f,
+        sect: 1,
+        desc: 0,
+        value: 0,
+    });
+    symbol_indexes.insert(function_symbol.to_string(), 0_u32);
+    for external in &external_symbols {
+        let name = strtab.insert(external);
+        let idx = symbols.len() as u32;
+        symbols.push(MachOSymbolEntry {
+            name,
+            ty: 0x01,
+            sect: 0,
+            desc: 0,
+            value: 0,
+        });
+        symbol_indexes.insert(external.clone(), idx);
+    }
+
+    const HEADER_SIZE: u64 = 32;
+    const SIZEOF_CMDS: u32 = 280;
+    let text_offset = HEADER_SIZE + u64::from(SIZEOF_CMDS);
+    let text_end = text_offset + text.len() as u64;
+    let reloc_offset = if relocations.is_empty() {
+        0
+    } else {
+        align_to(text_end, 4)
+    };
+    let reloc_size = relocations.len() as u64 * 8;
+    let symoff = align_to(
+        if relocations.is_empty() {
+            text_end
+        } else {
+            reloc_offset + reloc_size
+        },
+        8,
+    );
+    let stroff = symoff + symbols.len() as u64 * 16;
+
+    let mut out = macho_header(SIZEOF_CMDS);
+    out.extend_from_slice(&macho_segment_command(
+        text_offset as u32,
+        text.len() as u64,
+        reloc_offset as u32,
+        relocations.len() as u32,
+    ));
+    out.extend_from_slice(&macho_build_version_command());
+    out.extend_from_slice(&macho_symtab_command(
+        symoff as u32,
+        symbols.len() as u32,
+        stroff as u32,
+        strtab.bytes.len() as u32,
+    ));
+    out.extend_from_slice(&macho_dysymtab_command(1, external_symbols.len() as u32));
+
+    pad_to(&mut out, text_offset as usize);
+    out.extend_from_slice(text);
+    if !relocations.is_empty() {
+        pad_to(&mut out, reloc_offset as usize);
+        for relocation in relocations {
+            let symbol_index = symbol_indexes[&relocation.target_abi_symbol];
+            out.extend_from_slice(&(relocation.offset as i32).to_le_bytes());
+            let info =
+                symbol_index | (1 << 24) | (2 << 25) | (1 << 27) | (ARM64_RELOC_BRANCH26 << 28);
+            put_u32(&mut out, info);
+        }
+    }
+    pad_to(&mut out, symoff as usize);
+    for symbol in &symbols {
+        out.extend_from_slice(&symbol.to_bytes());
+    }
+    pad_to(&mut out, stroff as usize);
+    out.extend_from_slice(&strtab.bytes);
+    out
+}
+
+fn macho_header(sizeofcmds: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32);
+    put_u32(&mut out, 0xfeedfacf);
+    put_u32(&mut out, 0x0100000c);
+    put_u32(&mut out, 0);
+    put_u32(&mut out, 1);
+    put_u32(&mut out, 4);
+    put_u32(&mut out, sizeofcmds);
+    put_u32(&mut out, 0x2000);
+    put_u32(&mut out, 0);
+    debug_assert_eq!(out.len(), 32);
+    out
+}
+
+fn macho_segment_command(
+    text_offset: u32,
+    text_size: u64,
+    reloc_offset: u32,
+    reloc_count: u32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(152);
+    put_u32(&mut out, 0x19);
+    put_u32(&mut out, 152);
+    put_fixed_name(&mut out, "");
+    put_u64(&mut out, 0);
+    put_u64(&mut out, text_size);
+    put_u64(&mut out, u64::from(text_offset));
+    put_u64(&mut out, text_size);
+    put_u32(&mut out, 7);
+    put_u32(&mut out, 7);
+    put_u32(&mut out, 1);
+    put_u32(&mut out, 0);
+
+    put_fixed_name(&mut out, "__text");
+    put_fixed_name(&mut out, "__TEXT");
+    put_u64(&mut out, 0);
+    put_u64(&mut out, text_size);
+    put_u32(&mut out, text_offset);
+    put_u32(&mut out, 2);
+    put_u32(&mut out, reloc_offset);
+    put_u32(&mut out, reloc_count);
+    put_u32(&mut out, 0x80000400);
+    put_u32(&mut out, 0);
+    put_u32(&mut out, 0);
+    put_u32(&mut out, 0);
+    debug_assert_eq!(out.len(), 152);
+    out
+}
+
+fn macho_build_version_command() -> Vec<u8> {
+    let mut out = Vec::with_capacity(24);
+    put_u32(&mut out, 0x32);
+    put_u32(&mut out, 24);
+    put_u32(&mut out, 1);
+    put_u32(&mut out, 11 << 16);
+    put_u32(&mut out, 11 << 16);
+    put_u32(&mut out, 0);
+    out
+}
+
+fn macho_symtab_command(symoff: u32, nsyms: u32, stroff: u32, strsize: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24);
+    put_u32(&mut out, 0x2);
+    put_u32(&mut out, 24);
+    put_u32(&mut out, symoff);
+    put_u32(&mut out, nsyms);
+    put_u32(&mut out, stroff);
+    put_u32(&mut out, strsize);
+    out
+}
+
+fn macho_dysymtab_command(iundefsym: u32, nundefsym: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(80);
+    put_u32(&mut out, 0xb);
+    put_u32(&mut out, 80);
+    for value in [
+        0, 0, 0, 1, iundefsym, nundefsym, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ] {
+        put_u32(&mut out, value);
+    }
+    debug_assert_eq!(out.len(), 80);
+    out
+}
+
+fn put_fixed_name(out: &mut Vec<u8>, name: &str) {
+    let mut bytes = [0_u8; 16];
+    let name_bytes = name.as_bytes();
+    let len = name_bytes.len().min(16);
+    bytes[..len].copy_from_slice(&name_bytes[..len]);
+    out.extend_from_slice(&bytes);
+}
+
+#[derive(Debug, Clone)]
+struct MachOSymbolEntry {
+    name: u32,
+    ty: u8,
+    sect: u8,
+    desc: u16,
+    value: u64,
+}
+
+impl MachOSymbolEntry {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16);
+        put_u32(&mut out, self.name);
+        out.push(self.ty);
+        out.push(self.sect);
+        put_u16(&mut out, self.desc);
+        put_u64(&mut out, self.value);
+        out
+    }
+}
+
+fn macho_symbol_name(abi_symbol: &str) -> String {
+    format!("_{abi_symbol}")
+}
+
+fn strip_macho_symbol_prefix(symbol: &str) -> &str {
+    symbol.strip_prefix('_').unwrap_or(symbol)
 }
 
 #[derive(Default)]
