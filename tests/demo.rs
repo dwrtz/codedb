@@ -1151,6 +1151,11 @@ fn export_names_cannot_collide_with_native_internal_or_harness_symbols() {
     assert_eq!(branch_state(&db), branch_before_collision);
     assert_eq!(mutation_guard_counts(&db), counts_before_collision);
 
+    let c_keyword = run_failure(&["set-export", db.to_str().unwrap(), "tax", "long"]);
+    assert!(c_keyword.contains("reserved native ABI export name"));
+    assert_eq!(branch_state(&db), branch_before_collision);
+    assert_eq!(mutation_guard_counts(&db), counts_before_collision);
+
     bin()
         .args(["verify", db.to_str().unwrap()])
         .assert()

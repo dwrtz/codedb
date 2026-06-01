@@ -111,7 +111,57 @@ fn is_valid_abi_identifier(name: &str) -> bool {
 }
 
 fn is_reserved_native_export_name(name: &str) -> bool {
-    matches!(name, "main")
+    name == "main" || is_c_keyword(name)
+}
+
+fn is_c_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "auto"
+            | "break"
+            | "case"
+            | "char"
+            | "const"
+            | "continue"
+            | "default"
+            | "do"
+            | "double"
+            | "else"
+            | "enum"
+            | "extern"
+            | "float"
+            | "for"
+            | "goto"
+            | "if"
+            | "inline"
+            | "int"
+            | "long"
+            | "register"
+            | "restrict"
+            | "return"
+            | "short"
+            | "signed"
+            | "sizeof"
+            | "static"
+            | "struct"
+            | "switch"
+            | "typedef"
+            | "union"
+            | "unsigned"
+            | "void"
+            | "volatile"
+            | "while"
+            | "_Alignas"
+            | "_Alignof"
+            | "_Atomic"
+            | "_Bool"
+            | "_Complex"
+            | "_Generic"
+            | "_Imaginary"
+            | "_Noreturn"
+            | "_Static_assert"
+            | "_Thread_local"
+    )
 }
 
 #[cfg(test)]
@@ -135,6 +185,7 @@ mod tests {
         assert!(validate_exported_abi_name("9tax").is_err());
         assert!(validate_exported_abi_name("sales-tax").is_err());
         assert!(validate_exported_abi_name("main").is_err());
+        assert!(validate_exported_abi_name("long").is_err());
     }
 
     #[test]
