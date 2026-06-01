@@ -224,10 +224,52 @@ fn c_identifier(name: &str) -> String {
 }
 
 pub(crate) fn ensure_no_forbidden_runtime_calls(source: &str) -> Result<()> {
-    for forbidden in ["malloc", "free", "printf", "pthread_", "GC_", "dlopen"] {
-        if source.contains(forbidden) {
-            bail!("forbidden_runtime_dependency: generated C contains {forbidden}");
+    let bytes = source.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if is_c_ident_start(bytes[idx]) {
+            let start = idx;
+            idx += 1;
+            while idx < bytes.len() && is_c_ident_continue(bytes[idx]) {
+                idx += 1;
+            }
+            let ident = &source[start..idx];
+            let mut next = idx;
+            while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                next += 1;
+            }
+            if next < bytes.len() && bytes[next] == b'(' && forbidden_runtime_ident(ident) {
+                bail!("forbidden_runtime_dependency: generated C calls {ident}");
+            }
+        } else {
+            idx += 1;
         }
     }
     Ok(())
+}
+
+fn forbidden_runtime_ident(ident: &str) -> bool {
+    matches!(ident, "malloc" | "free" | "printf" | "dlopen")
+        || ident.starts_with("pthread_")
+        || ident.starts_with("GC_")
+}
+
+fn is_c_ident_start(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphabetic()
+}
+
+fn is_c_ident_continue(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_check_detects_calls_not_generated_identifier_substrings() {
+        ensure_no_forbidden_runtime_calls("long codedb_free(void) { return 1; }\n").unwrap();
+        assert!(ensure_no_forbidden_runtime_calls("void f(void) { free(); }\n").is_err());
+        assert!(ensure_no_forbidden_runtime_calls("void f(void) { pthread_create(); }\n").is_err());
+    }
 }

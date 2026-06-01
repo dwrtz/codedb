@@ -635,6 +635,18 @@ impl CodeDb {
                             false,
                         ));
                     }
+                    if !stale_expected_root && !self.recorded_operation_exists(&op)? {
+                        return Ok((
+                            MigrationOutcome::Conflict(MigrationConflict {
+                                current_root: old_root,
+                                expected_root: expected_root.to_string(),
+                                summary: fallback_summary.clone(),
+                                failed_preconditions,
+                                failed_postconditions,
+                            }),
+                            false,
+                        ));
+                    }
                     let summary = self.migration_summary_for_roots(&op, &old_root, &old_root)?;
                     return Ok((
                         MigrationOutcome::AlreadyApplied(MigrationReport {
@@ -1741,6 +1753,19 @@ impl CodeDb {
                   AND operation_json = ?4
             )",
             params![input_root, output_root, op.kind_name(), operation_json],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn recorded_operation_exists(&self, op: &Operation) -> Result<bool> {
+        let operation_json = canonical_json(&serde_json::to_value(op)?);
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM migrations
+                WHERE operation_kind = ?1
+                  AND operation_json = ?2
+            )",
+            params![op.kind_name(), operation_json],
             |row| row.get(0),
         )?)
     }

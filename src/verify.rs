@@ -748,6 +748,11 @@ impl CodeDb {
                 "bad_link_plan: {cache_key} unexpected external symbols"
             ));
         }
+        if plan.get("output_kind").and_then(JsonValue::as_str) != Some("executable") {
+            errors.push(format!(
+                "bad_link_plan: {cache_key} missing or unsupported output kind"
+            ));
+        }
         let object_symbols = plan
             .get("objects")
             .and_then(JsonValue::as_array)
@@ -869,6 +874,7 @@ impl CodeDb {
                     || input.get("entry_symbol_hash") != plan.get("entry_symbol_hash")
                     || input.get("entry_abi_symbol") != plan.get("entry_abi_symbol")
                     || input.get("export_map") != plan.get("export_map")
+                    || input.get("output_kind") != plan.get("output_kind")
                     || input.get("link_options") != plan.get("link_options")
                 {
                     errors.push(format!(
@@ -1017,6 +1023,13 @@ impl CodeDb {
                     .get("internal_abi_symbol")
                     .and_then(JsonValue::as_str)
                     != Some(expected_internal_abi.as_str())
+            {
+                return Ok(false);
+            }
+            let (param_types, return_type) = self.signature_parts(&entry.signature)?;
+            if json_string_vec(object.get("param_type_hashes")) != Some(param_types.clone())
+                || object.get("return_type_hash").and_then(JsonValue::as_str)
+                    != Some(return_type.as_str())
             {
                 return Ok(false);
             }
@@ -1289,6 +1302,16 @@ fn json_string_set(value: Option<&JsonValue>) -> BTreeSet<String> {
         .filter_map(JsonValue::as_str)
         .map(str::to_string)
         .collect()
+}
+
+fn json_string_vec(value: Option<&JsonValue>) -> Option<Vec<String>> {
+    value.map(|value| {
+        value
+            .as_array()?
+            .iter()
+            .map(|item| item.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+    })?
 }
 
 fn link_plan_object_symbols(plan: &JsonValue) -> Vec<String> {

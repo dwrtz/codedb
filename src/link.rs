@@ -5,7 +5,7 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value as JsonValue, json};
 
-use crate::abi::{export_map, internal_abi_symbol};
+use crate::abi::{export_map, internal_abi_symbol, validate_exported_abi_name};
 use crate::artifact::CacheKeyInput;
 use crate::backend::ArtifactKind;
 use crate::backend::native::NativeObjectArtifact;
@@ -120,6 +120,8 @@ impl CodeDb {
             let root_entry = self
                 .root_symbol(root, &symbol)
                 .ok_or_else(|| anyhow!("link plan symbol missing from root {symbol}"))?;
+            let (param_type_hashes, return_type_hash) =
+                self.signature_parts(&root_entry.signature)?;
             let object = self.emit_object_for_symbol(root_hash, &symbol, target_triple)?;
             let object_metadata = object.metadata.clone();
             let internal_abi = internal_abi_symbol(&symbol)?;
@@ -127,6 +129,8 @@ impl CodeDb {
                 "symbol_hash": &symbol,
                 "definition_hash": &root_entry.definition,
                 "signature_hash": &root_entry.signature,
+                "param_type_hashes": param_type_hashes,
+                "return_type_hash": return_type_hash,
                 "internal_abi_symbol": &internal_abi,
                 "defined_symbols": required_metadata_value(&object_metadata, "defined_symbols")?,
                 "object_symbols": object_metadata
@@ -167,6 +171,7 @@ impl CodeDb {
                 .map(|object| object.cache_key.clone())
                 .collect::<Vec<_>>(),
             "export_map": exports,
+            "output_kind": "executable",
             "link_options": link_options(target_triple)?,
         });
         let input_hash = self.put_object("LinkPlanInput", &input)?;
@@ -179,6 +184,7 @@ impl CodeDb {
             "objects": object_entries,
             "export_map": input["export_map"].clone(),
             "external_symbols": [],
+            "output_kind": input["output_kind"].clone(),
             "link_options": input["link_options"].clone(),
         });
         let object_cache_keys = objects
@@ -332,9 +338,12 @@ fn link_with_cc(prepared: &PreparedLink) -> Result<Vec<u8>> {
         .and_then(JsonValue::as_str)
         .ok_or_else(|| anyhow!("link plan missing entry ABI symbol"))?;
     let harness = temp_dir.join("codedb_main.c");
+    let export_wrappers = export_wrapper_source(&prepared.plan)?;
     std::fs::write(
         &harness,
-        format!("long {entry}(void);\nint main(void) {{ return (int){entry}(); }}\n"),
+        format!(
+            "{export_wrappers}long {entry}(void);\nint main(void) {{ return (int){entry}(); }}\n"
+        ),
     )
     .with_context(|| format!("failed to write {}", harness.display()))?;
     let executable = temp_dir.join("codedb_executable");
@@ -399,6 +408,94 @@ fn host_linker_identity_for_target(target_triple: &str) -> Result<String> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     ))
+}
+
+fn export_wrapper_source(plan: &JsonValue) -> Result<String> {
+    let mut out = String::new();
+    for export in plan
+        .get("export_map")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let symbol = export
+            .get("symbol_hash")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("link plan export missing symbol_hash"))?;
+        let internal = export
+            .get("internal_abi_symbol")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("link plan export missing internal_abi_symbol"))?;
+        let exported = export
+            .get("exported_abi_symbol")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("link plan export missing exported_abi_symbol"))?;
+        validate_exported_abi_name(exported)?;
+        if exported == internal {
+            continue;
+        }
+        let object = plan_object_for_symbol(plan, symbol)?;
+        let params = object
+            .get("param_type_hashes")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| anyhow!("link plan object missing param_type_hashes"))?;
+        let return_type = object
+            .get("return_type_hash")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("link plan object missing return_type_hash"))?;
+        let return_c_type = native_harness_c_type(return_type)?;
+        let params = params
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| {
+                let ty = value
+                    .as_str()
+                    .ok_or_else(|| anyhow!("link plan param type must be a hash"))?;
+                Ok(format!("{} a{idx}", native_harness_c_type(ty)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let declaration_params = if params.is_empty() {
+            "void".to_string()
+        } else {
+            params.join(", ")
+        };
+        let call_args = (0..params.len())
+            .map(|idx| format!("a{idx}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if return_c_type == "void" {
+            out.push_str(&format!(
+                "{return_c_type} {internal}({declaration_params});\n{return_c_type} {exported}({declaration_params}) {{ {internal}({call_args}); }}\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "{return_c_type} {internal}({declaration_params});\n{return_c_type} {exported}({declaration_params}) {{ return {internal}({call_args}); }}\n"
+            ));
+        }
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn plan_object_for_symbol<'a>(plan: &'a JsonValue, symbol: &str) -> Result<&'a JsonValue> {
+    plan.get("objects")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .find(|object| object.get("symbol_hash").and_then(JsonValue::as_str) == Some(symbol))
+        .ok_or_else(|| anyhow!("link plan export references unlinked symbol {symbol}"))
+}
+
+fn native_harness_c_type(type_hash: &str) -> Result<&'static str> {
+    if type_hash == type_hash_for("I64") || type_hash == type_hash_for("Bool") {
+        Ok("long")
+    } else if type_hash == type_hash_for("Unit") {
+        Ok("void")
+    } else {
+        bail!("unsupported native harness type {type_hash}")
+    }
 }
 
 fn link_options(target_triple: &str) -> Result<JsonValue> {

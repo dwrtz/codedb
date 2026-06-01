@@ -360,6 +360,7 @@ fn native_link_plan_is_deterministic_and_reused_across_rename() {
 
     let plan_json: JsonValue = serde_json::from_str(&before).unwrap();
     assert_eq!(plan_json["schema"], "codedb/link-plan/v1");
+    assert_eq!(plan_json["output_kind"], "executable");
     assert_eq!(plan_json["target_triple"], codedb::LINUX_X86_64_TARGET);
     assert_eq!(plan_json["objects"].as_array().unwrap().len(), 3);
     assert_eq!(plan_json["external_symbols"].as_array().unwrap().len(), 0);
@@ -961,6 +962,36 @@ fn export_map_changes_do_not_stale_native_object_metadata() {
 }
 
 #[test]
+fn native_build_materializes_reachable_export_wrappers() {
+    if !can_build_default_native_target() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("native-build-exports.sqlite");
+    let exe = temp.path().join("shop-with-export");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    run(&["set-export", db.to_str().unwrap(), "tax", "public_tax"]);
+    run(&[
+        "build",
+        db.to_str().unwrap(),
+        "main",
+        "--out",
+        exe.to_str().unwrap(),
+    ]);
+
+    let status = StdCommand::new(&exe)
+        .status()
+        .expect("run built executable");
+    assert_eq!(status.code(), Some(120));
+    if let Some(symbols) = native_symbols(&exe) {
+        assert!(symbols.contains("public_tax"), "symbols:\n{symbols}");
+    }
+}
+
+#[test]
 fn lowered_ir_uses_symbol_hash_calls_and_reuses_cache_across_rename() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("lowered-ir.sqlite");
@@ -1181,6 +1212,24 @@ fn rename_alias_returns_conflict_instead_of_hard_error() {
 
     assert!(conflict.contains("conflict rename_symbol main.sales_tax -> main.vat"));
     assert!(conflict.contains("failed_preconditions preferred_name_points_to_symbol"));
+    assert_eq!(branch_state(&db), branch_before_conflict);
+    assert_eq!(mutation_guard_counts(&db), counts_before_conflict);
+}
+
+#[test]
+fn rename_to_existing_name_without_matching_history_conflicts() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("invalid-rename-conflict.sqlite");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    let branch_before_conflict = branch_state(&db);
+    let counts_before_conflict = mutation_guard_counts(&db);
+
+    let conflict = run(&["rename", db.to_str().unwrap(), "not_a_symbol", "tax"]);
+
+    assert!(conflict.contains("conflict rename_symbol main.not_a_symbol -> main.tax"));
+    assert!(conflict.contains("failed_preconditions"));
     assert_eq!(branch_state(&db), branch_before_conflict);
     assert_eq!(mutation_guard_counts(&db), counts_before_conflict);
 }
@@ -1522,6 +1571,39 @@ fn failed_applied_migration_rolls_back_partial_writes() {
     assert!(stderr.contains("replacement body type bool does not match return type i64"));
     assert_eq!(branch_state(&db), branch_before_failure);
     assert_eq!(mutation_guard_counts(&db), counts_before_failure);
+
+    bin()
+        .args(["verify", db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+}
+
+#[test]
+fn c_projection_allows_generated_identifiers_that_contain_runtime_names() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("c-runtime-name-substring.sqlite");
+    let source = temp.path().join("runtime-name-substring.cdb");
+    let c_file = temp.path().join("projection.c");
+
+    std::fs::write(
+        &source,
+        "fn free(x: i64) -> i64 = x\n\nfn main() -> i64 = free(1)\n",
+    )
+    .unwrap();
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), source.to_str().unwrap()]);
+    run(&[
+        "emit-c",
+        db.to_str().unwrap(),
+        "main",
+        "--out",
+        c_file.to_str().unwrap(),
+    ]);
+
+    let c_source = std::fs::read_to_string(&c_file).unwrap();
+    assert!(c_source.contains("long codedb_free(long x)"));
+    assert!(c_source.contains("return codedb_free(1);"));
 
     bin()
         .args(["verify", db.to_str().unwrap()])
@@ -1910,4 +1992,20 @@ fn link_and_run_native(dir: &Path, objects: &[&Path], entry_symbol: &str, expect
 
 fn is_apple_silicon() -> bool {
     std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64"
+}
+
+fn is_linux_x86_64() -> bool {
+    std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64"
+}
+
+fn can_build_default_native_target() -> bool {
+    is_apple_silicon() || is_linux_x86_64()
+}
+
+fn native_symbols(path: &Path) -> Option<String> {
+    let output = StdCommand::new("nm").arg(path).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
