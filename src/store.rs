@@ -197,6 +197,8 @@ impl CodeDb {
         )?;
 
         for entry in &root.symbols {
+            let interface_metadata = function_interface_metadata(&entry.symbol, &entry.signature)?;
+            let interface_input_hash = self.put_object("FunctionInterface", &interface_metadata)?;
             self.conn.execute(
                 "INSERT OR REPLACE INTO root_symbols
                  (root_hash, symbol_hash, definition_hash, signature_hash)
@@ -204,15 +206,11 @@ impl CodeDb {
                 params![root_hash, entry.symbol, entry.definition, entry.signature],
             )?;
             self.write_cache_json(
-                &entry.signature,
+                &interface_input_hash,
                 "typechecker",
                 "interface",
                 ArtifactKind::InterfaceHash,
-                &json!({
-                    "symbol_hash": entry.symbol,
-                    "signature_hash": entry.signature,
-                    "internal_abi_symbol": internal_abi_symbol(&entry.symbol)?,
-                }),
+                &interface_metadata,
             )?;
             self.write_cache_json(
                 &entry.definition,
@@ -426,6 +424,18 @@ impl CodeDb {
         self.write_cache_entry(&key_input, &artifact_hash, Some(&artifact_json), None)
     }
 
+    pub(crate) fn write_cache_json_for_key(
+        &mut self,
+        key_input: CacheKeyInput,
+        artifact_json: &JsonValue,
+    ) -> Result<String> {
+        let key_input = key_input.normalized();
+        let artifact_hash = hash_bytes(BYTES_DOMAIN, canonical_json(artifact_json).as_bytes());
+        let artifact_json = json_artifact_metadata(&key_input, artifact_json);
+        self.write_cache_entry(&key_input, &artifact_hash, Some(&artifact_json), None)?;
+        Ok(artifact_hash)
+    }
+
     #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn write_cache(
         &mut self,
@@ -543,6 +553,14 @@ pub(crate) fn cache_key_for_input(key_input: &CacheKeyInput) -> Result<String> {
         CACHE_DOMAIN,
         cache_key_json(&key_input)?.as_bytes(),
     ))
+}
+
+pub(crate) fn function_interface_metadata(symbol: &str, signature: &str) -> Result<JsonValue> {
+    Ok(json!({
+        "symbol_hash": symbol,
+        "signature_hash": signature,
+        "internal_abi_symbol": internal_abi_symbol(symbol)?,
+    }))
 }
 
 fn migrate_compile_cache_schema(conn: &Connection) -> Result<()> {

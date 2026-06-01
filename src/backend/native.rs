@@ -5,12 +5,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value as JsonValue, json};
 
-use crate::abi::{exported_abi_names, internal_abi_symbol};
+use crate::abi::internal_abi_symbol;
 use crate::artifact::CacheKeyInput;
 use crate::backend::{ArtifactKind, ObjectBackend, ObjectBackendArtifact, ObjectBackendInput};
 use crate::lowering::{LoweredBlock, LoweredFunctionIr, LoweredOp};
 use crate::model::ProgramRootPayload;
-use crate::store::{CodeDb, canonical_json, hash_bytes};
+use crate::store::{CodeDb, canonical_json, function_interface_metadata, hash_bytes};
 use crate::types::type_hash_for;
 use crate::{APPLE_ARM64_TARGET, BYTES_DOMAIN, LINUX_X86_64_TARGET, MAIN_BRANCH};
 
@@ -76,7 +76,6 @@ impl ObjectBackend for ElfObjectBackend {
             "typed_body_expr_hash": &input.ir.typed_body_expr_hash,
             "lowered_ir_schema": &input.ir.schema,
             "defined_symbols": [function_symbol],
-            "exported_abi_names": input.exported_abi_names,
             "called_symbols": called_symbols,
             "relocations": relocations,
         });
@@ -137,7 +136,6 @@ impl ObjectBackend for MachOArm64ObjectBackend {
             "lowered_ir_schema": &input.ir.schema,
             "defined_symbols": [function_symbol],
             "object_symbols": [object_symbol],
-            "exported_abi_names": input.exported_abi_names,
             "called_symbols": called_symbols,
             "relocations": relocations,
         });
@@ -200,6 +198,7 @@ impl CodeDb {
             let metadata = cache_entry
                 .artifact_json
                 .ok_or_else(|| anyhow!("object cache entry missing artifact_json"))?;
+            let metadata = object_metadata_from_cache(&metadata)?;
             return Ok(NativeObjectArtifact {
                 artifact_hash: cache_entry.artifact_hash,
                 metadata,
@@ -210,7 +209,6 @@ impl CodeDb {
         let input = ObjectBackendInput {
             ir: &lowered.ir,
             target_triple,
-            exported_abi_names: exported_abi_names(&root, symbol),
         };
         let emitted = match target_triple {
             LINUX_X86_64_TARGET => ElfObjectBackend.emit_object(input)?,
@@ -238,11 +236,7 @@ impl CodeDb {
                 let entry = self
                     .root_symbol(root, &symbol)
                     .ok_or_else(|| anyhow!("native object dependency missing {symbol}"))?;
-                let metadata = json!({
-                    "symbol_hash": &entry.symbol,
-                    "signature_hash": &entry.signature,
-                    "internal_abi_symbol": internal_abi_symbol(&entry.symbol)?,
-                });
+                let metadata = function_interface_metadata(&entry.symbol, &entry.signature)?;
                 Ok(hash_bytes(
                     BYTES_DOMAIN,
                     canonical_json(&metadata).as_bytes(),
@@ -250,6 +244,20 @@ impl CodeDb {
             })
             .collect()
     }
+}
+
+pub(crate) fn object_metadata_from_cache(artifact_json: &JsonValue) -> Result<JsonValue> {
+    if artifact_json
+        .get("content_kind")
+        .and_then(JsonValue::as_str)
+        == Some("bytes")
+    {
+        return artifact_json
+            .get("metadata")
+            .cloned()
+            .ok_or_else(|| anyhow!("object cache entry missing metadata"));
+    }
+    Ok(artifact_json.clone())
 }
 
 fn backend_id_for_target(target_triple: &str) -> Result<&'static str> {

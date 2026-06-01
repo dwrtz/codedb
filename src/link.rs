@@ -10,11 +10,9 @@ use crate::artifact::CacheKeyInput;
 use crate::backend::ArtifactKind;
 use crate::backend::native::NativeObjectArtifact;
 use crate::model::ProgramRootPayload;
-use crate::store::{CodeDb, canonical_json, hash_bytes};
+use crate::store::CodeDb;
 use crate::types::type_hash_for;
-use crate::{
-    APPLE_ARM64_TARGET, BYTES_DOMAIN, DEFAULT_NATIVE_TARGET, LINUX_X86_64_TARGET, MAIN_BRANCH,
-};
+use crate::{APPLE_ARM64_TARGET, DEFAULT_NATIVE_TARGET, LINUX_X86_64_TARGET, MAIN_BRANCH};
 
 const LINK_PLAN_SCHEMA: &str = "codedb/link-plan/v1";
 const LINK_INPUT_SCHEMA: &str = "codedb/link-input/v1";
@@ -113,27 +111,22 @@ impl CodeDb {
                 .root_symbol(root, &symbol)
                 .ok_or_else(|| anyhow!("link plan symbol missing from root {symbol}"))?;
             let object = self.emit_object_for_symbol(root_hash, &symbol, target_triple)?;
+            let object_metadata = object.metadata.clone();
             let internal_abi = internal_abi_symbol(&symbol)?;
-            let relocations = self
-                .dependencies_for_symbol(root_hash, &symbol)?
-                .into_iter()
-                .filter(|dep| self.root_symbol(root, dep).is_some())
-                .map(|target| {
-                    Ok(json!({
-                        "kind": relocation_kind(target_triple)?,
-                        "target_symbol_hash": &target,
-                        "target_abi_symbol": internal_abi_symbol(&target)?,
-                    }))
-                })
-                .collect::<Result<Vec<_>>>()?;
             object_entries.push(json!({
                 "symbol_hash": &symbol,
                 "definition_hash": &root_entry.definition,
                 "signature_hash": &root_entry.signature,
                 "internal_abi_symbol": &internal_abi,
-                "object_format": object_format(target_triple)?,
+                "defined_symbols": required_metadata_value(&object_metadata, "defined_symbols")?,
+                "object_symbols": object_metadata
+                    .get("object_symbols")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+                "object_format": required_metadata_str(&object_metadata, "object_format")?,
                 "object_artifact_hash": &object.artifact_hash,
-                "relocations": relocations,
+                "called_symbols": required_metadata_value(&object_metadata, "called_symbols")?,
+                "relocations": required_metadata_value(&object_metadata, "relocations")?,
             }));
             objects.push(prepared_object(object));
         }
@@ -183,19 +176,14 @@ impl CodeDb {
             target_triple,
         )
         .with_dependency_implementation_hashes(object_hashes);
-        let plan_hash = hash_bytes(BYTES_DOMAIN, canonical_json(&plan).as_bytes());
+        let plan_hash;
         if let Some(cache_entry) = self.lookup_cache(&key_input)?
             && let Some(artifact_json) = cache_entry.artifact_json
         {
             plan = json_metadata(&artifact_json)?;
+            plan_hash = cache_entry.artifact_hash;
         } else {
-            self.write_cache_json(
-                &input_hash,
-                LINK_PLAN_BACKEND_ID,
-                target_triple,
-                ArtifactKind::LinkPlan,
-                &plan,
-            )?;
+            plan_hash = self.write_cache_json_for_key(key_input, &plan)?;
         }
 
         Ok(PreparedLink {
@@ -256,6 +244,20 @@ fn prepared_object(object: NativeObjectArtifact) -> PreparedObject {
         artifact_hash: object.artifact_hash,
         bytes: object.bytes,
     }
+}
+
+fn required_metadata_value(metadata: &JsonValue, key: &str) -> Result<JsonValue> {
+    metadata
+        .get(key)
+        .cloned()
+        .ok_or_else(|| anyhow!("native object metadata missing {key}"))
+}
+
+fn required_metadata_str<'a>(metadata: &'a JsonValue, key: &str) -> Result<&'a str> {
+    metadata
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| anyhow!("native object metadata missing string {key}"))
 }
 
 fn json_metadata(artifact_json: &JsonValue) -> Result<JsonValue> {
@@ -359,22 +361,6 @@ fn ensure_host_linker_for_target(target_triple: &str) -> Result<()> {
         bail!("cannot build executable: cc linker is not available");
     }
     Ok(())
-}
-
-fn object_format(target_triple: &str) -> Result<&'static str> {
-    match target_triple {
-        LINUX_X86_64_TARGET => Ok("elf64-x86-64-relocatable"),
-        APPLE_ARM64_TARGET => Ok("macho64-arm64-relocatable"),
-        other => bail!("unsupported native link target {other}"),
-    }
-}
-
-fn relocation_kind(target_triple: &str) -> Result<&'static str> {
-    match target_triple {
-        LINUX_X86_64_TARGET => Ok("R_X86_64_PLT32"),
-        APPLE_ARM64_TARGET => Ok("ARM64_RELOC_BRANCH26"),
-        other => bail!("unsupported native link target {other}"),
-    }
 }
 
 fn link_options(target_triple: &str) -> Result<JsonValue> {

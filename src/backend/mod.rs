@@ -34,7 +34,6 @@ pub(crate) trait CompilerBackend {
 pub(crate) struct ObjectBackendInput<'a> {
     pub ir: &'a LoweredFunctionIr,
     pub target_triple: &'a str,
-    pub exported_abi_names: Vec<String>,
 }
 
 pub(crate) struct ObjectBackendArtifact {

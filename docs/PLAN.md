@@ -163,7 +163,7 @@ Deliverables:
   - pipeline version
   - runtime sentinel, normally `runtime:none`
 - Use `artifact_bytes` for native objects and executables.
-- Store structured metadata in `artifact_json`, including symbol hash, exported ABI names, object format, target triple, and dependency closure.
+- Store structured metadata in `artifact_json`, including symbol hash, object format, target triple, and dependency closure; explicit public export names belong to link-plan export maps so export-map changes stay `relink_only`.
 - Add cache lookup helpers, not only cache write helpers.
 
 Files likely touched:

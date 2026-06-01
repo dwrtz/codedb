@@ -380,6 +380,82 @@ fn native_link_plan_is_deterministic_and_reused_across_rename() {
 }
 
 #[test]
+fn link_plan_cache_key_records_object_dependencies_and_duplicate_relocations() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("native-link-deps.sqlite");
+    let source = temp.path().join("two-calls.cdb");
+    let plan_path = temp.path().join("two-calls.link.json");
+    let plan_again_path = temp.path().join("two-calls-again.link.json");
+
+    std::fs::write(
+        &source,
+        "fn inc(x: i64) -> i64 = x + 1\n\nfn main() -> i64 = inc(1) + inc(2)\n",
+    )
+    .unwrap();
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), source.to_str().unwrap()]);
+    let main_symbol =
+        parse_line_value(&run(&["show", db.to_str().unwrap(), "main"]), "symbol ").to_string();
+
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_path.to_str().unwrap(),
+    ]);
+    let plan_text = std::fs::read_to_string(&plan_path).unwrap();
+    let plan_json: JsonValue = serde_json::from_str(&plan_text).unwrap();
+    let main_object = plan_json["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|object| object["symbol_hash"] == main_symbol)
+        .expect("main object in link plan");
+    let relocations = main_object["relocations"].as_array().unwrap();
+    assert_eq!(relocations.len(), 2);
+    assert!(relocations.iter().all(|relocation| {
+        relocation["kind"] == "R_X86_64_PLT32" && relocation["offset"].as_u64().is_some()
+    }));
+
+    let key_jsons = cache_key_json_values_by_kind(&db, "link_plan");
+    assert_eq!(key_jsons.len(), 1);
+    let mut key_dependencies = key_jsons[0]["dependency_implementation_hashes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let mut plan_objects = plan_json["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|object| object["object_artifact_hash"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    key_dependencies.sort();
+    plan_objects.sort();
+    assert_eq!(key_dependencies, plan_objects);
+
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_again_path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        std::fs::read_to_string(&plan_again_path).unwrap(),
+        plan_text
+    );
+    assert_eq!(cache_row_count_by_kind(&db, "link_plan"), 1);
+}
+
+#[test]
 fn native_build_emits_apple_executable_and_caches_it() {
     if !is_apple_silicon() {
         return;
@@ -419,6 +495,39 @@ fn native_build_emits_apple_executable_and_caches_it() {
     ]);
     assert_eq!(std::fs::read(&exe_again).unwrap(), bytes);
     assert_eq!(cache_row_count_by_kind(&db, "executable"), 1);
+}
+
+#[test]
+fn interface_cache_is_per_symbol_even_when_signatures_match() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("interfaces.sqlite");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+
+    let interface_rows = cache_json_values_by_kind(&db, "interface_hash");
+    let symbols = interface_rows
+        .iter()
+        .map(|value| {
+            value["metadata"]["symbol_hash"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let signatures = interface_rows
+        .iter()
+        .map(|value| {
+            value["metadata"]["signature_hash"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(interface_rows.len(), 3);
+    assert_eq!(symbols.len(), 3);
+    assert!(signatures.len() < symbols.len());
 }
 
 #[test]
@@ -620,6 +729,62 @@ fn export_map_changes_are_explicit_relink_only_operations() {
         .assert()
         .success()
         .stdout("verify ok\n");
+}
+
+#[test]
+fn export_map_changes_do_not_stale_native_object_metadata() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("export-object-metadata.sqlite");
+    let tax_before = temp.path().join("tax-before.o");
+    let tax_after = temp.path().join("tax-after.o");
+    let plan_path = temp.path().join("exports.link.json");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    let tax_definition =
+        parse_line_value(&run(&["show", db.to_str().unwrap(), "tax"]), "definition ").to_string();
+
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "tax",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        tax_before.to_str().unwrap(),
+    ]);
+    run(&["set-export", db.to_str().unwrap(), "tax", "public_tax"]);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "tax",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        tax_after.to_str().unwrap(),
+    ]);
+
+    assert_eq!(
+        std::fs::read(&tax_before).unwrap(),
+        std::fs::read(&tax_after).unwrap()
+    );
+    assert_eq!(cache_row_count_by_kind(&db, "object_file"), 1);
+    let (object_cache_json, _) = object_cache_entry_by_definition(&db, &tax_definition);
+    let object_cache_text = serde_json::to_string(&object_cache_json).unwrap();
+    assert!(!object_cache_text.contains("exported_abi_names"));
+    assert!(!object_cache_text.contains("public_tax"));
+
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_path.to_str().unwrap(),
+    ]);
+    let plan_text = std::fs::read_to_string(&plan_path).unwrap();
+    assert!(plan_text.contains("public_tax"));
 }
 
 #[test]
@@ -1169,6 +1334,34 @@ fn cache_rows(db: &Path) -> Vec<(String, String, String)> {
         .unwrap()
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap()
+}
+
+fn cache_json_values_by_kind(db: &Path, artifact_kind: &str) -> Vec<JsonValue> {
+    let conn = Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT artifact_json FROM compile_cache
+             WHERE artifact_kind = ?1 ORDER BY cache_key",
+        )
+        .unwrap();
+    stmt.query_map([artifact_kind], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+        .collect()
+}
+
+fn cache_key_json_values_by_kind(db: &Path, artifact_kind: &str) -> Vec<JsonValue> {
+    let conn = Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT cache_key_json FROM compile_cache
+             WHERE artifact_kind = ?1 ORDER BY cache_key",
+        )
+        .unwrap();
+    stmt.query_map([artifact_kind], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+        .collect()
 }
 
 fn row_count(db: &Path, table: &str) -> i64 {
