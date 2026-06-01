@@ -567,6 +567,38 @@ fn failed_applied_migration_rolls_back_partial_writes() {
         .stdout("verify ok\n");
 }
 
+#[test]
+fn verify_rejects_cache_key_payload_mismatch() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("cache-mismatch.sqlite");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, cache_key_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, cache_key_json FROM compile_cache
+             WHERE artifact_kind = 'interface_hash'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&cache_key_json).unwrap();
+    value["target_triple"] = JsonValue::String("aarch64-apple-darwin".to_string());
+    let tampered = serde_json::to_string(&value).unwrap();
+    conn.execute(
+        "UPDATE compile_cache SET cache_key_json = ?1 WHERE cache_key = ?2",
+        (&tampered, &cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_cache_entry"));
+    assert!(stderr.contains("cache key mismatch"));
+}
+
 fn cache_rows(db: &Path) -> Vec<(String, String, String)> {
     let conn = Connection::open(db).unwrap();
     let mut stmt = conn

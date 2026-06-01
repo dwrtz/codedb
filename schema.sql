@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS dependencies (
 
 CREATE TABLE IF NOT EXISTS compile_cache (
     cache_key TEXT PRIMARY KEY,
+    cache_key_json TEXT NOT NULL,
     input_hash TEXT NOT NULL,
     backend TEXT NOT NULL,
     target TEXT NOT NULL,

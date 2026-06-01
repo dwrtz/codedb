@@ -6,18 +6,26 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 
+use crate::artifact::{ARTIFACT_METADATA_SCHEMA, CacheKeyInput};
 use crate::backend::ArtifactKind;
 use crate::model::{
     BranchState, NameBinding, ProgramRootPayload, RootSymbolPayload, normalize_root, param_names,
     preferred_names, resolve_name_in_root,
 };
-use crate::{
-    BYTES_DOMAIN, CACHE_DOMAIN, COMPILER_VERSION, MAIN_BRANCH, OBJECT_DOMAIN, PIPELINE_VERSION,
-    SCHEMA_SQL, SCHEMA_VERSION,
-};
+use crate::{BYTES_DOMAIN, CACHE_DOMAIN, MAIN_BRANCH, OBJECT_DOMAIN, SCHEMA_SQL, SCHEMA_VERSION};
 
 pub struct CodeDb {
     pub(crate) conn: Connection,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct CacheEntry {
+    pub(crate) cache_key: String,
+    pub(crate) key_input: CacheKeyInput,
+    pub(crate) artifact_hash: String,
+    pub(crate) artifact_json: Option<JsonValue>,
+    pub(crate) artifact_bytes: Option<Vec<u8>>,
 }
 
 impl CodeDb {
@@ -25,6 +33,7 @@ impl CodeDb {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA_SQL)?;
+        migrate_compile_cache_schema(&conn)?;
         Ok(Self { conn })
     }
 
@@ -374,17 +383,10 @@ impl CodeDb {
         artifact_kind: ArtifactKind,
         text: &str,
     ) -> Result<()> {
+        let key_input = CacheKeyInput::new(artifact_kind, input_hash, backend, target);
         let artifact_hash = hash_bytes(BYTES_DOMAIN, text.as_bytes());
-        let artifact_json = json!({ "artifact_kind": artifact_kind.as_str(), "text": text });
-        self.write_cache(
-            input_hash,
-            backend,
-            target,
-            artifact_kind,
-            &artifact_hash,
-            Some(&artifact_json),
-            None,
-        )
+        let artifact_json = text_artifact_metadata(&key_input, text, &artifact_hash);
+        self.write_cache_entry(&key_input, &artifact_hash, Some(&artifact_json), None)
     }
 
     pub(crate) fn write_cache_json(
@@ -395,19 +397,13 @@ impl CodeDb {
         artifact_kind: ArtifactKind,
         artifact_json: &JsonValue,
     ) -> Result<()> {
+        let key_input = CacheKeyInput::new(artifact_kind, input_hash, backend, target);
         let artifact_hash = hash_bytes(BYTES_DOMAIN, canonical_json(artifact_json).as_bytes());
-        self.write_cache(
-            input_hash,
-            backend,
-            target,
-            artifact_kind,
-            &artifact_hash,
-            Some(artifact_json),
-            None,
-        )
+        let artifact_json = json_artifact_metadata(&key_input, artifact_json);
+        self.write_cache_entry(&key_input, &artifact_hash, Some(&artifact_json), None)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn write_cache(
         &mut self,
         input_hash: &str,
@@ -418,27 +414,60 @@ impl CodeDb {
         artifact_json: Option<&JsonValue>,
         artifact_bytes: Option<&[u8]>,
     ) -> Result<()> {
+        let key_input = CacheKeyInput::new(artifact_kind, input_hash, backend, target);
+        self.write_cache_entry(&key_input, artifact_hash, artifact_json, artifact_bytes)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn write_cache_bytes(
+        &mut self,
+        key_input: CacheKeyInput,
+        metadata: &JsonValue,
+        artifact_bytes: &[u8],
+    ) -> Result<()> {
+        let key_input = key_input.normalized();
+        let artifact_hash = hash_bytes(BYTES_DOMAIN, artifact_bytes);
+        let artifact_json = bytes_artifact_metadata(&key_input, metadata, &artifact_hash);
+        self.write_cache_entry(
+            &key_input,
+            &artifact_hash,
+            Some(&artifact_json),
+            Some(artifact_bytes),
+        )
+    }
+
+    pub(crate) fn write_cache_entry(
+        &mut self,
+        key_input: &CacheKeyInput,
+        artifact_hash: &str,
+        artifact_json: Option<&JsonValue>,
+        artifact_bytes: Option<&[u8]>,
+    ) -> Result<()> {
+        let key_input = key_input.clone().normalized();
+        key_input.validate()?;
         debug_assert!(
-            !artifact_kind.is_compiler_artifact() || backend != "projection",
+            !key_input.artifact_kind.is_compiler_artifact() || key_input.backend_id != "projection",
             "compiler artifacts must be emitted by a compiler backend"
         );
-        let key_payload = format!(
-            "{input_hash}\0{backend}\0{target}\0{COMPILER_VERSION}\0runtime:none\0{PIPELINE_VERSION}\0{}",
-            artifact_kind.as_str()
+        debug_assert!(
+            !key_input.artifact_kind.requires_artifact_bytes() || artifact_bytes.is_some(),
+            "native object and executable artifacts must use artifact_bytes"
         );
-        let cache_key = hash_bytes(CACHE_DOMAIN, key_payload.as_bytes());
+        let cache_key_json = cache_key_json(&key_input)?;
+        let cache_key = hash_bytes(CACHE_DOMAIN, cache_key_json.as_bytes());
         self.conn.execute(
             "INSERT OR REPLACE INTO compile_cache
-             (cache_key, input_hash, backend, target, compiler_version, artifact_kind,
+             (cache_key, cache_key_json, input_hash, backend, target, compiler_version, artifact_kind,
               artifact_hash, artifact_json, artifact_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 cache_key,
-                input_hash,
-                backend,
-                target,
-                COMPILER_VERSION,
-                artifact_kind.as_str(),
+                cache_key_json,
+                key_input.input_hash,
+                key_input.backend_id,
+                key_input.target_triple,
+                key_input.compiler_version,
+                key_input.artifact_kind.as_str(),
                 artifact_hash,
                 artifact_json.map(canonical_json),
                 artifact_bytes,
@@ -446,6 +475,116 @@ impl CodeDb {
         )?;
         Ok(())
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn lookup_cache(&self, key_input: &CacheKeyInput) -> Result<Option<CacheEntry>> {
+        let key_input = key_input.clone().normalized();
+        key_input.validate()?;
+        let cache_key = cache_key_for_input(&key_input)?;
+        let Some((cache_key_json, artifact_hash, artifact_json, artifact_bytes)) = self
+            .conn
+            .query_row(
+                "SELECT cache_key_json, artifact_hash, artifact_json, artifact_bytes
+                 FROM compile_cache WHERE cache_key = ?1",
+                params![cache_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let stored_key_input = serde_json::from_str::<CacheKeyInput>(&cache_key_json)?.normalized();
+        Ok(Some(CacheEntry {
+            cache_key,
+            key_input: stored_key_input,
+            artifact_hash,
+            artifact_json: artifact_json
+                .map(|json| serde_json::from_str::<JsonValue>(&json))
+                .transpose()?,
+            artifact_bytes,
+        }))
+    }
+}
+
+pub(crate) fn cache_key_for_input(key_input: &CacheKeyInput) -> Result<String> {
+    let key_input = key_input.clone().normalized();
+    key_input.validate()?;
+    Ok(hash_bytes(
+        CACHE_DOMAIN,
+        cache_key_json(&key_input)?.as_bytes(),
+    ))
+}
+
+fn migrate_compile_cache_schema(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(compile_cache)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    drop(stmt);
+
+    if !columns.contains("cache_key_json") {
+        conn.execute(
+            "ALTER TABLE compile_cache ADD COLUMN cache_key_json TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn cache_key_json(key_input: &CacheKeyInput) -> Result<String> {
+    let key_input = key_input.clone().normalized();
+    key_input.validate()?;
+    Ok(canonical_json(&serde_json::to_value(key_input)?))
+}
+
+fn text_artifact_metadata(key_input: &CacheKeyInput, text: &str, text_hash: &str) -> JsonValue {
+    json!({
+        "schema": ARTIFACT_METADATA_SCHEMA,
+        "artifact_kind": key_input.artifact_kind.as_str(),
+        "input_hash": &key_input.input_hash,
+        "backend_id": &key_input.backend_id,
+        "target_triple": &key_input.target_triple,
+        "content_kind": "text",
+        "text": text,
+        "text_hash": text_hash,
+    })
+}
+
+fn json_artifact_metadata(key_input: &CacheKeyInput, metadata: &JsonValue) -> JsonValue {
+    json!({
+        "schema": ARTIFACT_METADATA_SCHEMA,
+        "artifact_kind": key_input.artifact_kind.as_str(),
+        "input_hash": &key_input.input_hash,
+        "backend_id": &key_input.backend_id,
+        "target_triple": &key_input.target_triple,
+        "content_kind": "json",
+        "metadata": metadata,
+        "metadata_hash": hash_bytes(BYTES_DOMAIN, canonical_json(metadata).as_bytes()),
+    })
+}
+
+fn bytes_artifact_metadata(
+    key_input: &CacheKeyInput,
+    metadata: &JsonValue,
+    bytes_hash: &str,
+) -> JsonValue {
+    json!({
+        "schema": ARTIFACT_METADATA_SCHEMA,
+        "artifact_kind": key_input.artifact_kind.as_str(),
+        "input_hash": &key_input.input_hash,
+        "backend_id": &key_input.backend_id,
+        "target_triple": &key_input.target_triple,
+        "content_kind": "bytes",
+        "metadata": metadata,
+        "bytes_hash": bytes_hash,
+    })
 }
 
 pub(crate) fn hash_object_canonical(
@@ -521,5 +660,60 @@ fn extract_hash_strings(value: &JsonValue, out: &mut Vec<String>) {
             }
         }
         JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn object_cache_key_includes_target_and_lookup_round_trips_bytes() {
+        let temp = tempdir().unwrap();
+        let mut db = CodeDb::open(temp.path().join("cache.sqlite")).unwrap();
+        db.init().unwrap();
+        let input_hash = db
+            .put_object("LoweredFunctionIR", &json!({ "symbol": "demo" }))
+            .unwrap();
+        let dep_interface = hash_bytes(BYTES_DOMAIN, b"callee-interface");
+        let linux_key = CacheKeyInput::new(
+            ArtifactKind::ObjectFile,
+            &input_hash,
+            "native-elf-v0",
+            "x86_64-unknown-linux-gnu",
+        )
+        .with_dependency_interface_hashes(vec![dep_interface.clone()]);
+        let darwin_key = CacheKeyInput::new(
+            ArtifactKind::ObjectFile,
+            &input_hash,
+            "native-elf-v0",
+            "aarch64-apple-darwin",
+        )
+        .with_dependency_interface_hashes(vec![dep_interface]);
+
+        assert_ne!(
+            cache_key_for_input(&linux_key).unwrap(),
+            cache_key_for_input(&darwin_key).unwrap()
+        );
+
+        db.write_cache_bytes(
+            linux_key.clone(),
+            &json!({
+                "symbol_hash": input_hash,
+                "exported_abi_names": [],
+                "object_format": "elf-relocatable",
+                "target_triple": "x86_64-unknown-linux-gnu",
+                "dependency_closure": [],
+            }),
+            b"\x7fELF",
+        )
+        .unwrap();
+
+        let entry = db.lookup_cache(&linux_key).unwrap().unwrap();
+        assert_eq!(entry.artifact_bytes.as_deref(), Some(&b"\x7fELF"[..]));
+        assert!(db.lookup_cache(&darwin_key).unwrap().is_none());
+        db.verify().unwrap();
     }
 }

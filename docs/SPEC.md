@@ -746,6 +746,7 @@ CREATE TABLE IF NOT EXISTS dependencies (
 
 CREATE TABLE IF NOT EXISTS compile_cache (
     cache_key TEXT PRIMARY KEY,
+    cache_key_json TEXT NOT NULL,
     input_hash TEXT NOT NULL,
     backend TEXT NOT NULL,
     target TEXT NOT NULL,
@@ -765,6 +766,7 @@ USING fts5(root_hash, symbol_hash, rendered_source);
 Expected cache use:
 
 ```text
+cache_key_json stores the canonical typed cache-key input.
 artifact_kind is the typed artifact discriminator.
 backend stores the producer ID; projection artifacts use projection, while compiler artifacts use a backend ID.
 artifact_json stores deterministic metadata.

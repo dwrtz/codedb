@@ -1,3 +1,4 @@
+mod artifact;
 mod backend;
 mod backend_c;
 mod build_plan;
