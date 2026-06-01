@@ -10,7 +10,9 @@ use crate::artifact::CacheKeyInput;
 use crate::backend::{ArtifactKind, ObjectBackend, ObjectBackendArtifact, ObjectBackendInput};
 use crate::lowering::{LoweredBlock, LoweredFunctionIr, LoweredOp};
 use crate::model::ProgramRootPayload;
-use crate::store::{CodeDb, canonical_json, function_interface_metadata, hash_bytes};
+use crate::store::{
+    CodeDb, cache_key_for_input, canonical_json, function_interface_metadata, hash_bytes,
+};
 use crate::types::type_hash_for;
 use crate::{APPLE_ARM64_TARGET, BYTES_DOMAIN, LINUX_X86_64_TARGET, MAIN_BRANCH};
 
@@ -27,6 +29,7 @@ pub(crate) struct MachOArm64ObjectBackend;
 
 pub(crate) struct NativeObjectArtifact {
     pub(crate) artifact_hash: String,
+    pub(crate) cache_key: String,
     pub(crate) metadata: JsonValue,
     pub(crate) bytes: Vec<u8>,
 }
@@ -191,6 +194,7 @@ impl CodeDb {
             target_triple,
         )
         .with_dependency_interface_hashes(dependency_interface_hashes.clone());
+        let object_cache_key = cache_key_for_input(&key_input)?;
 
         if let Some(cache_entry) = self.lookup_cache(&key_input)? {
             let bytes = cache_entry
@@ -202,6 +206,7 @@ impl CodeDb {
             let metadata = object_metadata_from_cache(&metadata)?;
             return Ok(NativeObjectArtifact {
                 artifact_hash: cache_entry.artifact_hash,
+                cache_key: cache_entry.cache_key,
                 metadata,
                 bytes,
             });
@@ -225,6 +230,7 @@ impl CodeDb {
         self.write_cache_bytes(key_input, &metadata, &emitted.bytes)?;
         Ok(NativeObjectArtifact {
             artifact_hash: emitted.artifact_hash,
+            cache_key: object_cache_key,
             metadata,
             bytes: emitted.bytes,
         })

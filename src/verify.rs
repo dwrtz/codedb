@@ -791,6 +791,29 @@ impl CodeDb {
                     "bad_link_plan: {cache_key} object has invalid symbol hash: {err:#}"
                 )),
             }
+            let object_cache_key = object.get("object_cache_key").and_then(JsonValue::as_str);
+            let object_artifact_hash = object
+                .get("object_artifact_hash")
+                .and_then(JsonValue::as_str);
+            match (object_cache_key, object_artifact_hash) {
+                (Some(object_cache_key), Some(object_artifact_hash)) => {
+                    if !self.cache_key_artifact_exists(
+                        ArtifactKind::ObjectFile,
+                        object_cache_key,
+                        object_artifact_hash,
+                    )? {
+                        errors.push(format!(
+                            "bad_link_plan: {cache_key} object cache key does not identify artifact {object_artifact_hash}"
+                        ));
+                    }
+                }
+                (None, _) => errors.push(format!(
+                    "bad_link_plan: {cache_key} object missing object cache key"
+                )),
+                (_, None) => errors.push(format!(
+                    "bad_link_plan: {cache_key} object missing object artifact hash"
+                )),
+            }
         }
         let object_hashes = plan
             .get("objects")
@@ -804,7 +827,15 @@ impl CodeDb {
             })
             .map(str::to_string)
             .collect::<BTreeSet<_>>();
-        if object_hashes
+        let object_cache_keys = plan
+            .get("objects")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|object| object.get("object_cache_key").and_then(JsonValue::as_str))
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        if object_cache_keys
             != key_input
                 .dependency_implementation_hashes
                 .iter()
@@ -812,8 +843,15 @@ impl CodeDb {
                 .collect::<BTreeSet<_>>()
         {
             errors.push(format!(
-                "bad_link_plan: {cache_key} object artifact dependencies mismatch"
+                "bad_link_plan: {cache_key} object cache key dependencies mismatch"
             ));
+        }
+        for object_cache_key in &object_cache_keys {
+            if !self.cache_key_exists(ArtifactKind::ObjectFile, object_cache_key)? {
+                errors.push(format!(
+                    "bad_link_plan: {cache_key} references missing object cache key {object_cache_key}"
+                ));
+            }
         }
         for object_hash in &object_hashes {
             if !self.cache_artifact_exists(ArtifactKind::ObjectFile, object_hash)? {
@@ -840,6 +878,11 @@ impl CodeDb {
                 if json_string_set(input.get("object_artifact_hashes")) != object_hashes {
                     errors.push(format!(
                         "bad_link_plan: {cache_key} object list does not match link input"
+                    ));
+                }
+                if json_string_set(input.get("object_cache_keys")) != object_cache_keys {
+                    errors.push(format!(
+                        "bad_link_plan: {cache_key} object cache key list does not match link input"
                     ));
                 }
             }
@@ -938,12 +981,28 @@ impl CodeDb {
                 "bad_executable_artifact: {cache_key} missing linker identity dependency"
             ));
         }
-        for object_hash in json_string_set(metadata.get("object_artifact_hashes")) {
-            if !dependency_hashes.contains(&object_hash)
-                || !self.cache_artifact_exists(ArtifactKind::ObjectFile, &object_hash)?
+        let object_cache_keys = json_string_set(metadata.get("object_cache_keys"));
+        let mut expected_object_dependencies = dependency_hashes.clone();
+        expected_object_dependencies.remove(link_plan_hash);
+        expected_object_dependencies.remove(linker_identity_hash);
+        if object_cache_keys != expected_object_dependencies {
+            errors.push(format!(
+                "bad_executable_artifact: {cache_key} object cache key dependencies mismatch"
+            ));
+        }
+        for object_cache_key in object_cache_keys {
+            if !dependency_hashes.contains(&object_cache_key)
+                || !self.cache_key_exists(ArtifactKind::ObjectFile, &object_cache_key)?
             {
                 errors.push(format!(
-                    "bad_executable_artifact: {cache_key} missing object dependency {object_hash}"
+                    "bad_executable_artifact: {cache_key} missing object dependency {object_cache_key}"
+                ));
+            }
+        }
+        for object_hash in json_string_set(metadata.get("object_artifact_hashes")) {
+            if !self.cache_artifact_exists(ArtifactKind::ObjectFile, &object_hash)? {
+                errors.push(format!(
+                    "bad_executable_artifact: {cache_key} references missing object artifact {object_hash}"
                 ));
             }
         }
@@ -961,6 +1020,33 @@ impl CodeDb {
                 WHERE artifact_kind = ?1 AND artifact_hash = ?2
              )",
             params![artifact_kind.as_str(), artifact_hash],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn cache_key_exists(&self, artifact_kind: ArtifactKind, cache_key: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM compile_cache
+                WHERE artifact_kind = ?1 AND cache_key = ?2
+             )",
+            params![artifact_kind.as_str(), cache_key],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn cache_key_artifact_exists(
+        &self,
+        artifact_kind: ArtifactKind,
+        cache_key: &str,
+        artifact_hash: &str,
+    ) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM compile_cache
+                WHERE artifact_kind = ?1 AND cache_key = ?2 AND artifact_hash = ?3
+             )",
+            params![artifact_kind.as_str(), cache_key, artifact_hash],
             |row| row.get(0),
         )?)
     }

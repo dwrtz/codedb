@@ -609,6 +609,20 @@ impl CodeDb {
             let failed_postconditions =
                 self.failed_postconditions(&old_root, &current_postconditions)?;
             if failed_postconditions.is_empty() {
+                let stale_expected_root = failed_preconditions
+                    .iter()
+                    .any(|precondition| matches!(precondition, Precondition::RootIsCurrent { .. }));
+                if stale_expected_root
+                    && !self.recorded_operation_output_matches(expected_root, &old_root, &op)?
+                {
+                    return Ok(MigrationOutcome::Conflict(MigrationConflict {
+                        current_root: old_root,
+                        expected_root: expected_root.to_string(),
+                        summary: fallback_summary,
+                        failed_preconditions,
+                        failed_postconditions,
+                    }));
+                }
                 let summary = self.migration_summary_for_roots(&op, &old_root, &old_root)?;
                 return Ok(MigrationOutcome::AlreadyApplied(MigrationReport {
                     old_root: old_root.clone(),
@@ -1688,6 +1702,26 @@ impl CodeDb {
         }
         items.reverse();
         Ok(items)
+    }
+
+    fn recorded_operation_output_matches(
+        &self,
+        input_root: &str,
+        output_root: &str,
+        op: &Operation,
+    ) -> Result<bool> {
+        let operation_json = canonical_json(&serde_json::to_value(op)?);
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM migrations
+                WHERE input_root_hash = ?1
+                  AND output_root_hash = ?2
+                  AND operation_kind = ?3
+                  AND operation_json = ?4
+            )",
+            params![input_root, output_root, op.kind_name(), operation_json],
+            |row| row.get(0),
+        )?)
     }
 }
 

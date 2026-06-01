@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
@@ -501,14 +501,12 @@ impl CodeDb {
     ) -> Result<()> {
         let key_input = key_input.clone().normalized();
         key_input.validate()?;
-        debug_assert!(
-            !key_input.artifact_kind.is_compiler_artifact() || key_input.backend_id != "projection",
-            "compiler artifacts must be emitted by a compiler backend"
-        );
-        debug_assert!(
-            !key_input.artifact_kind.requires_artifact_bytes() || artifact_bytes.is_some(),
-            "native object and executable artifacts must use artifact_bytes"
-        );
+        if key_input.artifact_kind.is_compiler_artifact() && key_input.backend_id == "projection" {
+            bail!("compiler artifacts must be emitted by a compiler backend");
+        }
+        if key_input.artifact_kind.requires_artifact_bytes() && artifact_bytes.is_none() {
+            bail!("native object and executable artifacts must use artifact_bytes");
+        }
         let cache_key_json = cache_key_json(&key_input)?;
         let cache_key = hash_bytes(CACHE_DOMAIN, cache_key_json.as_bytes());
         self.conn.execute(

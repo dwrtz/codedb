@@ -35,6 +35,7 @@ struct PreparedLink {
 
 struct PreparedObject {
     artifact_hash: String,
+    cache_key: String,
     bytes: Vec<u8>,
 }
 
@@ -80,6 +81,10 @@ impl CodeDb {
             "object_artifact_hashes": prepared.objects
                 .iter()
                 .map(|object| object.artifact_hash.clone())
+                .collect::<Vec<_>>(),
+            "object_cache_keys": prepared.objects
+                .iter()
+                .map(|object| object.cache_key.clone())
                 .collect::<Vec<_>>(),
         });
         self.write_cache_bytes(key_input, &metadata, &executable)?;
@@ -130,6 +135,7 @@ impl CodeDb {
                     .unwrap_or_else(|| json!([])),
                 "object_format": required_metadata_str(&object_metadata, "object_format")?,
                 "object_artifact_hash": &object.artifact_hash,
+                "object_cache_key": &object.cache_key,
                 "called_symbols": required_metadata_value(&object_metadata, "called_symbols")?,
                 "relocations": required_metadata_value(&object_metadata, "relocations")?,
             }));
@@ -156,6 +162,10 @@ impl CodeDb {
                 .iter()
                 .map(|object| object.artifact_hash.clone())
                 .collect::<Vec<_>>(),
+            "object_cache_keys": objects
+                .iter()
+                .map(|object| object.cache_key.clone())
+                .collect::<Vec<_>>(),
             "export_map": exports,
             "link_options": link_options(target_triple)?,
         });
@@ -171,9 +181,9 @@ impl CodeDb {
             "external_symbols": [],
             "link_options": input["link_options"].clone(),
         });
-        let object_hashes = objects
+        let object_cache_keys = objects
             .iter()
-            .map(|object| object.artifact_hash.clone())
+            .map(|object| object.cache_key.clone())
             .collect::<Vec<_>>();
         let key_input = CacheKeyInput::new(
             ArtifactKind::LinkPlan,
@@ -181,7 +191,7 @@ impl CodeDb {
             LINK_PLAN_BACKEND_ID,
             target_triple,
         )
-        .with_dependency_implementation_hashes(object_hashes);
+        .with_dependency_implementation_hashes(object_cache_keys);
         let plan_hash;
         if let Some(cache_entry) = self.lookup_cache(&key_input)?
             && let Some(artifact_json) = cache_entry.artifact_json
@@ -252,6 +262,7 @@ impl CodeDb {
 fn prepared_object(object: NativeObjectArtifact) -> PreparedObject {
     PreparedObject {
         artifact_hash: object.artifact_hash,
+        cache_key: object.cache_key,
         bytes: object.bytes,
     }
 }
@@ -293,7 +304,7 @@ fn executable_cache_key(prepared: &PreparedLink, linker_identity_hash: &str) -> 
         prepared
             .objects
             .iter()
-            .map(|object| object.artifact_hash.clone())
+            .map(|object| object.cache_key.clone())
             .chain(std::iter::once(prepared.plan_hash.clone()))
             .chain(std::iter::once(linker_identity_hash.to_string()))
             .collect(),

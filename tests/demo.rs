@@ -433,7 +433,7 @@ fn link_plan_cache_key_records_object_dependencies_and_duplicate_relocations() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|object| object["object_artifact_hash"].as_str().unwrap().to_string())
+        .map(|object| object["object_cache_key"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     key_dependencies.sort();
     plan_objects.sort();
@@ -453,6 +453,76 @@ fn link_plan_cache_key_records_object_dependencies_and_duplicate_relocations() {
         plan_text
     );
     assert_eq!(cache_row_count_by_kind(&db, "link_plan"), 1);
+}
+
+#[test]
+fn link_plan_cache_key_distinguishes_semantic_objects_with_identical_bytes() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("same-bytes.sqlite");
+    let source = temp.path().join("same-bytes.cdb");
+    let plan_before = temp.path().join("before.link.json");
+    let plan_after = temp.path().join("after.link.json");
+
+    std::fs::write(&source, "fn id(x: i64) -> i64 = x\n").unwrap();
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), source.to_str().unwrap()]);
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "id",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_before.to_str().unwrap(),
+    ]);
+
+    let change = run(&[
+        "change-signature",
+        db.to_str().unwrap(),
+        "id",
+        "(x: bool) -> bool",
+    ]);
+    assert!(change.contains("build_impact recompile_dependents"));
+
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "id",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_after.to_str().unwrap(),
+    ]);
+
+    let before: JsonValue = serde_json::from_str(&std::fs::read_to_string(&plan_before).unwrap())
+        .expect("before link plan json");
+    let after: JsonValue = serde_json::from_str(&std::fs::read_to_string(&plan_after).unwrap())
+        .expect("after link plan json");
+    let before_object = &before["objects"][0];
+    let after_object = &after["objects"][0];
+
+    assert_ne!(before["input_hash"], after["input_hash"]);
+    assert_ne!(
+        before_object["definition_hash"],
+        after_object["definition_hash"]
+    );
+    assert_eq!(
+        before_object["object_artifact_hash"],
+        after_object["object_artifact_hash"]
+    );
+    assert_ne!(
+        before_object["object_cache_key"],
+        after_object["object_cache_key"]
+    );
+    assert_eq!(cache_row_count_by_kind(&db, "object_file"), 2);
+    assert_eq!(cache_row_count_by_kind(&db, "link_plan"), 2);
+
+    bin()
+        .args(["verify", db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
 }
 
 #[test]
@@ -1065,6 +1135,34 @@ fn stale_expected_root_returns_conflict_without_writes() {
         .assert()
         .success()
         .stdout("verify ok\n");
+}
+
+#[test]
+fn stale_expected_root_after_applied_operation_and_later_divergence_conflicts() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("already-applied-divergence.sqlite");
+
+    run(&["init", db.to_str().unwrap()]);
+    let import = run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    let expected_root = parse_line_value(&import, "root ");
+
+    run(&["rename", db.to_str().unwrap(), "tax", "vat"]);
+    run(&["create-alias", db.to_str().unwrap(), "total", "sum"]);
+    let branch_before_conflict = branch_state(&db);
+    let counts_before_conflict = mutation_guard_counts(&db);
+
+    let conflict = run(&[
+        "rename",
+        db.to_str().unwrap(),
+        "tax",
+        "vat",
+        "--expect-root",
+        expected_root,
+    ]);
+    assert!(conflict.contains("conflict rename_symbol main.tax -> main.vat"));
+    assert!(!conflict.contains("already_applied"));
+    assert_eq!(branch_state(&db), branch_before_conflict);
+    assert_eq!(mutation_guard_counts(&db), counts_before_conflict);
 }
 
 #[test]
