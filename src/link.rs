@@ -10,9 +10,11 @@ use crate::artifact::CacheKeyInput;
 use crate::backend::ArtifactKind;
 use crate::backend::native::NativeObjectArtifact;
 use crate::model::ProgramRootPayload;
-use crate::store::CodeDb;
+use crate::store::{CodeDb, hash_bytes};
 use crate::types::type_hash_for;
-use crate::{APPLE_ARM64_TARGET, DEFAULT_NATIVE_TARGET, LINUX_X86_64_TARGET, MAIN_BRANCH};
+use crate::{
+    APPLE_ARM64_TARGET, BYTES_DOMAIN, DEFAULT_NATIVE_TARGET, LINUX_X86_64_TARGET, MAIN_BRANCH,
+};
 
 const LINK_PLAN_SCHEMA: &str = "codedb/link-plan/v1";
 const LINK_INPUT_SCHEMA: &str = "codedb/link-input/v1";
@@ -57,14 +59,15 @@ impl CodeDb {
         let prepared = self.prepare_link_plan_main_branch(entry_name, target_triple)?;
         self.ensure_executable_entry(&prepared.plan)?;
 
-        let key_input = executable_cache_key(&prepared);
+        let linker_identity = host_linker_identity_for_target(target_triple)?;
+        let linker_identity_hash = hash_bytes(BYTES_DOMAIN, linker_identity.as_bytes());
+        let key_input = executable_cache_key(&prepared, &linker_identity_hash);
         if let Some(cache_entry) = self.lookup_cache(&key_input)?
             && let Some(bytes) = cache_entry.artifact_bytes
         {
             return Ok(NativeBuild { executable: bytes });
         }
 
-        ensure_host_linker_for_target(target_triple)?;
         let executable = link_with_cc(&prepared)?;
         let metadata = json!({
             "schema": EXECUTABLE_METADATA_SCHEMA,
@@ -73,6 +76,7 @@ impl CodeDb {
             "entry_abi_symbol": prepared.plan["entry_abi_symbol"].clone(),
             "link_plan_hash": prepared.plan_hash,
             "linker": "cc",
+            "linker_identity_hash": linker_identity_hash,
             "object_artifact_hashes": prepared.objects
                 .iter()
                 .map(|object| object.artifact_hash.clone())
@@ -104,6 +108,7 @@ impl CodeDb {
         target_triple: &str,
     ) -> Result<PreparedLink> {
         let symbols = self.reachable_symbols(root_hash, entry_symbol)?;
+        let linked_symbols = symbols.iter().cloned().collect::<BTreeSet<_>>();
         let mut objects = Vec::new();
         let mut object_entries = Vec::new();
         for symbol in symbols {
@@ -133,6 +138,7 @@ impl CodeDb {
 
         let exports = export_map(root)?
             .into_iter()
+            .filter(|export| linked_symbols.contains(&export.symbol))
             .map(|export| {
                 json!({
                     "symbol_hash": export.symbol,
@@ -274,7 +280,7 @@ fn json_metadata(artifact_json: &JsonValue) -> Result<JsonValue> {
         .ok_or_else(|| anyhow!("cached link plan missing metadata"))
 }
 
-fn executable_cache_key(prepared: &PreparedLink) -> CacheKeyInput {
+fn executable_cache_key(prepared: &PreparedLink, linker_identity_hash: &str) -> CacheKeyInput {
     CacheKeyInput::new(
         ArtifactKind::Executable,
         &prepared.input_hash,
@@ -289,6 +295,7 @@ fn executable_cache_key(prepared: &PreparedLink) -> CacheKeyInput {
             .iter()
             .map(|object| object.artifact_hash.clone())
             .chain(std::iter::once(prepared.plan_hash.clone()))
+            .chain(std::iter::once(linker_identity_hash.to_string()))
             .collect(),
     )
 }
@@ -350,7 +357,7 @@ fn build_temp_dir(plan_hash: &str) -> Result<PathBuf> {
     )))
 }
 
-fn ensure_host_linker_for_target(target_triple: &str) -> Result<()> {
+fn host_linker_identity_for_target(target_triple: &str) -> Result<String> {
     let supported = match target_triple {
         APPLE_ARM64_TARGET => cfg!(all(target_os = "macos", target_arch = "aarch64")),
         LINUX_X86_64_TARGET => cfg!(all(target_os = "linux", target_arch = "x86_64")),
@@ -361,10 +368,22 @@ fn ensure_host_linker_for_target(target_triple: &str) -> Result<()> {
             "cannot build executable for {target_triple} on this host with the external cc linker"
         );
     }
-    if Command::new("cc").arg("--version").output().is_err() {
-        bail!("cannot build executable: cc linker is not available");
+    let output = Command::new("cc")
+        .arg("--version")
+        .output()
+        .context("cannot build executable: cc linker is not available")?;
+    if !output.status.success() {
+        bail!(
+            "cannot identify cc linker\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
-    Ok(())
+    Ok(format!(
+        "{EXTERNAL_CC_LINKER_BACKEND_ID}\0{target_triple}\0{}\0{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
 }
 
 fn link_options(target_triple: &str) -> Result<JsonValue> {

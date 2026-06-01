@@ -621,6 +621,26 @@ impl CodeDb {
                 "bad_object_artifact: {cache_key} cannot load input object kind: {err:#}"
             )),
         }
+        match self.get_payload(&key_input.input_hash) {
+            Ok(definition) => {
+                for (metadata_key, definition_key, label) in [
+                    ("symbol_hash", "symbol", "symbol"),
+                    ("function_sig_hash", "function_sig_hash", "signature"),
+                    ("typed_body_expr_hash", "typed_body_expr_hash", "typed body"),
+                ] {
+                    if metadata.get(metadata_key).and_then(JsonValue::as_str)
+                        != definition.get(definition_key).and_then(JsonValue::as_str)
+                    {
+                        errors.push(format!(
+                            "bad_object_artifact: {cache_key} {label} metadata does not match FunctionDef"
+                        ));
+                    }
+                }
+            }
+            Err(err) => errors.push(format!(
+                "bad_object_artifact: {cache_key} cannot load FunctionDef payload: {err:#}"
+            )),
+        }
         let symbol = metadata
             .get("symbol_hash")
             .and_then(JsonValue::as_str)
@@ -728,6 +748,50 @@ impl CodeDb {
                 "bad_link_plan: {cache_key} unexpected external symbols"
             ));
         }
+        let object_symbols = plan
+            .get("objects")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|object| object.get("symbol_hash").and_then(JsonValue::as_str))
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        if let Some(entry_symbol) = plan.get("entry_symbol_hash").and_then(JsonValue::as_str) {
+            if !object_symbols.contains(entry_symbol) {
+                errors.push(format!(
+                    "bad_link_plan: {cache_key} entry symbol is not backed by a linked object"
+                ));
+            }
+        } else {
+            errors.push(format!("bad_link_plan: {cache_key} missing entry symbol"));
+        }
+        for object in plan
+            .get("objects")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(symbol) = object.get("symbol_hash").and_then(JsonValue::as_str) else {
+                errors.push(format!("bad_link_plan: {cache_key} object missing symbol"));
+                continue;
+            };
+            match internal_abi_symbol(symbol) {
+                Ok(expected) => {
+                    if object
+                        .get("internal_abi_symbol")
+                        .and_then(JsonValue::as_str)
+                        != Some(expected.as_str())
+                    {
+                        errors.push(format!(
+                            "bad_link_plan: {cache_key} object internal ABI symbol mismatch"
+                        ));
+                    }
+                }
+                Err(err) => errors.push(format!(
+                    "bad_link_plan: {cache_key} object has invalid symbol hash: {err:#}"
+                )),
+            }
+        }
         let object_hashes = plan
             .get("objects")
             .and_then(JsonValue::as_array)
@@ -789,12 +853,36 @@ impl CodeDb {
             .into_iter()
             .flatten()
         {
-            if export
+            let symbol = export.get("symbol_hash").and_then(JsonValue::as_str);
+            let internal_symbol = export
+                .get("internal_abi_symbol")
+                .and_then(JsonValue::as_str);
+            let exported_symbol = export
                 .get("exported_abi_symbol")
-                .and_then(JsonValue::as_str)
-                .is_none_or(|name| validate_exported_abi_name(name).is_err())
-            {
+                .and_then(JsonValue::as_str);
+            if exported_symbol.is_none_or(|name| validate_exported_abi_name(name).is_err()) {
                 errors.push(format!("bad_link_plan: {cache_key} invalid export map"));
+            }
+            let Some(symbol) = symbol else {
+                errors.push(format!("bad_link_plan: {cache_key} export missing symbol"));
+                continue;
+            };
+            if !object_symbols.contains(symbol) {
+                errors.push(format!(
+                    "bad_link_plan: {cache_key} export is not backed by a linked object"
+                ));
+            }
+            match internal_abi_symbol(symbol) {
+                Ok(expected) => {
+                    if internal_symbol != Some(expected.as_str()) {
+                        errors.push(format!(
+                            "bad_link_plan: {cache_key} export internal ABI symbol mismatch"
+                        ));
+                    }
+                }
+                Err(err) => errors.push(format!(
+                    "bad_link_plan: {cache_key} export has invalid symbol hash: {err:#}"
+                )),
             }
         }
         Ok(())
@@ -839,6 +927,15 @@ impl CodeDb {
         {
             errors.push(format!(
                 "bad_executable_artifact: {cache_key} missing link plan dependency"
+            ));
+        }
+        let linker_identity_hash = metadata
+            .get("linker_identity_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
+        if !dependency_hashes.contains(linker_identity_hash) {
+            errors.push(format!(
+                "bad_executable_artifact: {cache_key} missing linker identity dependency"
             ));
         }
         for object_hash in json_string_set(metadata.get("object_artifact_hashes")) {

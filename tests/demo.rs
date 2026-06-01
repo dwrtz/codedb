@@ -456,6 +456,68 @@ fn link_plan_cache_key_records_object_dependencies_and_duplicate_relocations() {
 }
 
 #[test]
+fn link_plan_filters_unreachable_exports_and_verify_rejects_unbacked_exports() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("unreachable-export.sqlite");
+    let source = temp.path().join("unreachable-export.cdb");
+    let plan_path = temp.path().join("main.link.json");
+
+    std::fs::write(&source, "fn main() -> i64 = 1\n\nfn unused() -> i64 = 2\n").unwrap();
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), source.to_str().unwrap()]);
+    let show_unused = run(&["show", db.to_str().unwrap(), "unused"]);
+    let unused_symbol = parse_line_value(&show_unused, "symbol ").to_string();
+    let unused_internal_abi = parse_line_value(&show_unused, "internal_abi_symbol ").to_string();
+    run(&[
+        "set-export",
+        db.to_str().unwrap(),
+        "unused",
+        "public_unused",
+    ]);
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_path.to_str().unwrap(),
+    ]);
+
+    let plan_text = std::fs::read_to_string(&plan_path).unwrap();
+    let plan_json: JsonValue = serde_json::from_str(&plan_text).unwrap();
+    assert_eq!(plan_json["objects"].as_array().unwrap().len(), 1);
+    assert_eq!(plan_json["export_map"].as_array().unwrap().len(), 0);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'link_plan'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    value["metadata"]["export_map"] = serde_json::json!([{
+        "symbol_hash": unused_symbol,
+        "internal_abi_symbol": unused_internal_abi,
+        "exported_abi_symbol": "public_unused",
+    }]);
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (serde_json::to_string(&value).unwrap(), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_link_plan"));
+    assert!(stderr.contains("export is not backed by a linked object"));
+}
+
+#[test]
 fn native_build_emits_apple_executable_and_caches_it() {
     if !is_apple_silicon() {
         return;
@@ -485,6 +547,18 @@ fn native_build_emits_apple_executable_and_caches_it() {
     assert_eq!(cache_row_count_by_kind(&db, "object_file"), 4);
     assert_eq!(cache_row_count_by_kind(&db, "link_plan"), 1);
     assert_eq!(cache_row_count_by_kind(&db, "executable"), 1);
+    let executable_key = cache_key_json_values_by_kind(&db, "executable");
+    let executable_artifact = cache_json_values_by_kind(&db, "executable");
+    let linker_identity_hash = executable_artifact[0]["metadata"]["linker_identity_hash"]
+        .as_str()
+        .expect("executable linker identity hash");
+    assert!(
+        executable_key[0]["dependency_implementation_hashes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some(linker_identity_hash))
+    );
 
     run(&[
         "build",
@@ -1381,6 +1455,49 @@ fn verify_rejects_native_object_metadata_mismatch() {
     let stderr = run_failure(&["verify", db.to_str().unwrap()]);
     assert!(stderr.contains("bad_object_artifact"));
     assert!(stderr.contains("target"));
+}
+
+#[test]
+fn verify_rejects_native_object_metadata_that_disagrees_with_function_def() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("object-function-def-mismatch.sqlite");
+    let tax_obj = temp.path().join("tax.o");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "tax",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        tax_obj.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'object_file'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    value["metadata"]["typed_body_expr_hash"] = JsonValue::String(
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+    );
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (serde_json::to_string(&value).unwrap(), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_object_artifact"));
+    assert!(stderr.contains("typed body metadata does not match FunctionDef"));
 }
 
 #[test]
