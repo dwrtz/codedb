@@ -385,6 +385,40 @@ impl CodeDb {
         Ok(format_outcome(outcome, json))
     }
 
+    pub fn remove_alias_main_branch(&mut self, name: &str, alias: &str) -> Result<String> {
+        self.remove_alias_main_branch_expected(name, alias, None)
+    }
+
+    pub fn remove_alias_main_branch_expected(
+        &mut self,
+        name: &str,
+        alias: &str,
+        expected_root: Option<&str>,
+    ) -> Result<String> {
+        self.remove_alias_main_branch_expected_format(name, alias, expected_root, false)
+    }
+
+    pub fn remove_alias_main_branch_expected_format(
+        &mut self,
+        name: &str,
+        alias: &str,
+        expected_root: Option<&str>,
+        json: bool,
+    ) -> Result<String> {
+        self.ensure_initialized()?;
+        let branch = self.branch(MAIN_BRANCH)?;
+        let operation_root = expected_root.unwrap_or(&branch.root_hash).to_string();
+        let symbol = self.resolve_name(&operation_root, "main", name)?;
+        let op = Operation::RemoveAlias {
+            module: "main".to_string(),
+            symbol,
+            name: name.to_string(),
+            alias: alias.to_string(),
+        };
+        let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
+        Ok(format_outcome(outcome, json))
+    }
+
     pub fn set_export_main_branch(&mut self, name: &str, exported_name: &str) -> Result<String> {
         self.set_export_main_branch_expected(name, exported_name, None)
     }

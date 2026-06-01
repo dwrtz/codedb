@@ -130,6 +130,15 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    RemoveAlias {
+        db: PathBuf,
+        name: String,
+        alias: String,
+        #[arg(long)]
+        expect_root: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     SetExport {
         db: PathBuf,
         name: String,
@@ -354,6 +363,24 @@ fn main() -> Result<()> {
             print!(
                 "{}",
                 codedb.create_alias_main_branch_expected_format(
+                    &name,
+                    &alias,
+                    expect_root.as_deref(),
+                    json
+                )?
+            );
+        }
+        Command::RemoveAlias {
+            db,
+            name,
+            alias,
+            expect_root,
+            json,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            print!(
+                "{}",
+                codedb.remove_alias_main_branch_expected_format(
                     &name,
                     &alias,
                     expect_root.as_deref(),

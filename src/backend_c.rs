@@ -169,7 +169,7 @@ impl CodeDb {
                 let expr = format!(
                     "{} {} {}",
                     self.c_expr(left, root, local_params, prec)?,
-                    op,
+                    c_binary_operator(op),
                     self.c_expr(right, root, local_params, prec + 1)?
                 );
                 if prec < parent_prec {
@@ -221,6 +221,14 @@ fn c_identifier(name: &str) -> String {
         }
     }
     if out.is_empty() { "_".to_string() } else { out }
+}
+
+fn c_binary_operator(op: &str) -> &str {
+    match op {
+        "&&" => "&",
+        "||" => "|",
+        other => other,
+    }
 }
 
 pub(crate) fn ensure_no_forbidden_runtime_calls(source: &str) -> Result<()> {

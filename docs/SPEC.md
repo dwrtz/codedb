@@ -228,6 +228,7 @@ replace_function_body
 change_function_signature
 delete_symbol
 create_alias
+remove_alias
 set_export
 remove_export
 set_metadata
@@ -1103,6 +1104,16 @@ Build impact:
 metadata_only
 ```
 
+#### remove_alias
+
+Removes a non-preferred projection alias for an existing symbol.
+
+Build impact:
+
+```text
+metadata_only
+```
+
 #### set_export / remove_export
 
 Changes public ABI export metadata.
@@ -1664,6 +1675,7 @@ replace_function_body(symbol_or_name, body_ast)
 change_function_signature(symbol_or_name, new_signature, callsite_updates)
 delete_symbol(symbol_or_name)
 create_alias(symbol_or_name, alias)
+remove_alias(symbol_or_name, alias)
 set_export(symbol_or_name, exported_name)
 remove_export(symbol_or_name, exported_name)
 ```

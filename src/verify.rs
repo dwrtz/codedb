@@ -508,6 +508,8 @@ impl CodeDb {
                     &cache_key,
                     artifact_kind,
                     &input_hash,
+                    &backend,
+                    &target,
                     &artifact_hash,
                     value,
                     artifact_bytes.as_deref(),
@@ -1176,20 +1178,16 @@ fn verify_artifact_metadata(
     cache_key: &str,
     artifact_kind: ArtifactKind,
     input_hash: &str,
+    backend: &str,
+    target: &str,
     artifact_hash: &str,
     artifact_json: &JsonValue,
     artifact_bytes: Option<&[u8]>,
 ) {
-    if artifact_json
-        .get("schema")
-        .and_then(JsonValue::as_str)
-        .is_some_and(|schema| schema != ARTIFACT_METADATA_SCHEMA)
-    {
+    if artifact_json.get("schema").and_then(JsonValue::as_str) != Some(ARTIFACT_METADATA_SCHEMA) {
         errors.push(format!(
             "bad_cache_entry: artifact metadata schema mismatch {cache_key}"
         ));
-    }
-    if artifact_json.get("schema").and_then(JsonValue::as_str) != Some(ARTIFACT_METADATA_SCHEMA) {
         return;
     }
     if artifact_json
@@ -1204,6 +1202,20 @@ fn verify_artifact_metadata(
     if artifact_json.get("input_hash").and_then(JsonValue::as_str) != Some(input_hash) {
         errors.push(format!(
             "bad_cache_entry: artifact metadata input mismatch {cache_key}"
+        ));
+    }
+    if artifact_json.get("backend_id").and_then(JsonValue::as_str) != Some(backend) {
+        errors.push(format!(
+            "bad_cache_entry: artifact metadata backend mismatch {cache_key}"
+        ));
+    }
+    if artifact_json
+        .get("target_triple")
+        .and_then(JsonValue::as_str)
+        != Some(target)
+    {
+        errors.push(format!(
+            "bad_cache_entry: artifact metadata target mismatch {cache_key}"
         ));
     }
 

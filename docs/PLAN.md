@@ -374,6 +374,7 @@ Deliverables:
   - `change_function_signature`
   - `delete_symbol`
   - `create_alias`
+  - `remove_alias`
   - `set_export`
   - `remove_export`
 - Add JSON output mode for relevant CLI commands.

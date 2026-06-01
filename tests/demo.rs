@@ -381,6 +381,41 @@ fn native_link_plan_is_deterministic_and_reused_across_rename() {
 }
 
 #[test]
+fn replayed_history_reaches_the_same_native_link_plan() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("native-link-plan-replay.sqlite");
+    let plan_before = temp.path().join("before-replay.link.json");
+    let plan_after = temp.path().join("after-replay.link.json");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_before.to_str().unwrap(),
+    ]);
+    run(&["replay", db.to_str().unwrap(), "--from-genesis"]);
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_after.to_str().unwrap(),
+    ]);
+
+    assert_eq!(
+        std::fs::read_to_string(&plan_after).unwrap(),
+        std::fs::read_to_string(&plan_before).unwrap()
+    );
+}
+
+#[test]
 fn link_plan_cache_key_records_object_dependencies_and_duplicate_relocations() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("native-link-deps.sqlite");
@@ -897,6 +932,43 @@ fn export_map_changes_are_explicit_relink_only_operations() {
 
     let show_unexported_vat = run(&["show", db.to_str().unwrap(), "vat"]);
     assert!(show_unexported_vat.contains("exported_abi_symbols none"));
+
+    bin()
+        .args(["verify", db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+}
+
+#[test]
+fn alias_removal_is_metadata_only_and_idempotent() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("alias-removal.sqlite");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    run(&["create-alias", db.to_str().unwrap(), "tax", "sales_tax"]);
+
+    let remove = run(&["remove-alias", db.to_str().unwrap(), "tax", "sales_tax"]);
+    let old_root = parse_line_value(&remove, "old_root ");
+    let new_root = parse_line_value(&remove, "new_root ");
+    assert!(remove.contains("applied remove_alias main.tax as main.sales_tax"));
+    assert!(remove.contains("semantic_impact alias_removed"));
+    assert!(remove.contains("build_impact metadata_only"));
+    assert!(remove.contains("recompile none"));
+    assert!(remove.contains("relink false"));
+
+    let diff = run(&["diff", db.to_str().unwrap(), old_root, new_root]);
+    assert!(diff.contains("alias_removed"));
+    assert!(diff.contains("alias: main.sales_tax"));
+    assert!(diff.contains("build_impact metadata_only"));
+
+    let branch_before_retry = branch_state(&db);
+    let counts_before_retry = mutation_guard_counts(&db);
+    let retry = run(&["remove-alias", db.to_str().unwrap(), "tax", "sales_tax"]);
+    assert!(retry.contains("already_applied remove_alias main.tax as main.sales_tax"));
+    assert_eq!(branch_state(&db), branch_before_retry);
+    assert_eq!(mutation_guard_counts(&db), counts_before_retry);
 
     bin()
         .args(["verify", db.to_str().unwrap()])
@@ -1613,6 +1685,32 @@ fn c_projection_allows_generated_identifiers_that_contain_runtime_names() {
 }
 
 #[test]
+fn c_projection_boolean_ops_are_strict_like_the_reference_evaluator() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("c-strict-bool.sqlite");
+    let source = temp.path().join("strict-bool.cdb");
+    let c_file = temp.path().join("projection.c");
+
+    std::fs::write(&source, "fn main() -> bool = false && (1 / 0 == 0)\n").unwrap();
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), source.to_str().unwrap()]);
+
+    let stderr = run_failure(&["eval", db.to_str().unwrap(), "main"]);
+    assert!(stderr.contains("division by zero"));
+
+    run(&[
+        "emit-c",
+        db.to_str().unwrap(),
+        "main",
+        "--out",
+        c_file.to_str().unwrap(),
+    ]);
+    let c_source = std::fs::read_to_string(&c_file).unwrap();
+    assert!(c_source.contains("return 0 & 1 / 0 == 0;"));
+    assert!(!c_source.contains("&&"));
+}
+
+#[test]
 fn verify_rejects_cache_key_payload_mismatch() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("cache-mismatch.sqlite");
@@ -1642,6 +1740,45 @@ fn verify_rejects_cache_key_payload_mismatch() {
     let stderr = run_failure(&["verify", db.to_str().unwrap()]);
     assert!(stderr.contains("bad_cache_entry"));
     assert!(stderr.contains("cache key mismatch"));
+}
+
+#[test]
+fn verify_rejects_artifact_metadata_backend_mismatch() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("artifact-metadata-mismatch.sqlite");
+    let c_file = temp.path().join("projection.c");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    run(&[
+        "emit-c",
+        db.to_str().unwrap(),
+        "main",
+        "--out",
+        c_file.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'c_projection'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    value["backend_id"] = JsonValue::String("wrong-backend".to_string());
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (serde_json::to_string(&value).unwrap(), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_cache_entry"));
+    assert!(stderr.contains("artifact metadata backend mismatch"));
 }
 
 #[test]

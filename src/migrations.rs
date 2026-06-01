@@ -58,6 +58,12 @@ pub(crate) enum Operation {
         name: String,
         alias: String,
     },
+    RemoveAlias {
+        module: String,
+        symbol: String,
+        name: String,
+        alias: String,
+    },
     SetExport {
         module: String,
         symbol: String,
@@ -81,6 +87,7 @@ impl Operation {
             Operation::ChangeFunctionSignature { .. } => "change_function_signature",
             Operation::DeleteSymbol { .. } => "delete_symbol",
             Operation::CreateAlias { .. } => "create_alias",
+            Operation::RemoveAlias { .. } => "remove_alias",
             Operation::SetExport { .. } => "set_export",
             Operation::RemoveExport { .. } => "remove_export",
         }
@@ -275,6 +282,7 @@ pub(crate) enum SemanticImpact {
     InterfaceChanged,
     SymbolDeleted,
     AliasCreated,
+    AliasRemoved,
     ExportSet,
     ExportRemoved,
 }
@@ -288,6 +296,7 @@ impl SemanticImpact {
             SemanticImpact::InterfaceChanged => "interface_changed",
             SemanticImpact::SymbolDeleted => "symbol_deleted",
             SemanticImpact::AliasCreated => "alias_created",
+            SemanticImpact::AliasRemoved => "alias_removed",
             SemanticImpact::ExportSet => "export_set",
             SemanticImpact::ExportRemoved => "export_removed",
         }
@@ -333,6 +342,11 @@ pub(crate) enum Precondition {
         name: String,
         symbol: String,
     },
+    AliasPointsToSymbol {
+        module: String,
+        alias: String,
+        symbol: String,
+    },
     ExportNameIsAvailable {
         name: String,
     },
@@ -349,6 +363,7 @@ impl Precondition {
             Precondition::NameIsAvailable { .. } => "name_is_available",
             Precondition::NamePointsToSymbol { .. } => "name_points_to_symbol",
             Precondition::PreferredNamePointsToSymbol { .. } => "preferred_name_points_to_symbol",
+            Precondition::AliasPointsToSymbol { .. } => "alias_points_to_symbol",
             Precondition::ExportNameIsAvailable { .. } => "export_name_is_available",
             Precondition::ExportPointsToSymbol { .. } => "export_points_to_symbol",
         }
@@ -487,6 +502,16 @@ fn operation_summary_parts(op: &Operation) -> (String, SemanticImpact, Typecheck
             SemanticImpact::AliasCreated,
             TypecheckImpact::Unchanged,
         ),
+        Operation::RemoveAlias {
+            module,
+            name,
+            alias,
+            ..
+        } => (
+            format!("{module}.{name} as {module}.{alias}"),
+            SemanticImpact::AliasRemoved,
+            TypecheckImpact::Unchanged,
+        ),
         Operation::SetExport {
             module,
             name,
@@ -519,7 +544,9 @@ fn fallback_build_impact(op: &Operation) -> BuildImpact {
             vec![],
             vec![BuildImpactReason::SymbolAdded],
         ),
-        Operation::RenameSymbol { .. } | Operation::CreateAlias { .. } => (
+        Operation::RenameSymbol { .. }
+        | Operation::CreateAlias { .. }
+        | Operation::RemoveAlias { .. } => (
             BuildImpactKind::MetadataOnly,
             vec![],
             false,
@@ -840,6 +867,26 @@ impl CodeDb {
                     name: alias.clone(),
                 },
             ],
+            Operation::RemoveAlias {
+                module,
+                symbol,
+                name,
+                alias,
+            } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::NamePointsToSymbol {
+                    module: module.clone(),
+                    name: name.clone(),
+                    symbol: symbol.clone(),
+                },
+                Precondition::AliasPointsToSymbol {
+                    module: module.clone(),
+                    alias: alias.clone(),
+                    symbol: symbol.clone(),
+                },
+            ],
             Operation::SetExport {
                 module,
                 symbol,
@@ -981,6 +1028,15 @@ impl CodeDb {
                     symbol: symbol.clone(),
                 },
             ],
+            Operation::RemoveAlias { module, alias, .. } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::NameAbsent {
+                    module: module.clone(),
+                    name: alias.clone(),
+                },
+            ],
             Operation::SetExport {
                 symbol,
                 exported_name,
@@ -1059,6 +1115,11 @@ impl CodeDb {
                     name,
                     symbol,
                 } => preferred_name_points_to_symbol(&root, module, name, symbol),
+                Precondition::AliasPointsToSymbol {
+                    module,
+                    alias,
+                    symbol,
+                } => alias_points_to_symbol(&root, module, alias, symbol),
                 Precondition::ExportNameIsAvailable { name } => !root
                     .exports
                     .iter()
@@ -1269,6 +1330,12 @@ impl CodeDb {
                 name,
                 alias,
             } => self.apply_create_alias(input_root, module, symbol, name, alias),
+            Operation::RemoveAlias {
+                module,
+                symbol,
+                name,
+                alias,
+            } => self.apply_remove_alias(input_root, module, symbol, name, alias),
             Operation::SetExport {
                 module,
                 symbol,
@@ -1510,6 +1577,31 @@ impl CodeDb {
             symbol: symbol.to_string(),
             is_preferred: false,
         });
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    pub(crate) fn apply_remove_alias(
+        &mut self,
+        input_root: &str,
+        module: &str,
+        symbol: &str,
+        name: &str,
+        alias: &str,
+    ) -> Result<String> {
+        let mut root = self.load_root(input_root)?;
+        self.assert_name_points(&root, module, name, symbol)?;
+        let original_len = root.names.len();
+        root.names.retain(|binding| {
+            !(binding.module == module
+                && binding.display_name == alias
+                && binding.symbol == symbol
+                && !binding.is_preferred)
+        });
+        if root.names.len() == original_len {
+            bail!("alias {module}.{alias} does not point to {symbol}");
+        }
         let new_root = self.put_program_root(&root)?;
         self.index_root(&new_root)?;
         Ok(new_root)
@@ -1803,6 +1895,20 @@ fn preferred_name_points_to_symbol(
             && binding.display_name == name
             && binding.symbol == symbol
             && binding.is_preferred
+    })
+}
+
+fn alias_points_to_symbol(
+    root: &ProgramRootPayload,
+    module: &str,
+    alias: &str,
+    symbol: &str,
+) -> bool {
+    root.names.iter().any(|binding| {
+        binding.module == module
+            && binding.display_name == alias
+            && binding.symbol == symbol
+            && !binding.is_preferred
     })
 }
 
