@@ -230,6 +230,75 @@ fn export_map_changes_are_explicit_relink_only_operations() {
 }
 
 #[test]
+fn lowered_ir_uses_symbol_hash_calls_and_reuses_cache_across_rename() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("lowered-ir.sqlite");
+    let tax_ir = temp.path().join("tax.ir.json");
+    let total_ir_before = temp.path().join("total-before.ir.json");
+    let total_ir_after = temp.path().join("total-after.ir.json");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+
+    run(&[
+        "emit-ir",
+        db.to_str().unwrap(),
+        "tax",
+        "--out",
+        tax_ir.to_str().unwrap(),
+    ]);
+    let tax_ir_text = std::fs::read_to_string(&tax_ir).unwrap();
+    let tax_ir_json: JsonValue = serde_json::from_str(&tax_ir_text).unwrap();
+    assert_eq!(tax_ir_json["ir"]["schema"], "codedb/lowered-function-ir/v1");
+    assert!(tax_ir_text.contains("division_by_zero"));
+    assert!(tax_ir_text.contains("\"op\": \"return\""));
+
+    run(&[
+        "emit-ir",
+        db.to_str().unwrap(),
+        "total",
+        "--out",
+        total_ir_before.to_str().unwrap(),
+    ]);
+    let before_text = std::fs::read_to_string(&total_ir_before).unwrap();
+    let before: JsonValue = serde_json::from_str(&before_text).unwrap();
+    let before_hash = before["lowered_ir_hash"].as_str().unwrap().to_string();
+    assert!(before_text.contains("target_symbol_hash"));
+    assert!(!before_text.contains("tax"));
+    assert!(!before_text.contains("total"));
+    assert!(!before_text.contains("vat"));
+
+    let lowered_cache_rows = cache_row_count_by_kind(&db, "lowered_ir");
+    assert_eq!(lowered_cache_rows, 2);
+
+    run(&["rename", db.to_str().unwrap(), "tax", "vat"]);
+    run(&[
+        "emit-ir",
+        db.to_str().unwrap(),
+        "total",
+        "--out",
+        total_ir_after.to_str().unwrap(),
+    ]);
+    let after_text = std::fs::read_to_string(&total_ir_after).unwrap();
+    let after: JsonValue = serde_json::from_str(&after_text).unwrap();
+    assert_eq!(after["lowered_ir_hash"].as_str().unwrap(), before_hash);
+    assert_eq!(
+        cache_row_count_by_kind(&db, "lowered_ir"),
+        lowered_cache_rows
+    );
+    assert!(after_text.contains("target_symbol_hash"));
+    assert!(!after_text.contains("tax"));
+    assert!(!after_text.contains("total"));
+    assert!(!after_text.contains("vat"));
+
+    bin()
+        .args(["verify", db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+}
+
+#[test]
 fn replace_body_updates_only_implementation_and_literal_diff() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("replace.sqlite");
@@ -714,6 +783,16 @@ fn row_count(db: &Path, table: &str) -> i64 {
     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
         row.get(0)
     })
+    .unwrap()
+}
+
+fn cache_row_count_by_kind(db: &Path, artifact_kind: &str) -> i64 {
+    let conn = Connection::open(db).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM compile_cache WHERE artifact_kind = ?1",
+        [artifact_kind],
+        |row| row.get(0),
+    )
     .unwrap()
 }
 

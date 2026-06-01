@@ -39,6 +39,13 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    #[command(about = "Emit target-independent lowered IR for debugging and backend inspection")]
+    EmitIr {
+        db: PathBuf,
+        function_name: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
     List {
         db: PathBuf,
     },
@@ -180,6 +187,16 @@ fn main() -> Result<()> {
             let source = codedb.emit_c_main_branch(&function_name)?;
             std::fs::write(&out, source)?;
             println!("emitted C projection {}", out.display());
+        }
+        Command::EmitIr {
+            db,
+            function_name,
+            out,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            let ir = codedb.emit_ir_main_branch(&function_name)?;
+            std::fs::write(&out, ir)?;
+            println!("emitted lowered IR {}", out.display());
         }
         Command::List { db } => {
             let codedb = codedb::CodeDb::open(db)?;

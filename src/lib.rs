@@ -5,6 +5,7 @@ mod backend_c;
 mod build_plan;
 mod diff;
 mod expr;
+mod lowering;
 mod migrations;
 mod model;
 mod store;

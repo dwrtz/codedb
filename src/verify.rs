@@ -527,6 +527,19 @@ impl CodeDb {
                     "forbidden_runtime_dependency: {cache_key}: {err:#}"
                 ));
             }
+
+            if artifact_kind == ArtifactKind::LoweredIr
+                && let Some(value) = artifact_value.as_ref()
+            {
+                match crate::lowering::lowered_ir_from_artifact_metadata(value) {
+                    Ok(ir) => {
+                        if let Err(err) = self.verify_lowered_ir_against_index(&input_hash, &ir) {
+                            errors.push(format!("bad_lowered_ir: {cache_key}: {err:#}"));
+                        }
+                    }
+                    Err(err) => errors.push(format!("bad_lowered_ir: {cache_key}: {err:#}")),
+                }
+            }
         }
         Ok(())
     }
