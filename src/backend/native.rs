@@ -182,6 +182,7 @@ impl CodeDb {
         let root = self.load_root(root_hash)?;
         let lowered = self.lower_symbol(root_hash, symbol)?;
         let dependency_interface_hashes = self.dependency_interface_hashes(&root, &lowered.ir)?;
+        let dependency_closure = self.dependency_closure_for_symbol(root_hash, symbol)?;
         let backend_id = backend_id_for_target(target_triple)?;
         let key_input = CacheKeyInput::new(
             ArtifactKind::ObjectFile,
@@ -189,7 +190,7 @@ impl CodeDb {
             backend_id,
             target_triple,
         )
-        .with_dependency_interface_hashes(dependency_interface_hashes);
+        .with_dependency_interface_hashes(dependency_interface_hashes.clone());
 
         if let Some(cache_entry) = self.lookup_cache(&key_input)? {
             let bytes = cache_entry
@@ -215,10 +216,16 @@ impl CodeDb {
             APPLE_ARM64_TARGET => MachOArm64ObjectBackend.emit_object(input)?,
             _ => unreachable!("unsupported target was checked by backend_id_for_target"),
         };
-        self.write_cache_bytes(key_input, &emitted.metadata, &emitted.bytes)?;
+        let mut metadata = emitted.metadata;
+        add_native_object_dependency_metadata(
+            &mut metadata,
+            &dependency_interface_hashes,
+            &dependency_closure,
+        )?;
+        self.write_cache_bytes(key_input, &metadata, &emitted.bytes)?;
         Ok(NativeObjectArtifact {
             artifact_hash: emitted.artifact_hash,
-            metadata: emitted.metadata,
+            metadata,
             bytes: emitted.bytes,
         })
     }
@@ -244,6 +251,46 @@ impl CodeDb {
             })
             .collect()
     }
+
+    fn dependency_closure_for_symbol(&self, root_hash: &str, symbol: &str) -> Result<Vec<String>> {
+        let mut seen = BTreeSet::new();
+        self.collect_dependency_closure(root_hash, symbol, symbol, &mut seen)?;
+        Ok(seen.into_iter().collect())
+    }
+
+    fn collect_dependency_closure(
+        &self,
+        root_hash: &str,
+        origin: &str,
+        symbol: &str,
+        seen: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        for dependency in self.dependencies_for_symbol(root_hash, symbol)? {
+            if dependency == origin {
+                continue;
+            }
+            if seen.insert(dependency.clone()) {
+                self.collect_dependency_closure(root_hash, origin, &dependency, seen)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn add_native_object_dependency_metadata(
+    metadata: &mut JsonValue,
+    dependency_interface_hashes: &[String],
+    dependency_closure: &[String],
+) -> Result<()> {
+    let object = metadata
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("native object metadata must be a JSON object"))?;
+    object.insert(
+        "dependency_interface_hashes".to_string(),
+        json!(dependency_interface_hashes),
+    );
+    object.insert("dependency_closure".to_string(), json!(dependency_closure));
+    Ok(())
 }
 
 pub(crate) fn object_metadata_from_cache(artifact_json: &JsonValue) -> Result<JsonValue> {

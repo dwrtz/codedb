@@ -1039,6 +1039,23 @@ fn structural_operations_retry_with_expected_root_return_already_applied() {
         mutation_guard_counts(&replace_db),
         counts_before_replace_retry
     );
+    let branch_before_current_replace_retry = branch_state(&replace_db);
+    let counts_before_current_replace_retry = mutation_guard_counts(&replace_db);
+    let current_replace_retry = run(&[
+        "replace-body",
+        replace_db.to_str().unwrap(),
+        "tax",
+        "subtotal * 18 / 100",
+    ]);
+    assert!(current_replace_retry.contains("already_applied replace_function_body main.tax"));
+    assert_eq!(
+        branch_state(&replace_db),
+        branch_before_current_replace_retry
+    );
+    assert_eq!(
+        mutation_guard_counts(&replace_db),
+        counts_before_current_replace_retry
+    );
 
     let signature_db = temp.path().join("signature-retry.sqlite");
     let signature_source = temp.path().join("signature.cdb");
@@ -1323,6 +1340,88 @@ fn verify_rejects_cache_key_payload_mismatch() {
     let stderr = run_failure(&["verify", db.to_str().unwrap()]);
     assert!(stderr.contains("bad_cache_entry"));
     assert!(stderr.contains("cache key mismatch"));
+}
+
+#[test]
+fn verify_rejects_native_object_metadata_mismatch() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("object-metadata-mismatch.sqlite");
+    let tax_obj = temp.path().join("tax.o");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "tax",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        tax_obj.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'object_file'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    value["metadata"]["target_triple"] = JsonValue::String("bad-target".to_string());
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (serde_json::to_string(&value).unwrap(), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_object_artifact"));
+    assert!(stderr.contains("target"));
+}
+
+#[test]
+fn verify_rejects_cached_link_plan_metadata_mismatch() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("link-plan-metadata-mismatch.sqlite");
+    let plan_path = temp.path().join("main.link.json");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_path.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'link_plan'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    value["metadata"]["external_symbols"] = serde_json::json!(["puts"]);
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (serde_json::to_string(&value).unwrap(), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_link_plan"));
+    assert!(stderr.contains("external symbols"));
 }
 
 fn cache_rows(db: &Path) -> Vec<(String, String, String)> {

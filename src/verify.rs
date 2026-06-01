@@ -5,7 +5,7 @@ use rusqlite::params;
 use serde_json::Value as JsonValue;
 
 use crate::BYTES_DOMAIN;
-use crate::abi::{export_map, validate_exported_abi_name};
+use crate::abi::{export_map, internal_abi_symbol, validate_exported_abi_name};
 use crate::artifact::{ARTIFACT_METADATA_SCHEMA, CacheKeyInput};
 use crate::backend::ArtifactKind;
 use crate::backend_c::ensure_no_forbidden_runtime_calls;
@@ -407,6 +407,7 @@ impl CodeDb {
                 continue;
             };
 
+            let mut parsed_key_input = None;
             match cache_key_json {
                 Some(cache_key_json) => match serde_json::from_str::<JsonValue>(&cache_key_json) {
                     Ok(value) => {
@@ -454,7 +455,9 @@ impl CodeDb {
                                                 "bad_cache_entry: cache key mismatch {cache_key} recomputes to {recomputed}"
                                             ));
                                         }
-                                        Ok(_) => {}
+                                        Ok(_) => {
+                                            parsed_key_input = Some(key_input);
+                                        }
                                         Err(err) => errors.push(format!(
                                             "bad_cache_entry: cannot recompute cache key {cache_key}: {err:#}"
                                         )),
@@ -540,8 +543,329 @@ impl CodeDb {
                     Err(err) => errors.push(format!("bad_lowered_ir: {cache_key}: {err:#}")),
                 }
             }
+
+            if let (Some(key_input), Some(value)) =
+                (parsed_key_input.as_ref(), artifact_value.as_ref())
+            {
+                match artifact_kind {
+                    ArtifactKind::ObjectFile => {
+                        self.verify_object_artifact(
+                            errors,
+                            &cache_key,
+                            key_input,
+                            value,
+                            artifact_bytes.as_deref(),
+                        )?;
+                    }
+                    ArtifactKind::LinkPlan => {
+                        self.verify_link_plan_artifact(errors, &cache_key, key_input, value)?;
+                    }
+                    ArtifactKind::Executable => {
+                        self.verify_executable_artifact(errors, &cache_key, key_input, value)?;
+                    }
+                    _ => {}
+                }
+            }
         }
         Ok(())
+    }
+
+    fn verify_object_artifact(
+        &self,
+        errors: &mut Vec<String>,
+        cache_key: &str,
+        key_input: &CacheKeyInput,
+        artifact_json: &JsonValue,
+        artifact_bytes: Option<&[u8]>,
+    ) -> Result<()> {
+        let Some(metadata) = artifact_inner_metadata(artifact_json) else {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} missing object metadata"
+            ));
+            return Ok(());
+        };
+        if metadata.get("schema").and_then(JsonValue::as_str) != Some("codedb/native-object/v1") {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} bad object metadata schema"
+            ));
+        }
+        if metadata.get("backend_id").and_then(JsonValue::as_str)
+            != Some(key_input.backend_id.as_str())
+        {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} backend metadata mismatch"
+            ));
+        }
+        if metadata.get("target_triple").and_then(JsonValue::as_str)
+            != Some(key_input.target_triple.as_str())
+        {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} target metadata mismatch"
+            ));
+        }
+        if metadata
+            .get("function_def_hash")
+            .and_then(JsonValue::as_str)
+            != Some(key_input.input_hash.as_str())
+        {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} function definition metadata mismatch"
+            ));
+        }
+        match self.get_kind(&key_input.input_hash) {
+            Ok(kind) if kind == "FunctionDef" => {}
+            Ok(kind) => errors.push(format!(
+                "bad_object_artifact: {cache_key} input object is {kind}, not FunctionDef"
+            )),
+            Err(err) => errors.push(format!(
+                "bad_object_artifact: {cache_key} cannot load input object kind: {err:#}"
+            )),
+        }
+        let symbol = metadata
+            .get("symbol_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
+        if symbol.is_empty() {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} missing symbol hash"
+            ));
+        } else if let Ok(internal_symbol) = internal_abi_symbol(symbol) {
+            if !json_array_contains_str(metadata.get("defined_symbols"), &internal_symbol) {
+                errors.push(format!(
+                    "bad_object_artifact: {cache_key} defined symbols do not include internal ABI symbol"
+                ));
+            }
+        } else {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} invalid symbol hash"
+            ));
+        }
+        if json_string_set(metadata.get("dependency_interface_hashes"))
+            != key_input
+                .dependency_interface_hashes
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} dependency interface hashes mismatch"
+            ));
+        }
+        if metadata
+            .get("dependency_closure")
+            .and_then(JsonValue::as_array)
+            .is_none()
+        {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} missing dependency closure"
+            ));
+        }
+        for relocation in metadata
+            .get("relocations")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if relocation
+                .get("target_symbol_hash")
+                .and_then(JsonValue::as_str)
+                .is_none()
+                || relocation
+                    .get("target_abi_symbol")
+                    .and_then(JsonValue::as_str)
+                    .is_none()
+            {
+                errors.push(format!(
+                    "bad_object_artifact: {cache_key} malformed relocation"
+                ));
+            }
+        }
+        if let Some(bytes) = artifact_bytes {
+            match key_input.target_triple.as_str() {
+                crate::LINUX_X86_64_TARGET if !bytes.starts_with(b"\x7fELF") => errors.push(
+                    format!("bad_object_artifact: {cache_key} object bytes are not ELF"),
+                ),
+                crate::APPLE_ARM64_TARGET if !bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe]) => {
+                    errors.push(format!(
+                        "bad_object_artifact: {cache_key} object bytes are not Mach-O"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_link_plan_artifact(
+        &self,
+        errors: &mut Vec<String>,
+        cache_key: &str,
+        key_input: &CacheKeyInput,
+        artifact_json: &JsonValue,
+    ) -> Result<()> {
+        let Some(plan) = artifact_inner_metadata(artifact_json) else {
+            errors.push(format!("bad_link_plan: {cache_key} missing plan metadata"));
+            return Ok(());
+        };
+        if plan.get("schema").and_then(JsonValue::as_str) != Some("codedb/link-plan/v1") {
+            errors.push(format!("bad_link_plan: {cache_key} bad schema"));
+        }
+        if plan.get("input_hash").and_then(JsonValue::as_str) != Some(key_input.input_hash.as_str())
+        {
+            errors.push(format!("bad_link_plan: {cache_key} input hash mismatch"));
+        }
+        if plan.get("target_triple").and_then(JsonValue::as_str)
+            != Some(key_input.target_triple.as_str())
+        {
+            errors.push(format!("bad_link_plan: {cache_key} target mismatch"));
+        }
+        if plan
+            .get("external_symbols")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|symbols| !symbols.is_empty())
+        {
+            errors.push(format!(
+                "bad_link_plan: {cache_key} unexpected external symbols"
+            ));
+        }
+        let object_hashes = plan
+            .get("objects")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|object| {
+                object
+                    .get("object_artifact_hash")
+                    .and_then(JsonValue::as_str)
+            })
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        if object_hashes
+            != key_input
+                .dependency_implementation_hashes
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        {
+            errors.push(format!(
+                "bad_link_plan: {cache_key} object artifact dependencies mismatch"
+            ));
+        }
+        for object_hash in &object_hashes {
+            if !self.cache_artifact_exists(ArtifactKind::ObjectFile, object_hash)? {
+                errors.push(format!(
+                    "bad_link_plan: {cache_key} references missing object artifact {object_hash}"
+                ));
+            }
+        }
+        match self.get_payload(&key_input.input_hash) {
+            Ok(input) => {
+                if input.get("schema").and_then(JsonValue::as_str) != Some("codedb/link-input/v1") {
+                    errors.push(format!("bad_link_plan: {cache_key} bad link input schema"));
+                }
+                if input.get("target_triple") != plan.get("target_triple")
+                    || input.get("entry_symbol_hash") != plan.get("entry_symbol_hash")
+                    || input.get("entry_abi_symbol") != plan.get("entry_abi_symbol")
+                    || input.get("export_map") != plan.get("export_map")
+                    || input.get("link_options") != plan.get("link_options")
+                {
+                    errors.push(format!(
+                        "bad_link_plan: {cache_key} plan does not match link input"
+                    ));
+                }
+                if json_string_set(input.get("object_artifact_hashes")) != object_hashes {
+                    errors.push(format!(
+                        "bad_link_plan: {cache_key} object list does not match link input"
+                    ));
+                }
+            }
+            Err(err) => errors.push(format!(
+                "bad_link_plan: {cache_key} cannot load link input: {err:#}"
+            )),
+        }
+        for export in plan
+            .get("export_map")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if export
+                .get("exported_abi_symbol")
+                .and_then(JsonValue::as_str)
+                .is_none_or(|name| validate_exported_abi_name(name).is_err())
+            {
+                errors.push(format!("bad_link_plan: {cache_key} invalid export map"));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_executable_artifact(
+        &self,
+        errors: &mut Vec<String>,
+        cache_key: &str,
+        key_input: &CacheKeyInput,
+        artifact_json: &JsonValue,
+    ) -> Result<()> {
+        let Some(metadata) = artifact_inner_metadata(artifact_json) else {
+            errors.push(format!(
+                "bad_executable_artifact: {cache_key} missing executable metadata"
+            ));
+            return Ok(());
+        };
+        if metadata.get("schema").and_then(JsonValue::as_str) != Some("codedb/executable/v1") {
+            errors.push(format!(
+                "bad_executable_artifact: {cache_key} bad executable metadata schema"
+            ));
+        }
+        if metadata.get("target_triple").and_then(JsonValue::as_str)
+            != Some(key_input.target_triple.as_str())
+        {
+            errors.push(format!(
+                "bad_executable_artifact: {cache_key} target mismatch"
+            ));
+        }
+        let dependency_hashes = key_input
+            .dependency_implementation_hashes
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let link_plan_hash = metadata
+            .get("link_plan_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
+        if !dependency_hashes.contains(link_plan_hash)
+            || !self.cache_artifact_exists(ArtifactKind::LinkPlan, link_plan_hash)?
+        {
+            errors.push(format!(
+                "bad_executable_artifact: {cache_key} missing link plan dependency"
+            ));
+        }
+        for object_hash in json_string_set(metadata.get("object_artifact_hashes")) {
+            if !dependency_hashes.contains(&object_hash)
+                || !self.cache_artifact_exists(ArtifactKind::ObjectFile, &object_hash)?
+            {
+                errors.push(format!(
+                    "bad_executable_artifact: {cache_key} missing object dependency {object_hash}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn cache_artifact_exists(
+        &self,
+        artifact_kind: ArtifactKind,
+        artifact_hash: &str,
+    ) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM compile_cache
+                WHERE artifact_kind = ?1 AND artifact_hash = ?2
+             )",
+            params![artifact_kind.as_str(), artifact_hash],
+            |row| row.get(0),
+        )?)
     }
 }
 
@@ -658,4 +982,28 @@ fn artifact_text(artifact_json: &JsonValue) -> Option<&str> {
         return artifact_json.get("text").and_then(JsonValue::as_str);
     }
     artifact_json.get("text").and_then(JsonValue::as_str)
+}
+
+fn artifact_inner_metadata(artifact_json: &JsonValue) -> Option<&JsonValue> {
+    if artifact_json.get("schema").and_then(JsonValue::as_str) == Some(ARTIFACT_METADATA_SCHEMA) {
+        artifact_json.get("metadata")
+    } else {
+        Some(artifact_json)
+    }
+}
+
+fn json_string_set(value: Option<&JsonValue>) -> BTreeSet<String> {
+    value
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn json_array_contains_str(value: Option<&JsonValue>, needle: &str) -> bool {
+    value
+        .and_then(JsonValue::as_array)
+        .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(needle)))
 }

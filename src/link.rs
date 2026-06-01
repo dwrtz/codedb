@@ -180,7 +180,11 @@ impl CodeDb {
         if let Some(cache_entry) = self.lookup_cache(&key_input)?
             && let Some(artifact_json) = cache_entry.artifact_json
         {
-            plan = json_metadata(&artifact_json)?;
+            let cached_plan = json_metadata(&artifact_json)?;
+            if cached_plan != plan {
+                bail!("cached link plan does not match recomputed link plan");
+            }
+            plan = cached_plan;
             plan_hash = cache_entry.artifact_hash;
         } else {
             plan_hash = self.write_cache_json_for_key(key_input, &plan)?;

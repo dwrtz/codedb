@@ -199,6 +199,24 @@ impl CodeDb {
         for entry in &root.symbols {
             let interface_metadata = function_interface_metadata(&entry.symbol, &entry.signature)?;
             let interface_input_hash = self.put_object("FunctionInterface", &interface_metadata)?;
+            let body_hash = self.function_body_hash(&entry.definition)?;
+            let direct_dependencies = self.dependencies_for_definition(&root, &entry.definition)?;
+            let mut direct_dependency_interface_hashes = Vec::new();
+            for dependency in &direct_dependencies {
+                let Some(dependency_entry) = self.root_symbol(&root, dependency) else {
+                    continue;
+                };
+                let dependency_interface = function_interface_metadata(
+                    &dependency_entry.symbol,
+                    &dependency_entry.signature,
+                )?;
+                direct_dependency_interface_hashes.push(hash_bytes(
+                    BYTES_DOMAIN,
+                    canonical_json(&dependency_interface).as_bytes(),
+                ));
+            }
+            direct_dependency_interface_hashes.sort();
+            direct_dependency_interface_hashes.dedup();
             self.conn.execute(
                 "INSERT OR REPLACE INTO root_symbols
                  (root_hash, symbol_hash, definition_hash, signature_hash)
@@ -220,7 +238,12 @@ impl CodeDb {
                 &json!({
                     "symbol_hash": entry.symbol,
                     "definition_hash": entry.definition,
+                    "function_sig_hash": entry.signature,
+                    "typed_body_expr_hash": body_hash,
                     "internal_abi_symbol": internal_abi_symbol(&entry.symbol)?,
+                    "direct_dependency_symbols": direct_dependencies.iter().cloned().collect::<Vec<_>>(),
+                    "direct_dependency_interface_hashes": direct_dependency_interface_hashes,
+                    "semantic_lowering_version": crate::lowering::LOWERED_IR_SCHEMA,
                 }),
             )?;
         }
@@ -715,9 +738,23 @@ mod tests {
         let temp = tempdir().unwrap();
         let mut db = CodeDb::open(temp.path().join("cache.sqlite")).unwrap();
         db.init().unwrap();
-        let input_hash = db
-            .put_object("LoweredFunctionIR", &json!({ "symbol": "demo" }))
+        let symbol_hash = db.put_symbol_birth(None, "demo").unwrap();
+        let i64_type = db.resolve_type("i64").unwrap();
+        let signature_hash = db.put_signature(&[], &i64_type).unwrap();
+        let body_hash = db
+            .put_object(
+                "Expression",
+                &json!({
+                    "expr_kind": "literal_i64",
+                    "value": "1",
+                    "type": i64_type,
+                }),
+            )
             .unwrap();
+        let input_hash = db
+            .put_function_def(&symbol_hash, &signature_hash, &body_hash)
+            .unwrap();
+        let internal_symbol = internal_abi_symbol(&symbol_hash).unwrap();
         let dep_interface = hash_bytes(BYTES_DOMAIN, b"callee-interface");
         let linux_key = CacheKeyInput::new(
             ArtifactKind::ObjectFile,
@@ -732,7 +769,7 @@ mod tests {
             "native-elf-v0",
             "aarch64-apple-darwin",
         )
-        .with_dependency_interface_hashes(vec![dep_interface]);
+        .with_dependency_interface_hashes(vec![dep_interface.clone()]);
 
         assert_ne!(
             cache_key_for_input(&linux_key).unwrap(),
@@ -742,10 +779,19 @@ mod tests {
         db.write_cache_bytes(
             linux_key.clone(),
             &json!({
-                "symbol_hash": input_hash,
-                "exported_abi_names": [],
-                "object_format": "elf-relocatable",
+                "schema": "codedb/native-object/v1",
+                "backend_id": "native-elf-v0",
+                "object_format": "elf64-x86-64-relocatable",
                 "target_triple": "x86_64-unknown-linux-gnu",
+                "symbol_hash": symbol_hash,
+                "function_def_hash": input_hash,
+                "function_sig_hash": signature_hash,
+                "typed_body_expr_hash": body_hash,
+                "lowered_ir_schema": "codedb/lowered-function-ir/v1",
+                "defined_symbols": [internal_symbol],
+                "called_symbols": [],
+                "relocations": [],
+                "dependency_interface_hashes": [dep_interface],
                 "dependency_closure": [],
             }),
             b"\x7fELF",

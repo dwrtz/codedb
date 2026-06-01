@@ -641,6 +641,19 @@ impl CodeDb {
                     condition_names(&failed_postconditions)
                 );
             }
+            if new_root == old_root {
+                let summary = self.migration_summary_for_roots(&op, &old_root, &old_root)?;
+                return Ok((
+                    MigrationOutcome::AlreadyApplied(MigrationReport {
+                        old_root: old_root.clone(),
+                        new_root: old_root,
+                        migration_hash: None,
+                        history_hash: branch.history_hash.clone(),
+                        summary,
+                    }),
+                    false,
+                ));
+            }
             let operation_json = serde_json::to_value(&op)?;
             let preconditions_json = serde_json::to_value(&preconditions)?;
             let postconditions_json = serde_json::to_value(&postconditions)?;
@@ -679,18 +692,25 @@ impl CodeDb {
                 params![history_hash, branch.history_hash, migration_hash, new_root],
             )?;
             self.update_branch(MAIN_BRANCH, &new_root, &history_hash)?;
-            Ok(MigrationOutcome::Applied(MigrationReport {
-                old_root,
-                new_root,
-                migration_hash: Some(migration_hash),
-                history_hash: Some(history_hash),
-                summary,
-            }))
+            Ok((
+                MigrationOutcome::Applied(MigrationReport {
+                    old_root,
+                    new_root,
+                    migration_hash: Some(migration_hash),
+                    history_hash: Some(history_hash),
+                    summary,
+                }),
+                true,
+            ))
         })();
 
         match result {
-            Ok(outcome) => {
-                self.conn.execute_batch("COMMIT")?;
+            Ok((outcome, should_commit)) => {
+                if should_commit {
+                    self.conn.execute_batch("COMMIT")?;
+                } else {
+                    self.conn.execute_batch("ROLLBACK")?;
+                }
                 Ok(outcome)
             }
             Err(err) => {
