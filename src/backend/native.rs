@@ -200,13 +200,22 @@ impl CodeDb {
             let bytes = cache_entry
                 .artifact_bytes
                 .ok_or_else(|| anyhow!("object cache entry missing artifact_bytes"))?;
-            let metadata = cache_entry
+            let artifact_json = cache_entry
                 .artifact_json
                 .ok_or_else(|| anyhow!("object cache entry missing artifact_json"))?;
-            let metadata = object_metadata_from_cache(&metadata)?;
+            let mut metadata = object_metadata_from_cache(&artifact_json)?;
+            let original_metadata = metadata.clone();
+            add_native_object_dependency_metadata(
+                &mut metadata,
+                &dependency_interface_hashes,
+                &dependency_closure,
+            )?;
+            if metadata != original_metadata {
+                self.write_cache_bytes(key_input.clone(), &metadata, &bytes)?;
+            }
             return Ok(NativeObjectArtifact {
                 artifact_hash: cache_entry.artifact_hash,
-                cache_key: cache_entry.cache_key,
+                cache_key: object_cache_key,
                 metadata,
                 bytes,
             });

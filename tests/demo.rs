@@ -492,6 +492,37 @@ fn link_plan_cache_key_records_object_dependencies_and_duplicate_relocations() {
 }
 
 #[test]
+fn build_plan_cli_outputs_native_build_plan_json() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("native-build-plan.sqlite");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+
+    let plan = run(&[
+        "build-plan",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--json",
+    ]);
+    let plan: JsonValue = serde_json::from_str(&plan).unwrap();
+
+    assert_eq!(plan["schema"], "codedb/native-build-plan/v1");
+    assert_eq!(plan["target_triple"], codedb::LINUX_X86_64_TARGET);
+    assert!(
+        plan["link_plan_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert_eq!(plan["objects"].as_array().unwrap().len(), 3);
+    assert_eq!(cache_row_count_by_kind(&db, "object_file"), 3);
+    assert_eq!(cache_row_count_by_kind(&db, "link_plan"), 1);
+}
+
+#[test]
 fn link_plan_cache_key_distinguishes_semantic_objects_with_identical_bytes() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("same-bytes.sqlite");
@@ -621,6 +652,72 @@ fn link_plan_filters_unreachable_exports_and_verify_rejects_unbacked_exports() {
     let stderr = run_failure(&["verify", db.to_str().unwrap()]);
     assert!(stderr.contains("bad_link_plan"));
     assert!(stderr.contains("export is not backed by a linked object"));
+}
+
+#[test]
+fn native_object_cache_refreshes_dependency_closure_on_reuse() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("object-closure-refresh.sqlite");
+    let source = temp.path().join("object-closure-refresh.cdb");
+    let main_before = temp.path().join("main-before.o");
+    let main_after = temp.path().join("main-after.o");
+
+    std::fs::write(
+        &source,
+        "fn helper() -> i64 = 2\n\nfn leaf() -> i64 = 1\n\nfn mid() -> i64 = leaf()\n\nfn main() -> i64 = mid()\n",
+    )
+    .unwrap();
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), source.to_str().unwrap()]);
+    let helper_symbol =
+        parse_line_value(&run(&["show", db.to_str().unwrap(), "helper"]), "symbol ").to_string();
+    let main_definition =
+        parse_line_value(&run(&["show", db.to_str().unwrap(), "main"]), "definition ").to_string();
+
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        main_before.to_str().unwrap(),
+    ]);
+    let (before_metadata, before_bytes) = object_cache_entry_by_definition(&db, &main_definition);
+    let before_closure = before_metadata["metadata"]["dependency_closure"]
+        .as_array()
+        .unwrap();
+    assert_eq!(before_closure.len(), 2);
+    assert!(
+        !before_closure
+            .iter()
+            .any(|symbol| symbol.as_str() == Some(helper_symbol.as_str()))
+    );
+
+    run(&["replace-body", db.to_str().unwrap(), "leaf", "helper()"]);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        main_after.to_str().unwrap(),
+    ]);
+    let (after_metadata, after_bytes) = object_cache_entry_by_definition(&db, &main_definition);
+    let after_closure = after_metadata["metadata"]["dependency_closure"]
+        .as_array()
+        .unwrap();
+
+    assert_eq!(before_bytes, after_bytes);
+    assert_eq!(cache_row_count_by_kind(&db, "object_file"), 1);
+    assert_eq!(after_closure.len(), 3);
+    assert!(
+        after_closure
+            .iter()
+            .any(|symbol| symbol.as_str() == Some(helper_symbol.as_str()))
+    );
 }
 
 #[test]
@@ -1948,6 +2045,65 @@ fn verify_rejects_cached_link_plan_metadata_mismatch() {
     let stderr = run_failure(&["verify", db.to_str().unwrap()]);
     assert!(stderr.contains("bad_link_plan"));
     assert!(stderr.contains("external symbols"));
+}
+
+#[test]
+fn verify_rejects_link_plan_object_metadata_that_disagrees_with_cached_object() {
+    let temp = tempdir().unwrap();
+    let db = temp
+        .path()
+        .join("link-plan-object-metadata-mismatch.sqlite");
+    let plan_path = temp.path().join("main.link.json");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_path.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'object_file'
+             ORDER BY cache_key",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    drop(stmt);
+    let (cache_key, mut value) = rows
+        .into_iter()
+        .find_map(|(cache_key, artifact_json)| {
+            let value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+            let has_relocations = value["metadata"]["relocations"]
+                .as_array()
+                .is_some_and(|relocations| !relocations.is_empty());
+            has_relocations.then_some((cache_key, value))
+        })
+        .expect("object with relocations");
+    value["metadata"]["relocations"] = serde_json::json!([]);
+    value["metadata"]["called_symbols"] = serde_json::json!([]);
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (serde_json::to_string(&value).unwrap(), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_link_plan"));
+    assert!(stderr.contains("does not match object artifact metadata"));
 }
 
 #[test]

@@ -10,7 +10,7 @@ use crate::artifact::CacheKeyInput;
 use crate::backend::ArtifactKind;
 use crate::backend::native::NativeObjectArtifact;
 use crate::model::ProgramRootPayload;
-use crate::store::{CodeDb, hash_bytes};
+use crate::store::{CodeDb, canonical_json, hash_bytes};
 use crate::types::type_hash_for;
 use crate::{
     APPLE_ARM64_TARGET, BYTES_DOMAIN, DEFAULT_NATIVE_TARGET, LINUX_X86_64_TARGET, MAIN_BRANCH,
@@ -50,6 +50,28 @@ impl CodeDb {
             "{}\n",
             serde_json::to_string_pretty(&prepared.plan)?
         ))
+    }
+
+    pub fn build_plan_main_branch(
+        &mut self,
+        entry_name: &str,
+        target_triple: &str,
+    ) -> Result<String> {
+        let prepared = self.prepare_link_plan_main_branch(entry_name, target_triple)?;
+        let payload = json!({
+            "schema": "codedb/native-build-plan/v1",
+            "target_triple": prepared.plan["target_triple"].clone(),
+            "entry_symbol_hash": prepared.plan["entry_symbol_hash"].clone(),
+            "entry_abi_symbol": prepared.plan["entry_abi_symbol"].clone(),
+            "link_plan_input_hash": prepared.input_hash,
+            "link_plan_hash": prepared.plan_hash,
+            "artifact_kinds": ["object_file", "link_plan", "executable"],
+            "objects": prepared.plan["objects"].clone(),
+            "export_map": prepared.plan["export_map"].clone(),
+            "external_symbols": prepared.plan["external_symbols"].clone(),
+            "link_options": prepared.plan["link_options"].clone(),
+        });
+        Ok(format!("{}\n", canonical_json(&payload)))
     }
 
     pub fn build_main_branch(

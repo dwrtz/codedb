@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
-use anyhow::{Result, bail};
-use rusqlite::params;
+use anyhow::{Result, anyhow, bail};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value as JsonValue, json};
 
 use crate::BYTES_DOMAIN;
@@ -553,14 +553,16 @@ impl CodeDb {
             if let Some(value) = artifact_value.as_ref() {
                 verify_artifact_metadata(
                     errors,
-                    &cache_key,
-                    artifact_kind,
-                    &input_hash,
-                    &backend,
-                    &target,
-                    &artifact_hash,
-                    value,
-                    artifact_bytes.as_deref(),
+                    ArtifactMetadataCheck {
+                        cache_key: &cache_key,
+                        artifact_kind,
+                        input_hash: &input_hash,
+                        backend: &backend,
+                        target: &target,
+                        artifact_hash: &artifact_hash,
+                        artifact_json: value,
+                        artifact_bytes: artifact_bytes.as_deref(),
+                    },
                 );
             } else if let Some(bytes) = artifact_bytes.as_deref() {
                 let recomputed = hash_bytes(BYTES_DOMAIN, bytes);
@@ -852,14 +854,27 @@ impl CodeDb {
                 .and_then(JsonValue::as_str);
             match (object_cache_key, object_artifact_hash) {
                 (Some(object_cache_key), Some(object_artifact_hash)) => {
-                    if !self.cache_key_artifact_exists(
-                        ArtifactKind::ObjectFile,
-                        object_cache_key,
-                        object_artifact_hash,
-                    )? {
-                        errors.push(format!(
-                            "bad_link_plan: {cache_key} object cache key does not identify artifact {object_artifact_hash}"
-                        ));
+                    match self
+                        .object_artifact_metadata_for_key(object_cache_key, object_artifact_hash)
+                    {
+                        Ok(Some(object_metadata)) => {
+                            verify_link_plan_object_matches_object_metadata(
+                                errors,
+                                cache_key,
+                                object,
+                                &object_metadata,
+                            );
+                        }
+                        Ok(None) => {
+                            errors.push(format!(
+                                "bad_link_plan: {cache_key} object cache key does not identify artifact {object_artifact_hash}"
+                            ));
+                        }
+                        Err(err) => {
+                            errors.push(format!(
+                                "bad_link_plan: {cache_key} cannot read object artifact metadata: {err:#}"
+                            ));
+                        }
                     }
                 }
                 (None, _) => errors.push(format!(
@@ -1204,138 +1219,229 @@ impl CodeDb {
         )?)
     }
 
-    fn cache_key_artifact_exists(
+    fn object_artifact_metadata_for_key(
         &self,
-        artifact_kind: ArtifactKind,
         cache_key: &str,
         artifact_hash: &str,
-    ) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM compile_cache
-                WHERE artifact_kind = ?1 AND cache_key = ?2 AND artifact_hash = ?3
-             )",
-            params![artifact_kind.as_str(), cache_key, artifact_hash],
-            |row| row.get(0),
-        )?)
+    ) -> Result<Option<JsonValue>> {
+        let artifact_json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT artifact_json
+                 FROM compile_cache
+                 WHERE artifact_kind = ?1 AND cache_key = ?2 AND artifact_hash = ?3",
+                params![ArtifactKind::ObjectFile.as_str(), cache_key, artifact_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        artifact_json
+            .map(|artifact_json| {
+                let value = serde_json::from_str::<JsonValue>(&artifact_json)?;
+                artifact_inner_metadata(&value)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("object artifact missing metadata"))
+            })
+            .transpose()
     }
 }
 
-fn verify_artifact_metadata(
-    errors: &mut Vec<String>,
-    cache_key: &str,
+struct ArtifactMetadataCheck<'a> {
+    cache_key: &'a str,
     artifact_kind: ArtifactKind,
-    input_hash: &str,
-    backend: &str,
-    target: &str,
-    artifact_hash: &str,
-    artifact_json: &JsonValue,
-    artifact_bytes: Option<&[u8]>,
-) {
-    if artifact_json.get("schema").and_then(JsonValue::as_str) != Some(ARTIFACT_METADATA_SCHEMA) {
+    input_hash: &'a str,
+    backend: &'a str,
+    target: &'a str,
+    artifact_hash: &'a str,
+    artifact_json: &'a JsonValue,
+    artifact_bytes: Option<&'a [u8]>,
+}
+
+fn verify_artifact_metadata(errors: &mut Vec<String>, check: ArtifactMetadataCheck<'_>) {
+    if check
+        .artifact_json
+        .get("schema")
+        .and_then(JsonValue::as_str)
+        != Some(ARTIFACT_METADATA_SCHEMA)
+    {
         errors.push(format!(
-            "bad_cache_entry: artifact metadata schema mismatch {cache_key}"
+            "bad_cache_entry: artifact metadata schema mismatch {}",
+            check.cache_key
         ));
         return;
     }
-    if artifact_json
+    if check
+        .artifact_json
         .get("artifact_kind")
         .and_then(JsonValue::as_str)
-        != Some(artifact_kind.as_str())
+        != Some(check.artifact_kind.as_str())
     {
         errors.push(format!(
-            "bad_cache_entry: artifact metadata kind mismatch {cache_key}"
+            "bad_cache_entry: artifact metadata kind mismatch {}",
+            check.cache_key
         ));
     }
-    if artifact_json.get("input_hash").and_then(JsonValue::as_str) != Some(input_hash) {
+    if check
+        .artifact_json
+        .get("input_hash")
+        .and_then(JsonValue::as_str)
+        != Some(check.input_hash)
+    {
         errors.push(format!(
-            "bad_cache_entry: artifact metadata input mismatch {cache_key}"
+            "bad_cache_entry: artifact metadata input mismatch {}",
+            check.cache_key
         ));
     }
-    if artifact_json.get("backend_id").and_then(JsonValue::as_str) != Some(backend) {
+    if check
+        .artifact_json
+        .get("backend_id")
+        .and_then(JsonValue::as_str)
+        != Some(check.backend)
+    {
         errors.push(format!(
-            "bad_cache_entry: artifact metadata backend mismatch {cache_key}"
+            "bad_cache_entry: artifact metadata backend mismatch {}",
+            check.cache_key
         ));
     }
-    if artifact_json
+    if check
+        .artifact_json
         .get("target_triple")
         .and_then(JsonValue::as_str)
-        != Some(target)
+        != Some(check.target)
     {
         errors.push(format!(
-            "bad_cache_entry: artifact metadata target mismatch {cache_key}"
+            "bad_cache_entry: artifact metadata target mismatch {}",
+            check.cache_key
         ));
     }
 
-    match artifact_json
+    match check
+        .artifact_json
         .get("content_kind")
         .and_then(JsonValue::as_str)
         .unwrap_or("")
     {
         "text" => {
-            let Some(text) = artifact_json.get("text").and_then(JsonValue::as_str) else {
+            let Some(text) = check.artifact_json.get("text").and_then(JsonValue::as_str) else {
                 errors.push(format!(
-                    "bad_cache_entry: text artifact missing text {cache_key}"
+                    "bad_cache_entry: text artifact missing text {}",
+                    check.cache_key
                 ));
                 return;
             };
             let recomputed = hash_bytes(BYTES_DOMAIN, text.as_bytes());
-            if recomputed != artifact_hash {
+            if recomputed != check.artifact_hash {
                 errors.push(format!(
-                    "bad_cache_entry: artifact text hash {artifact_hash} recomputes to {recomputed}"
+                    "bad_cache_entry: artifact text hash {} recomputes to {recomputed}",
+                    check.artifact_hash
                 ));
             }
-            if artifact_json.get("text_hash").and_then(JsonValue::as_str) != Some(artifact_hash) {
+            if check
+                .artifact_json
+                .get("text_hash")
+                .and_then(JsonValue::as_str)
+                != Some(check.artifact_hash)
+            {
                 errors.push(format!(
-                    "bad_cache_entry: text artifact metadata hash mismatch {cache_key}"
+                    "bad_cache_entry: text artifact metadata hash mismatch {}",
+                    check.cache_key
                 ));
             }
         }
         "json" => {
-            let Some(metadata) = artifact_json.get("metadata") else {
+            let Some(metadata) = check.artifact_json.get("metadata") else {
                 errors.push(format!(
-                    "bad_cache_entry: json artifact missing metadata {cache_key}"
+                    "bad_cache_entry: json artifact missing metadata {}",
+                    check.cache_key
                 ));
                 return;
             };
             let recomputed = hash_bytes(BYTES_DOMAIN, canonical_json(metadata).as_bytes());
-            if recomputed != artifact_hash {
+            if recomputed != check.artifact_hash {
                 errors.push(format!(
-                    "bad_cache_entry: artifact json hash {artifact_hash} recomputes to {recomputed}"
+                    "bad_cache_entry: artifact json hash {} recomputes to {recomputed}",
+                    check.artifact_hash
                 ));
             }
-            if artifact_json
+            if check
+                .artifact_json
                 .get("metadata_hash")
                 .and_then(JsonValue::as_str)
-                != Some(artifact_hash)
+                != Some(check.artifact_hash)
             {
                 errors.push(format!(
-                    "bad_cache_entry: json artifact metadata hash mismatch {cache_key}"
+                    "bad_cache_entry: json artifact metadata hash mismatch {}",
+                    check.cache_key
                 ));
             }
         }
         "bytes" => {
-            let Some(bytes) = artifact_bytes else {
+            let Some(bytes) = check.artifact_bytes else {
                 errors.push(format!(
-                    "bad_artifact_bytes: bytes artifact missing artifact_bytes {cache_key}"
+                    "bad_artifact_bytes: bytes artifact missing artifact_bytes {}",
+                    check.cache_key
                 ));
                 return;
             };
             let recomputed = hash_bytes(BYTES_DOMAIN, bytes);
-            if recomputed != artifact_hash {
+            if recomputed != check.artifact_hash {
                 errors.push(format!(
-                    "bad_artifact_bytes: artifact bytes hash {artifact_hash} recomputes to {recomputed}"
+                    "bad_artifact_bytes: artifact bytes hash {} recomputes to {recomputed}",
+                    check.artifact_hash
                 ));
             }
-            if artifact_json.get("bytes_hash").and_then(JsonValue::as_str) != Some(artifact_hash) {
+            if check
+                .artifact_json
+                .get("bytes_hash")
+                .and_then(JsonValue::as_str)
+                != Some(check.artifact_hash)
+            {
                 errors.push(format!(
-                    "bad_artifact_bytes: bytes artifact metadata hash mismatch {cache_key}"
+                    "bad_artifact_bytes: bytes artifact metadata hash mismatch {}",
+                    check.cache_key
                 ));
             }
         }
         other => errors.push(format!(
-            "bad_cache_entry: unknown artifact content kind {other:?} for {cache_key}"
+            "bad_cache_entry: unknown artifact content kind {other:?} for {}",
+            check.cache_key
         )),
+    }
+}
+
+fn verify_link_plan_object_matches_object_metadata(
+    errors: &mut Vec<String>,
+    plan_cache_key: &str,
+    object: &JsonValue,
+    metadata: &JsonValue,
+) {
+    for (label, plan_key, metadata_key) in [
+        ("symbol", "symbol_hash", "symbol_hash"),
+        ("definition", "definition_hash", "function_def_hash"),
+        ("signature", "signature_hash", "function_sig_hash"),
+        ("object format", "object_format", "object_format"),
+        ("defined symbols", "defined_symbols", "defined_symbols"),
+        ("called symbols", "called_symbols", "called_symbols"),
+        ("relocations", "relocations", "relocations"),
+    ] {
+        if object.get(plan_key) != metadata.get(metadata_key) {
+            errors.push(format!(
+                "bad_link_plan: {plan_cache_key} object {label} does not match object artifact metadata"
+            ));
+        }
+    }
+
+    let plan_object_symbols = object
+        .get("object_symbols")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let metadata_object_symbols = metadata
+        .get("object_symbols")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    if plan_object_symbols != metadata_object_symbols {
+        errors.push(format!(
+            "bad_link_plan: {plan_cache_key} object symbols do not match object artifact metadata"
+        ));
     }
 }
 

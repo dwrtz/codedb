@@ -64,6 +64,15 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    #[command(about = "Emit a deterministic native build plan as JSON")]
+    BuildPlan {
+        db: PathBuf,
+        entry_name: String,
+        #[arg(long, default_value = codedb::DEFAULT_NATIVE_TARGET)]
+        target: String,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Build a native executable for an entry function through a cached link plan")]
     Build {
         db: PathBuf,
@@ -255,6 +264,18 @@ fn main() -> Result<()> {
             let plan = codedb.link_plan_main_branch(&entry_name, &target)?;
             std::fs::write(&out, plan)?;
             println!("emitted native link plan {}", out.display());
+        }
+        Command::BuildPlan {
+            db,
+            entry_name,
+            target,
+            json,
+        } => {
+            if !json {
+                anyhow::bail!("build-plan currently requires --json");
+            }
+            let mut codedb = codedb::CodeDb::open(db)?;
+            print!("{}", codedb.build_plan_main_branch(&entry_name, &target)?);
         }
         Command::Build {
             db,
