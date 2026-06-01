@@ -29,6 +29,213 @@ fn parse_line_value<'a>(text: &'a str, key: &str) -> &'a str {
 }
 
 #[test]
+fn native_object_backend_emits_elf_and_reuses_cache_across_rename() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("native.sqlite");
+    let tax_obj = temp.path().join("tax.o");
+    let total_obj = temp.path().join("total.o");
+    let main_obj = temp.path().join("main.o");
+    let total_after_rename_obj = temp.path().join("total-after-rename.o");
+    let vat_obj = temp.path().join("vat.o");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+
+    let show_tax = run(&["show", db.to_str().unwrap(), "tax"]);
+    let tax_internal_abi = parse_line_value(&show_tax, "internal_abi_symbol ").to_string();
+    let tax_definition = parse_line_value(&show_tax, "definition ").to_string();
+    let show_total = run(&["show", db.to_str().unwrap(), "total"]);
+    let total_definition = parse_line_value(&show_total, "definition ").to_string();
+    let show_main = run(&["show", db.to_str().unwrap(), "main"]);
+    let main_internal_abi = parse_line_value(&show_main, "internal_abi_symbol ").to_string();
+
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "tax",
+        "--out",
+        tax_obj.to_str().unwrap(),
+    ]);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "total",
+        "--out",
+        total_obj.to_str().unwrap(),
+    ]);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "main",
+        "--out",
+        main_obj.to_str().unwrap(),
+    ]);
+
+    let tax_bytes = std::fs::read(&tax_obj).unwrap();
+    let total_bytes = std::fs::read(&total_obj).unwrap();
+    assert_eq!(&tax_bytes[..4], b"\x7fELF");
+    assert!(bytes_contain(&tax_bytes, tax_internal_abi.as_bytes()));
+    assert!(!bytes_contain(&tax_bytes, b"tax"));
+    assert!(!bytes_contain(&total_bytes, b"total"));
+    assert_eq!(cache_row_count_by_kind(&db, "object_file"), 3);
+
+    let (tax_cache_json, tax_cache_bytes) = object_cache_entry_by_definition(&db, &tax_definition);
+    assert_eq!(tax_cache_bytes, tax_bytes);
+    assert_eq!(tax_cache_json["content_kind"], "bytes");
+    assert_eq!(
+        tax_cache_json["metadata"]["object_format"],
+        "elf64-x86-64-relocatable"
+    );
+    assert_eq!(
+        tax_cache_json["metadata"]["target_triple"],
+        codedb::DEFAULT_NATIVE_TARGET
+    );
+    assert_eq!(
+        tax_cache_json["metadata"]["defined_symbols"][0],
+        tax_internal_abi
+    );
+
+    let (total_cache_json, _) = object_cache_entry_by_definition(&db, &total_definition);
+    assert_eq!(
+        total_cache_json["metadata"]["relocations"][0]["target_abi_symbol"],
+        tax_internal_abi
+    );
+    assert_eq!(
+        total_cache_json["metadata"]["relocations"][0]["kind"],
+        "R_X86_64_PLT32"
+    );
+
+    link_and_run_native_if_linux(
+        temp.path(),
+        &[&tax_obj, &total_obj, &main_obj],
+        &main_internal_abi,
+        120,
+    );
+
+    run(&["rename", db.to_str().unwrap(), "tax", "vat"]);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "total",
+        "--out",
+        total_after_rename_obj.to_str().unwrap(),
+    ]);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "vat",
+        "--out",
+        vat_obj.to_str().unwrap(),
+    ]);
+    assert_eq!(std::fs::read(&total_after_rename_obj).unwrap(), total_bytes);
+    assert_eq!(std::fs::read(&vat_obj).unwrap(), tax_bytes);
+    assert_eq!(cache_row_count_by_kind(&db, "object_file"), 3);
+
+    bin()
+        .args(["verify", db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+}
+
+#[test]
+fn native_object_backend_reuses_unchanged_objects_after_body_change() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("native-body-change.sqlite");
+    let tax_before = temp.path().join("tax-before.o");
+    let tax_after = temp.path().join("tax-after.o");
+    let total_before = temp.path().join("total-before.o");
+    let total_after = temp.path().join("total-after.o");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "tax",
+        "--out",
+        tax_before.to_str().unwrap(),
+    ]);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "total",
+        "--out",
+        total_before.to_str().unwrap(),
+    ]);
+    assert_eq!(cache_row_count_by_kind(&db, "object_file"), 2);
+
+    run(&[
+        "replace-body",
+        db.to_str().unwrap(),
+        "tax",
+        "subtotal * 18 / 100",
+    ]);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "total",
+        "--out",
+        total_after.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        std::fs::read(&total_after).unwrap(),
+        std::fs::read(&total_before).unwrap()
+    );
+    assert_eq!(cache_row_count_by_kind(&db, "object_file"), 2);
+
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "tax",
+        "--out",
+        tax_after.to_str().unwrap(),
+    ]);
+    assert_ne!(
+        std::fs::read(&tax_after).unwrap(),
+        std::fs::read(&tax_before).unwrap()
+    );
+    assert_eq!(cache_row_count_by_kind(&db, "object_file"), 3);
+}
+
+#[test]
+fn native_object_backend_handles_bool_calls_and_conditionals() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("native-booleans.sqlite");
+    let is_large_obj = temp.path().join("is-large.o");
+    let fee_obj = temp.path().join("fee.o");
+    let main_obj = temp.path().join("main.o");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/booleans.cdb"]);
+
+    for (name, out) in [
+        ("is_large", &is_large_obj),
+        ("fee", &fee_obj),
+        ("main", &main_obj),
+    ] {
+        run(&[
+            "emit-object",
+            db.to_str().unwrap(),
+            name,
+            "--out",
+            out.to_str().unwrap(),
+        ]);
+        let bytes = std::fs::read(out).unwrap();
+        assert_eq!(&bytes[..4], b"\x7fELF");
+    }
+
+    let show_main = run(&["show", db.to_str().unwrap(), "main"]);
+    let main_internal_abi = parse_line_value(&show_main, "internal_abi_symbol ").to_string();
+    link_and_run_native_if_linux(
+        temp.path(),
+        &[&is_large_obj, &fee_obj, &main_obj],
+        &main_internal_abi,
+        5,
+    );
+}
+
+#[test]
 fn shop_demo_flow_preserves_symbol_identity_across_rename() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("demo.sqlite");
@@ -796,6 +1003,23 @@ fn cache_row_count_by_kind(db: &Path, artifact_kind: &str) -> i64 {
     .unwrap()
 }
 
+fn object_cache_entry_by_definition(db: &Path, definition: &str) -> (JsonValue, Vec<u8>) {
+    let conn = Connection::open(db).unwrap();
+    let (artifact_json, artifact_bytes): (String, Vec<u8>) = conn
+        .query_row(
+            "SELECT artifact_json, artifact_bytes FROM compile_cache
+             WHERE artifact_kind = 'object_file' AND input_hash = ?1
+             ORDER BY cache_key LIMIT 1",
+            [definition],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    (
+        serde_json::from_str(&artifact_json).unwrap(),
+        artifact_bytes,
+    )
+}
+
 fn branch_state(db: &Path) -> (String, Option<String>) {
     let conn = Connection::open(db).unwrap();
     conn.query_row(
@@ -844,5 +1068,42 @@ fn compile_and_run_c_if_available(c_file: &Path) {
         .expect("run cc");
     assert!(status.success());
     let status = StdCommand::new(&exe).status().expect("run c harness");
+    assert!(status.success());
+}
+
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn link_and_run_native_if_linux(dir: &Path, objects: &[&Path], entry_symbol: &str, expected: i64) {
+    if std::env::consts::OS != "linux" {
+        return;
+    }
+    if StdCommand::new("cc").arg("--version").output().is_err() {
+        return;
+    }
+    let harness = dir.join("native_harness.c");
+    let exe = dir.join("native_harness");
+    std::fs::write(
+        &harness,
+        format!(
+            "long {entry_symbol}(void);\nint main(void) {{ return {entry_symbol}() == {expected} ? 0 : 1; }}\n"
+        ),
+    )
+    .unwrap();
+    let mut command = StdCommand::new("cc");
+    for object in objects {
+        command.arg(object);
+    }
+    let status = command
+        .arg(&harness)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+        .expect("link native harness");
+    assert!(status.success());
+    let status = StdCommand::new(&exe).status().expect("run native harness");
     assert!(status.success());
 }

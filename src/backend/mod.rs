@@ -1,6 +1,9 @@
 use serde_json::Value as JsonValue;
 
+pub(crate) mod elf;
+
 pub(crate) use crate::artifact::ArtifactKind;
+use crate::lowering::LoweredFunctionIr;
 
 #[allow(dead_code)]
 pub(crate) struct CompilerBackendInput<'a> {
@@ -26,4 +29,22 @@ pub(crate) trait CompilerBackend {
         &self,
         input: CompilerBackendInput<'_>,
     ) -> anyhow::Result<CompilerBackendArtifact>;
+}
+
+pub(crate) struct ObjectBackendInput<'a> {
+    pub ir: &'a LoweredFunctionIr,
+    pub target_triple: &'a str,
+    pub exported_abi_names: Vec<String>,
+}
+
+pub(crate) struct ObjectBackendArtifact {
+    pub artifact_hash: String,
+    pub metadata: JsonValue,
+    pub bytes: Vec<u8>,
+}
+
+pub(crate) trait ObjectBackend {
+    fn backend_id(&self) -> &'static str;
+
+    fn emit_object(&self, input: ObjectBackendInput<'_>) -> anyhow::Result<ObjectBackendArtifact>;
 }

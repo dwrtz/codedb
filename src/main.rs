@@ -46,6 +46,15 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    #[command(about = "Emit a native ELF relocatable object artifact for one lowered function")]
+    EmitObject {
+        db: PathBuf,
+        function_name: String,
+        #[arg(long, default_value = codedb::DEFAULT_NATIVE_TARGET)]
+        target: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
     List {
         db: PathBuf,
     },
@@ -197,6 +206,17 @@ fn main() -> Result<()> {
             let ir = codedb.emit_ir_main_branch(&function_name)?;
             std::fs::write(&out, ir)?;
             println!("emitted lowered IR {}", out.display());
+        }
+        Command::EmitObject {
+            db,
+            function_name,
+            target,
+            out,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            let object = codedb.emit_object_main_branch(&function_name, &target)?;
+            std::fs::write(&out, object)?;
+            println!("emitted native object {}", out.display());
         }
         Command::List { db } => {
             let codedb = codedb::CodeDb::open(db)?;
