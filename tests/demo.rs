@@ -999,6 +999,44 @@ fn source_projection_parenthesizes_if_inside_binary_expressions() {
 }
 
 #[test]
+fn source_projection_orders_dependencies_for_reimport() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("shop-export.sqlite");
+    let projection = temp.path().join("projection.cdb");
+    let reimport_db = temp.path().join("shop-reimport.sqlite");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    run(&[
+        "export",
+        db.to_str().unwrap(),
+        "--branch",
+        "main",
+        "--out",
+        projection.to_str().unwrap(),
+    ]);
+
+    let projected = std::fs::read_to_string(&projection).unwrap();
+    let tax_pos = projected.find("fn tax").expect("tax definition");
+    let total_pos = projected.find("fn total").expect("total definition");
+    let main_pos = projected.find("fn main").expect("main definition");
+    assert!(tax_pos < total_pos);
+    assert!(total_pos < main_pos);
+
+    run(&["init", reimport_db.to_str().unwrap()]);
+    run(&[
+        "import",
+        reimport_db.to_str().unwrap(),
+        projection.to_str().unwrap(),
+    ]);
+    bin()
+        .args(["eval", reimport_db.to_str().unwrap(), "main"])
+        .assert()
+        .success()
+        .stdout("120\n");
+}
+
+#[test]
 fn export_map_changes_are_explicit_relink_only_operations() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("exports.sqlite");

@@ -209,7 +209,7 @@ impl CodeDb {
     pub(crate) fn render_source(&self, root_hash: &str) -> Result<String> {
         let root = self.load_root(root_hash)?;
         let mut chunks = Vec::new();
-        for binding in preferred_names(&root) {
+        for binding in self.source_projection_order(&root)? {
             let symbol = binding.symbol;
             let root_symbol = self
                 .root_symbol(&root, &symbol)
@@ -223,6 +223,73 @@ impl CodeDb {
             ));
         }
         Ok(format!("{}\n", chunks.join("\n\n")))
+    }
+
+    fn source_projection_order(
+        &self,
+        root: &ProgramRootPayload,
+    ) -> Result<Vec<crate::model::NameBinding>> {
+        let bindings = preferred_names(root);
+        let binding_by_symbol = bindings
+            .iter()
+            .map(|binding| (binding.symbol.clone(), binding.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut visiting = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        let mut ordered = Vec::new();
+
+        for binding in bindings {
+            self.visit_projection_symbol(
+                root,
+                &binding_by_symbol,
+                &binding.symbol,
+                &mut visiting,
+                &mut visited,
+                &mut ordered,
+            )?;
+        }
+
+        Ok(ordered)
+    }
+
+    fn visit_projection_symbol(
+        &self,
+        root: &ProgramRootPayload,
+        binding_by_symbol: &std::collections::BTreeMap<String, crate::model::NameBinding>,
+        symbol: &str,
+        visiting: &mut BTreeSet<String>,
+        visited: &mut BTreeSet<String>,
+        ordered: &mut Vec<crate::model::NameBinding>,
+    ) -> Result<()> {
+        if visited.contains(symbol) {
+            return Ok(());
+        }
+        if !visiting.insert(symbol.to_string()) {
+            return Ok(());
+        }
+
+        if let Some(entry) = self.root_symbol(root, symbol) {
+            for dependency in self.dependencies_for_definition(root, &entry.definition)? {
+                if binding_by_symbol.contains_key(&dependency) {
+                    self.visit_projection_symbol(
+                        root,
+                        binding_by_symbol,
+                        &dependency,
+                        visiting,
+                        visited,
+                        ordered,
+                    )?;
+                }
+            }
+        }
+
+        visiting.remove(symbol);
+        if visited.insert(symbol.to_string())
+            && let Some(binding) = binding_by_symbol.get(symbol)
+        {
+            ordered.push(binding.clone());
+        }
+        Ok(())
     }
 
     pub(crate) fn signature_source(

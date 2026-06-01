@@ -259,9 +259,20 @@ impl CodeDb {
                             reasons.insert(BuildImpactReason::DependencySetChanged);
                         }
 
-                        let direct = self.direct_dependents_for_symbol(new_root_hash, &symbol)?;
-                        let transitive =
-                            self.transitive_dependents_for_symbol(new_root_hash, &symbol)?;
+                        let direct = self.dependents_for_signature_change(
+                            old_root_hash,
+                            new_root_hash,
+                            &symbol,
+                            &new_symbols,
+                            false,
+                        )?;
+                        let transitive = self.dependents_for_signature_change(
+                            old_root_hash,
+                            new_root_hash,
+                            &symbol,
+                            &new_symbols,
+                            true,
+                        )?;
                         for dependent in &transitive {
                             recompile_symbols.insert(dependent.clone());
                         }
@@ -325,6 +336,30 @@ impl CodeDb {
             transitive_dependents,
             reasons,
         })
+    }
+
+    fn dependents_for_signature_change(
+        &self,
+        old_root_hash: &str,
+        new_root_hash: &str,
+        symbol: &str,
+        new_symbols: &BTreeMap<String, &RootSymbolPayload>,
+        transitive: bool,
+    ) -> Result<Vec<String>> {
+        let mut dependents = BTreeSet::new();
+        for root_hash in [old_root_hash, new_root_hash] {
+            let root_dependents = if transitive {
+                self.transitive_dependents_for_symbol(root_hash, symbol)?
+            } else {
+                self.direct_dependents_for_symbol(root_hash, symbol)?
+            };
+            for dependent in root_dependents {
+                if new_symbols.contains_key(&dependent) {
+                    dependents.insert(dependent);
+                }
+            }
+        }
+        Ok(dependents.into_iter().collect())
     }
 }
 
@@ -605,6 +640,169 @@ mod tests {
         );
     }
 
+    #[test]
+    fn signature_change_reports_dependents_from_old_dependency_graph() {
+        let temp = tempdir().unwrap();
+        let mut db = CodeDb::open(temp.path().join("old-dependents.sqlite")).unwrap();
+        db.init().unwrap();
+
+        let i64_type = db.resolve_type("i64").unwrap();
+        let sig_one_arg = db
+            .put_signature(std::slice::from_ref(&i64_type), &i64_type)
+            .unwrap();
+        let sig_no_args = db.put_signature(&[], &i64_type).unwrap();
+
+        let leaf_symbol = db.put_symbol_birth(None, "leaf").unwrap();
+        let mid_symbol = db.put_symbol_birth(None, "mid").unwrap();
+        let root_symbol = db.put_symbol_birth(None, "root").unwrap();
+
+        let leaf_old_body = db
+            .put_object(
+                "Expression",
+                &serde_json::json!({
+                    "expr_kind": "param_ref",
+                    "index": 0,
+                    "type": i64_type,
+                }),
+            )
+            .unwrap();
+        let leaf_new_body = literal_i64(&mut db, &i64_type, "1");
+        let mid_old_arg = literal_i64(&mut db, &i64_type, "2");
+        let mid_old_body = db
+            .put_object(
+                "Expression",
+                &serde_json::json!({
+                    "expr_kind": "call",
+                    "symbol": leaf_symbol,
+                    "args": [mid_old_arg],
+                    "type": i64_type,
+                }),
+            )
+            .unwrap();
+        let mid_new_body = literal_i64(&mut db, &i64_type, "3");
+        let root_old_body = db
+            .put_object(
+                "Expression",
+                &serde_json::json!({
+                    "expr_kind": "call",
+                    "symbol": mid_symbol,
+                    "args": [],
+                    "type": i64_type,
+                }),
+            )
+            .unwrap();
+        let root_new_body = literal_i64(&mut db, &i64_type, "4");
+
+        let leaf_def_old = db
+            .put_function_def(&leaf_symbol, &sig_one_arg, &leaf_old_body)
+            .unwrap();
+        let leaf_def_new = db
+            .put_function_def(&leaf_symbol, &sig_no_args, &leaf_new_body)
+            .unwrap();
+        let mid_def_old = db
+            .put_function_def(&mid_symbol, &sig_no_args, &mid_old_body)
+            .unwrap();
+        let mid_def_new = db
+            .put_function_def(&mid_symbol, &sig_no_args, &mid_new_body)
+            .unwrap();
+        let root_def_old = db
+            .put_function_def(&root_symbol, &sig_no_args, &root_old_body)
+            .unwrap();
+        let root_def_new = db
+            .put_function_def(&root_symbol, &sig_no_args, &root_new_body)
+            .unwrap();
+
+        let old_root = db
+            .put_program_root(&ProgramRootPayload {
+                symbols: vec![
+                    RootSymbolPayload {
+                        symbol: leaf_symbol.clone(),
+                        definition: leaf_def_old,
+                        signature: sig_one_arg,
+                    },
+                    RootSymbolPayload {
+                        symbol: mid_symbol.clone(),
+                        definition: mid_def_old,
+                        signature: sig_no_args.clone(),
+                    },
+                    RootSymbolPayload {
+                        symbol: root_symbol.clone(),
+                        definition: root_def_old,
+                        signature: sig_no_args.clone(),
+                    },
+                ],
+                names: vec![
+                    name("leaf", &leaf_symbol),
+                    name("mid", &mid_symbol),
+                    name("root", &root_symbol),
+                ],
+                param_names: vec![],
+                exports: vec![],
+                metadata: BTreeMap::new(),
+            })
+            .unwrap();
+        let new_root = db
+            .put_program_root(&ProgramRootPayload {
+                symbols: vec![
+                    RootSymbolPayload {
+                        symbol: leaf_symbol.clone(),
+                        definition: leaf_def_new,
+                        signature: sig_no_args.clone(),
+                    },
+                    RootSymbolPayload {
+                        symbol: mid_symbol.clone(),
+                        definition: mid_def_new,
+                        signature: sig_no_args.clone(),
+                    },
+                    RootSymbolPayload {
+                        symbol: root_symbol.clone(),
+                        definition: root_def_new,
+                        signature: sig_no_args,
+                    },
+                ],
+                names: vec![
+                    name("leaf", &leaf_symbol),
+                    name("mid", &mid_symbol),
+                    name("root", &root_symbol),
+                ],
+                param_names: vec![],
+                exports: vec![],
+                metadata: BTreeMap::new(),
+            })
+            .unwrap();
+        db.index_root(&old_root).unwrap();
+        db.index_root(&new_root).unwrap();
+
+        let plan = db.plan_build_impact(&old_root, &new_root).unwrap();
+
+        assert_eq!(
+            plan.direct_dependents.get(&leaf_symbol).unwrap(),
+            &vec![mid_symbol.clone()]
+        );
+        let transitive = plan
+            .transitive_dependents
+            .get(&leaf_symbol)
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            transitive,
+            [mid_symbol.clone(), root_symbol.clone()]
+                .into_iter()
+                .collect()
+        );
+        let recompile = plan
+            .recompile_symbols
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            recompile,
+            [leaf_symbol, mid_symbol, root_symbol].into_iter().collect()
+        );
+    }
+
     fn name(display_name: &str, symbol: &str) -> NameBinding {
         NameBinding {
             module: "main".to_string(),
@@ -612,5 +810,17 @@ mod tests {
             symbol: symbol.to_string(),
             is_preferred: true,
         }
+    }
+
+    fn literal_i64(db: &mut CodeDb, i64_type: &str, value: &str) -> String {
+        db.put_object(
+            "Expression",
+            &serde_json::json!({
+                "expr_kind": "literal_i64",
+                "value": value,
+                "type": i64_type,
+            }),
+        )
+        .unwrap()
     }
 }
