@@ -245,6 +245,26 @@ fn verify_rejects_bad_source_search_index() {
 }
 
 #[test]
+fn verify_rejects_duplicate_source_search_rows() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("duplicate-source-search.sqlite");
+    setup_shop(&db);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO source_search (root_hash, symbol_hash, rendered_source)
+         SELECT root_hash, symbol_hash, rendered_source
+         FROM source_search
+         LIMIT 1",
+        [],
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_index: source_search mismatch"));
+}
+
+#[test]
 fn verify_rejects_bad_history_hashes() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("bad-history.sqlite");
@@ -570,6 +590,148 @@ fn verify_rejects_mismatched_object_bytes_hashes() {
 }
 
 #[test]
+fn verify_rejects_native_object_bytes_that_do_not_match_metadata() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("fake-object-bytes.sqlite");
+    let object = temp.path().join("tax.o");
+    setup_shop(&db);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "tax",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        object.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'object_file'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let fake_bytes = b"\x7fELFnot-real".to_vec();
+    let fake_hash = test_bytes_hash(&fake_bytes);
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    value["bytes_hash"] = JsonValue::String(fake_hash.clone());
+    conn.execute(
+        "UPDATE compile_cache
+         SET artifact_bytes = ?1, artifact_hash = ?2, artifact_json = ?3
+         WHERE cache_key = ?4",
+        (
+            fake_bytes.as_slice(),
+            &fake_hash,
+            test_canonical_json(&value),
+            cache_key,
+        ),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_object_artifact"));
+    assert!(stderr.contains("object bytes are not valid ELF"));
+}
+
+#[test]
+fn verify_rejects_native_object_dependency_metadata_mismatch() {
+    let temp = tempdir().unwrap();
+    let db = temp
+        .path()
+        .join("object-dependency-metadata-mismatch.sqlite");
+    let object = temp.path().join("total.o");
+    setup_shop(&db);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "total",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        object.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'object_file'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    value["metadata"]["called_symbols"] = serde_json::json!([]);
+    value["metadata"]["relocations"] = serde_json::json!([]);
+    value["metadata"]["dependency_closure"] = serde_json::json!([]);
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (test_canonical_json(&value), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_object_artifact"));
+    assert!(stderr.contains("called_symbols metadata does not match any indexed root"));
+}
+
+#[test]
+fn verify_rejects_native_object_dependency_interfaces_that_match_tampered_cache_key() {
+    let temp = tempdir().unwrap();
+    let db = temp
+        .path()
+        .join("object-dependency-interface-mismatch.sqlite");
+    let object = temp.path().join("total.o");
+    setup_shop(&db);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "total",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        object.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, cache_key_json, artifact_json): (String, String, String) = conn
+        .query_row(
+            "SELECT cache_key, cache_key_json, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'object_file'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let mut key_value: JsonValue = serde_json::from_str(&cache_key_json).unwrap();
+    let mut artifact_value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    key_value["dependency_interface_hashes"] = serde_json::json!([]);
+    artifact_value["metadata"]["dependency_interface_hashes"] = serde_json::json!([]);
+    let new_cache_key = test_cache_hash(&key_value);
+    conn.execute(
+        "UPDATE compile_cache
+         SET cache_key = ?1, cache_key_json = ?2, artifact_json = ?3
+         WHERE cache_key = ?4",
+        (
+            &new_cache_key,
+            test_canonical_json(&key_value),
+            test_canonical_json(&artifact_value),
+            cache_key,
+        ),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_object_artifact"));
+    assert!(stderr.contains("dependency interface metadata does not match indexed root"));
+}
+
+#[test]
 fn verify_rejects_missing_native_object_bytes() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("missing-object-bytes.sqlite");
@@ -862,6 +1024,13 @@ fn test_bytes_hash(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"codedb/bytes/v1\0");
     hasher.update(bytes);
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn test_cache_hash(value: &JsonValue) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codedb/cache/v1\0");
+    hasher.update(test_canonical_json(value).as_bytes());
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 

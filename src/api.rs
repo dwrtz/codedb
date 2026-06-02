@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value as JsonValue, json};
 
 use crate::MAIN_BRANCH;
 use crate::expr::RawExpr;
@@ -266,6 +266,7 @@ impl CodeDb {
             let stop = matches!(status, MigrationStatus::Conflict);
             results.push(outcome.to_json());
             if stop {
+                let results = mark_rolled_back_results(results);
                 let payload = apply_result_json(
                     aggregate_status,
                     false,
@@ -487,6 +488,26 @@ fn apply_result_json(
         "applied_operation_count": applied_operation_count,
         "results": results,
     })
+}
+
+fn mark_rolled_back_results(results: Vec<JsonValue>) -> Vec<JsonValue> {
+    results
+        .into_iter()
+        .map(|mut result| {
+            if result.get("status").and_then(JsonValue::as_str) == Some("applied")
+                && let Some(object) = result.as_object_mut()
+            {
+                object.insert(
+                    "status".to_string(),
+                    JsonValue::String("rolled_back".to_string()),
+                );
+                object.insert("migration_hash".to_string(), JsonValue::Null);
+                object.insert("history_hash".to_string(), JsonValue::Null);
+                object.insert("rolled_back".to_string(), JsonValue::Bool(true));
+            }
+            result
+        })
+        .collect()
 }
 
 fn merge_status(current: MigrationStatus, next: MigrationStatus) -> MigrationStatus {

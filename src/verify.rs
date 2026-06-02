@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, anyhow, bail};
 use rusqlite::{OptionalExtension, params};
@@ -9,6 +9,7 @@ use crate::abi::{
 };
 use crate::artifact::{ARTIFACT_METADATA_SCHEMA, CacheKeyInput};
 use crate::backend::ArtifactKind;
+use crate::backend::native::{ELF_BACKEND_ID, MACHO_BACKEND_ID};
 use crate::backend_c::ensure_no_forbidden_runtime_calls;
 use crate::diff::dependency_pairs;
 use crate::migrations::{history_hash, migration_hash};
@@ -719,7 +720,7 @@ impl CodeDb {
         root: &ProgramRootPayload,
         errors: &mut Vec<String>,
     ) -> Result<()> {
-        let mut expected = BTreeSet::new();
+        let mut expected = BTreeMap::new();
         for binding in preferred_names(root) {
             let symbol = binding.symbol.clone();
             if let Some(entry) = self.root_symbol(root, &symbol) {
@@ -730,7 +731,7 @@ impl CodeDb {
                     self.signature_source(&entry.signature, &param_names(root, &symbol))?,
                     self.expr_to_source(&body, root, &param_names(root, &symbol), 0)?
                 );
-                expected.insert((symbol, source));
+                *expected.entry((symbol, source)).or_insert(0) += 1;
             }
         }
         let actual = {
@@ -738,10 +739,14 @@ impl CodeDb {
                 "SELECT symbol_hash, rendered_source FROM source_search
                  WHERE root_hash = ?1 ORDER BY symbol_hash, rendered_source",
             )?;
-            stmt.query_map(params![root_hash], |row| {
+            let rows = stmt.query_map(params![root_hash], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<std::result::Result<BTreeSet<_>, _>>()?
+            })?;
+            let mut actual = BTreeMap::new();
+            for row in rows {
+                *actual.entry(row?).or_insert(0) += 1;
+            }
+            actual
         };
         if expected != actual {
             errors.push(format!("bad_index: source_search mismatch for {root_hash}"));
@@ -1458,17 +1463,141 @@ impl CodeDb {
                 ));
             }
         }
+        let uses_builtin_native_backend =
+            object_artifact_uses_builtin_native_backend(key_input, metadata);
+        if uses_builtin_native_backend {
+            self.verify_object_artifact_matches_indexed_root(
+                errors, cache_key, key_input, metadata,
+            )?;
+        }
         if let Some(bytes) = artifact_bytes {
-            match key_input.target_triple.as_str() {
-                crate::LINUX_X86_64_TARGET if !bytes.starts_with(b"\x7fELF") => errors.push(
-                    format!("bad_object_artifact: {cache_key} object bytes are not ELF"),
-                ),
-                crate::APPLE_ARM64_TARGET if !bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe]) => {
-                    errors.push(format!(
-                        "bad_object_artifact: {cache_key} object bytes are not Mach-O"
-                    ));
-                }
-                _ => {}
+            if uses_builtin_native_backend {
+                verify_native_object_bytes_match_metadata(
+                    errors,
+                    cache_key,
+                    &key_input.target_triple,
+                    metadata,
+                    bytes,
+                );
+            } else {
+                verify_native_object_bytes_have_declared_format(
+                    errors,
+                    cache_key,
+                    &key_input.target_triple,
+                    bytes,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_object_artifact_matches_indexed_root(
+        &self,
+        errors: &mut Vec<String>,
+        cache_key: &str,
+        key_input: &CacheKeyInput,
+        metadata: &JsonValue,
+    ) -> Result<()> {
+        let Some(symbol) = metadata.get("symbol_hash").and_then(JsonValue::as_str) else {
+            return Ok(());
+        };
+        if symbol.is_empty() {
+            return Ok(());
+        }
+        let Some(called_symbols) = json_string_vec(metadata.get("called_symbols")) else {
+            return Ok(());
+        };
+        let Some(metadata_dependency_interfaces) =
+            json_string_vec(metadata.get("dependency_interface_hashes"))
+        else {
+            return Ok(());
+        };
+        let Some(metadata_dependency_closure) = json_string_vec(metadata.get("dependency_closure"))
+        else {
+            return Ok(());
+        };
+        let Some(relocations) = metadata.get("relocations").and_then(JsonValue::as_array) else {
+            return Ok(());
+        };
+
+        let indexed_roots = self.dependency_symbols_for_indexed_roots(&key_input.input_hash)?;
+        if indexed_roots.is_empty() {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} definition is not indexed by any root"
+            ));
+            return Ok(());
+        }
+
+        let mut saw_dependency_match = false;
+        let mut saw_interface_match = false;
+        for (root_hash, dependencies) in indexed_roots {
+            if dependencies != called_symbols {
+                continue;
+            }
+            saw_dependency_match = true;
+            let root = self.load_root(&root_hash)?;
+            let expected_interfaces = self.interface_hashes_for_symbols(&root, &dependencies)?;
+            if expected_interfaces.into_iter().collect::<BTreeSet<_>>()
+                != metadata_dependency_interfaces
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            {
+                continue;
+            }
+            saw_interface_match = true;
+            let expected_closure = self.verify_dependency_closure_for_symbol(&root_hash, symbol)?;
+            if expected_closure != metadata_dependency_closure {
+                continue;
+            }
+            verify_object_relocations_match_dependencies(
+                errors,
+                cache_key,
+                relocations,
+                &dependencies,
+            );
+            return Ok(());
+        }
+
+        if !saw_dependency_match {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} called_symbols metadata does not match any indexed root"
+            ));
+        } else if !saw_interface_match {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} dependency interface metadata does not match indexed root"
+            ));
+        } else {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} dependency closure metadata does not match indexed root"
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_dependency_closure_for_symbol(
+        &self,
+        root_hash: &str,
+        origin: &str,
+    ) -> Result<Vec<String>> {
+        let mut seen = BTreeSet::new();
+        self.collect_verify_dependency_closure(root_hash, origin, origin, &mut seen)?;
+        Ok(seen.into_iter().collect())
+    }
+
+    fn collect_verify_dependency_closure(
+        &self,
+        root_hash: &str,
+        origin: &str,
+        symbol: &str,
+        seen: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        for dependency in self.dependencies_for_symbol(root_hash, symbol)? {
+            if dependency == origin {
+                continue;
+            }
+            if seen.insert(dependency.clone()) {
+                self.collect_verify_dependency_closure(root_hash, origin, &dependency, seen)?;
             }
         }
         Ok(())
@@ -2112,6 +2241,232 @@ fn verify_artifact_metadata(errors: &mut Vec<String>, check: ArtifactMetadataChe
             check.cache_key
         )),
     }
+}
+
+fn verify_object_relocations_match_dependencies(
+    errors: &mut Vec<String>,
+    cache_key: &str,
+    relocations: &[JsonValue],
+    dependency_symbols: &[String],
+) {
+    let expected_symbols = dependency_symbols.iter().cloned().collect::<BTreeSet<_>>();
+    let actual_symbols = relocations
+        .iter()
+        .filter_map(|relocation| {
+            relocation
+                .get("target_symbol_hash")
+                .and_then(JsonValue::as_str)
+        })
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if actual_symbols != expected_symbols {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} relocations do not match direct dependencies"
+        ));
+    }
+
+    for relocation in relocations {
+        let Some(target_symbol) = relocation
+            .get("target_symbol_hash")
+            .and_then(JsonValue::as_str)
+        else {
+            continue;
+        };
+        let expected_abi_symbol = match internal_abi_symbol(target_symbol) {
+            Ok(symbol) => symbol,
+            Err(err) => {
+                errors.push(format!(
+                    "bad_object_artifact: {cache_key} relocation target symbol is invalid: {err:#}"
+                ));
+                continue;
+            }
+        };
+        if relocation
+            .get("target_abi_symbol")
+            .and_then(JsonValue::as_str)
+            != Some(expected_abi_symbol.as_str())
+        {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} relocation ABI symbol mismatch"
+            ));
+        }
+        if let Some(object_symbol) = relocation
+            .get("target_object_symbol")
+            .and_then(JsonValue::as_str)
+        {
+            let expected_object_symbol = format!("_{expected_abi_symbol}");
+            if object_symbol != expected_object_symbol {
+                errors.push(format!(
+                    "bad_object_artifact: {cache_key} relocation object symbol mismatch"
+                ));
+            }
+        }
+    }
+}
+
+fn verify_native_object_bytes_match_metadata(
+    errors: &mut Vec<String>,
+    cache_key: &str,
+    target_triple: &str,
+    metadata: &JsonValue,
+    bytes: &[u8],
+) {
+    match target_triple {
+        crate::LINUX_X86_64_TARGET => verify_elf_object_header(errors, cache_key, bytes),
+        crate::APPLE_ARM64_TARGET => verify_macho_object_header(errors, cache_key, bytes),
+        _ => {}
+    }
+
+    for symbol in required_object_byte_symbols(target_triple, metadata) {
+        if !bytes_contain(bytes, symbol.as_bytes()) {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} object bytes missing symbol {symbol}"
+            ));
+        }
+    }
+}
+
+fn verify_native_object_bytes_have_declared_format(
+    errors: &mut Vec<String>,
+    cache_key: &str,
+    target_triple: &str,
+    bytes: &[u8],
+) {
+    match target_triple {
+        crate::LINUX_X86_64_TARGET if !bytes.starts_with(b"\x7fELF") => errors.push(format!(
+            "bad_object_artifact: {cache_key} object bytes are not ELF"
+        )),
+        crate::APPLE_ARM64_TARGET if !bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe]) => {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} object bytes are not Mach-O"
+            ));
+        }
+        _ => {}
+    }
+}
+
+fn object_artifact_uses_builtin_native_backend(
+    key_input: &CacheKeyInput,
+    metadata: &JsonValue,
+) -> bool {
+    let backend_id = metadata.get("backend_id").and_then(JsonValue::as_str);
+    matches!(
+        (key_input.backend_id.as_str(), backend_id),
+        (ELF_BACKEND_ID, Some(ELF_BACKEND_ID)) | (MACHO_BACKEND_ID, Some(MACHO_BACKEND_ID))
+    )
+}
+
+fn verify_elf_object_header(errors: &mut Vec<String>, cache_key: &str, bytes: &[u8]) {
+    if bytes.len() < 64 || !bytes.starts_with(b"\x7fELF") {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} object bytes are not valid ELF"
+        ));
+        return;
+    }
+    if bytes[4] != 2 {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} object bytes are not ELF64"
+        ));
+    }
+    if bytes[5] != 1 {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} object bytes are not little-endian ELF"
+        ));
+    }
+    let object_type = u16::from_le_bytes([bytes[16], bytes[17]]);
+    if object_type != 1 {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} ELF object is not relocatable"
+        ));
+    }
+    let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+    if machine != 62 {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} ELF object is not x86_64"
+        ));
+    }
+}
+
+fn verify_macho_object_header(errors: &mut Vec<String>, cache_key: &str, bytes: &[u8]) {
+    if bytes.len() < 32 || !bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe]) {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} object bytes are not valid Mach-O"
+        ));
+        return;
+    }
+    let cpu_type = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if cpu_type != 0x0100000c {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} Mach-O object is not arm64"
+        ));
+    }
+    let file_type = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    if file_type != 1 {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} Mach-O object is not relocatable"
+        ));
+    }
+}
+
+fn required_object_byte_symbols(target_triple: &str, metadata: &JsonValue) -> BTreeSet<String> {
+    let mut symbols = BTreeSet::new();
+    match target_triple {
+        crate::LINUX_X86_64_TARGET => {
+            symbols.extend(json_string_set(metadata.get("defined_symbols")));
+            symbols.extend(
+                metadata
+                    .get("relocations")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|relocation| {
+                        relocation
+                            .get("target_abi_symbol")
+                            .and_then(JsonValue::as_str)
+                    })
+                    .map(str::to_string),
+            );
+        }
+        crate::APPLE_ARM64_TARGET => {
+            let object_symbols = json_string_set(metadata.get("object_symbols"));
+            if object_symbols.is_empty() {
+                symbols.extend(
+                    json_string_set(metadata.get("defined_symbols"))
+                        .into_iter()
+                        .map(|symbol| format!("_{symbol}")),
+                );
+            } else {
+                symbols.extend(object_symbols);
+            }
+            for relocation in metadata
+                .get("relocations")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(object_symbol) = relocation
+                    .get("target_object_symbol")
+                    .and_then(JsonValue::as_str)
+                {
+                    symbols.insert(object_symbol.to_string());
+                } else if let Some(abi_symbol) = relocation
+                    .get("target_abi_symbol")
+                    .and_then(JsonValue::as_str)
+                {
+                    symbols.insert(format!("_{abi_symbol}"));
+                }
+            }
+        }
+        _ => {}
+    }
+    symbols
+}
+
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 fn verify_link_plan_object_matches_object_metadata(

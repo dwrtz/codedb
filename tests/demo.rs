@@ -1980,6 +1980,11 @@ fn apply_json_conflict_rolls_back_whole_batch() {
     assert_eq!(conflict["rollback_reason"], "conflict");
     assert_eq!(conflict["processed_operation_count"], 2);
     assert_eq!(conflict["applied_operation_count"], 0);
+    assert_eq!(conflict["results"][0]["status"], "rolled_back");
+    assert_eq!(conflict["results"][0]["rolled_back"], true);
+    assert_eq!(conflict["results"][0]["migration_hash"], JsonValue::Null);
+    assert_eq!(conflict["results"][0]["history_hash"], JsonValue::Null);
+    assert_eq!(conflict["results"][1]["status"], "conflict");
     assert_eq!(conflict["old_root_hash"], branch_before.0);
     assert_eq!(conflict["new_root_hash"], branch_before.0);
     assert_eq!(branch_state(&db), branch_before);
