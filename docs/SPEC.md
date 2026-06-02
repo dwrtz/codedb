@@ -1,7 +1,8 @@
-# SPEC.md — CodeDB Proof of Concept
+# SPEC.md — CodeDB v0 Proof of Concept
 
 Status: Draft 0.4
-Scope: Rust proof of concept plus the next native-artifact architecture  
+Scope: v0 Rust proof of concept plus the implemented native-artifact architecture.
+The v1 semantic workspace design track lives in [SPEC_V1.md](SPEC_V1.md).  
 Working name: `codedb`
 
 ## 1. Thesis

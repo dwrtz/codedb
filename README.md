@@ -1,6 +1,6 @@
 # codedb
 
-`codedb` is a Rust proof of concept for the model in [docs/SPEC.md](docs/SPEC.md):
+`codedb` is a Rust proof of concept for the v0 model in [docs/SPEC.md](docs/SPEC.md):
 programs are stored as immutable, content-addressed semantic objects in
 SQLite, and source files are projections.
 
@@ -132,7 +132,12 @@ For operation-by-operation examples, see [docs/MIGRATIONS.md](docs/MIGRATIONS.md
 
 ## Documentation Map
 
-- [docs/SPEC.md](docs/SPEC.md): design contract and current v0 architecture.
+- [docs/SPEC.md](docs/SPEC.md): v0 design contract and current implemented
+  proof-of-concept architecture.
+- [docs/PLAN.md](docs/PLAN.md): v0 implementation plan and current status.
+- [docs/SPEC_V1.md](docs/SPEC_V1.md): v1 semantic workspace design track.
+- [docs/PLAN_V1.md](docs/PLAN_V1.md): v1 semantic workspace implementation
+  roadmap.
 - [docs/ARTIFACTS.md](docs/ARTIFACTS.md): object payloads, artifact cache model,
   native object metadata, link plans, and SQLite table roles.
 - [docs/MIGRATIONS.md](docs/MIGRATIONS.md): migration cookbook for every

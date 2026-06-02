@@ -1,7 +1,9 @@
-# CodeDB Implementation Plan
+# CodeDB v0 Implementation Plan
 
 Status: Draft 0.3  
-Scope: roadmap from the current Rust proof of concept toward an incremental object-code compiler/database prototype
+Scope: implementation plan and status for the current v0 Rust proof of concept
+and incremental object-code compiler/database prototype. The v1 semantic
+workspace roadmap lives in [PLAN_V1.md](PLAN_V1.md).
 
 ## Direction
 
