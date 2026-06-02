@@ -13,7 +13,7 @@ use crate::backend::native::{ELF_BACKEND_ID, MACHO_BACKEND_ID};
 use crate::backend_c::ensure_no_forbidden_runtime_calls;
 use crate::diff::dependency_pairs;
 use crate::lowering::{LoweredFunctionIr, LoweredOp};
-use crate::migrations::{history_hash, migration_hash};
+use crate::migrations::{Operation, history_hash, migration_hash};
 use crate::model::{
     ProgramRootPayload, param_names, preferred_names, validate_projection_identifier,
 };
@@ -473,7 +473,7 @@ impl CodeDb {
         let mut migration_outputs = BTreeMap::new();
         let mut stmt = self.conn.prepare(
             "SELECT hash, parent_history_hash, input_root_hash, output_root_hash,
-                    operation_json, preconditions_json, postconditions_json
+                    operation_kind, operation_json, preconditions_json, postconditions_json
              FROM migrations ORDER BY created_at, hash",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -485,6 +485,7 @@ impl CodeDb {
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
             ))
         })?;
         for row in rows {
@@ -493,20 +494,28 @@ impl CodeDb {
                 parent_history,
                 input_root,
                 output_root,
+                operation_kind,
                 operation_json,
                 preconditions_json,
                 postconditions_json,
             ) = row?;
-            let operation = serde_json::from_str::<JsonValue>(&operation_json);
+            let operation_value = serde_json::from_str::<JsonValue>(&operation_json);
+            let operation = serde_json::from_str::<Operation>(&operation_json);
             let preconditions = serde_json::from_str::<JsonValue>(&preconditions_json);
             let postconditions = serde_json::from_str::<JsonValue>(&postconditions_json);
-            match (operation, preconditions, postconditions) {
-                (Ok(operation), Ok(preconditions), Ok(postconditions)) => {
+            match (operation_value, operation, preconditions, postconditions) {
+                (Ok(operation_value), Ok(operation), Ok(preconditions), Ok(postconditions)) => {
+                    if operation.kind_name() != operation_kind {
+                        errors.push(format!(
+                            "bad_history_link: migration {hash} operation kind {operation_kind} does not match operation {}",
+                            operation.kind_name()
+                        ));
+                    }
                     let recomputed = migration_hash(
                         parent_history.as_deref(),
                         &input_root,
                         &output_root,
-                        &operation,
+                        &operation_value,
                         &preconditions,
                         &postconditions,
                     );

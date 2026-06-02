@@ -284,6 +284,28 @@ fn verify_rejects_bad_history_hashes() {
 }
 
 #[test]
+fn verify_rejects_migration_operation_kind_mismatch() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("migration-kind-mismatch.sqlite");
+    setup_shop(&db);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE migrations
+         SET operation_kind = 'rename_symbol'
+         WHERE rowid = (SELECT rowid FROM migrations ORDER BY created_at, hash LIMIT 1)",
+        [],
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_history_link"));
+    assert!(
+        stderr.contains("operation kind rename_symbol does not match operation create_function")
+    );
+}
+
+#[test]
 fn verify_rejects_history_output_that_disagrees_with_migration_output() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("history-output-mismatch.sqlite");
