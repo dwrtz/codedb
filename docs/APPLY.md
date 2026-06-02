@@ -88,12 +88,18 @@ Bodies use structural `RawExpr` JSON:
 ```json
 { "kind": "literal_i64", "value": "100" }
 { "kind": "literal_bool", "value": true }
+{ "kind": "unit" }
 { "kind": "param_name", "name": "subtotal" }
 { "kind": "param_ref", "index": 0 }
 { "kind": "call", "name": "tax", "args": [] }
 { "kind": "binary", "op": "+", "left": {}, "right": {} }
+{ "kind": "unary", "op": "!", "expr": {} }
+{ "kind": "let", "name": "x", "type": "i64", "value": {}, "body": {} }
 { "kind": "if", "cond": {}, "then": {}, "else": {} }
 ```
 
 See [examples/shop.apply.json](../examples/shop.apply.json) for a complete
 program built without projection text.
+
+For operation-by-operation migration examples, see
+[MIGRATIONS.md](MIGRATIONS.md).

@@ -479,6 +479,20 @@ Acceptance checks:
 
 Goal: keep the prototype understandable as the implementation grows.
 
+Initial implementation status:
+
+- `README.md` has a runnable quickstart, structural apply demo, history
+  export/import demo, native artifact walkthrough, command reference, and links
+  to the deeper docs.
+- `docs/ARTIFACTS.md` documents current object kinds and payload shapes,
+  artifact kinds, cache key structure, lowered IR, native object metadata, link
+  plans, executable metadata, and SQLite table roles.
+- `docs/MIGRATIONS.md` provides a cookbook for every structural operation and
+  walkthroughs for rename, body replacement, aliasing, signature change,
+  export-map changes, native builds, diffs, and history rebuilds.
+- Existing integration tests in `tests/demo.rs` and `tests/corruption.rs`
+  exercise the major command examples and artifact verification paths.
+
 Deliverables:
 
 - Document the object kinds and payload shapes currently supported.

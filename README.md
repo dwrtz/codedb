@@ -1,26 +1,110 @@
 # codedb
 
-`codedb` is a Rust proof of concept for the model in [docs/SPEC.md](docs/SPEC.md): programs are stored as immutable, content-addressed semantic objects in SQLite, and source files are projections. `emit-c` emits a C projection for debugging and inspection; it is not the primary compiler backend.
+`codedb` is a Rust proof of concept for the model in [docs/SPEC.md](docs/SPEC.md):
+programs are stored as immutable, content-addressed semantic objects in
+SQLite, and source files are projections.
 
-## Demo
+The compiler path is object-artifact first:
 
-```bash
-cargo run -- init demo.codedb.sqlite
-cargo run -- import demo.codedb.sqlite examples/shop.cdb
-cargo run -- apply demo.codedb.sqlite --json examples/shop.apply.json
-cargo run -- eval demo.codedb.sqlite main
-cargo run -- callers demo.codedb.sqlite tax
-cargo run -- show demo.codedb.sqlite tax
-cargo run -- set-export demo.codedb.sqlite tax public_tax
-cargo run -- export-map demo.codedb.sqlite
-cargo run -- rename demo.codedb.sqlite tax vat
-cargo run -- export demo.codedb.sqlite --branch main --out projection.cdb
-cargo run -- emit-c demo.codedb.sqlite main --out projection.c
-cargo run -- replay demo.codedb.sqlite --from-genesis
-cargo run -- verify demo.codedb.sqlite
+```text
+typed semantic DAG -> lowered IR -> native object files -> link plan -> executable
 ```
 
-Expected `eval main` result for `examples/shop.cdb` is `120`. After `rename tax vat`, the exported projection renders `vat` at both the definition and call site while preserving the original symbol hash and function body hash.
+`emit-c` emits a deterministic C projection for debugging and inspection. It is
+not the primary native backend.
+
+## Quickstart
+
+Prerequisites:
+
+- Rust and Cargo.
+- A host `cc` linker for `codedb build` on the host native target.
+
+Run the shop demo:
+
+```bash
+DB=demo.codedb.sqlite
+rm -f "$DB" projection.cdb projection.c main.ir.json main.o main.link.json history.ndjson
+
+cargo run -- init "$DB"
+cargo run -- import "$DB" examples/shop.cdb
+cargo run -- eval "$DB" main
+cargo run -- callers "$DB" tax
+cargo run -- show "$DB" tax
+cargo run -- list "$DB" --json
+cargo run -- history "$DB" --json
+cargo run -- verify "$DB"
+```
+
+Expected `eval main` output is `120`.
+
+Projection and migration walkthrough:
+
+```bash
+cargo run -- set-export "$DB" tax public_tax
+cargo run -- export-map "$DB"
+cargo run -- rename "$DB" tax vat
+cargo run -- replace-body "$DB" vat "subtotal * 18 / 100"
+cargo run -- create-alias "$DB" vat sales_tax
+cargo run -- remove-alias "$DB" vat sales_tax
+cargo run -- remove-export "$DB" vat public_tax
+cargo run -- export "$DB" --branch main --out projection.cdb
+cargo run -- emit-c "$DB" main --out projection.c
+cargo run -- replay "$DB" --from-genesis
+cargo run -- verify "$DB"
+```
+
+After `rename tax vat`, the exported projection renders `vat` at the definition
+and call site while preserving the original symbol hash and native ABI symbol.
+After `replace-body`, `eval main` changes from `120` to `118`.
+
+Build from structural JSON instead of projection text:
+
+```bash
+APPLY_DB=apply-demo.codedb.sqlite
+rm -f "$APPLY_DB"
+
+cargo run -- init "$APPLY_DB"
+cargo run -- apply "$APPLY_DB" --json examples/shop.apply.json
+cargo run -- eval "$APPLY_DB" main
+cargo run -- verify "$APPLY_DB"
+```
+
+Export and import replayable history:
+
+```bash
+REBUILT_DB=rebuilt.codedb.sqlite
+rm -f "$REBUILT_DB"
+
+cargo run -- export-history "$DB" --branch main --out history.ndjson
+cargo run -- init "$REBUILT_DB"
+cargo run -- import-history "$REBUILT_DB" history.ndjson
+cargo run -- branches "$REBUILT_DB" --json
+cargo run -- verify "$REBUILT_DB"
+```
+
+Native artifact inspection:
+
+```bash
+cargo run -- emit-ir "$DB" main --out main.ir.json
+cargo run -- emit-object "$DB" main --target x86_64-unknown-linux-gnu --out main.o
+cargo run -- link-native "$DB" main --target x86_64-unknown-linux-gnu --out main.link.json
+cargo run -- build-plan "$DB" main --target x86_64-unknown-linux-gnu --json
+```
+
+`codedb build` invokes the host linker, so use it for the host native target.
+On Apple Silicon, the default target is `aarch64-apple-darwin`; otherwise the
+default target is `x86_64-unknown-linux-gnu`.
+
+```bash
+cargo run -- build "$DB" main --out demo-native
+./demo-native
+echo $?
+```
+
+The process exit status is the entry function result.
+
+## Structural Writes
 
 Native ABI identity is separate from display names. `show` prints the stable internal ABI symbol derived from the symbol hash, while `set-export` and `remove-export` manage explicit public ABI names. Renaming `tax` to `vat` does not change either the internal ABI symbol or an explicit export such as `public_tax`.
 
@@ -36,3 +120,71 @@ to write projection text to mutate the database. See
 [docs/APPLY.md](docs/APPLY.md) and [examples/shop.apply.json](examples/shop.apply.json).
 Use `--json` on `list`, `show`, `export-map`, and `history` for machine-readable
 inspection output.
+
+For operation-by-operation examples, see [docs/MIGRATIONS.md](docs/MIGRATIONS.md).
+
+## Documentation Map
+
+- [docs/SPEC.md](docs/SPEC.md): design contract and current v0 architecture.
+- [docs/ARTIFACTS.md](docs/ARTIFACTS.md): object payloads, artifact cache model,
+  native object metadata, link plans, and SQLite table roles.
+- [docs/MIGRATIONS.md](docs/MIGRATIONS.md): migration cookbook for every
+  structural operation and walkthroughs for common edits.
+- [docs/APPLY.md](docs/APPLY.md): stable `codedb/apply/v1` JSON schema.
+
+## Command Reference
+
+Core database commands:
+
+```bash
+cargo run -- init <db>
+cargo run -- import <db> <file.cdb>
+cargo run -- export <db> --branch main --out <file.cdb>
+cargo run -- export-history <db> --branch main --out <history.ndjson>
+cargo run -- import-history <db> <history.ndjson>
+cargo run -- replay <db> --from-genesis
+cargo run -- verify <db>
+```
+
+Inspection and evaluation:
+
+```bash
+cargo run -- eval <db> <function-name> [args...]
+cargo run -- list <db> [--json]
+cargo run -- show <db> <symbol-or-name> [--json]
+cargo run -- callers <db> <symbol-or-name>
+cargo run -- diff <db> <root-a> <root-b> [--json]
+cargo run -- history <db> [--json]
+cargo run -- branches <db> [--json]
+cargo run -- export-map <db> [--json]
+```
+
+Structural mutations:
+
+```bash
+cargo run -- apply <db> --json <apply.json>
+cargo run -- rename <db> <old-name> <new-name> [--expect-root <root>] [--json]
+cargo run -- replace-body <db> <name> <expr> [--expect-root <root>] [--json]
+cargo run -- change-signature <db> <name> "<signature>" [--expect-root <root>] [--json]
+cargo run -- delete-symbol <db> <name> [--force] [--expect-root <root>] [--json]
+cargo run -- create-alias <db> <name> <alias> [--expect-root <root>] [--json]
+cargo run -- remove-alias <db> <name> <alias> [--expect-root <root>] [--json]
+cargo run -- set-export <db> <name> <exported-name> [--expect-root <root>] [--json]
+cargo run -- remove-export <db> <name> <exported-name> [--expect-root <root>] [--json]
+```
+
+Projection and native artifacts:
+
+```bash
+cargo run -- emit-c <db> <function-name> --out <file.c>
+cargo run -- emit-ir <db> <function-name> --out <file.json>
+cargo run -- emit-object <db> <function-name> --target <triple> --out <file.o>
+cargo run -- link-native <db> <entry-name> --target <triple> --out <file.json>
+cargo run -- build-plan <db> <entry-name> --target <triple> --json
+cargo run -- build <db> <entry-name> --target <triple> --out <executable>
+```
+
+The integration suite in [tests/demo.rs](tests/demo.rs) and
+[tests/corruption.rs](tests/corruption.rs) exercises these command examples,
+including object artifact reuse, link plan determinism, history import/export,
+structural apply, and verification failures.

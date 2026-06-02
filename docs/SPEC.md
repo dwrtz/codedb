@@ -408,6 +408,10 @@ executable
 
 `c_projection` is a projection artifact. `object_file`, `link_plan`, and `executable` are compiler artifacts.
 
+The current implementation's concrete object payloads, cache metadata wrappers,
+lowered IR shape, native object metadata, link plan shape, and SQLite table
+roles are cataloged in [ARTIFACTS.md](ARTIFACTS.md).
+
 ### 8.2 Interface hash
 
 An interface hash describes the callable surface that a caller depends on.
@@ -1025,6 +1029,9 @@ If neither preconditions nor postconditions hold:
 This makes migrations safe to retry.
 
 ### 14.3 Required v0 migrations
+
+For concrete CLI and `codedb/apply/v1` examples for every structural operation,
+see [MIGRATIONS.md](MIGRATIONS.md).
 
 #### create_function
 
