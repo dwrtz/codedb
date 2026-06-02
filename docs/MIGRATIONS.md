@@ -10,6 +10,7 @@ Each mutation returns one of:
 applied
 already_applied
 conflict
+error
 ```
 
 Use `--expect-root <root>` when an agent wants stale writes to fail instead of
@@ -315,6 +316,7 @@ canonical `codedb/apply-result/v1` JSON with:
 ```text
 status
 committed
+error
 old_root_hash
 new_root_hash
 history_hash

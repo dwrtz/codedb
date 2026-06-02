@@ -1867,6 +1867,38 @@ fn import_history_rejects_missing_reordered_and_tampered_migrations() {
         tampered_path.to_str().unwrap(),
     ]);
     assert!(stderr.contains("bad_history_link"));
+
+    let extra_header_path = temp.path().join("history-extra-header.ndjson");
+    let mut extra_header = lines.clone();
+    let mut header: JsonValue = serde_json::from_str(&extra_header[0]).unwrap();
+    header["extra"] = JsonValue::String("schema drift".to_string());
+    extra_header[0] = canonical_json(&header);
+    std::fs::write(&extra_header_path, format!("{}\n", extra_header.join("\n"))).unwrap();
+    let extra_header_db = temp.path().join("phase12-extra-header.sqlite");
+    run(&["init", extra_header_db.to_str().unwrap()]);
+    let stderr = run_failure(&[
+        "import-history",
+        extra_header_db.to_str().unwrap(),
+        extra_header_path.to_str().unwrap(),
+    ]);
+    assert!(stderr.contains("unknown field"));
+    assert!(stderr.contains("extra"));
+
+    let extra_row_path = temp.path().join("history-extra-row.ndjson");
+    let mut extra_row = lines.clone();
+    let mut row: JsonValue = serde_json::from_str(&extra_row[1]).unwrap();
+    row["extra"] = JsonValue::String("schema drift".to_string());
+    extra_row[1] = canonical_json(&row);
+    std::fs::write(&extra_row_path, format!("{}\n", extra_row.join("\n"))).unwrap();
+    let extra_row_db = temp.path().join("phase12-extra-row.sqlite");
+    run(&["init", extra_row_db.to_str().unwrap()]);
+    let stderr = run_failure(&[
+        "import-history",
+        extra_row_db.to_str().unwrap(),
+        extra_row_path.to_str().unwrap(),
+    ]);
+    assert!(stderr.contains("unknown field"));
+    assert!(stderr.contains("extra"));
 }
 
 #[test]
@@ -2013,13 +2045,28 @@ fn invalid_apply_json_operation_rolls_back_partial_writes() {
     let branch_before = branch_state(&db);
     let counts_before = mutation_guard_counts(&db);
 
-    let stderr = run_failure(&[
+    let error = run(&[
         "apply",
         db.to_str().unwrap(),
         "--json",
         ops.to_str().unwrap(),
     ]);
-    assert!(stderr.contains("function main.bad body type bool does not match return type i64"));
+    let error: JsonValue = serde_json::from_str(&error).unwrap();
+    assert_eq!(error["schema"], "codedb/apply-result/v1");
+    assert_eq!(error["status"], "error");
+    assert_eq!(error["committed"], false);
+    assert_eq!(error["rollback_reason"], "error");
+    assert_eq!(error["operation_count"], 2);
+    assert_eq!(error["processed_operation_count"], 2);
+    assert_eq!(error["applied_operation_count"], 0);
+    assert_eq!(error["results"][0]["status"], "rolled_back");
+    assert_eq!(error["results"][1]["status"], "error");
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("function main.bad body type bool does not match return type i64")
+    );
     assert!(run_failure(&["show", db.to_str().unwrap(), "ok"]).contains("unknown name"));
     assert_eq!(branch_state(&db), branch_before);
     assert_eq!(mutation_guard_counts(&db), counts_before);
@@ -2152,13 +2199,23 @@ fn apply_json_rejects_invalid_let_binding_names_before_commit() {
     let branch_before = branch_state(&db);
     let counts_before = mutation_guard_counts(&db);
 
-    let stderr = run_failure(&[
+    let error = run(&[
         "apply",
         db.to_str().unwrap(),
         "--json",
         ops.to_str().unwrap(),
     ]);
-    assert!(stderr.contains("let binding must be a projection-safe identifier"));
+    let error: JsonValue = serde_json::from_str(&error).unwrap();
+    assert_eq!(error["schema"], "codedb/apply-result/v1");
+    assert_eq!(error["status"], "error");
+    assert_eq!(error["committed"], false);
+    assert_eq!(error["processed_operation_count"], 1);
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("let binding must be a projection-safe identifier")
+    );
     assert_eq!(branch_state(&db), branch_before);
     assert_eq!(mutation_guard_counts(&db), counts_before);
     assert!(run_failure(&["show", db.to_str().unwrap(), "main"]).contains("unknown name"));
@@ -3056,4 +3113,37 @@ fn native_symbols(path: &Path) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn canonical_json(value: &JsonValue) -> String {
+    match value {
+        JsonValue::Null => "null".to_string(),
+        JsonValue::Bool(value) => value.to_string(),
+        JsonValue::Number(value) => value.to_string(),
+        JsonValue::String(value) => serde_json::to_string(value).unwrap(),
+        JsonValue::Array(values) => {
+            let inner = values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{inner}]")
+        }
+        JsonValue::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let inner = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).unwrap(),
+                        canonical_json(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{inner}}}")
+        }
+    }
 }

@@ -5,7 +5,8 @@
 
 Apply is atomic. If any operation errors or returns `conflict`, the whole batch
 is rolled back and the branch, history rows, materialized indexes, and caches
-remain unchanged.
+remain unchanged. Per-operation errors return canonical `codedb/apply-result/v1`
+JSON with `status: "error"` and `committed: false`.
 
 ## Document
 

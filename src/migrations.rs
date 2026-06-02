@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -278,7 +278,7 @@ impl MigrationSummary {
         self.build_impact.push_cli_lines(out);
     }
 
-    fn to_json(&self) -> JsonValue {
+    pub(crate) fn to_json(&self) -> JsonValue {
         json!({
             "kind": self.operation_kind,
             "display": &self.display,
@@ -1873,6 +1873,17 @@ impl CodeDb {
             .next()
             .ok_or_else(|| anyhow!("history import is empty"))?;
         let header = parse_canonical_ndjson_line(header_line, "history export header")?;
+        reject_unknown_fields(
+            &header,
+            "history export header",
+            &[
+                "schema",
+                "branch",
+                "root_hash",
+                "history_hash",
+                "migration_count",
+            ],
+        )?;
         if header.get("schema").and_then(JsonValue::as_str) != Some(HISTORY_EXPORT_SCHEMA) {
             bail!("unsupported history export schema");
         }
@@ -1947,6 +1958,24 @@ impl CodeDb {
         current_root: &mut String,
         current_history: &mut Option<String>,
     ) -> Result<()> {
+        reject_unknown_fields(
+            row,
+            "history export migration",
+            &[
+                "schema",
+                "sequence",
+                "migration_hash",
+                "history_hash",
+                "parent_history_hash",
+                "input_root_hash",
+                "output_root_hash",
+                "operation_kind",
+                "operation",
+                "preconditions",
+                "postconditions",
+                "agent",
+            ],
+        )?;
         if row.get("schema").and_then(JsonValue::as_str) != Some(HISTORY_EXPORT_MIGRATION_SCHEMA) {
             bail!("unsupported history migration export schema");
         }
@@ -2286,6 +2315,19 @@ fn parse_canonical_ndjson_line(line: &str, label: &str) -> Result<JsonValue> {
         bail!("{label} is not canonical");
     }
     Ok(value)
+}
+
+fn reject_unknown_fields(value: &JsonValue, label: &str, allowed: &[&str]) -> Result<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{label} must be a JSON object"))?;
+    let allowed = allowed.iter().copied().collect::<BTreeSet<_>>();
+    for key in object.keys() {
+        if !allowed.contains(key.as_str()) {
+            bail!("{label} has unknown field {key:?}");
+        }
+    }
+    Ok(())
 }
 
 fn required_string(value: &JsonValue, field: &str) -> Result<String> {

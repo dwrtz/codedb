@@ -796,6 +796,56 @@ fn verify_rejects_native_object_bytes_that_do_not_match_metadata() {
 }
 
 #[test]
+fn verify_rejects_native_object_text_bytes_that_match_updated_hash() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("tampered-object-text.sqlite");
+    let object = temp.path().join("tax.o");
+    setup_shop(&db);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "tax",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        object.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json, mut object_bytes): (String, String, Vec<u8>) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json, artifact_bytes FROM compile_cache
+             WHERE artifact_kind = 'object_file'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(&object_bytes[..4], b"\x7fELF");
+    assert!(object_bytes.len() > 64);
+    object_bytes[64] ^= 0xff;
+    let updated_hash = test_bytes_hash(&object_bytes);
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    value["bytes_hash"] = JsonValue::String(updated_hash.clone());
+    conn.execute(
+        "UPDATE compile_cache
+         SET artifact_bytes = ?1, artifact_hash = ?2, artifact_json = ?3
+         WHERE cache_key = ?4",
+        (
+            object_bytes.as_slice(),
+            &updated_hash,
+            test_canonical_json(&value),
+            cache_key,
+        ),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_object_artifact"));
+    assert!(stderr.contains("deterministic native backend output"));
+}
+
+#[test]
 fn verify_rejects_native_object_dependency_metadata_mismatch() {
     let temp = tempdir().unwrap();
     let db = temp

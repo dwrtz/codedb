@@ -114,7 +114,8 @@ The process exit status is the entry function result.
 
 Native ABI identity is separate from display names. `show` prints the stable internal ABI symbol derived from the symbol hash, while `set-export` and `remove-export` manage explicit public ABI names. Renaming `tax` to `vat` does not change either the internal ABI symbol or an explicit export such as `public_tax`.
 
-Structural mutation commands return `applied`, `already_applied`, or `conflict`.
+Structural mutation commands return `applied`, `already_applied`, `conflict`, or
+`error`.
 Use `--expect-root <root>` on mutation commands when an agent needs to reject
 stale writes instead of applying against a branch that has moved.
 

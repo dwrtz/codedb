@@ -8,8 +8,10 @@ use crate::abi::{
     export_map, internal_abi_symbol, validate_export_map, validate_exported_abi_name,
 };
 use crate::artifact::{ARTIFACT_METADATA_SCHEMA, CacheKeyInput};
-use crate::backend::ArtifactKind;
-use crate::backend::native::{ELF_BACKEND_ID, MACHO_BACKEND_ID};
+use crate::backend::native::{
+    ELF_BACKEND_ID, ElfObjectBackend, MACHO_BACKEND_ID, MachOArm64ObjectBackend,
+};
+use crate::backend::{ArtifactKind, ObjectBackend, ObjectBackendInput};
 use crate::backend_c::ensure_no_forbidden_runtime_calls;
 use crate::diff::dependency_pairs;
 use crate::lowering::{LoweredFunctionIr, LoweredOp};
@@ -1506,7 +1508,11 @@ impl CodeDb {
             object_artifact_uses_builtin_native_backend(key_input, metadata);
         if uses_builtin_native_backend {
             self.verify_object_artifact_matches_indexed_root(
-                errors, cache_key, key_input, metadata,
+                errors,
+                cache_key,
+                key_input,
+                metadata,
+                artifact_bytes,
             )?;
         }
         if let Some(bytes) = artifact_bytes {
@@ -1536,6 +1542,7 @@ impl CodeDb {
         cache_key: &str,
         key_input: &CacheKeyInput,
         metadata: &JsonValue,
+        artifact_bytes: Option<&[u8]>,
     ) -> Result<()> {
         let Some(symbol) = metadata.get("symbol_hash").and_then(JsonValue::as_str) else {
             return Ok(());
@@ -1604,6 +1611,15 @@ impl CodeDb {
                 &dependencies,
                 &expected_relocation_targets,
             );
+            if let Some(bytes) = artifact_bytes {
+                verify_builtin_native_object_bytes_reemit(
+                    errors,
+                    cache_key,
+                    key_input,
+                    &expected_ir,
+                    bytes,
+                );
+            }
             return Ok(());
         }
 
@@ -2423,6 +2439,38 @@ fn verify_native_object_bytes_match_metadata(
                 "bad_object_artifact: {cache_key} object bytes missing symbol {symbol}"
             ));
         }
+    }
+}
+
+fn verify_builtin_native_object_bytes_reemit(
+    errors: &mut Vec<String>,
+    cache_key: &str,
+    key_input: &CacheKeyInput,
+    ir: &LoweredFunctionIr,
+    bytes: &[u8],
+) {
+    let emitted = match key_input.backend_id.as_str() {
+        ELF_BACKEND_ID => ElfObjectBackend.emit_object(ObjectBackendInput {
+            ir,
+            target_triple: &key_input.target_triple,
+        }),
+        MACHO_BACKEND_ID => MachOArm64ObjectBackend.emit_object(ObjectBackendInput {
+            ir,
+            target_triple: &key_input.target_triple,
+        }),
+        _ => return,
+    };
+    match emitted {
+        Ok(emitted) => {
+            if emitted.bytes != bytes {
+                errors.push(format!(
+                    "bad_object_artifact: {cache_key} object bytes do not match deterministic native backend output"
+                ));
+            }
+        }
+        Err(err) => errors.push(format!(
+            "bad_object_artifact: {cache_key} cannot re-emit native object: {err:#}"
+        )),
     }
 }
 

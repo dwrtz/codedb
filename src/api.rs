@@ -258,11 +258,68 @@ impl CodeDb {
                     }
                 })
                 .unwrap_or_else(|| branch.root_hash.clone());
-            let operation = self
-                .operation_from_api(&expected_root, api_operation)
-                .with_context(|| format!("operation {idx} is invalid"))?;
+            let operation = match self.operation_from_api(&expected_root, api_operation) {
+                Ok(operation) => operation,
+                Err(err) => {
+                    self.conn.execute_batch(&format!(
+                        "ROLLBACK TO SAVEPOINT {savepoint}; RELEASE SAVEPOINT {savepoint}"
+                    ))?;
+                    let mut results = mark_rolled_back_results(results);
+                    let message = format!("operation {idx} is invalid: {err:#}");
+                    results.push(apply_error_result_json(
+                        idx,
+                        &branch.root_hash,
+                        &message,
+                        None,
+                    ));
+                    let payload = apply_result_json(
+                        "error",
+                        false,
+                        Some("error"),
+                        &initial_root,
+                        &initial_root,
+                        initial_history.as_ref(),
+                        request.operations.len(),
+                        results.len(),
+                        0,
+                        Some(&message),
+                        results,
+                    );
+                    return Ok((format!("{}\n", canonical_json(&payload)), false));
+                }
+            };
+            let summary = self.migration_summary(&operation);
             let (outcome, operation_changed_root) =
-                self.apply_and_record_expected_in_tx(&expected_root, operation)?;
+                match self.apply_and_record_expected_in_tx(&expected_root, operation) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        self.conn.execute_batch(&format!(
+                            "ROLLBACK TO SAVEPOINT {savepoint}; RELEASE SAVEPOINT {savepoint}"
+                        ))?;
+                        let mut results = mark_rolled_back_results(results);
+                        let message = format!("operation {idx} failed: {err:#}");
+                        results.push(apply_error_result_json(
+                            idx,
+                            &branch.root_hash,
+                            &message,
+                            Some(&summary),
+                        ));
+                        let payload = apply_result_json(
+                            "error",
+                            false,
+                            Some("error"),
+                            &initial_root,
+                            &initial_root,
+                            initial_history.as_ref(),
+                            request.operations.len(),
+                            results.len(),
+                            0,
+                            Some(&message),
+                            results,
+                        );
+                        return Ok((format!("{}\n", canonical_json(&payload)), false));
+                    }
+                };
             let status = outcome.status();
             if matches!(status, MigrationStatus::Applied) {
                 debug_assert!(operation_changed_root);
@@ -280,7 +337,7 @@ impl CodeDb {
             if stop {
                 let results = mark_rolled_back_results(results);
                 let payload = apply_result_json(
-                    aggregate_status,
+                    aggregate_status.as_str(),
                     false,
                     Some("conflict"),
                     &initial_root,
@@ -289,6 +346,7 @@ impl CodeDb {
                     request.operations.len(),
                     results.len(),
                     0,
+                    None,
                     results,
                 );
                 return Ok((format!("{}\n", canonical_json(&payload)), false));
@@ -307,7 +365,7 @@ impl CodeDb {
             (initial_root.clone(), initial_history.clone(), 0)
         };
         let payload = apply_result_json(
-            aggregate_status,
+            aggregate_status.as_str(),
             should_commit,
             None,
             &initial_root,
@@ -316,6 +374,7 @@ impl CodeDb {
             request.operations.len(),
             results.len(),
             applied_operation_count,
+            None,
             results,
         );
         Ok((format!("{}\n", canonical_json(&payload)), should_commit))
@@ -474,7 +533,7 @@ impl CodeDb {
 
 #[allow(clippy::too_many_arguments)]
 fn apply_result_json(
-    status: MigrationStatus,
+    status: &str,
     committed: bool,
     rollback_reason: Option<&str>,
     old_root_hash: &str,
@@ -483,15 +542,17 @@ fn apply_result_json(
     operation_count: usize,
     processed_operation_count: usize,
     applied_operation_count: usize,
+    error: Option<&str>,
     results: Vec<serde_json::Value>,
 ) -> serde_json::Value {
     json!({
         "schema": APPLY_RESULT_SCHEMA,
-        "status": status.as_str(),
+        "status": status,
         "branch": MAIN_BRANCH,
         "atomic": true,
         "committed": committed,
         "rollback_reason": rollback_reason,
+        "error": error,
         "old_root_hash": old_root_hash,
         "new_root_hash": new_root_hash,
         "history_hash": history_hash,
@@ -499,6 +560,24 @@ fn apply_result_json(
         "processed_operation_count": processed_operation_count,
         "applied_operation_count": applied_operation_count,
         "results": results,
+    })
+}
+
+fn apply_error_result_json(
+    operation_index: usize,
+    current_root_hash: &str,
+    error: &str,
+    summary: Option<&crate::migrations::MigrationSummary>,
+) -> JsonValue {
+    json!({
+        "status": "error",
+        "operation_index": operation_index,
+        "current_root_hash": current_root_hash,
+        "migration_hash": JsonValue::Null,
+        "history_hash": JsonValue::Null,
+        "rolled_back": true,
+        "error": error,
+        "summary": summary.map(crate::migrations::MigrationSummary::to_json),
     })
 }
 
