@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow, bail};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
@@ -180,14 +180,28 @@ impl CodeDb {
                 .ok_or_else(|| anyhow!("lowered IR cache entry missing artifact_json"))?;
             let ir = lowered_ir_from_artifact_metadata(artifact_json)?;
             self.verify_lowered_ir(root, &ir)?;
+            let expected = self.build_lowered_function_ir(root, entry)?;
+            let ir_json = serde_json::to_value(&ir)?;
+            let recomputed_hash = hash_lowered_ir_json(&ir_json);
+            if ir != expected || recomputed_hash != cache_entry.artifact_hash {
+                return self.write_lowered_ir_artifact(entry, expected);
+            }
             return Ok(LoweredFunctionArtifact {
                 ir,
-                lowered_ir_hash: cache_entry.artifact_hash,
+                lowered_ir_hash: recomputed_hash,
             });
         }
 
         let ir = self.build_lowered_function_ir(root, entry)?;
         self.verify_lowered_ir(root, &ir)?;
+        self.write_lowered_ir_artifact(entry, ir)
+    }
+
+    fn write_lowered_ir_artifact(
+        &mut self,
+        entry: &RootSymbolPayload,
+        ir: LoweredFunctionIr,
+    ) -> Result<LoweredFunctionArtifact> {
         let ir_json = serde_json::to_value(&ir)?;
         let lowered_ir_hash = hash_lowered_ir_json(&ir_json);
         self.write_cache_json(
@@ -203,7 +217,7 @@ impl CodeDb {
         })
     }
 
-    fn build_lowered_function_ir(
+    pub(crate) fn build_lowered_function_ir(
         &self,
         root: &ProgramRootPayload,
         entry: &RootSymbolPayload,
@@ -558,22 +572,45 @@ impl CodeDb {
                 ir.function_def_hash
             );
         }
-        let root_hash = self
+        let root_hashes = self
             .conn
-            .query_row(
+            .prepare(
                 "SELECT root_hash FROM root_symbols
                  WHERE definition_hash = ?1 AND symbol_hash = ?2
-                 ORDER BY root_hash LIMIT 1",
-                params![input_hash, &ir.symbol_hash],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if let Some(root_hash) = root_hash {
-            let root = self.load_root(&root_hash)?;
-            self.verify_lowered_ir(&root, ir)
-        } else {
-            self.verify_lowered_ir_shape(ir)
+                 ORDER BY root_hash",
+            )?
+            .query_map(params![input_hash, &ir.symbol_hash], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if root_hashes.is_empty() {
+            return self.verify_lowered_ir_shape(ir);
         }
+
+        let mut last_error = None;
+        for root_hash in root_hashes {
+            let root = self.load_root(&root_hash)?;
+            let Some(entry) = self.root_symbol(&root, &ir.symbol_hash) else {
+                last_error = Some(anyhow!(
+                    "lowered IR symbol {} missing from indexed root {root_hash}",
+                    ir.symbol_hash
+                ));
+                continue;
+            };
+            match self.build_lowered_function_ir(&root, entry) {
+                Ok(expected) if &expected == ir => return Ok(()),
+                Ok(_) => {
+                    last_error = Some(anyhow!(
+                        "lowered IR does not match recomputed semantic DAG for root {root_hash}"
+                    ));
+                }
+                Err(err) => last_error = Some(err),
+            }
+        }
+        if let Some(err) = last_error {
+            bail!("{err:#}");
+        }
+        bail!("lowered IR does not match any indexed root");
     }
 
     fn verify_lowered_ir(&self, root: &ProgramRootPayload, ir: &LoweredFunctionIr) -> Result<()> {

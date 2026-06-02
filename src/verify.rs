@@ -12,6 +12,7 @@ use crate::backend::ArtifactKind;
 use crate::backend::native::{ELF_BACKEND_ID, MACHO_BACKEND_ID};
 use crate::backend_c::ensure_no_forbidden_runtime_calls;
 use crate::diff::dependency_pairs;
+use crate::lowering::{LoweredFunctionIr, LoweredOp};
 use crate::migrations::{history_hash, migration_hash};
 use crate::model::{
     ProgramRootPayload, param_names, preferred_names, validate_projection_identifier,
@@ -469,6 +470,7 @@ impl CodeDb {
     }
 
     fn verify_migrations_and_histories(&self, errors: &mut Vec<String>) -> Result<()> {
+        let mut migration_outputs = BTreeMap::new();
         let mut stmt = self.conn.prepare(
             "SELECT hash, parent_history_hash, input_root_hash, output_root_hash,
                     operation_json, preconditions_json, postconditions_json
@@ -516,6 +518,7 @@ impl CodeDb {
                 }
                 _ => errors.push(format!("corrupt_object: migration json invalid {hash}")),
             }
+            migration_outputs.insert(hash.clone(), (parent_history.clone(), output_root.clone()));
             for root in [input_root, output_root] {
                 let exists: bool = self.conn.query_row(
                     "SELECT EXISTS(SELECT 1 FROM objects WHERE hash = ?1)",
@@ -548,6 +551,33 @@ impl CodeDb {
             if recomputed != history {
                 errors.push(format!(
                     "bad_history_link: {history} recomputes to {recomputed}"
+                ));
+            }
+            match migration_outputs.get(&migration) {
+                Some((migration_parent, migration_output)) => {
+                    if migration_parent != &parent {
+                        errors.push(format!(
+                            "bad_history_link: history {history} parent does not match migration {migration} parent"
+                        ));
+                    }
+                    if migration_output != &output_root {
+                        errors.push(format!(
+                            "bad_history_link: history {history} output root {output_root} does not match migration {migration} output root {migration_output}"
+                        ));
+                    }
+                }
+                None => errors.push(format!(
+                    "bad_history_link: history {history} references missing migration {migration}"
+                )),
+            }
+            let output_exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM objects WHERE hash = ?1)",
+                params![&output_root],
+                |row| row.get(0),
+            )?;
+            if !output_exists {
+                errors.push(format!(
+                    "missing_object: history {history} references missing root {output_root}"
                 ));
             }
         }
@@ -1550,11 +1580,20 @@ impl CodeDb {
             if expected_closure != metadata_dependency_closure {
                 continue;
             }
+            let Some(entry) = self.root_symbol(&root, symbol) else {
+                errors.push(format!(
+                    "bad_object_artifact: {cache_key} symbol missing from indexed root {root_hash}"
+                ));
+                return Ok(());
+            };
+            let expected_ir = self.build_lowered_function_ir(&root, entry)?;
+            let expected_relocation_targets = lowered_call_targets(&expected_ir);
             verify_object_relocations_match_dependencies(
                 errors,
                 cache_key,
                 relocations,
                 &dependencies,
+                &expected_relocation_targets,
             );
             return Ok(());
         }
@@ -2248,6 +2287,7 @@ fn verify_object_relocations_match_dependencies(
     cache_key: &str,
     relocations: &[JsonValue],
     dependency_symbols: &[String],
+    expected_relocation_targets: &[String],
 ) {
     let expected_symbols = dependency_symbols.iter().cloned().collect::<BTreeSet<_>>();
     let actual_symbols = relocations
@@ -2262,6 +2302,18 @@ fn verify_object_relocations_match_dependencies(
     if actual_symbols != expected_symbols {
         errors.push(format!(
             "bad_object_artifact: {cache_key} relocations do not match direct dependencies"
+        ));
+    }
+    let actual_target_counts = string_counts(relocations.iter().filter_map(|relocation| {
+        relocation
+            .get("target_symbol_hash")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+    }));
+    let expected_target_counts = string_counts(expected_relocation_targets.iter().cloned());
+    if actual_target_counts != expected_target_counts {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} relocations do not match lowered call sites"
         ));
     }
 
@@ -2302,6 +2354,45 @@ fn verify_object_relocations_match_dependencies(
             }
         }
     }
+}
+
+fn lowered_call_targets(ir: &LoweredFunctionIr) -> Vec<String> {
+    let mut targets = Vec::new();
+    collect_lowered_call_targets(&ir.operations, &mut targets);
+    targets
+}
+
+fn collect_lowered_call_targets(operations: &[LoweredOp], targets: &mut Vec<String>) {
+    for op in operations {
+        match op {
+            LoweredOp::Call {
+                target_symbol_hash, ..
+            } => targets.push(target_symbol_hash.clone()),
+            LoweredOp::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                collect_lowered_call_targets(&then_block.operations, targets);
+                collect_lowered_call_targets(&else_block.operations, targets);
+            }
+            LoweredOp::Param { .. }
+            | LoweredOp::ConstI64 { .. }
+            | LoweredOp::ConstBool { .. }
+            | LoweredOp::ConstUnit { .. }
+            | LoweredOp::Unary { .. }
+            | LoweredOp::Binary { .. }
+            | LoweredOp::Return { .. } => {}
+        }
+    }
+}
+
+fn string_counts(values: impl IntoIterator<Item = String>) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for value in values {
+        *counts.entry(value).or_insert(0) += 1;
+    }
+    counts
 }
 
 fn verify_native_object_bytes_match_metadata(

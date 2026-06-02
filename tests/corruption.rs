@@ -3,7 +3,7 @@ use std::process::Command as ProcessCommand;
 
 use assert_cmd::Command;
 use rusqlite::Connection;
-use serde_json::Value as JsonValue;
+use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
@@ -284,6 +284,85 @@ fn verify_rejects_bad_history_hashes() {
 }
 
 #[test]
+fn verify_rejects_history_output_that_disagrees_with_migration_output() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("history-output-mismatch.sqlite");
+    setup_shop(&db);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let old_history_hash: String = conn
+        .query_row(
+            "SELECT history_hash FROM branches WHERE name = 'main'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let (parent_history, old_migration_hash, history_output): (Option<String>, String, String) =
+        conn.query_row(
+            "SELECT parent_history_hash, migration_hash, output_root_hash
+             FROM histories WHERE history_hash = ?1",
+            [&old_history_hash],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let (input_root, operation_json, preconditions_json, postconditions_json): (
+        String,
+        String,
+        String,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT input_root_hash, operation_json, preconditions_json, postconditions_json
+             FROM migrations WHERE hash = ?1",
+            [&old_migration_hash],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_ne!(input_root, history_output);
+    let operation = serde_json::from_str::<JsonValue>(&operation_json).unwrap();
+    let preconditions = serde_json::from_str::<JsonValue>(&preconditions_json).unwrap();
+    let postconditions = serde_json::from_str::<JsonValue>(&postconditions_json).unwrap();
+    let new_migration_hash = test_migration_hash(
+        parent_history.as_deref(),
+        &input_root,
+        &input_root,
+        &operation,
+        &preconditions,
+        &postconditions,
+    );
+    let new_history_hash = test_history_hash(
+        parent_history.as_deref(),
+        &new_migration_hash,
+        &history_output,
+    );
+
+    conn.execute(
+        "UPDATE migrations
+         SET hash = ?1, output_root_hash = ?2
+         WHERE hash = ?3",
+        (&new_migration_hash, &input_root, &old_migration_hash),
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE histories
+         SET history_hash = ?1, migration_hash = ?2
+         WHERE history_hash = ?3",
+        (&new_history_hash, &new_migration_hash, &old_history_hash),
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE branches SET history_hash = ?1 WHERE name = 'main'",
+        [&new_history_hash],
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_history_link"));
+    assert!(stderr.contains("does not match migration"));
+}
+
+#[test]
 fn verify_replay_does_not_repair_corrupt_indexes() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("verify-readonly.sqlite");
@@ -397,6 +476,63 @@ fn verify_rejects_implementation_hash_metadata_mismatch() {
     let stderr = run_failure(&["verify", db.to_str().unwrap()]);
     assert!(stderr.contains("bad_implementation_hash"));
     assert!(stderr.contains("dependency interface metadata does not match cache key"));
+}
+
+#[test]
+fn verify_rejects_lowered_ir_that_does_not_match_semantic_dag() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("lowered-ir-mismatch.sqlite");
+    let ir = temp.path().join("main.ir.json");
+    setup_shop(&db);
+    run(&[
+        "emit-ir",
+        db.to_str().unwrap(),
+        "main",
+        "--out",
+        ir.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'lowered_ir'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    let operations = value["metadata"]["operations"].as_array_mut().unwrap();
+    let const_i64 = operations
+        .iter_mut()
+        .find(|op| op["op"].as_str() == Some("const_i64"))
+        .expect("const_i64 operation");
+    const_i64["value"] = JsonValue::String("999".to_string());
+    let metadata_hash = test_metadata_hash(&value["metadata"]);
+    value["metadata_hash"] = JsonValue::String(metadata_hash.clone());
+    conn.execute(
+        "UPDATE compile_cache
+         SET artifact_json = ?1, artifact_hash = ?2
+         WHERE cache_key = ?3",
+        (test_canonical_json(&value), metadata_hash, cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_lowered_ir"));
+    assert!(stderr.contains("does not match recomputed semantic DAG"));
+
+    run(&[
+        "emit-ir",
+        db.to_str().unwrap(),
+        "main",
+        "--out",
+        ir.to_str().unwrap(),
+    ]);
+    let repaired_ir = std::fs::read_to_string(&ir).unwrap();
+    assert!(!repaired_ir.contains("\"value\": \"999\""));
+    assert!(repaired_ir.contains("\"value\": \"100\""));
 }
 
 #[test]
@@ -732,6 +868,69 @@ fn verify_rejects_native_object_dependency_interfaces_that_match_tampered_cache_
 }
 
 #[test]
+fn verify_rejects_missing_duplicate_relocation_metadata() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("duplicate-relocation-metadata.sqlite");
+    let source = temp.path().join("two-calls.cdb");
+    let object = temp.path().join("main.o");
+    std::fs::write(
+        &source,
+        "fn inc(x: i64) -> i64 = x + 1\n\nfn main() -> i64 = inc(1) + inc(2)\n",
+    )
+    .unwrap();
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), source.to_str().unwrap()]);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        object.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'object_file'
+             ORDER BY cache_key",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap();
+    let (cache_key, mut value) = rows
+        .map(|row| {
+            let (cache_key, artifact_json) = row.unwrap();
+            let value = serde_json::from_str::<JsonValue>(&artifact_json).unwrap();
+            (cache_key, value)
+        })
+        .find(|(_, value)| {
+            value["metadata"]["relocations"]
+                .as_array()
+                .is_some_and(|relocations| relocations.len() == 2)
+        })
+        .expect("object with duplicate call relocations");
+    value["metadata"]["relocations"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(1);
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (test_canonical_json(&value), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_object_artifact"));
+    assert!(stderr.contains("relocations do not match lowered call sites"));
+}
+
+#[test]
 fn verify_rejects_missing_native_object_bytes() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("missing-object-bytes.sqlite");
@@ -1046,6 +1245,43 @@ fn test_object_hash(kind: &str, canonical_payload: &str) -> String {
     hasher.update(b"1");
     hasher.update(b"\0");
     hasher.update(canonical_payload.as_bytes());
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn test_migration_hash(
+    parent_history_hash: Option<&str>,
+    input_root_hash: &str,
+    output_root_hash: &str,
+    operation: &JsonValue,
+    preconditions: &JsonValue,
+    postconditions: &JsonValue,
+) -> String {
+    let payload = json!({
+        "parent_history_hash": parent_history_hash,
+        "input_root_hash": input_root_hash,
+        "output_root_hash": output_root_hash,
+        "operation": operation,
+        "preconditions": preconditions,
+        "postconditions": postconditions,
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(b"codedb/migration/v1\0");
+    hasher.update(test_canonical_json(&payload).as_bytes());
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn test_history_hash(
+    parent_history_hash: Option<&str>,
+    migration_hash: &str,
+    output_root_hash: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codedb/history/v1\0");
+    hasher.update(parent_history_hash.unwrap_or("").as_bytes());
+    hasher.update([0]);
+    hasher.update(migration_hash.as_bytes());
+    hasher.update([0]);
+    hasher.update(output_root_hash.as_bytes());
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
