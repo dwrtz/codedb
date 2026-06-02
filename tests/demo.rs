@@ -1423,6 +1423,126 @@ fn build_impact_is_available_as_json() {
 }
 
 #[test]
+fn apply_json_builds_shop_demo_from_structural_operations() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("apply-shop.sqlite");
+    let replay_db = temp.path().join("apply-shop-replay.sqlite");
+    let ops = temp.path().join("shop.apply.json");
+
+    std::fs::write(
+        &ops,
+        serde_json::to_string_pretty(&shop_apply_document()).unwrap(),
+    )
+    .unwrap();
+
+    run(&["init", db.to_str().unwrap()]);
+    let applied = run(&[
+        "apply",
+        db.to_str().unwrap(),
+        "--json",
+        ops.to_str().unwrap(),
+    ]);
+    let applied: JsonValue = serde_json::from_str(&applied).unwrap();
+    assert_eq!(applied["schema"], "codedb/apply-result/v1");
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["operation_count"], 3);
+    assert_eq!(applied["applied_operation_count"], 3);
+    assert_eq!(applied["results"][0]["summary"]["typecheck"], "checked");
+    assert_eq!(
+        applied["results"][1]["summary"]["semantic_impact"],
+        "function_created"
+    );
+    assert_eq!(
+        applied["results"][1]["summary"]["build_impact"]["kind"],
+        "recompile_symbols"
+    );
+    assert!(
+        applied["results"][1]["summary"]["build_impact"]["artifact_kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind == "object_file")
+    );
+
+    bin()
+        .args(["eval", db.to_str().unwrap(), "main"])
+        .assert()
+        .success()
+        .stdout("120\n");
+    bin()
+        .args(["verify", db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+
+    let branch_before_retry = branch_state(&db);
+    let counts_before_retry = mutation_guard_counts(&db);
+    let retry = run(&[
+        "apply",
+        db.to_str().unwrap(),
+        "--json",
+        ops.to_str().unwrap(),
+    ]);
+    let retry: JsonValue = serde_json::from_str(&retry).unwrap();
+    assert_eq!(retry["status"], "already_applied");
+    assert_eq!(branch_state(&db), branch_before_retry);
+    assert_eq!(mutation_guard_counts(&db), counts_before_retry);
+
+    run(&["init", replay_db.to_str().unwrap()]);
+    let replayed = run(&[
+        "apply",
+        replay_db.to_str().unwrap(),
+        "--json",
+        ops.to_str().unwrap(),
+    ]);
+    let replayed: JsonValue = serde_json::from_str(&replayed).unwrap();
+    assert_eq!(replayed["new_root_hash"], applied["new_root_hash"]);
+    assert_eq!(replayed["history_hash"], applied["history_hash"]);
+}
+
+#[test]
+fn invalid_apply_json_operation_rolls_back_partial_writes() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("apply-invalid.sqlite");
+    let ops = temp.path().join("invalid.apply.json");
+
+    std::fs::write(
+        &ops,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "codedb/apply/v1",
+            "operations": [{
+                "kind": "create_function",
+                "name": "bad",
+                "params": [],
+                "return_type": "i64",
+                "body": { "kind": "literal_bool", "value": true }
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    run(&["init", db.to_str().unwrap()]);
+    let branch_before = branch_state(&db);
+    let counts_before = mutation_guard_counts(&db);
+
+    let stderr = run_failure(&[
+        "apply",
+        db.to_str().unwrap(),
+        "--json",
+        ops.to_str().unwrap(),
+    ]);
+    assert!(stderr.contains("function main.bad body type bool does not match return type i64"));
+    assert_eq!(branch_state(&db), branch_before);
+    assert_eq!(mutation_guard_counts(&db), counts_before);
+
+    bin()
+        .args(["verify", db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+}
+
+#[test]
 fn conditionals_and_booleans_import_and_evaluate() {
     let temp = tempdir().unwrap();
 
@@ -1985,6 +2105,62 @@ fn c_projection_boolean_ops_are_strict_like_the_reference_evaluator() {
     let c_source = std::fs::read_to_string(&c_file).unwrap();
     assert!(c_source.contains("return 0 & 1 / 0 == 0;"));
     assert!(!c_source.contains("&&"));
+}
+
+fn shop_apply_document() -> JsonValue {
+    serde_json::json!({
+        "schema": "codedb/apply/v1",
+        "operations": [
+            {
+                "kind": "create_function",
+                "name": "tax",
+                "birth_seed": "json-shop-tax",
+                "params": [{ "name": "subtotal", "type": "i64" }],
+                "return_type": "i64",
+                "body": expr_bin(
+                    "/",
+                    expr_bin("*", param("subtotal"), lit_i64(20)),
+                    lit_i64(100)
+                )
+            },
+            {
+                "kind": "create_function",
+                "name": "total",
+                "birth_seed": "json-shop-total",
+                "params": [{ "name": "subtotal", "type": "i64" }],
+                "return_type": "i64",
+                "body": expr_bin(
+                    "+",
+                    param("subtotal"),
+                    call("tax", vec![param("subtotal")])
+                )
+            },
+            {
+                "kind": "create_function",
+                "name": "main",
+                "birth_seed": "json-shop-main",
+                "params": [],
+                "return_type": "i64",
+                "body": call("total", vec![lit_i64(100)])
+            }
+        ]
+    })
+}
+
+fn lit_i64(value: i64) -> JsonValue {
+    serde_json::json!({ "kind": "literal_i64", "value": value.to_string() })
+}
+
+fn param(name: &str) -> JsonValue {
+    serde_json::json!({ "kind": "param_name", "name": name })
+}
+
+fn call(name: &str, args: Vec<JsonValue>) -> JsonValue {
+    serde_json::json!({ "kind": "call", "name": name, "args": args })
+}
+
+fn expr_bin(op: &str, left: JsonValue, right: JsonValue) -> JsonValue {
+    serde_json::json!({ "kind": "binary", "op": op, "left": left, "right": right })
 }
 
 fn cache_rows(db: &Path) -> Vec<(String, String, String)> {

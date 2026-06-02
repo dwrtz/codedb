@@ -7,6 +7,7 @@
 ```bash
 cargo run -- init demo.codedb.sqlite
 cargo run -- import demo.codedb.sqlite examples/shop.cdb
+cargo run -- apply demo.codedb.sqlite --json operations.json
 cargo run -- eval demo.codedb.sqlite main
 cargo run -- callers demo.codedb.sqlite tax
 cargo run -- show demo.codedb.sqlite tax
@@ -26,3 +27,9 @@ Native ABI identity is separate from display names. `show` prints the stable int
 Structural mutation commands return `applied`, `already_applied`, or `conflict`.
 Use `--expect-root <root>` on mutation commands when an agent needs to reject
 stale writes instead of applying against a branch that has moved.
+
+`codedb apply <db> --json <file>` accepts a structural `codedb/apply/v1` JSON
+document with operations such as `create_function`, `rename_symbol`,
+`replace_function_body`, `create_alias`, and `set_export`. Function bodies are
+structural expression JSON objects, so agents do not need to write projection
+text to mutate the database.

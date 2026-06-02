@@ -119,6 +119,14 @@ pub(crate) enum MigrationOutcome {
 }
 
 impl MigrationOutcome {
+    pub(crate) fn status(&self) -> MigrationStatus {
+        match self {
+            MigrationOutcome::Applied(_) => MigrationStatus::Applied,
+            MigrationOutcome::AlreadyApplied(_) => MigrationStatus::AlreadyApplied,
+            MigrationOutcome::Conflict(_) => MigrationStatus::Conflict,
+        }
+    }
+
     pub(crate) fn format_cli(&self) -> String {
         match self {
             MigrationOutcome::Applied(report) => report.format_cli(MigrationStatus::Applied),
@@ -129,15 +137,18 @@ impl MigrationOutcome {
         }
     }
 
-    pub(crate) fn format_json(&self) -> String {
-        let payload = match self {
+    pub(crate) fn to_json(&self) -> JsonValue {
+        match self {
             MigrationOutcome::Applied(report) => report.to_json(MigrationStatus::Applied),
             MigrationOutcome::AlreadyApplied(report) => {
                 report.to_json(MigrationStatus::AlreadyApplied)
             }
             MigrationOutcome::Conflict(conflict) => conflict.to_json(),
-        };
-        format!("{}\n", canonical_json(&payload))
+        }
+    }
+
+    pub(crate) fn format_json(&self) -> String {
+        format!("{}\n", canonical_json(&self.to_json()))
     }
 }
 

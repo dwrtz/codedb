@@ -364,6 +364,14 @@ Acceptance checks:
 
 Goal: make agent-first writes practical without relying on projection text.
 
+Initial implementation status:
+
+- `codedb apply <db> --json <file>` accepts a `codedb/apply/v1` JSON document.
+- Apply documents can contain structural `create_function`, `rename_symbol`, `replace_function_body`, `change_function_signature`, `delete_symbol`, `create_alias`, `remove_alias`, `set_export`, and `remove_export` operations.
+- Function bodies in apply documents are structural `RawExpr` JSON values, not projection text.
+- Apply results are canonical JSON and include per-operation migration summaries with root hashes, migration/history hashes, type-check status, semantic impact, and structured build impact.
+- The shop demo can be built and replayed from JSON operations.
+
 Deliverables:
 
 - Add `codedb apply <db> --json <file>` for structural operations.

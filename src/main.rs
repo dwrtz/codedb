@@ -20,6 +20,12 @@ enum Command {
         db: PathBuf,
         file: PathBuf,
     },
+    #[command(about = "Apply structural operations from a codedb/apply/v1 JSON file")]
+    Apply {
+        db: PathBuf,
+        #[arg(long)]
+        json: PathBuf,
+    },
     Export {
         db: PathBuf,
         #[arg(long, default_value = "main")]
@@ -203,6 +209,10 @@ fn main() -> Result<()> {
             let mut codedb = codedb::CodeDb::open(db)?;
             let report = codedb.import_file(&file)?;
             print!("{report}");
+        }
+        Command::Apply { db, json } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            print!("{}", codedb.apply_json_file(&json)?);
         }
         Command::Export { db, branch, out } => {
             let mut codedb = codedb::CodeDb::open(db)?;
