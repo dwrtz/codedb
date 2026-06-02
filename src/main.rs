@@ -33,6 +33,19 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    #[command(about = "Export a branch migration history as canonical NDJSON")]
+    ExportHistory {
+        db: PathBuf,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    #[command(about = "Import a canonical NDJSON migration history into an empty branch")]
+    ImportHistory {
+        db: PathBuf,
+        file: PathBuf,
+    },
     Eval {
         db: PathBuf,
         function_name: String,
@@ -193,6 +206,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    Branches {
+        db: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     Replay {
         db: PathBuf,
         #[arg(long)]
@@ -227,6 +245,16 @@ fn main() -> Result<()> {
             let source = codedb.export_branch(&branch)?;
             std::fs::write(&out, source)?;
             println!("exported {}", out.display());
+        }
+        Command::ExportHistory { db, branch, out } => {
+            let codedb = codedb::CodeDb::open(db)?;
+            let history = codedb.export_history_branch(&branch)?;
+            std::fs::write(&out, history)?;
+            println!("exported history {}", out.display());
+        }
+        Command::ImportHistory { db, file } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            print!("{}", codedb.import_history_file(&file)?);
         }
         Command::Eval {
             db,
@@ -498,6 +526,14 @@ fn main() -> Result<()> {
                 print!("{}", codedb.history_main_branch_json()?);
             } else {
                 print!("{}", codedb.history_main_branch()?);
+            }
+        }
+        Command::Branches { db, json } => {
+            let codedb = codedb::CodeDb::open(db)?;
+            if json {
+                print!("{}", codedb.branches_json()?);
+            } else {
+                print!("{}", codedb.branches()?);
             }
         }
         Command::Replay { db, from_genesis } => {

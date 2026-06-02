@@ -444,6 +444,15 @@ Acceptance checks:
 
 Goal: make database rebuild independent from copying the SQLite file.
 
+Initial implementation status:
+
+- `codedb export-history <db> --branch main --out history.ndjson` writes a deterministic canonical NDJSON history export.
+- `codedb import-history <db> history.ndjson` rebuilds an empty branch from the exported migration chain.
+- The export has a canonical header with expected branch root, history head, and migration count, followed by canonical migration rows.
+- Import validates ordering, migration hashes, history hashes, operation kinds, preconditions, postconditions, final root, and final history head.
+- `codedb branches <db>` and `codedb branches <db> --json` expose branch root/history pointers.
+- Native object artifacts remain disposable after import and can be regenerated from the rebuilt semantic roots.
+
 Deliverables:
 
 - Add `codedb export-history <db> --branch main --out history.ndjson`.

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -15,6 +16,9 @@ use crate::model::{
 use crate::store::{CodeDb, canonical_json, hash_bytes};
 use crate::types::ParamSpec;
 use crate::{HISTORY_DOMAIN, MAIN_BRANCH, MIGRATION_DOMAIN};
+
+const HISTORY_EXPORT_SCHEMA: &str = "codedb/history-export/v1";
+const HISTORY_EXPORT_MIGRATION_SCHEMA: &str = "codedb/history-export-migration/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1739,6 +1743,355 @@ impl CodeDb {
         ))
     }
 
+    pub fn branches(&self) -> Result<String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, root_hash, history_hash FROM branches ORDER BY name")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let mut out = String::new();
+        for row in rows {
+            let (name, root_hash, history_hash) = row?;
+            out.push_str(&format!(
+                "{name} root {root_hash} history {}\n",
+                history_hash.unwrap_or_else(|| "none".to_string())
+            ));
+        }
+        if out.is_empty() {
+            out.push_str("branches empty\n");
+        }
+        Ok(out)
+    }
+
+    pub fn branches_json(&self) -> Result<String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, root_hash, history_hash FROM branches ORDER BY name")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(json!({
+                "name": row.get::<_, String>(0)?,
+                "root_hash": row.get::<_, String>(1)?,
+                "history_hash": row.get::<_, Option<String>>(2)?,
+            }))
+        })?;
+        let branches = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(format!(
+            "{}\n",
+            canonical_json(&json!({
+                "schema": "codedb/branches/v1",
+                "branches": branches,
+            }))
+        ))
+    }
+
+    pub fn export_history_branch(&self, branch: &str) -> Result<String> {
+        let state = self.branch(branch)?;
+        let chain = self.history_chain(branch)?;
+        let mut out = String::new();
+        out.push_str(&canonical_json(&json!({
+            "schema": HISTORY_EXPORT_SCHEMA,
+            "branch": branch,
+            "root_hash": state.root_hash,
+            "history_hash": state.history_hash,
+            "migration_count": chain.len(),
+        })));
+        out.push('\n');
+        for (sequence, item) in chain.iter().enumerate() {
+            let row = self.history_export_migration_line(sequence, item)?;
+            out.push_str(&canonical_json(&row));
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    pub fn import_history_file(&mut self, path: &Path) -> Result<String> {
+        self.ensure_initialized()?;
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        self.import_history_str(&text)
+            .with_context(|| format!("failed to import {}", path.display()))
+    }
+
+    pub fn import_history_str(&mut self, text: &str) -> Result<String> {
+        self.ensure_initialized()?;
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = self.import_history_str_in_tx(text);
+        match result {
+            Ok(report) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(report)
+            }
+            Err(err) => {
+                if let Err(rollback_err) = self.conn.execute_batch("ROLLBACK") {
+                    return Err(err).context(format!("rollback failed: {rollback_err}"));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn history_export_migration_line(
+        &self,
+        sequence: usize,
+        item: &HistoryItem,
+    ) -> Result<JsonValue> {
+        let (parent_history_hash, preconditions_json, postconditions_json, agent_json): (
+            Option<String>,
+            String,
+            String,
+            String,
+        ) = self.conn.query_row(
+            "SELECT parent_history_hash, preconditions_json, postconditions_json, agent_json
+             FROM migrations WHERE hash = ?1",
+            params![&item.migration_hash],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        Ok(json!({
+            "schema": HISTORY_EXPORT_MIGRATION_SCHEMA,
+            "sequence": sequence,
+            "migration_hash": item.migration_hash,
+            "history_hash": item.history_hash,
+            "parent_history_hash": parent_history_hash,
+            "input_root_hash": item.input_root,
+            "output_root_hash": item.output_root,
+            "operation_kind": item.operation_kind,
+            "operation": serde_json::to_value(&item.operation)?,
+            "preconditions": serde_json::from_str::<JsonValue>(&preconditions_json)?,
+            "postconditions": serde_json::from_str::<JsonValue>(&postconditions_json)?,
+            "agent": serde_json::from_str::<JsonValue>(&agent_json)?,
+        }))
+    }
+
+    fn import_history_str_in_tx(&mut self, text: &str) -> Result<String> {
+        let mut lines = text.lines();
+        let header_line = lines
+            .next()
+            .ok_or_else(|| anyhow!("history import is empty"))?;
+        let header = parse_canonical_ndjson_line(header_line, "history export header")?;
+        if header.get("schema").and_then(JsonValue::as_str) != Some(HISTORY_EXPORT_SCHEMA) {
+            bail!("unsupported history export schema");
+        }
+        let branch = header
+            .get("branch")
+            .and_then(JsonValue::as_str)
+            .unwrap_or(MAIN_BRANCH);
+        if branch != MAIN_BRANCH {
+            bail!("only branch {MAIN_BRANCH:?} is supported by import-history, got {branch:?}");
+        }
+        let expected_root = required_string(&header, "root_hash")?;
+        let expected_history = optional_string(&header, "history_hash")?;
+        let expected_count = header
+            .get("migration_count")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| anyhow!("history export header missing migration_count"))?
+            as usize;
+
+        let initial_branch = self.branch(MAIN_BRANCH)?;
+        if initial_branch.history_hash.is_some() {
+            bail!("import-history requires an empty branch history");
+        }
+
+        let mut current_root = initial_branch.root_hash;
+        let mut current_history: Option<String> = None;
+        let mut imported_count = 0usize;
+
+        for (sequence, line) in lines.enumerate() {
+            let row = parse_canonical_ndjson_line(line, "history export migration")?;
+            self.import_history_migration_row(
+                sequence,
+                &row,
+                &mut current_root,
+                &mut current_history,
+            )?;
+            imported_count += 1;
+        }
+
+        if imported_count != expected_count {
+            bail!(
+                "bad_history_link: expected {expected_count} migrations, imported {imported_count}"
+            );
+        }
+        if current_root != expected_root {
+            bail!(
+                "bad_history_link: final root mismatch, expected {expected_root}, imported {current_root}"
+            );
+        }
+        if current_history != expected_history {
+            bail!(
+                "bad_history_link: final history mismatch, expected {:?}, imported {:?}",
+                expected_history,
+                current_history
+            );
+        }
+
+        if let Some(history_hash) = &current_history {
+            self.update_branch(MAIN_BRANCH, &current_root, history_hash)?;
+        }
+        Ok(format!(
+            "imported history\nroot {}\nhistory {}\nmigrations {}\n",
+            current_root,
+            current_history.unwrap_or_else(|| "none".to_string()),
+            imported_count
+        ))
+    }
+
+    fn import_history_migration_row(
+        &mut self,
+        expected_sequence: usize,
+        row: &JsonValue,
+        current_root: &mut String,
+        current_history: &mut Option<String>,
+    ) -> Result<()> {
+        if row.get("schema").and_then(JsonValue::as_str) != Some(HISTORY_EXPORT_MIGRATION_SCHEMA) {
+            bail!("unsupported history migration export schema");
+        }
+        let sequence =
+            row.get("sequence")
+                .and_then(JsonValue::as_u64)
+                .ok_or_else(|| anyhow!("history migration missing sequence"))? as usize;
+        if sequence != expected_sequence {
+            bail!("bad_history_link: expected sequence {expected_sequence}, got {sequence}");
+        }
+
+        let migration_hash_value = required_string(row, "migration_hash")?;
+        let history_hash_value = required_string(row, "history_hash")?;
+        let parent_history_hash = optional_string(row, "parent_history_hash")?;
+        if parent_history_hash != *current_history {
+            bail!(
+                "bad_history_link: migration {migration_hash_value} parent {:?} does not match current {:?}",
+                parent_history_hash,
+                current_history
+            );
+        }
+        let input_root = required_string(row, "input_root_hash")?;
+        if input_root != *current_root {
+            bail!(
+                "bad_history_link: migration {migration_hash_value} expected input {input_root}, import has {current_root}"
+            );
+        }
+        let output_root = required_string(row, "output_root_hash")?;
+        let operation_kind = required_string(row, "operation_kind")?;
+        let operation_value = row
+            .get("operation")
+            .cloned()
+            .ok_or_else(|| anyhow!("history migration missing operation"))?;
+        let operation: Operation = serde_json::from_value(operation_value.clone())?;
+        if operation.kind_name() != operation_kind {
+            bail!(
+                "bad_history_link: operation kind mismatch for {migration_hash_value}: row has {operation_kind}, operation has {}",
+                operation.kind_name()
+            );
+        }
+        let preconditions = row
+            .get("preconditions")
+            .cloned()
+            .ok_or_else(|| anyhow!("history migration missing preconditions"))?;
+        let postconditions = row
+            .get("postconditions")
+            .cloned()
+            .ok_or_else(|| anyhow!("history migration missing postconditions"))?;
+        let agent = row.get("agent").cloned().unwrap_or_else(|| json!({}));
+
+        let recomputed_migration = migration_hash(
+            current_history.as_deref(),
+            current_root,
+            &output_root,
+            &operation_value,
+            &preconditions,
+            &postconditions,
+        );
+        if recomputed_migration != migration_hash_value {
+            bail!(
+                "bad_history_link: migration {migration_hash_value} recomputes to {recomputed_migration}"
+            );
+        }
+
+        let recomputed_preconditions = canonical_json(&serde_json::to_value(
+            self.preconditions_for(current_root, &operation),
+        )?);
+        if recomputed_preconditions != canonical_json(&preconditions) {
+            bail!("bad_history_link: preconditions changed for {migration_hash_value}");
+        }
+        let failed_preconditions = self.failed_preconditions(
+            current_root,
+            &self.preconditions_for(current_root, &operation),
+        )?;
+        if !failed_preconditions.is_empty() {
+            bail!(
+                "semantic_conflict: migration {migration_hash_value} failed preconditions {}",
+                condition_names(&failed_preconditions)
+            );
+        }
+
+        let produced =
+            self.apply_operation_to_root(current_root, current_history.as_deref(), &operation)?;
+        if produced != output_root {
+            bail!(
+                "bad_history_link: migration {migration_hash_value} expected output {output_root}, produced {produced}"
+            );
+        }
+        let recomputed_postconditions = canonical_json(&serde_json::to_value(
+            self.postconditions_for(&produced, &operation),
+        )?);
+        if recomputed_postconditions != canonical_json(&postconditions) {
+            bail!("bad_history_link: postconditions changed for {migration_hash_value}");
+        }
+        let failed_postconditions =
+            self.failed_postconditions(&produced, &self.postconditions_for(&produced, &operation))?;
+        if !failed_postconditions.is_empty() {
+            bail!(
+                "semantic_conflict: migration {migration_hash_value} failed postconditions {}",
+                condition_names(&failed_postconditions)
+            );
+        }
+
+        let recomputed_history =
+            history_hash(current_history.as_deref(), &migration_hash_value, &produced);
+        if recomputed_history != history_hash_value {
+            bail!(
+                "bad_history_link: history {history_hash_value} recomputes to {recomputed_history}"
+            );
+        }
+
+        self.conn.execute(
+            "INSERT OR IGNORE INTO migrations
+             (hash, parent_history_hash, input_root_hash, output_root_hash,
+              operation_kind, operation_json, preconditions_json, postconditions_json, agent_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                &migration_hash_value,
+                current_history.as_deref(),
+                current_root.as_str(),
+                &produced,
+                &operation_kind,
+                canonical_json(&operation_value),
+                canonical_json(&preconditions),
+                canonical_json(&postconditions),
+                canonical_json(&agent),
+            ],
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO histories
+             (history_hash, parent_history_hash, migration_hash, output_root_hash)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &history_hash_value,
+                current_history.as_deref(),
+                &migration_hash_value,
+                &produced
+            ],
+        )?;
+
+        *current_root = produced;
+        *current_history = Some(history_hash_value);
+        Ok(())
+    }
+
     pub fn replay_main_branch(&mut self) -> Result<String> {
         self.ensure_initialized()?;
         let expected = self.branch(MAIN_BRANCH)?;
@@ -1919,6 +2272,32 @@ struct HistoryItem {
     output_root: String,
     operation_kind: String,
     operation: Operation,
+}
+
+fn parse_canonical_ndjson_line(line: &str, label: &str) -> Result<JsonValue> {
+    let value: JsonValue =
+        serde_json::from_str(line).with_context(|| format!("invalid {label}"))?;
+    let canonical = canonical_json(&value);
+    if canonical != line {
+        bail!("{label} is not canonical");
+    }
+    Ok(value)
+}
+
+fn required_string(value: &JsonValue, field: &str) -> Result<String> {
+    value
+        .get(field)
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("missing string field {field}"))
+}
+
+fn optional_string(value: &JsonValue, field: &str) -> Result<Option<String>> {
+    match value.get(field) {
+        Some(JsonValue::String(text)) => Ok(Some(text.clone())),
+        Some(JsonValue::Null) | None => Ok(None),
+        Some(_) => bail!("field {field} must be string or null"),
+    }
 }
 
 fn name_points_to_symbol(

@@ -1721,6 +1721,151 @@ fn apply_json_builds_shop_demo_from_structural_operations() {
 }
 
 #[test]
+fn export_history_imports_into_fresh_database_and_regenerates_native_artifacts() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("phase12-source.sqlite");
+    let imported_db = temp.path().join("phase12-imported.sqlite");
+    let history_path = temp.path().join("history.ndjson");
+    let history_again_path = temp.path().join("history-again.ndjson");
+    let object_path = temp.path().join("tax-after-import.o");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    run(&[
+        "export-history",
+        db.to_str().unwrap(),
+        "--branch",
+        "main",
+        "--out",
+        history_path.to_str().unwrap(),
+    ]);
+    run(&[
+        "export-history",
+        db.to_str().unwrap(),
+        "--branch",
+        "main",
+        "--out",
+        history_again_path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        std::fs::read_to_string(&history_path).unwrap(),
+        std::fs::read_to_string(&history_again_path).unwrap()
+    );
+    for line in std::fs::read_to_string(&history_path).unwrap().lines() {
+        let value: JsonValue = serde_json::from_str(line).unwrap();
+        assert_eq!(line, serde_json::to_string(&value).unwrap());
+    }
+
+    let source_branch = branch_state(&db);
+    let branches: JsonValue =
+        serde_json::from_str(&run(&["branches", db.to_str().unwrap(), "--json"])).unwrap();
+    assert_eq!(branches["schema"], "codedb/branches/v1");
+    assert_eq!(branches["branches"][0]["name"], "main");
+    assert_eq!(branches["branches"][0]["root_hash"], source_branch.0);
+    assert_eq!(
+        branches["branches"][0]["history_hash"],
+        serde_json::to_value(&source_branch.1).unwrap()
+    );
+
+    run(&["init", imported_db.to_str().unwrap()]);
+    assert_eq!(cache_row_count_by_kind(&imported_db, "object_file"), 0);
+    let import_report = run(&[
+        "import-history",
+        imported_db.to_str().unwrap(),
+        history_path.to_str().unwrap(),
+    ]);
+    assert!(import_report.contains("imported history"));
+    assert_eq!(branch_state(&imported_db), source_branch);
+
+    bin()
+        .args(["eval", imported_db.to_str().unwrap(), "main"])
+        .assert()
+        .success()
+        .stdout("120\n");
+    bin()
+        .args(["verify", imported_db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+
+    run(&[
+        "emit-object",
+        imported_db.to_str().unwrap(),
+        "tax",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        object_path.to_str().unwrap(),
+    ]);
+    let bytes = std::fs::read(&object_path).unwrap();
+    assert_eq!(&bytes[..4], b"\x7fELF");
+    assert_eq!(cache_row_count_by_kind(&imported_db, "object_file"), 1);
+}
+
+#[test]
+fn import_history_rejects_missing_reordered_and_tampered_migrations() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("phase12-source.sqlite");
+    let history_path = temp.path().join("history.ndjson");
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    run(&[
+        "export-history",
+        db.to_str().unwrap(),
+        "--branch",
+        "main",
+        "--out",
+        history_path.to_str().unwrap(),
+    ]);
+    let lines = std::fs::read_to_string(&history_path)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert!(lines.len() > 3);
+
+    let missing_path = temp.path().join("history-missing.ndjson");
+    std::fs::write(&missing_path, format!("{}\n", lines[..lines.len() - 1].join("\n"))).unwrap();
+    let missing_db = temp.path().join("phase12-missing.sqlite");
+    run(&["init", missing_db.to_str().unwrap()]);
+    let stderr = run_failure(&[
+        "import-history",
+        missing_db.to_str().unwrap(),
+        missing_path.to_str().unwrap(),
+    ]);
+    assert!(stderr.contains("bad_history_link"));
+
+    let reordered_path = temp.path().join("history-reordered.ndjson");
+    let mut reordered = lines.clone();
+    reordered.swap(1, 2);
+    std::fs::write(&reordered_path, format!("{}\n", reordered.join("\n"))).unwrap();
+    let reordered_db = temp.path().join("phase12-reordered.sqlite");
+    run(&["init", reordered_db.to_str().unwrap()]);
+    let stderr = run_failure(&[
+        "import-history",
+        reordered_db.to_str().unwrap(),
+        reordered_path.to_str().unwrap(),
+    ]);
+    assert!(stderr.contains("bad_history_link"));
+
+    let tampered_path = temp.path().join("history-tampered.ndjson");
+    let mut tampered = lines.clone();
+    let mut row: JsonValue = serde_json::from_str(&tampered[1]).unwrap();
+    row["operation"]["name"] = JsonValue::String("tampered".to_string());
+    tampered[1] = serde_json::to_string(&row).unwrap();
+    std::fs::write(&tampered_path, format!("{}\n", tampered.join("\n"))).unwrap();
+    let tampered_db = temp.path().join("phase12-tampered.sqlite");
+    run(&["init", tampered_db.to_str().unwrap()]);
+    let stderr = run_failure(&[
+        "import-history",
+        tampered_db.to_str().unwrap(),
+        tampered_path.to_str().unwrap(),
+    ]);
+    assert!(stderr.contains("bad_history_link"));
+}
+
+#[test]
 fn apply_json_covers_all_structural_operation_kinds() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("apply-all.sqlite");
