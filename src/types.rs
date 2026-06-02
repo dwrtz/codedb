@@ -15,6 +15,12 @@ pub struct ParamSpec {
     pub ty: String,
 }
 
+#[derive(Debug, Clone)]
+struct LocalTypeBinding {
+    name: String,
+    type_hash: String,
+}
+
 impl CodeDb {
     pub(crate) fn insert_builtin_types(&mut self) -> Result<()> {
         for type_name in ["I64", "Bool", "Unit"] {
@@ -138,6 +144,17 @@ impl CodeDb {
         param_names: &[String],
         param_types: &[String],
     ) -> Result<TypeCheckResult> {
+        self.type_expr_with_locals(expr, root, param_names, param_types, &mut Vec::new())
+    }
+
+    fn type_expr_with_locals(
+        &mut self,
+        expr: &RawExpr,
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+        locals: &mut Vec<LocalTypeBinding>,
+    ) -> Result<TypeCheckResult> {
         match expr {
             RawExpr::LiteralI64 { value } => {
                 value
@@ -186,6 +203,27 @@ impl CodeDb {
                     type_hash,
                 })
             }
+            RawExpr::Unit => {
+                let type_hash = type_hash_for("Unit");
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "literal_unit",
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
             RawExpr::ParamRef { index } => {
                 let type_hash = param_types
                     .get(*index)
@@ -212,11 +250,40 @@ impl CodeDb {
                 })
             }
             RawExpr::ParamName { name } => {
-                let index = param_names
-                    .iter()
-                    .position(|candidate| candidate == name)
-                    .ok_or_else(|| anyhow!("unknown parameter {name}"))?;
-                self.type_expr(&RawExpr::ParamRef { index }, root, param_names, param_types)
+                if let Some((depth, binding)) = local_binding_at_name(locals, name) {
+                    let type_hash = binding.type_hash.clone();
+                    let expr_hash = self.put_object(
+                        "Expression",
+                        &json!({
+                            "expr_kind": "local_ref",
+                            "depth": depth,
+                            "type": type_hash,
+                        }),
+                    )?;
+                    self.write_cache_json(
+                        &expr_hash,
+                        "typechecker",
+                        "typed-dag",
+                        ArtifactKind::TypedExpression,
+                        &json!({ "type": type_hash }),
+                    )?;
+                    Ok(TypeCheckResult {
+                        expr_hash,
+                        type_hash,
+                    })
+                } else {
+                    let index = param_names
+                        .iter()
+                        .position(|candidate| candidate == name)
+                        .ok_or_else(|| anyhow!("unknown parameter {name}"))?;
+                    self.type_expr_with_locals(
+                        &RawExpr::ParamRef { index },
+                        root,
+                        param_names,
+                        param_types,
+                        locals,
+                    )
+                }
             }
             RawExpr::Call { name, args } => {
                 let symbol = resolve_name_in_root(root, "main", name)
@@ -234,7 +301,8 @@ impl CodeDb {
                 }
                 let mut typed_args = Vec::with_capacity(args.len());
                 for (idx, arg) in args.iter().enumerate() {
-                    let typed = self.type_expr(arg, root, param_names, param_types)?;
+                    let typed =
+                        self.type_expr_with_locals(arg, root, param_names, param_types, locals)?;
                     if typed.type_hash != expected_params[idx] {
                         bail!(
                             "call arg {} for {name} expected {}, got {}",
@@ -267,8 +335,10 @@ impl CodeDb {
                 })
             }
             RawExpr::Binary { op, left, right } => {
-                let left = self.type_expr(left, root, param_names, param_types)?;
-                let right = self.type_expr(right, root, param_names, param_types)?;
+                let left =
+                    self.type_expr_with_locals(left, root, param_names, param_types, locals)?;
+                let right =
+                    self.type_expr_with_locals(right, root, param_names, param_types, locals)?;
                 let i64_hash = type_hash_for("I64");
                 let bool_hash = type_hash_for("Bool");
                 let result_type = match op.as_str() {
@@ -311,16 +381,96 @@ impl CodeDb {
                     type_hash: result_type,
                 })
             }
+            RawExpr::Unary { op, expr } => {
+                let typed =
+                    self.type_expr_with_locals(expr, root, param_names, param_types, locals)?;
+                let i64_hash = type_hash_for("I64");
+                let bool_hash = type_hash_for("Bool");
+                let result_type = match op.as_str() {
+                    "-" => {
+                        require_type(&typed.type_hash, &i64_hash, "unary operand", self)?;
+                        i64_hash
+                    }
+                    "!" => {
+                        require_type(&typed.type_hash, &bool_hash, "unary operand", self)?;
+                        bool_hash
+                    }
+                    _ => bail!("unsupported unary operator {op}"),
+                };
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "unary",
+                        "op": op,
+                        "expr": typed.expr_hash,
+                        "type": result_type,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": result_type }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash: result_type,
+                })
+            }
+            RawExpr::Let {
+                name,
+                ty,
+                value,
+                body,
+            } => {
+                let binding_type = self.resolve_type(ty)?;
+                let value =
+                    self.type_expr_with_locals(value, root, param_names, param_types, locals)?;
+                require_type(&value.type_hash, &binding_type, "let binding", self)?;
+                locals.push(LocalTypeBinding {
+                    name: name.clone(),
+                    type_hash: binding_type.clone(),
+                });
+                let body = self.type_expr_with_locals(body, root, param_names, param_types, locals);
+                locals.pop();
+                let body = body?;
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "let",
+                        "binding_name": name,
+                        "binding_type": binding_type,
+                        "value": value.expr_hash,
+                        "body": body.expr_hash,
+                        "type": body.type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": body.type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash: body.type_hash,
+                })
+            }
             RawExpr::If {
                 cond,
                 then_expr,
                 else_expr,
             } => {
-                let cond = self.type_expr(cond, root, param_names, param_types)?;
+                let cond =
+                    self.type_expr_with_locals(cond, root, param_names, param_types, locals)?;
                 let bool_hash = type_hash_for("Bool");
                 require_type(&cond.type_hash, &bool_hash, "if condition", self)?;
-                let then_expr = self.type_expr(then_expr, root, param_names, param_types)?;
-                let else_expr = self.type_expr(else_expr, root, param_names, param_types)?;
+                let then_expr =
+                    self.type_expr_with_locals(then_expr, root, param_names, param_types, locals)?;
+                let else_expr =
+                    self.type_expr_with_locals(else_expr, root, param_names, param_types, locals)?;
                 if then_expr.type_hash != else_expr.type_hash {
                     bail!(
                         "if branches differ: {} vs {}",
@@ -385,6 +535,16 @@ impl CodeDb {
         root: &ProgramRootPayload,
         param_types: &[String],
     ) -> Result<String> {
+        self.verify_expr_type_with_locals(expr_hash, root, param_types, &mut Vec::new())
+    }
+
+    fn verify_expr_type_with_locals(
+        &self,
+        expr_hash: &str,
+        root: &ProgramRootPayload,
+        param_types: &[String],
+        locals: &mut Vec<String>,
+    ) -> Result<String> {
         if self.get_kind(expr_hash)? != "Expression" {
             bail!("bad_type: object is not expression {expr_hash}");
         }
@@ -401,6 +561,7 @@ impl CodeDb {
         {
             "literal_i64" => type_hash_for("I64"),
             "literal_bool" => type_hash_for("Bool"),
+            "literal_unit" => type_hash_for("Unit"),
             "param_ref" => {
                 let index = payload
                     .get("index")
@@ -411,6 +572,16 @@ impl CodeDb {
                     .get(index)
                     .cloned()
                     .ok_or_else(|| anyhow!("param_ref out of bounds {index}"))?
+            }
+            "local_ref" => {
+                let depth = payload
+                    .get("depth")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
+                    as usize;
+                local_type_at_depth(locals, depth)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("local_ref out of bounds {depth}"))?
             }
             "call" => {
                 let symbol = payload
@@ -432,7 +603,8 @@ impl CodeDb {
                     let arg_hash = arg
                         .as_str()
                         .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                    let arg_type = self.verify_expr_type(arg_hash, root, param_types)?;
+                    let arg_type =
+                        self.verify_expr_type_with_locals(arg_hash, root, param_types, locals)?;
                     if arg_type != expected_params[idx] {
                         bail!("call arg type mismatch for {symbol} at arg {idx}");
                     }
@@ -452,8 +624,10 @@ impl CodeDb {
                     .get("right")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("binary missing right"))?;
-                let left = self.verify_expr_type(left_hash, root, param_types)?;
-                let right = self.verify_expr_type(right_hash, root, param_types)?;
+                let left =
+                    self.verify_expr_type_with_locals(left_hash, root, param_types, locals)?;
+                let right =
+                    self.verify_expr_type_with_locals(right_hash, root, param_types, locals)?;
                 let i64_hash = type_hash_for("I64");
                 let bool_hash = type_hash_for("Bool");
                 match op {
@@ -478,6 +652,62 @@ impl CodeDb {
                     _ => bail!("unsupported binary op {op}"),
                 }
             }
+            "unary" => {
+                let op = payload
+                    .get("op")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unary missing op"))?;
+                let child = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unary missing expr"))?;
+                let child_type =
+                    self.verify_expr_type_with_locals(child, root, param_types, locals)?;
+                match op {
+                    "-" => {
+                        if child_type != type_hash_for("I64") {
+                            bail!("integer unary op requires i64 operand");
+                        }
+                        type_hash_for("I64")
+                    }
+                    "!" => {
+                        if child_type != type_hash_for("Bool") {
+                            bail!("bool unary op requires bool operand");
+                        }
+                        type_hash_for("Bool")
+                    }
+                    _ => bail!("unsupported unary op {op}"),
+                }
+            }
+            "let" => {
+                let binding_type = payload
+                    .get("binding_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing binding_type"))?
+                    .to_string();
+                payload
+                    .get("binding_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing binding_name"))?;
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing value"))?;
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing body"))?;
+                let value_type =
+                    self.verify_expr_type_with_locals(value_hash, root, param_types, locals)?;
+                if value_type != binding_type {
+                    bail!("let binding type mismatch");
+                }
+                locals.push(binding_type);
+                let body_type =
+                    self.verify_expr_type_with_locals(body_hash, root, param_types, locals);
+                locals.pop();
+                body_type?
+            }
             "if" => {
                 let cond = payload
                     .get("cond")
@@ -491,12 +721,15 @@ impl CodeDb {
                     .get("else")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("if missing else"))?;
-                let cond_type = self.verify_expr_type(cond, root, param_types)?;
+                let cond_type =
+                    self.verify_expr_type_with_locals(cond, root, param_types, locals)?;
                 if cond_type != type_hash_for("Bool") {
                     bail!("if condition must be bool");
                 }
-                let then_type = self.verify_expr_type(then_hash, root, param_types)?;
-                let else_type = self.verify_expr_type(else_hash, root, param_types)?;
+                let then_type =
+                    self.verify_expr_type_with_locals(then_hash, root, param_types, locals)?;
+                let else_type =
+                    self.verify_expr_type_with_locals(else_hash, root, param_types, locals)?;
                 if then_type != else_type {
                     bail!("if branches must have the same type");
                 }
@@ -522,6 +755,25 @@ fn require_type(actual: &str, expected: &str, label: &str, db: &CodeDb) -> Resul
         );
     }
     Ok(())
+}
+
+fn local_binding_at_name<'a>(
+    locals: &'a [LocalTypeBinding],
+    name: &str,
+) -> Option<(usize, &'a LocalTypeBinding)> {
+    locals
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, binding)| binding.name == name)
+        .map(|(idx, binding)| (locals.len() - 1 - idx, binding))
+}
+
+fn local_type_at_depth(locals: &[String], depth: usize) -> Option<&String> {
+    locals
+        .len()
+        .checked_sub(depth + 1)
+        .and_then(|idx| locals.get(idx))
 }
 
 pub(crate) fn type_hash_for(type_kind: &str) -> String {

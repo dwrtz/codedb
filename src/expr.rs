@@ -18,6 +18,7 @@ pub enum RawExpr {
     LiteralBool {
         value: bool,
     },
+    Unit,
     ParamRef {
         index: usize,
     },
@@ -32,6 +33,17 @@ pub enum RawExpr {
         op: String,
         left: Box<RawExpr>,
         right: Box<RawExpr>,
+    },
+    Unary {
+        op: String,
+        expr: Box<RawExpr>,
+    },
+    Let {
+        name: String,
+        #[serde(rename = "type")]
+        ty: String,
+        value: Box<RawExpr>,
+        body: Box<RawExpr>,
     },
     If {
         cond: Box<RawExpr>,
@@ -117,6 +129,16 @@ impl CodeDb {
         expr_hash: &str,
         args: &[Value],
     ) -> Result<Value> {
+        self.eval_expr_with_locals(root_hash, expr_hash, args, &mut Vec::new())
+    }
+
+    fn eval_expr_with_locals(
+        &self,
+        root_hash: &str,
+        expr_hash: &str,
+        args: &[Value],
+        locals: &mut Vec<Value>,
+    ) -> Result<Value> {
         let payload = self.get_payload(expr_hash)?;
         match payload
             .get("expr_kind")
@@ -138,6 +160,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("literal_bool missing value"))?;
                 Ok(Value::Bool(value))
             }
+            "literal_unit" => Ok(Value::Unit),
             "param_ref" => {
                 let index = payload
                     .get("index")
@@ -147,6 +170,16 @@ impl CodeDb {
                 args.get(index)
                     .cloned()
                     .ok_or_else(|| anyhow!("parameter index out of bounds: {index}"))
+            }
+            "local_ref" => {
+                let depth = payload
+                    .get("depth")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
+                    as usize;
+                local_at_depth(locals, depth)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))
             }
             "call" => {
                 let symbol = payload
@@ -162,7 +195,7 @@ impl CodeDb {
                     let hash = arg
                         .as_str()
                         .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                    call_args.push(self.eval_expr(root_hash, hash, args)?);
+                    call_args.push(self.eval_expr_with_locals(root_hash, hash, args, locals)?);
                 }
                 self.eval_symbol(root_hash, symbol, call_args)
             }
@@ -179,9 +212,36 @@ impl CodeDb {
                     .get("right")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("binary missing right"))?;
-                let left = self.eval_expr(root_hash, left_hash, args)?;
-                let right = self.eval_expr(root_hash, right_hash, args)?;
+                let left = self.eval_expr_with_locals(root_hash, left_hash, args, locals)?;
+                let right = self.eval_expr_with_locals(root_hash, right_hash, args, locals)?;
                 eval_binary(op, left, right)
+            }
+            "unary" => {
+                let op = payload
+                    .get("op")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unary missing op"))?;
+                let expr_hash = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unary missing expr"))?;
+                let value = self.eval_expr_with_locals(root_hash, expr_hash, args, locals)?;
+                eval_unary(op, value)
+            }
+            "let" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing value"))?;
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing body"))?;
+                let value = self.eval_expr_with_locals(root_hash, value_hash, args, locals)?;
+                locals.push(value);
+                let body = self.eval_expr_with_locals(root_hash, body_hash, args, locals);
+                locals.pop();
+                body
             }
             "if" => {
                 let cond_hash = payload
@@ -196,9 +256,13 @@ impl CodeDb {
                     .get("else")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("if missing else"))?;
-                match self.eval_expr(root_hash, cond_hash, args)? {
-                    Value::Bool(true) => self.eval_expr(root_hash, then_hash, args),
-                    Value::Bool(false) => self.eval_expr(root_hash, else_hash, args),
+                match self.eval_expr_with_locals(root_hash, cond_hash, args, locals)? {
+                    Value::Bool(true) => {
+                        self.eval_expr_with_locals(root_hash, then_hash, args, locals)
+                    }
+                    Value::Bool(false) => {
+                        self.eval_expr_with_locals(root_hash, else_hash, args, locals)
+                    }
                     other => bail!("if condition evaluated to non-bool {other}"),
                 }
             }
@@ -323,6 +387,17 @@ impl CodeDb {
         local_params: &[String],
         parent_prec: u8,
     ) -> Result<String> {
+        self.expr_to_source_with_locals(expr_hash, root, local_params, &mut Vec::new(), parent_prec)
+    }
+
+    fn expr_to_source_with_locals(
+        &self,
+        expr_hash: &str,
+        root: &ProgramRootPayload,
+        local_params: &[String],
+        local_names: &mut Vec<String>,
+        parent_prec: u8,
+    ) -> Result<String> {
         let payload = self.get_payload(expr_hash)?;
         let rendered = match payload
             .get("expr_kind")
@@ -339,6 +414,7 @@ impl CodeDb {
                 .and_then(JsonValue::as_bool)
                 .ok_or_else(|| anyhow!("literal_bool missing value"))?
                 .to_string(),
+            "literal_unit" => "()".to_string(),
             "param_ref" => {
                 let index = payload
                     .get("index")
@@ -349,6 +425,16 @@ impl CodeDb {
                     .get(index)
                     .cloned()
                     .unwrap_or_else(|| format!("p{index}"))
+            }
+            "local_ref" => {
+                let depth = payload
+                    .get("depth")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
+                    as usize;
+                local_at_depth(local_names, depth)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))?
             }
             "call" => {
                 let symbol = payload
@@ -365,7 +451,7 @@ impl CodeDb {
                         let hash = arg
                             .as_str()
                             .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                        self.expr_to_source(hash, root, local_params, 0)
+                        self.expr_to_source_with_locals(hash, root, local_params, local_names, 0)
                     })
                     .collect::<Result<Vec<_>>>()?;
                 format!(
@@ -390,11 +476,76 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("binary missing right"))?;
                 let expr = format!(
                     "{} {} {}",
-                    self.expr_to_source(left, root, local_params, prec)?,
+                    self.expr_to_source_with_locals(left, root, local_params, local_names, prec)?,
                     op,
-                    self.expr_to_source(right, root, local_params, prec + 1)?
+                    self.expr_to_source_with_locals(
+                        right,
+                        root,
+                        local_params,
+                        local_names,
+                        prec + 1,
+                    )?
                 );
                 if prec < parent_prec {
+                    format!("({expr})")
+                } else {
+                    expr
+                }
+            }
+            "unary" => {
+                let op = payload
+                    .get("op")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unary missing op"))?;
+                let child = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unary missing expr"))?;
+                let prec = unary_precedence();
+                let expr = format!(
+                    "{op}{}",
+                    self.expr_to_source_with_locals(child, root, local_params, local_names, prec)?
+                );
+                if prec < parent_prec {
+                    format!("({expr})")
+                } else {
+                    expr
+                }
+            }
+            "let" => {
+                let name = payload
+                    .get("binding_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing binding_name"))?;
+                let binding_type = payload
+                    .get("binding_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing binding_type"))?;
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing value"))?;
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing body"))?;
+                let value = self.expr_to_source_with_locals(
+                    value_hash,
+                    root,
+                    local_params,
+                    local_names,
+                    0,
+                )?;
+                local_names.push(name.to_string());
+                let body =
+                    self.expr_to_source_with_locals(body_hash, root, local_params, local_names, 0);
+                local_names.pop();
+                let expr = format!(
+                    "let {name}: {} = {value} in {}",
+                    self.type_name(binding_type)?,
+                    body?
+                );
+                if parent_prec > 0 {
                     format!("({expr})")
                 } else {
                     expr
@@ -415,9 +566,9 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("if missing else"))?;
                 let expr = format!(
                     "if {} then {} else {}",
-                    self.expr_to_source(cond, root, local_params, 0)?,
-                    self.expr_to_source(then_hash, root, local_params, 0)?,
-                    self.expr_to_source(else_hash, root, local_params, 0)?
+                    self.expr_to_source_with_locals(cond, root, local_params, local_names, 0)?,
+                    self.expr_to_source_with_locals(then_hash, root, local_params, local_names, 0)?,
+                    self.expr_to_source_with_locals(else_hash, root, local_params, local_names, 0)?
                 );
                 if parent_prec > 0 {
                     format!("({expr})")
@@ -434,6 +585,15 @@ impl CodeDb {
         &self,
         expr_hash: &str,
         root: &ProgramRootPayload,
+    ) -> Result<RawExpr> {
+        self.typed_expr_to_raw_with_locals(expr_hash, root, &mut Vec::new())
+    }
+
+    fn typed_expr_to_raw_with_locals(
+        &self,
+        expr_hash: &str,
+        root: &ProgramRootPayload,
+        local_names: &mut Vec<String>,
     ) -> Result<RawExpr> {
         let payload = self.get_payload(expr_hash)?;
         match payload
@@ -454,6 +614,7 @@ impl CodeDb {
                     .and_then(JsonValue::as_bool)
                     .ok_or_else(|| anyhow!("literal_bool missing value"))?,
             }),
+            "literal_unit" => Ok(RawExpr::Unit),
             "param_ref" => Ok(RawExpr::ParamRef {
                 index: payload
                     .get("index")
@@ -461,6 +622,18 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("param_ref missing index"))?
                     as usize,
             }),
+            "local_ref" => {
+                let depth = payload
+                    .get("depth")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
+                    as usize;
+                Ok(RawExpr::ParamName {
+                    name: local_at_depth(local_names, depth)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))?,
+                })
+            }
             "call" => {
                 let symbol = payload
                     .get("symbol")
@@ -478,7 +651,7 @@ impl CodeDb {
                             let hash = arg
                                 .as_str()
                                 .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                            self.typed_expr_to_raw(hash, root)
+                            self.typed_expr_to_raw_with_locals(hash, root, local_names)
                         })
                         .collect::<Result<Vec<_>>>()?,
                 })
@@ -490,50 +663,107 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("binary missing op"))?
                     .to_string(),
                 left: Box::new(
-                    self.typed_expr_to_raw(
+                    self.typed_expr_to_raw_with_locals(
                         payload
                             .get("left")
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("binary missing left"))?,
                         root,
+                        local_names,
                     )?,
                 ),
                 right: Box::new(
-                    self.typed_expr_to_raw(
+                    self.typed_expr_to_raw_with_locals(
                         payload
                             .get("right")
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("binary missing right"))?,
                         root,
+                        local_names,
                     )?,
                 ),
             }),
+            "unary" => Ok(RawExpr::Unary {
+                op: payload
+                    .get("op")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unary missing op"))?
+                    .to_string(),
+                expr: Box::new(
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("expr")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("unary missing expr"))?,
+                        root,
+                        local_names,
+                    )?,
+                ),
+            }),
+            "let" => {
+                let name = payload
+                    .get("binding_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing binding_name"))?
+                    .to_string();
+                let binding_type = payload
+                    .get("binding_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing binding_type"))?;
+                let value = self.typed_expr_to_raw_with_locals(
+                    payload
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("let missing value"))?,
+                    root,
+                    local_names,
+                )?;
+                local_names.push(name.clone());
+                let body = self.typed_expr_to_raw_with_locals(
+                    payload
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("let missing body"))?,
+                    root,
+                    local_names,
+                );
+                local_names.pop();
+                Ok(RawExpr::Let {
+                    name,
+                    ty: self.type_name(binding_type)?.to_string(),
+                    value: Box::new(value),
+                    body: Box::new(body?),
+                })
+            }
             "if" => Ok(RawExpr::If {
                 cond: Box::new(
-                    self.typed_expr_to_raw(
+                    self.typed_expr_to_raw_with_locals(
                         payload
                             .get("cond")
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("if missing cond"))?,
                         root,
+                        local_names,
                     )?,
                 ),
                 then_expr: Box::new(
-                    self.typed_expr_to_raw(
+                    self.typed_expr_to_raw_with_locals(
                         payload
                             .get("then")
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("if missing then"))?,
                         root,
+                        local_names,
                     )?,
                 ),
                 else_expr: Box::new(
-                    self.typed_expr_to_raw(
+                    self.typed_expr_to_raw_with_locals(
                         payload
                             .get("else")
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("if missing else"))?,
                         root,
+                        local_names,
                     )?,
                 ),
             }),
@@ -561,6 +791,14 @@ fn eval_binary(op: &str, left: Value, right: Value) -> Result<Value> {
     }
 }
 
+fn eval_unary(op: &str, value: Value) -> Result<Value> {
+    match (op, value) {
+        ("-", Value::I64(value)) => Ok(Value::I64(-value)),
+        ("!", Value::Bool(value)) => Ok(Value::Bool(!value)),
+        (op, value) => bail!("invalid operand for {op}: {value}"),
+    }
+}
+
 pub(crate) fn op_precedence(op: &str) -> u8 {
     match op {
         "||" => 1,
@@ -571,6 +809,10 @@ pub(crate) fn op_precedence(op: &str) -> u8 {
         "*" | "/" => 6,
         _ => 9,
     }
+}
+
+pub(crate) fn unary_precedence() -> u8 {
+    7
 }
 
 impl CodeDb {
@@ -597,7 +839,7 @@ impl CodeDb {
             .and_then(JsonValue::as_str)
             .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
         {
-            "literal_i64" | "literal_bool" | "param_ref" => {}
+            "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" | "local_ref" => {}
             "call" => {
                 let symbol = payload
                     .get("symbol")
@@ -628,6 +870,22 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("binary missing right"))?;
                 self.collect_expr_deps(root, left, deps)?;
                 self.collect_expr_deps(root, right, deps)?;
+            }
+            "unary" => {
+                let child = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unary missing expr"))?;
+                self.collect_expr_deps(root, child, deps)?;
+            }
+            "let" => {
+                for key in ["value", "body"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("let missing {key}"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
             }
             "if" => {
                 for key in ["cond", "then", "else"] {
@@ -734,7 +992,27 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<RawExpr> {
-        self.parse_if()
+        self.parse_let()
+    }
+
+    fn parse_let(&mut self) -> Result<RawExpr> {
+        if self.consume_ident_value("let") {
+            let name = self.expect_ident()?;
+            self.expect_symbol(":")?;
+            let ty = self.expect_ident_or_unit()?;
+            self.expect_symbol("=")?;
+            let value = self.parse_expr()?;
+            self.expect_ident_value("in")?;
+            let body = self.parse_expr()?;
+            Ok(RawExpr::Let {
+                name,
+                ty,
+                value: Box::new(value),
+                body: Box::new(body),
+            })
+        } else {
+            self.parse_if()
+        }
     }
 
     fn parse_if(&mut self) -> Result<RawExpr> {
@@ -755,7 +1033,7 @@ impl Parser {
     }
 
     fn parse_binary_prec(&mut self, min_prec: u8) -> Result<RawExpr> {
-        let mut left = self.parse_primary()?;
+        let mut left = self.parse_unary()?;
         loop {
             let op = match self.peek() {
                 Token::Symbol(op) if is_binary_op(op) => op.clone(),
@@ -774,6 +1052,20 @@ impl Parser {
             };
         }
         Ok(left)
+    }
+
+    fn parse_unary(&mut self) -> Result<RawExpr> {
+        match self.peek() {
+            Token::Symbol(op) if op == "-" || op == "!" => {
+                let op = op.clone();
+                self.next();
+                Ok(RawExpr::Unary {
+                    op,
+                    expr: Box::new(self.parse_unary()?),
+                })
+            }
+            _ => self.parse_primary(),
+        }
     }
 
     fn parse_primary(&mut self) -> Result<RawExpr> {
@@ -799,6 +1091,9 @@ impl Parser {
                 }
             }
             Token::Symbol(symbol) if symbol == "(" => {
+                if self.consume_symbol(")") {
+                    return Ok(RawExpr::Unit);
+                }
                 let expr = self.parse_expr()?;
                 self.expect_symbol(")")?;
                 Ok(expr)
@@ -915,4 +1210,11 @@ fn is_binary_op(op: &str) -> bool {
         op,
         "+" | "-" | "*" | "/" | "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||"
     )
+}
+
+fn local_at_depth<T>(locals: &[T], depth: usize) -> Option<&T> {
+    locals
+        .len()
+        .checked_sub(depth + 1)
+        .and_then(|idx| locals.get(idx))
 }

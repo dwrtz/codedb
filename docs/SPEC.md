@@ -557,9 +557,13 @@ Required v0 expression kinds:
 ```text
 literal_i64
 literal_bool
+literal_unit
 param_ref
+local_ref
 call
 binary
+unary
+let
 if
 ```
 
@@ -568,9 +572,6 @@ Each expression has a statically known type.
 Optional after the basic demo:
 
 ```text
-let
-unit
-unary
 record
 field_access
 fixed_array
@@ -633,6 +634,49 @@ Conditional:
 }
 ```
 
+Unit literal:
+
+```json
+{
+  "kind": "literal_unit",
+  "type": "sha256:type-unit"
+}
+```
+
+Unary expression:
+
+```json
+{
+  "kind": "unary",
+  "op": "!",
+  "expr": "sha256:expr-bool",
+  "type": "sha256:type-bool"
+}
+```
+
+Let expression with a typed binding:
+
+```json
+{
+  "kind": "let",
+  "binding_name": "x",
+  "binding_type": "sha256:type-i64",
+  "value": "sha256:expr-value",
+  "body": "sha256:expr-body",
+  "type": "sha256:type-i64"
+}
+```
+
+Local reference inside a let body:
+
+```json
+{
+  "kind": "local_ref",
+  "depth": 0,
+  "type": "sha256:type-i64"
+}
+```
+
 ## 10. Type checking
 
 Type checking is mandatory in v0.
@@ -651,10 +695,16 @@ Required checks:
 ```text
 literal_i64 has type I64
 literal_bool has type Bool
+literal_unit has type Unit
 param_ref index is in bounds and has the declared parameter type
+local_ref depth is in bounds and has the active let binding type
 binary integer ops require I64 operands and return I64
 comparison ops require I64 operands and return Bool
 boolean ops require Bool operands and return Bool
+unary integer negation requires an I64 operand and returns I64
+unary boolean not requires a Bool operand and returns Bool
+let binding value type must match the declared binding type
+let expression type is the type of its body
 if condition must be Bool
 if branches must have the same type
 call arguments must match callee signature
@@ -1340,6 +1390,8 @@ i64 parameters and returns
 bool values represented as target integer values
 unit returns
 arithmetic and comparison ops
+unary integer negation and boolean not
+let bindings lowered to shared values
 conditionals
 static direct calls
 one target triple

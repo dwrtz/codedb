@@ -1985,37 +1985,97 @@ fn validate_param_names(params: &[ParamSpec]) -> Result<()> {
 }
 
 fn normalize_param_refs(expr: &RawExpr, local_params: &[String]) -> RawExpr {
+    normalize_param_refs_scoped(expr, local_params, &mut Vec::new())
+}
+
+fn normalize_param_refs_scoped(
+    expr: &RawExpr,
+    local_params: &[String],
+    local_bindings: &mut Vec<String>,
+) -> RawExpr {
     match expr {
         RawExpr::LiteralI64 { value } => RawExpr::LiteralI64 {
             value: value.clone(),
         },
         RawExpr::LiteralBool { value } => RawExpr::LiteralBool { value: *value },
+        RawExpr::Unit => RawExpr::Unit,
         RawExpr::ParamRef { index } => RawExpr::ParamRef { index: *index },
-        RawExpr::ParamName { name } => local_params
-            .iter()
-            .position(|candidate| candidate == name)
-            .map(|index| RawExpr::ParamRef { index })
-            .unwrap_or_else(|| RawExpr::ParamName { name: name.clone() }),
+        RawExpr::ParamName { name } => {
+            if local_bindings.iter().rev().any(|binding| binding == name) {
+                RawExpr::ParamName { name: name.clone() }
+            } else {
+                local_params
+                    .iter()
+                    .position(|candidate| candidate == name)
+                    .map(|index| RawExpr::ParamRef { index })
+                    .unwrap_or_else(|| RawExpr::ParamName { name: name.clone() })
+            }
+        }
         RawExpr::Call { name, args } => RawExpr::Call {
             name: name.clone(),
             args: args
                 .iter()
-                .map(|arg| normalize_param_refs(arg, local_params))
+                .map(|arg| normalize_param_refs_scoped(arg, local_params, local_bindings))
                 .collect(),
         },
         RawExpr::Binary { op, left, right } => RawExpr::Binary {
             op: op.clone(),
-            left: Box::new(normalize_param_refs(left, local_params)),
-            right: Box::new(normalize_param_refs(right, local_params)),
+            left: Box::new(normalize_param_refs_scoped(
+                left,
+                local_params,
+                local_bindings,
+            )),
+            right: Box::new(normalize_param_refs_scoped(
+                right,
+                local_params,
+                local_bindings,
+            )),
         },
+        RawExpr::Unary { op, expr } => RawExpr::Unary {
+            op: op.clone(),
+            expr: Box::new(normalize_param_refs_scoped(
+                expr,
+                local_params,
+                local_bindings,
+            )),
+        },
+        RawExpr::Let {
+            name,
+            ty,
+            value,
+            body,
+        } => {
+            let value = normalize_param_refs_scoped(value, local_params, local_bindings);
+            local_bindings.push(name.clone());
+            let body = normalize_param_refs_scoped(body, local_params, local_bindings);
+            local_bindings.pop();
+            RawExpr::Let {
+                name: name.clone(),
+                ty: ty.clone(),
+                value: Box::new(value),
+                body: Box::new(body),
+            }
+        }
         RawExpr::If {
             cond,
             then_expr,
             else_expr,
         } => RawExpr::If {
-            cond: Box::new(normalize_param_refs(cond, local_params)),
-            then_expr: Box::new(normalize_param_refs(then_expr, local_params)),
-            else_expr: Box::new(normalize_param_refs(else_expr, local_params)),
+            cond: Box::new(normalize_param_refs_scoped(
+                cond,
+                local_params,
+                local_bindings,
+            )),
+            then_expr: Box::new(normalize_param_refs_scoped(
+                then_expr,
+                local_params,
+                local_bindings,
+            )),
+            else_expr: Box::new(normalize_param_refs_scoped(
+                else_expr,
+                local_params,
+                local_bindings,
+            )),
         },
     }
 }

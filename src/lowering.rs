@@ -65,6 +65,16 @@ pub(crate) enum LoweredOp {
         value: bool,
         type_hash: String,
     },
+    ConstUnit {
+        id: String,
+        type_hash: String,
+    },
+    Unary {
+        id: String,
+        kind: String,
+        value: String,
+        type_hash: String,
+    },
     Binary {
         id: String,
         kind: String,
@@ -100,6 +110,12 @@ pub(crate) struct LoweredFunctionArtifact {
 
 struct LoweredExpr {
     operations: Vec<LoweredOp>,
+    value: String,
+    type_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct LocalLoweredBinding {
     value: String,
     type_hash: String,
 }
@@ -227,7 +243,7 @@ impl CodeDb {
         }
 
         let mut ctx = LowerCtx::default();
-        let mut lowered = self.lower_expr(root, &body, &param_types, &mut ctx)?;
+        let mut lowered = self.lower_expr(root, &body, &param_types, &mut ctx, &mut Vec::new())?;
         lowered.operations.push(LoweredOp::Return {
             value: lowered.value,
             type_hash: return_type.clone(),
@@ -258,6 +274,7 @@ impl CodeDb {
         expr_hash: &str,
         param_types: &[String],
         ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
     ) -> Result<LoweredExpr> {
         let payload = self.get_payload(expr_hash)?;
         let type_hash = expr_type(&payload, expr_hash)?;
@@ -300,6 +317,20 @@ impl CodeDb {
                     type_hash,
                 })
             }
+            "literal_unit" => {
+                if type_hash != type_hash_for("Unit") {
+                    bail!("literal_unit type mismatch");
+                }
+                let id = ctx.value();
+                Ok(LoweredExpr {
+                    operations: vec![LoweredOp::ConstUnit {
+                        id: id.clone(),
+                        type_hash: type_hash.clone(),
+                    }],
+                    value: id,
+                    type_hash,
+                })
+            }
             "param_ref" => {
                 let slot = payload
                     .get("index")
@@ -323,6 +354,23 @@ impl CodeDb {
                     type_hash,
                 })
             }
+            "local_ref" => {
+                let depth = payload
+                    .get("depth")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
+                    as usize;
+                let binding = local_lowered_at_depth(locals, depth)
+                    .ok_or_else(|| anyhow!("local_ref depth out of bounds {depth}"))?;
+                if binding.type_hash != type_hash {
+                    bail!("local_ref type mismatch while lowering");
+                }
+                Ok(LoweredExpr {
+                    operations: Vec::new(),
+                    value: binding.value.clone(),
+                    type_hash,
+                })
+            }
             "call" => {
                 let target_symbol_hash = payload
                     .get("symbol")
@@ -342,7 +390,7 @@ impl CodeDb {
                     let arg_hash = arg
                         .as_str()
                         .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                    let lowered = self.lower_expr(root, arg_hash, param_types, ctx)?;
+                    let lowered = self.lower_expr(root, arg_hash, param_types, ctx, locals)?;
                     operations.extend(lowered.operations);
                     arg_values.push(lowered.value);
                 }
@@ -368,8 +416,8 @@ impl CodeDb {
                     .get("right")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("binary missing right"))?;
-                let left = self.lower_expr(root, left_hash, param_types, ctx)?;
-                let right = self.lower_expr(root, right_hash, param_types, ctx)?;
+                let left = self.lower_expr(root, left_hash, param_types, ctx, locals)?;
+                let right = self.lower_expr(root, right_hash, param_types, ctx, locals)?;
                 let source_op = payload
                     .get("op")
                     .and_then(JsonValue::as_str)
@@ -394,6 +442,64 @@ impl CodeDb {
                     type_hash,
                 })
             }
+            "unary" => {
+                let child_hash = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unary missing expr"))?;
+                let child = self.lower_expr(root, child_hash, param_types, ctx, locals)?;
+                let source_op = payload
+                    .get("op")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unary missing op"))?;
+                let kind = lower_unary_kind(source_op, &child.type_hash, &type_hash)?;
+                let id = ctx.value();
+                let mut operations = child.operations;
+                operations.push(LoweredOp::Unary {
+                    id: id.clone(),
+                    kind,
+                    value: child.value,
+                    type_hash: type_hash.clone(),
+                });
+                Ok(LoweredExpr {
+                    operations,
+                    value: id,
+                    type_hash,
+                })
+            }
+            "let" => {
+                let binding_type = payload
+                    .get("binding_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing binding_type"))?
+                    .to_string();
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing value"))?;
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing body"))?;
+                let value = self.lower_expr(root, value_hash, param_types, ctx, locals)?;
+                if value.type_hash != binding_type {
+                    bail!("let binding type mismatch while lowering");
+                }
+                locals.push(LocalLoweredBinding {
+                    value: value.value.clone(),
+                    type_hash: binding_type,
+                });
+                let body = self.lower_expr(root, body_hash, param_types, ctx, locals);
+                locals.pop();
+                let body = body?;
+                let mut operations = value.operations;
+                operations.extend(body.operations);
+                Ok(LoweredExpr {
+                    operations,
+                    value: body.value,
+                    type_hash: body.type_hash,
+                })
+            }
             "if" => {
                 let cond_hash = payload
                     .get("cond")
@@ -407,12 +513,12 @@ impl CodeDb {
                     .get("else")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("if missing else"))?;
-                let cond = self.lower_expr(root, cond_hash, param_types, ctx)?;
+                let cond = self.lower_expr(root, cond_hash, param_types, ctx, locals)?;
                 if cond.type_hash != type_hash_for("Bool") {
                     bail!("if condition must lower to bool");
                 }
-                let then_expr = self.lower_expr(root, then_hash, param_types, ctx)?;
-                let else_expr = self.lower_expr(root, else_hash, param_types, ctx)?;
+                let then_expr = self.lower_expr(root, then_hash, param_types, ctx, locals)?;
+                let else_expr = self.lower_expr(root, else_hash, param_types, ctx, locals)?;
                 if then_expr.type_hash != else_expr.type_hash || then_expr.type_hash != type_hash {
                     bail!("if branch type mismatch while lowering");
                 }
@@ -612,6 +718,22 @@ impl CodeDb {
                     if type_hash != &type_hash_for("Bool") {
                         bail!("lowered const_bool type mismatch");
                     }
+                    insert_value(values, id, type_hash)?;
+                }
+                LoweredOp::ConstUnit { id, type_hash } => {
+                    if type_hash != &type_hash_for("Unit") {
+                        bail!("lowered const_unit type mismatch");
+                    }
+                    insert_value(values, id, type_hash)?;
+                }
+                LoweredOp::Unary {
+                    id,
+                    kind,
+                    value,
+                    type_hash,
+                } => {
+                    let value_type = value_type(values, value)?;
+                    verify_unary_kind(kind, value_type, type_hash)?;
                     insert_value(values, id, type_hash)?;
                 }
                 LoweredOp::Binary {
@@ -818,6 +940,30 @@ fn verify_binary_kind(
     }
 }
 
+fn lower_unary_kind(source_op: &str, input_type: &str, result_type: &str) -> Result<String> {
+    let i64_hash = type_hash_for("I64");
+    let bool_hash = type_hash_for("Bool");
+    let kind = match source_op {
+        "-" if input_type == i64_hash && result_type == i64_hash => "neg_i64",
+        "!" if input_type == bool_hash && result_type == bool_hash => "not_bool",
+        _ => bail!("cannot lower unary operator {source_op} with operand/result types"),
+    };
+    Ok(kind.to_string())
+}
+
+fn verify_unary_kind(kind: &str, input_type: &str, result_type: &str) -> Result<()> {
+    let source_op = match kind {
+        "neg_i64" => "-",
+        "not_bool" => "!",
+        _ => bail!("unknown lowered unary kind {kind}"),
+    };
+    let expected = lower_unary_kind(source_op, input_type, result_type)?;
+    if expected != kind {
+        bail!("lowered unary kind/type mismatch");
+    }
+    Ok(())
+}
+
 fn insert_value(values: &mut BTreeMap<String, String>, id: &str, type_hash: &str) -> Result<()> {
     if values
         .insert(id.to_string(), type_hash.to_string())
@@ -836,4 +982,14 @@ fn value_type<'a>(values: &'a BTreeMap<String, String>, id: &str) -> Result<&'a 
 
 fn is_hash(value: &str) -> bool {
     value.starts_with("sha256:")
+}
+
+fn local_lowered_at_depth(
+    locals: &[LocalLoweredBinding],
+    depth: usize,
+) -> Option<&LocalLoweredBinding> {
+    locals
+        .len()
+        .checked_sub(depth + 1)
+        .and_then(|idx| locals.get(idx))
 }

@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value as JsonValue;
 
-use crate::expr::op_precedence;
+use crate::expr::{op_precedence, unary_precedence};
 use crate::model::{ProgramRootPayload, param_names, preferred_names};
 use crate::store::CodeDb;
 use crate::types::type_hash_for;
@@ -42,6 +42,10 @@ impl CodeDb {
             ));
             let return_type = self.signature_parts(&entry.signature)?.1;
             if return_type == type_hash_for("Unit") {
+                out.push_str(&format!(
+                    "    {};\n",
+                    self.c_expr(&body, &root, &params, 0)?
+                ));
                 out.push_str("    return;\n");
             } else {
                 out.push_str(&format!(
@@ -102,6 +106,17 @@ impl CodeDb {
         local_params: &[String],
         parent_prec: u8,
     ) -> Result<String> {
+        self.c_expr_with_locals(expr_hash, root, local_params, &mut Vec::new(), parent_prec)
+    }
+
+    fn c_expr_with_locals(
+        &self,
+        expr_hash: &str,
+        root: &ProgramRootPayload,
+        local_params: &[String],
+        locals: &mut Vec<CBinding>,
+        parent_prec: u8,
+    ) -> Result<String> {
         let payload = self.get_payload(expr_hash)?;
         let rendered = match payload
             .get("expr_kind")
@@ -124,6 +139,7 @@ impl CodeDb {
                     "0".to_string()
                 }
             }
+            "literal_unit" => "((void)0)".to_string(),
             "param_ref" => {
                 let index = payload
                     .get("index")
@@ -131,6 +147,20 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("param_ref missing index"))?
                     as usize;
                 c_identifier(local_params.get(index).map(String::as_str).unwrap_or("p"))
+            }
+            "local_ref" => {
+                let depth = payload
+                    .get("depth")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
+                    as usize;
+                let binding = c_local_at_depth(locals, depth)
+                    .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))?;
+                if binding.type_hash == type_hash_for("Unit") {
+                    "((void)0)".to_string()
+                } else {
+                    binding.c_name.clone()
+                }
             }
             "call" => {
                 let symbol = payload
@@ -147,7 +177,7 @@ impl CodeDb {
                         let hash = arg
                             .as_str()
                             .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                        self.c_expr(hash, root, local_params, 0)
+                        self.c_expr_with_locals(hash, root, local_params, locals, 0)
                     })
                     .collect::<Result<Vec<_>>>()?;
                 format!(
@@ -172,14 +202,69 @@ impl CodeDb {
                 let prec = op_precedence(op);
                 let expr = format!(
                     "{} {} {}",
-                    self.c_expr(left, root, local_params, prec)?,
+                    self.c_expr_with_locals(left, root, local_params, locals, prec)?,
                     c_binary_operator(op),
-                    self.c_expr(right, root, local_params, prec + 1)?
+                    self.c_expr_with_locals(right, root, local_params, locals, prec + 1)?
                 );
                 if prec < parent_prec {
                     format!("({expr})")
                 } else {
                     expr
+                }
+            }
+            "unary" => {
+                let op = payload
+                    .get("op")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unary missing op"))?;
+                let child = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unary missing expr"))?;
+                let prec = unary_precedence();
+                let expr = format!(
+                    "{op}{}",
+                    self.c_expr_with_locals(child, root, local_params, locals, prec)?
+                );
+                if prec < parent_prec {
+                    format!("({expr})")
+                } else {
+                    expr
+                }
+            }
+            "let" => {
+                let name = payload
+                    .get("binding_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing binding_name"))?;
+                let binding_type = payload
+                    .get("binding_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing binding_type"))?;
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing value"))?;
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing body"))?;
+                let value = self.c_expr_with_locals(value_hash, root, local_params, locals, 0)?;
+                let c_name = c_identifier(name);
+                locals.push(CBinding {
+                    c_name: c_name.clone(),
+                    type_hash: binding_type.to_string(),
+                });
+                let body = self.c_expr_with_locals(body_hash, root, local_params, locals, 0);
+                locals.pop();
+                let body = body?;
+                if binding_type == type_hash_for("Unit") {
+                    format!("({{ {value}; {body}; }})")
+                } else {
+                    format!(
+                        "({{ {} {c_name} = {value}; {body}; }})",
+                        self.c_type(binding_type)?
+                    )
                 }
             }
             "if" => {
@@ -197,15 +282,21 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("if missing else"))?;
                 format!(
                     "({} ? {} : {})",
-                    self.c_expr(cond, root, local_params, 0)?,
-                    self.c_expr(then_hash, root, local_params, 0)?,
-                    self.c_expr(else_hash, root, local_params, 0)?
+                    self.c_expr_with_locals(cond, root, local_params, locals, 0)?,
+                    self.c_expr_with_locals(then_hash, root, local_params, locals, 0)?,
+                    self.c_expr_with_locals(else_hash, root, local_params, locals, 0)?
                 )
             }
             other => bail!("unknown expression kind {other}"),
         };
         Ok(rendered)
     }
+}
+
+#[derive(Debug, Clone)]
+struct CBinding {
+    c_name: String,
+    type_hash: String,
 }
 
 fn ensure_unique_c_projection_symbols(root: &ProgramRootPayload) -> Result<()> {
@@ -286,6 +377,13 @@ fn is_c_ident_start(byte: u8) -> bool {
 
 fn is_c_ident_continue(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+fn c_local_at_depth(locals: &[CBinding], depth: usize) -> Option<&CBinding> {
+    locals
+        .len()
+        .checked_sub(depth + 1)
+        .and_then(|idx| locals.get(idx))
 }
 
 #[cfg(test)]

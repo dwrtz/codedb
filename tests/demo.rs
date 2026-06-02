@@ -256,6 +256,195 @@ fn native_object_backend_handles_bool_calls_and_conditionals() {
 }
 
 #[test]
+fn language_surface_handles_let_unit_and_unary_across_artifacts() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("phase11.sqlite");
+    let reimport_db = temp.path().join("phase11-reimport.sqlite");
+    let source = temp.path().join("phase11.cdb");
+    let projection = temp.path().join("phase11-projection.cdb");
+    let c_file = temp.path().join("phase11.c");
+    let ir_file = temp.path().join("phase11.ir.json");
+    let touch_obj = temp.path().join("touch.o");
+    let flip_obj = temp.path().join("flip.o");
+    let choose_obj = temp.path().join("choose.o");
+    let square_obj = temp.path().join("square-next.o");
+    let main_obj = temp.path().join("main.o");
+
+    std::fs::write(
+        &source,
+        "\
+fn touch() -> unit = ()\n\
+\n\
+fn flip(flag: bool) -> bool = !flag\n\
+\n\
+fn choose(x: i64) -> i64 = let doubled: i64 = x * 2 in if !(doubled < 10) then -doubled else doubled\n\
+\n\
+fn square_next(x: i64) -> i64 = let y: i64 = x + 1 in y * y\n\
+\n\
+fn main() -> i64 = let ignored: unit = touch() in let base: i64 = choose(6) in if flip(false) then square_next(base) else 0\n",
+    )
+    .unwrap();
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), source.to_str().unwrap()]);
+
+    bin()
+        .args(["eval", db.to_str().unwrap(), "main"])
+        .assert()
+        .success()
+        .stdout("121\n");
+    bin()
+        .args(["eval", db.to_str().unwrap(), "touch"])
+        .assert()
+        .success()
+        .stdout("()\n");
+
+    run(&[
+        "export",
+        db.to_str().unwrap(),
+        "--branch",
+        "main",
+        "--out",
+        projection.to_str().unwrap(),
+    ]);
+    let projected = std::fs::read_to_string(&projection).unwrap();
+    assert!(projected.contains("fn touch() -> unit = ()"));
+    assert!(projected.contains("fn flip(flag: bool) -> bool = !flag"));
+    assert!(
+        projected
+            .contains("let doubled: i64 = x * 2 in if !(doubled < 10) then -doubled else doubled")
+    );
+    assert!(projected.contains("let y: i64 = x + 1 in y * y"));
+
+    run(&["init", reimport_db.to_str().unwrap()]);
+    run(&[
+        "import",
+        reimport_db.to_str().unwrap(),
+        projection.to_str().unwrap(),
+    ]);
+    bin()
+        .args(["eval", reimport_db.to_str().unwrap(), "main"])
+        .assert()
+        .success()
+        .stdout("121\n");
+
+    let square_show = run(&["show", db.to_str().unwrap(), "square_next"]);
+    let square_body = parse_line_value(&square_show, "body ");
+    let let_payload = object_payload(&db, square_body);
+    assert_eq!(let_payload["expr_kind"], "let");
+    let body_payload = object_payload(&db, let_payload["body"].as_str().unwrap());
+    assert_eq!(body_payload["expr_kind"], "binary");
+    assert_eq!(body_payload["left"], body_payload["right"]);
+    let local_ref_payload = object_payload(&db, body_payload["left"].as_str().unwrap());
+    assert_eq!(local_ref_payload["expr_kind"], "local_ref");
+    assert_eq!(local_ref_payload["depth"], 0);
+
+    run(&[
+        "emit-c",
+        db.to_str().unwrap(),
+        "main",
+        "--out",
+        c_file.to_str().unwrap(),
+    ]);
+    let c_source = std::fs::read_to_string(&c_file).unwrap();
+    assert!(c_source.contains("void codedb_touch(void)"));
+    assert!(c_source.contains("codedb_touch();"));
+    assert!(c_source.contains("!flag"));
+    assert!(c_source.contains("({ long doubled = x * 2;"));
+    compile_and_run_c_with_expected(&c_file, 121);
+
+    run(&[
+        "emit-ir",
+        db.to_str().unwrap(),
+        "main",
+        "--out",
+        ir_file.to_str().unwrap(),
+    ]);
+    let ir = std::fs::read_to_string(&ir_file).unwrap();
+    assert!(ir.contains("\"op\": \"call\""));
+    run(&[
+        "emit-ir",
+        db.to_str().unwrap(),
+        "choose",
+        "--out",
+        ir_file.to_str().unwrap(),
+    ]);
+    let ir = std::fs::read_to_string(&ir_file).unwrap();
+    assert!(ir.contains("\"kind\": \"not_bool\""));
+    assert!(ir.contains("\"kind\": \"neg_i64\""));
+
+    for (name, out) in [
+        ("touch", &touch_obj),
+        ("flip", &flip_obj),
+        ("choose", &choose_obj),
+        ("square_next", &square_obj),
+        ("main", &main_obj),
+    ] {
+        run(&[
+            "emit-object",
+            db.to_str().unwrap(),
+            name,
+            "--target",
+            codedb::LINUX_X86_64_TARGET,
+            "--out",
+            out.to_str().unwrap(),
+        ]);
+        let bytes = std::fs::read(out).unwrap();
+        assert_eq!(&bytes[..4], b"\x7fELF");
+    }
+
+    let main_internal_abi = parse_line_value(
+        &run(&["show", db.to_str().unwrap(), "main"]),
+        "internal_abi_symbol ",
+    )
+    .to_string();
+    link_and_run_native_if_linux(
+        temp.path(),
+        &[&touch_obj, &flip_obj, &choose_obj, &square_obj, &main_obj],
+        &main_internal_abi,
+        121,
+    );
+
+    bin()
+        .args(["verify", db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+}
+
+#[test]
+fn language_surface_rejects_let_unit_and_unary_type_errors() {
+    for (idx, (program, expected)) in [
+        (
+            "fn bad() -> i64 = let x: bool = 1 in 0\n",
+            "let binding expected bool, got i64",
+        ),
+        (
+            "fn bad() -> i64 = !1\n",
+            "unary operand expected bool, got i64",
+        ),
+        (
+            "fn bad() -> unit = 1\n",
+            "body type i64 does not match return type unit",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join(format!("phase11-error-{idx}.sqlite"));
+        let source = temp.path().join(format!("phase11-error-{idx}.cdb"));
+        std::fs::write(&source, program).unwrap();
+        run(&["init", db.to_str().unwrap()]);
+        let stderr = run_failure(&["import", db.to_str().unwrap(), source.to_str().unwrap()]);
+        assert!(
+            stderr.contains(expected),
+            "stderr did not contain {expected:?}:\n{stderr}"
+        );
+    }
+}
+
+#[test]
 fn native_object_backend_links_default_target_on_apple_silicon() {
     if !is_apple_silicon() {
         return;
@@ -2434,6 +2623,18 @@ fn object_cache_entry_by_definition(db: &Path, definition: &str) -> (JsonValue, 
     )
 }
 
+fn object_payload(db: &Path, hash: &str) -> JsonValue {
+    let conn = Connection::open(db).unwrap();
+    let payload_json: String = conn
+        .query_row(
+            "SELECT payload_json FROM objects WHERE hash = ?1",
+            [hash],
+            |row| row.get(0),
+        )
+        .unwrap();
+    serde_json::from_str(&payload_json).unwrap()
+}
+
 fn branch_state(db: &Path) -> (String, Option<String>) {
     let conn = Connection::open(db).unwrap();
     conn.query_row(
@@ -2462,6 +2663,10 @@ fn mutation_guard_counts(db: &Path) -> Vec<(String, i64)> {
 }
 
 fn compile_and_run_c_if_available(c_file: &Path) {
+    compile_and_run_c_with_expected(c_file, 120);
+}
+
+fn compile_and_run_c_with_expected(c_file: &Path, expected: i64) {
     if StdCommand::new("cc").arg("--version").output().is_err() {
         return;
     }
@@ -2470,7 +2675,9 @@ fn compile_and_run_c_if_available(c_file: &Path) {
     let exe = dir.join("harness");
     std::fs::write(
         &harness,
-        "long codedb_main(void);\nint main(void) { return codedb_main() == 120 ? 0 : 1; }\n",
+        format!(
+            "long codedb_main(void);\nint main(void) {{ return codedb_main() == {expected} ? 0 : 1; }}\n"
+        ),
     )
     .unwrap();
     let status = StdCommand::new("cc")

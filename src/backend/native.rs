@@ -351,6 +351,8 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             LoweredOp::Param { .. }
             | LoweredOp::ConstI64 { .. }
             | LoweredOp::ConstBool { .. }
+            | LoweredOp::ConstUnit { .. }
+            | LoweredOp::Unary { .. }
             | LoweredOp::Binary { .. }
             | LoweredOp::Return { .. } => {}
         }
@@ -360,8 +362,12 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
 fn validate_native_ir(ir: &LoweredFunctionIr) -> Result<()> {
     let i64_type = type_hash_for("I64");
     let bool_type = type_hash_for("Bool");
-    if ir.return_type_hash != i64_type && ir.return_type_hash != bool_type {
-        bail!("native object backend v0 supports only i64 and bool returns");
+    let unit_type = type_hash_for("Unit");
+    if ir.return_type_hash != i64_type
+        && ir.return_type_hash != bool_type
+        && ir.return_type_hash != unit_type
+    {
+        bail!("native object backend v0 supports only i64, bool, and unit returns");
     }
     if ir.params.len() > 6 {
         bail!("native object backend v0 supports at most 6 parameters");
@@ -371,21 +377,28 @@ fn validate_native_ir(ir: &LoweredFunctionIr) -> Result<()> {
             bail!("native object backend v0 supports only i64 and bool parameters");
         }
     }
-    validate_native_ops(&ir.operations, &i64_type, &bool_type)
+    validate_native_ops(&ir.operations, &i64_type, &bool_type, &unit_type)
 }
 
-fn validate_native_ops(operations: &[LoweredOp], i64_type: &str, bool_type: &str) -> Result<()> {
+fn validate_native_ops(
+    operations: &[LoweredOp],
+    i64_type: &str,
+    bool_type: &str,
+    unit_type: &str,
+) -> Result<()> {
     for op in operations {
         match op {
             LoweredOp::Param { type_hash, .. }
             | LoweredOp::ConstI64 { type_hash, .. }
             | LoweredOp::ConstBool { type_hash, .. }
+            | LoweredOp::ConstUnit { type_hash, .. }
+            | LoweredOp::Unary { type_hash, .. }
             | LoweredOp::Binary { type_hash, .. }
             | LoweredOp::Call { type_hash, .. }
             | LoweredOp::If { type_hash, .. }
             | LoweredOp::Return { type_hash, .. } => {
-                if type_hash != i64_type && type_hash != bool_type {
-                    bail!("native object backend v0 supports only i64 and bool values");
+                if type_hash != i64_type && type_hash != bool_type && type_hash != unit_type {
+                    bail!("native object backend v0 supports only i64, bool, and unit values");
                 }
             }
         }
@@ -395,8 +408,8 @@ fn validate_native_ops(operations: &[LoweredOp], i64_type: &str, bool_type: &str
             ..
         } = op
         {
-            validate_native_ops(&then_block.operations, i64_type, bool_type)?;
-            validate_native_ops(&else_block.operations, i64_type, bool_type)?;
+            validate_native_ops(&then_block.operations, i64_type, bool_type, unit_type)?;
+            validate_native_ops(&else_block.operations, i64_type, bool_type, unit_type)?;
         }
     }
     Ok(())
@@ -440,9 +453,11 @@ fn compile_x86_64_function(
         .ok_or_else(|| anyhow!("lowered function has no return"))?;
     emitter.emit_ops(body)?;
     match last {
-        LoweredOp::Return { value, .. } => {
-            let offset = emitter.value_offset(value)?;
-            emitter.mov_rax_stack(offset);
+        LoweredOp::Return { value, type_hash } => {
+            if type_hash != &type_hash_for("Unit") {
+                let offset = emitter.value_offset(value)?;
+                emitter.mov_rax_stack(offset);
+            }
             emitter.emit_epilogue();
         }
         _ => bail!("lowered function must end with return"),
@@ -501,6 +516,8 @@ fn collect_value_ids_inner(
             LoweredOp::Param { id, .. }
             | LoweredOp::ConstI64 { id, .. }
             | LoweredOp::ConstBool { id, .. }
+            | LoweredOp::ConstUnit { id, .. }
+            | LoweredOp::Unary { id, .. }
             | LoweredOp::Binary { id, .. }
             | LoweredOp::Call { id, .. } => push_value_id(ids, seen, id)?,
             LoweredOp::If {
@@ -584,6 +601,16 @@ impl FunctionEmitter {
                 self.mov_rax_imm32(if *value { 1 } else { 0 });
                 self.mov_stack_rax(self.value_offset(id)?);
             }
+            LoweredOp::ConstUnit { id, .. } => {
+                self.mov_rax_imm32(0);
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::Unary {
+                id, kind, value, ..
+            } => {
+                self.emit_unary(kind, value)?;
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
             LoweredOp::Binary {
                 id,
                 kind,
@@ -629,6 +656,20 @@ impl FunctionEmitter {
             LoweredOp::Return { .. } => {
                 bail!("return is only valid as the final lowered operation");
             }
+        }
+        Ok(())
+    }
+
+    fn emit_unary(&mut self, kind: &str, value: &str) -> Result<()> {
+        self.mov_rax_stack(self.value_offset(value)?);
+        match kind {
+            "neg_i64" => self.text.extend_from_slice(&[0x48, 0xf7, 0xd8]),
+            "not_bool" => {
+                self.text.extend_from_slice(&[0x48, 0x85, 0xc0]);
+                self.text.extend_from_slice(&[0x0f, 0x94, 0xc0]);
+                self.text.extend_from_slice(&[0x0f, 0xb6, 0xc0]);
+            }
+            other => bail!("unsupported lowered unary op for native object backend: {other}"),
         }
         Ok(())
     }
@@ -810,9 +851,11 @@ fn compile_arm64_function(
         .ok_or_else(|| anyhow!("lowered function has no return"))?;
     emitter.emit_ops(body)?;
     match last {
-        LoweredOp::Return { value, .. } => {
-            let offset = emitter.value_offset(value)?;
-            emitter.ldr_stack(0, offset)?;
+        LoweredOp::Return { value, type_hash } => {
+            if type_hash != &type_hash_for("Unit") {
+                let offset = emitter.value_offset(value)?;
+                emitter.ldr_stack(0, offset)?;
+            }
             emitter.emit_epilogue()?;
         }
         _ => bail!("lowered function must end with return"),
@@ -913,6 +956,16 @@ impl Arm64Emitter {
                 self.mov_u64(0, if *value { 1 } else { 0 });
                 self.str_stack(0, self.value_offset(id)?)?;
             }
+            LoweredOp::ConstUnit { id, .. } => {
+                self.mov_u64(0, 0);
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::Unary {
+                id, kind, value, ..
+            } => {
+                self.emit_unary(kind, value)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
             LoweredOp::Binary {
                 id,
                 kind,
@@ -958,6 +1011,19 @@ impl Arm64Emitter {
             LoweredOp::Return { .. } => {
                 bail!("return is only valid as the final lowered operation");
             }
+        }
+        Ok(())
+    }
+
+    fn emit_unary(&mut self, kind: &str, value: &str) -> Result<()> {
+        self.ldr_stack(0, self.value_offset(value)?)?;
+        match kind {
+            "neg_i64" => self.sub_reg(0, 31, 0),
+            "not_bool" => {
+                self.cmp_imm_zero(0);
+                self.cset(0, 0);
+            }
+            other => bail!("unsupported lowered unary op for native arm64 backend: {other}"),
         }
         Ok(())
     }
@@ -1089,6 +1155,10 @@ impl Arm64Emitter {
 
     fn cmp_reg(&mut self, rn: u8, rm: u8) {
         self.emit_u32(0xeb00001f | (u32::from(rm) << 16) | (u32::from(rn) << 5));
+    }
+
+    fn cmp_imm_zero(&mut self, rn: u8) {
+        self.emit_u32(0xf100001f | (u32::from(rn) << 5));
     }
 
     fn cset(&mut self, rd: u8, cond: u8) {

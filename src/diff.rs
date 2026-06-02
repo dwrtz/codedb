@@ -332,6 +332,9 @@ impl CodeDb {
                     short_json(b.get("value").unwrap_or(&JsonValue::Null))
                 ));
             }
+            "literal_unit" => {
+                out.push_str(&format!("{indent}unit_literal_changed_by_hash\n"));
+            }
             "call" => {
                 let sym_a = a.get("symbol").and_then(JsonValue::as_str).unwrap_or("");
                 let sym_b = b.get("symbol").and_then(JsonValue::as_str).unwrap_or("");
@@ -386,6 +389,51 @@ impl CodeDb {
                     )?;
                 }
             }
+            "unary" => {
+                let op_a = a.get("op").and_then(JsonValue::as_str).unwrap_or("");
+                let op_b = b.get("op").and_then(JsonValue::as_str).unwrap_or("");
+                if op_a != op_b {
+                    out.push_str(&format!(
+                        "{indent}expression_replaced: unary op {op_a} -> {op_b}\n"
+                    ));
+                }
+                out.push_str(&format!("{indent}expr:\n"));
+                self.diff_exprs(
+                    root_a,
+                    root_b,
+                    a.get("expr").and_then(JsonValue::as_str).unwrap_or(""),
+                    b.get("expr").and_then(JsonValue::as_str).unwrap_or(""),
+                    out,
+                    &format!("{indent}  "),
+                )?;
+            }
+            "let" => {
+                if a.get("binding_type") != b.get("binding_type") {
+                    out.push_str(&format!(
+                        "{indent}let_binding_type_changed: {} -> {}\n",
+                        short_json(a.get("binding_type").unwrap_or(&JsonValue::Null)),
+                        short_json(b.get("binding_type").unwrap_or(&JsonValue::Null))
+                    ));
+                }
+                if a.get("binding_name") != b.get("binding_name") {
+                    out.push_str(&format!(
+                        "{indent}let_binding_name_changed: {} -> {}\n",
+                        short_json(a.get("binding_name").unwrap_or(&JsonValue::Null)),
+                        short_json(b.get("binding_name").unwrap_or(&JsonValue::Null))
+                    ));
+                }
+                for key in ["value", "body"] {
+                    out.push_str(&format!("{indent}{key}:\n"));
+                    self.diff_exprs(
+                        root_a,
+                        root_b,
+                        a.get(key).and_then(JsonValue::as_str).unwrap_or(""),
+                        b.get(key).and_then(JsonValue::as_str).unwrap_or(""),
+                        out,
+                        &format!("{indent}  "),
+                    )?;
+                }
+            }
             "if" => {
                 for key in ["cond", "then", "else"] {
                     out.push_str(&format!("{indent}{key}:\n"));
@@ -405,6 +453,15 @@ impl CodeDb {
                         "{indent}expression_replaced: param_ref {} -> {}\n",
                         short_json(a.get("index").unwrap_or(&JsonValue::Null)),
                         short_json(b.get("index").unwrap_or(&JsonValue::Null))
+                    ));
+                }
+            }
+            "local_ref" => {
+                if a.get("depth") != b.get("depth") {
+                    out.push_str(&format!(
+                        "{indent}expression_replaced: local_ref {} -> {}\n",
+                        short_json(a.get("depth").unwrap_or(&JsonValue::Null)),
+                        short_json(b.get("depth").unwrap_or(&JsonValue::Null))
                     ));
                 }
             }

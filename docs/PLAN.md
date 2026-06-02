@@ -408,6 +408,13 @@ Acceptance checks:
 
 Goal: add a small amount of language expressiveness that exercises the DAG model and backend boundaries.
 
+Initial implementation status:
+
+- `let` expressions are parsed, type checked, stored as typed DAG nodes, projected deterministically, evaluated, lowered, and compiled by the native object backends.
+- Unit literals and unit-returning functions are supported by the evaluator, source projection, C projection, lowered IR, and native object backends.
+- Unary integer negation and boolean not are supported through type checking, projection, lowering, and native codegen.
+- Local let references are stored as `local_ref` objects with lexical depth so repeated references can share the same expression hash.
+
 Deliverables:
 
 - Add `let` expressions with typed bindings.
