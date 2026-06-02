@@ -2094,6 +2094,10 @@ impl CodeDb {
 
     pub fn replay_main_branch(&mut self) -> Result<String> {
         self.ensure_initialized()?;
+        self.replay_main_branch_without_init()
+    }
+
+    pub(crate) fn replay_main_branch_without_init(&mut self) -> Result<String> {
         let expected = self.branch(MAIN_BRANCH)?;
         let chain = self.history_chain(MAIN_BRANCH)?;
         let mut current_root = self.put_program_root(&ProgramRootPayload {

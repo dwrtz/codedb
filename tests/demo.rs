@@ -1826,7 +1826,11 @@ fn import_history_rejects_missing_reordered_and_tampered_migrations() {
     assert!(lines.len() > 3);
 
     let missing_path = temp.path().join("history-missing.ndjson");
-    std::fs::write(&missing_path, format!("{}\n", lines[..lines.len() - 1].join("\n"))).unwrap();
+    std::fs::write(
+        &missing_path,
+        format!("{}\n", lines[..lines.len() - 1].join("\n")),
+    )
+    .unwrap();
     let missing_db = temp.path().join("phase12-missing.sqlite");
     run(&["init", missing_db.to_str().unwrap()]);
     let stderr = run_failure(&[
@@ -2014,6 +2018,55 @@ fn invalid_apply_json_operation_rolls_back_partial_writes() {
     assert!(run_failure(&["show", db.to_str().unwrap(), "ok"]).contains("unknown name"));
     assert_eq!(branch_state(&db), branch_before);
     assert_eq!(mutation_guard_counts(&db), counts_before);
+
+    bin()
+        .args(["verify", db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+}
+
+#[test]
+fn apply_json_rejects_invalid_let_binding_names_before_commit() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("apply-invalid-let.sqlite");
+    let ops = temp.path().join("invalid-let.apply.json");
+
+    std::fs::write(
+        &ops,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "codedb/apply/v1",
+            "operations": [{
+                "kind": "create_function",
+                "name": "main",
+                "params": [],
+                "return_type": "i64",
+                "body": {
+                    "kind": "let",
+                    "name": "bad-name",
+                    "type": "i64",
+                    "value": { "kind": "literal_i64", "value": "1" },
+                    "body": { "kind": "literal_i64", "value": "2" }
+                }
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    run(&["init", db.to_str().unwrap()]);
+    let branch_before = branch_state(&db);
+    let counts_before = mutation_guard_counts(&db);
+
+    let stderr = run_failure(&[
+        "apply",
+        db.to_str().unwrap(),
+        "--json",
+        ops.to_str().unwrap(),
+    ]);
+    assert!(stderr.contains("let binding must be a projection-safe identifier"));
+    assert_eq!(branch_state(&db), branch_before);
+    assert_eq!(mutation_guard_counts(&db), counts_before);
+    assert!(run_failure(&["show", db.to_str().unwrap(), "main"]).contains("unknown name"));
 
     bin()
         .args(["verify", db.to_str().unwrap()])

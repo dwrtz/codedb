@@ -110,6 +110,40 @@ fn verify_rejects_missing_objects_referenced_by_payloads() {
 }
 
 #[test]
+fn verify_rejects_missing_object_references_even_without_edges() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("missing-payload-ref.sqlite");
+    setup_shop(&db);
+
+    let conn = Connection::open(&db).unwrap();
+    let payload_json: String = conn
+        .query_row(
+            "SELECT payload_json FROM objects
+             WHERE kind = 'FunctionDef'
+             ORDER BY hash LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut payload: JsonValue = serde_json::from_str(&payload_json).unwrap();
+    payload["typed_body_expr_hash"] = JsonValue::String(
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+    );
+    let canonical = test_canonical_json(&payload);
+    let hash = test_object_hash("FunctionDef", &canonical);
+    conn.execute(
+        "INSERT INTO objects (hash, kind, schema_version, payload_json, payload_size_bytes)
+         VALUES (?1, 'FunctionDef', 1, ?2, ?3)",
+        (&hash, &canonical, canonical.len() as i64),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("missing_object"));
+    assert!(stderr.contains("typed_body_expr_hash"));
+}
+
+#[test]
 fn verify_recomputes_object_edges_from_payload_references() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("bad-edges.sqlite");
@@ -180,6 +214,34 @@ fn verify_rejects_bad_root_export_indexes() {
 
     let stderr = run_failure(&["verify", db.to_str().unwrap()]);
     assert!(stderr.contains("bad_index: root_exports mismatch"));
+}
+
+#[test]
+fn verify_rejects_missing_main_branch_without_repairing_it() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("missing-main-branch.sqlite");
+    setup_shop(&db);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("DELETE FROM branches WHERE name = 'main'", [])
+        .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_index: main branch is missing"));
+    assert_eq!(table_row_count(&db, "branches"), 0);
+}
+
+#[test]
+fn verify_rejects_bad_source_search_index() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("bad-source-search.sqlite");
+    setup_shop(&db);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("DELETE FROM source_search", []).unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_index: source_search mismatch"));
 }
 
 #[test]
@@ -805,6 +867,25 @@ fn test_bytes_hash(bytes: &[u8]) -> String {
 
 fn test_metadata_hash(value: &JsonValue) -> String {
     test_bytes_hash(test_canonical_json(value).as_bytes())
+}
+
+fn test_object_hash(kind: &str, canonical_payload: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codedb/object/v1\0");
+    hasher.update(kind.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(b"1");
+    hasher.update(b"\0");
+    hasher.update(canonical_payload.as_bytes());
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn table_row_count(db: &Path, table: &str) -> i64 {
+    let conn = Connection::open(db).unwrap();
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })
+    .unwrap()
 }
 
 fn can_build_default_native_target() -> bool {

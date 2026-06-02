@@ -4,7 +4,9 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::backend::ArtifactKind;
 use crate::expr::RawExpr;
-use crate::model::{ProgramRootPayload, TypeCheckResult, resolve_name_in_root};
+use crate::model::{
+    ProgramRootPayload, TypeCheckResult, resolve_name_in_root, validate_projection_identifier,
+};
 use crate::store::{CodeDb, canonical_json, hash_object_canonical};
 use crate::{ABI_TAG, SCHEMA_VERSION};
 
@@ -424,6 +426,7 @@ impl CodeDb {
                 value,
                 body,
             } => {
+                validate_projection_identifier("let binding", name)?;
                 let binding_type = self.resolve_type(ty)?;
                 let value =
                     self.type_expr_with_locals(value, root, param_names, param_types, locals)?;
@@ -685,10 +688,11 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("let missing binding_type"))?
                     .to_string();
-                payload
+                let binding_name = payload
                     .get("binding_name")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("let missing binding_name"))?;
+                validate_projection_identifier("let binding", binding_name)?;
                 let value_hash = payload
                     .get("value")
                     .and_then(JsonValue::as_str)

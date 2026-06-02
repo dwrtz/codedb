@@ -12,7 +12,9 @@ use crate::backend::ArtifactKind;
 use crate::backend_c::ensure_no_forbidden_runtime_calls;
 use crate::diff::dependency_pairs;
 use crate::migrations::{history_hash, migration_hash};
-use crate::model::{ProgramRootPayload, validate_projection_identifier};
+use crate::model::{
+    ProgramRootPayload, param_names, preferred_names, validate_projection_identifier,
+};
 use crate::store::{
     CodeDb, cache_key_for_input, canonical_json, extract_hash_strings, function_interface_metadata,
     hash_bytes, hash_object_canonical,
@@ -21,7 +23,7 @@ use crate::{BYTES_DOMAIN, SCHEMA_VERSION};
 
 impl CodeDb {
     pub fn verify(&mut self) -> Result<String> {
-        self.ensure_initialized()?;
+        self.prepare_verify()?;
         let mut errors = Vec::new();
         self.verify_objects(&mut errors)?;
         self.verify_edges(&mut errors)?;
@@ -36,6 +38,19 @@ impl CodeDb {
         } else {
             bail!("verify failed\n{}", errors.join("\n"));
         }
+    }
+
+    fn prepare_verify(&mut self) -> Result<()> {
+        let object_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM objects", [], |row| row.get(0))?;
+        let branch_count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM branches", [], |row| row.get(0))?;
+        if object_count == 0 && branch_count == 0 {
+            self.insert_builtin_types()?;
+        }
+        Ok(())
     }
 
     fn verify_objects(&self, errors: &mut Vec<String>) -> Result<()> {
@@ -62,6 +77,7 @@ impl CodeDb {
                     if recomputed != hash {
                         errors.push(format!("bad_hash: {hash} recomputes to {recomputed}"));
                     }
+                    self.verify_known_object_references(&hash, &kind, &value, errors)?;
                 }
                 Err(err) => errors.push(format!("corrupt_object: {hash}: {err}")),
             }
@@ -69,9 +85,240 @@ impl CodeDb {
         Ok(())
     }
 
+    fn verify_known_object_references(
+        &self,
+        parent_hash: &str,
+        kind: &str,
+        payload: &JsonValue,
+        errors: &mut Vec<String>,
+    ) -> Result<()> {
+        match kind {
+            "Type" | "SymbolBirth" => {}
+            "FunctionSignature" => {
+                self.check_hash_array_refs(parent_hash, "params", payload.get("params"), errors)?;
+                self.check_hash_ref(parent_hash, "return", payload.get("return"), errors)?;
+            }
+            "Expression" => {
+                self.check_hash_ref(parent_hash, "type", payload.get("type"), errors)?;
+                match payload.get("expr_kind").and_then(JsonValue::as_str) {
+                    Some(
+                        "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" | "local_ref",
+                    ) => {}
+                    Some("call") => {
+                        self.check_hash_ref(parent_hash, "symbol", payload.get("symbol"), errors)?;
+                        self.check_hash_array_refs(
+                            parent_hash,
+                            "args",
+                            payload.get("args"),
+                            errors,
+                        )?;
+                    }
+                    Some("binary") => {
+                        self.check_hash_ref(parent_hash, "left", payload.get("left"), errors)?;
+                        self.check_hash_ref(parent_hash, "right", payload.get("right"), errors)?;
+                    }
+                    Some("unary") => {
+                        self.check_hash_ref(parent_hash, "expr", payload.get("expr"), errors)?;
+                    }
+                    Some("let") => {
+                        self.check_hash_ref(
+                            parent_hash,
+                            "binding_type",
+                            payload.get("binding_type"),
+                            errors,
+                        )?;
+                        self.check_hash_ref(parent_hash, "value", payload.get("value"), errors)?;
+                        self.check_hash_ref(parent_hash, "body", payload.get("body"), errors)?;
+                    }
+                    Some("if") => {
+                        self.check_hash_ref(parent_hash, "cond", payload.get("cond"), errors)?;
+                        self.check_hash_ref(parent_hash, "then", payload.get("then"), errors)?;
+                        self.check_hash_ref(parent_hash, "else", payload.get("else"), errors)?;
+                    }
+                    Some(_) | None => {}
+                }
+            }
+            "FunctionDef" => {
+                self.check_hash_ref(parent_hash, "symbol", payload.get("symbol"), errors)?;
+                self.check_hash_ref(
+                    parent_hash,
+                    "function_sig_hash",
+                    payload.get("function_sig_hash"),
+                    errors,
+                )?;
+                self.check_hash_ref(
+                    parent_hash,
+                    "typed_body_expr_hash",
+                    payload.get("typed_body_expr_hash"),
+                    errors,
+                )?;
+            }
+            "FunctionInterface" => {
+                self.check_hash_ref(
+                    parent_hash,
+                    "symbol_hash",
+                    payload.get("symbol_hash"),
+                    errors,
+                )?;
+                self.check_hash_ref(
+                    parent_hash,
+                    "signature_hash",
+                    payload.get("signature_hash"),
+                    errors,
+                )?;
+            }
+            "ProgramRoot" => {
+                for (idx, entry) in payload
+                    .get("symbols")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("symbols[{idx}].symbol"),
+                        entry.get("symbol"),
+                        errors,
+                    )?;
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("symbols[{idx}].definition"),
+                        entry.get("definition"),
+                        errors,
+                    )?;
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("symbols[{idx}].signature"),
+                        entry.get("signature"),
+                        errors,
+                    )?;
+                }
+                for (idx, entry) in payload
+                    .get("names")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("names[{idx}].symbol"),
+                        entry.get("symbol"),
+                        errors,
+                    )?;
+                }
+                for (idx, entry) in payload
+                    .get("param_names")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("param_names[{idx}].symbol"),
+                        entry.get("symbol"),
+                        errors,
+                    )?;
+                }
+                for (idx, entry) in payload
+                    .get("exports")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("exports[{idx}].symbol"),
+                        entry.get("symbol"),
+                        errors,
+                    )?;
+                }
+            }
+            "LinkPlanInput" => {
+                self.check_hash_ref(
+                    parent_hash,
+                    "entry_symbol_hash",
+                    payload.get("entry_symbol_hash"),
+                    errors,
+                )?;
+                for (idx, entry) in payload
+                    .get("export_map")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("export_map[{idx}].symbol_hash"),
+                        entry.get("symbol_hash"),
+                        errors,
+                    )?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn check_hash_array_refs(
+        &self,
+        parent_hash: &str,
+        field: &str,
+        value: Option<&JsonValue>,
+        errors: &mut Vec<String>,
+    ) -> Result<()> {
+        for (idx, value) in value
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            self.check_hash_ref(parent_hash, &format!("{field}[{idx}]"), Some(value), errors)?;
+        }
+        Ok(())
+    }
+
+    fn check_hash_ref(
+        &self,
+        parent_hash: &str,
+        field: &str,
+        value: Option<&JsonValue>,
+        errors: &mut Vec<String>,
+    ) -> Result<()> {
+        let Some(child_hash) = value.and_then(JsonValue::as_str) else {
+            return Ok(());
+        };
+        if !child_hash.starts_with("sha256:") {
+            return Ok(());
+        }
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM objects WHERE hash = ?1)",
+            params![child_hash],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            errors.push(format!(
+                "missing_object: {parent_hash} field {field} references missing object {child_hash}"
+            ));
+        }
+        Ok(())
+    }
+
     fn verify_history_replay_readonly(&mut self, errors: &mut Vec<String>) -> Result<()> {
+        let has_main_branch: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM branches WHERE name = ?1)",
+            params![crate::MAIN_BRANCH],
+            |row| row.get(0),
+        )?;
+        if !has_main_branch {
+            return Ok(());
+        }
         self.conn.execute_batch("SAVEPOINT verify_replay")?;
-        let replay_result = self.replay_main_branch();
+        let replay_result = self.replay_main_branch_without_init();
         let rollback_result = self
             .conn
             .execute_batch("ROLLBACK TO verify_replay; RELEASE verify_replay");
@@ -177,6 +424,20 @@ impl CodeDb {
     }
 
     fn verify_branches(&self, errors: &mut Vec<String>) -> Result<()> {
+        let program_root_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM objects WHERE kind = 'ProgramRoot'",
+            [],
+            |row| row.get(0),
+        )?;
+        let main_branch_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM branches WHERE name = ?1)",
+            params![crate::MAIN_BRANCH],
+            |row| row.get(0),
+        )?;
+        if program_root_count > 0 && !main_branch_exists {
+            errors.push("bad_index: main branch is missing".to_string());
+        }
+
         let missing_roots: i64 = self.conn.query_row(
             "SELECT COUNT(*)
              FROM branches b
@@ -188,6 +449,19 @@ impl CodeDb {
         if missing_roots > 0 {
             errors.push(format!(
                 "missing_object: branch roots missing {missing_roots}"
+            ));
+        }
+        let missing_histories: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM branches b
+             LEFT JOIN histories h ON h.history_hash = b.history_hash
+             WHERE b.history_hash IS NOT NULL AND h.history_hash IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if missing_histories > 0 {
+            errors.push(format!(
+                "bad_history_link: branch histories missing {missing_histories}"
             ));
         }
         Ok(())
@@ -300,7 +574,9 @@ impl CodeDb {
                     continue;
                 }
             };
-            self.verify_root_indexes(&root_hash, &root, errors)?;
+            if let Err(err) = self.verify_root_indexes(&root_hash, &root, errors) {
+                errors.push(format!("bad_index: root {root_hash}: {err:#}"));
+            }
         }
         Ok(())
     }
@@ -432,6 +708,43 @@ impl CodeDb {
             errors.push(format!(
                 "bad_dependency_index: dependencies mismatch for {root_hash}"
             ));
+        }
+        self.verify_source_search_index(root_hash, root, errors)?;
+        Ok(())
+    }
+
+    fn verify_source_search_index(
+        &self,
+        root_hash: &str,
+        root: &ProgramRootPayload,
+        errors: &mut Vec<String>,
+    ) -> Result<()> {
+        let mut expected = BTreeSet::new();
+        for binding in preferred_names(root) {
+            let symbol = binding.symbol.clone();
+            if let Some(entry) = self.root_symbol(root, &symbol) {
+                let body = self.function_body_hash(&entry.definition)?;
+                let source = format!(
+                    "fn {}{} = {}",
+                    binding.display_name,
+                    self.signature_source(&entry.signature, &param_names(root, &symbol))?,
+                    self.expr_to_source(&body, root, &param_names(root, &symbol), 0)?
+                );
+                expected.insert((symbol, source));
+            }
+        }
+        let actual = {
+            let mut stmt = self.conn.prepare(
+                "SELECT symbol_hash, rendered_source FROM source_search
+                 WHERE root_hash = ?1 ORDER BY symbol_hash, rendered_source",
+            )?;
+            stmt.query_map(params![root_hash], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?
+        };
+        if expected != actual {
+            errors.push(format!("bad_index: source_search mismatch for {root_hash}"));
         }
         Ok(())
     }
