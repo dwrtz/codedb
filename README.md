@@ -130,6 +130,21 @@ inspection output.
 
 For operation-by-operation examples, see [docs/MIGRATIONS.md](docs/MIGRATIONS.md).
 
+## Workspace API
+
+Start a local workspace server with:
+
+```bash
+cargo run -- serve "$DB" --addr 127.0.0.1:8787
+```
+
+The server accepts HTTP `POST /` JSON requests with `method`, `params`, and
+optional JSON-RPC `id` fields. Responses use the stable
+`codedb/response/v1` envelope. The first v1 slice exposes read-only workspace
+methods: `workspace.current`, `workspace.branches`, `symbols.list`,
+`symbols.show`, `symbols.resolve`, `symbols.callers`, `roots.diff`,
+`roots.export_projection`, `build.plan`, `history.list`, and `verify.run`.
+
 ## Documentation Map
 
 - [docs/SPEC.md](docs/SPEC.md): v0 design contract and current implemented
@@ -151,6 +166,7 @@ Core database commands:
 ```bash
 cargo run -- init <db>
 cargo run -- import <db> <file.cdb>
+cargo run -- serve <db> --addr 127.0.0.1:8787
 cargo run -- export <db> --branch main --out <file.cdb>
 cargo run -- export-history <db> --branch main --out <history.ndjson>
 cargo run -- import-history <db> <history.ndjson>

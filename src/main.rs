@@ -219,6 +219,12 @@ enum Command {
     Verify {
         db: PathBuf,
     },
+    #[command(about = "Serve the semantic workspace API over local HTTP JSON requests")]
+    Serve {
+        db: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        addr: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -546,6 +552,9 @@ fn main() -> Result<()> {
         Command::Verify { db } => {
             let mut codedb = codedb::CodeDb::open(db)?;
             print!("{}", codedb.verify()?);
+        }
+        Command::Serve { db, addr } => {
+            codedb::server::serve_workspace(db, &addr)?;
         }
     }
 

@@ -10,9 +10,11 @@ mod link;
 mod lowering;
 mod migrations;
 mod model;
+pub mod server;
 mod store;
 mod types;
 mod verify;
+pub mod workspace;
 
 use std::path::Path;
 
