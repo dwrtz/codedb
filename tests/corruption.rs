@@ -1,10 +1,19 @@
 use std::path::Path;
+use std::process::Command as ProcessCommand;
 
 use assert_cmd::Command;
 use rusqlite::Connection;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
+
+// Phase 9 coverage map:
+// - object store: payload tampering, missing objects, recomputed object_edges
+// - materialized indexes: root_symbols/root_names/root_exports/dependencies
+// - histories: bad migration/history links and read-only replay checks
+// - caches/artifacts: cache key JSON, artifact metadata, bytes hashes, missing bytes
+// - native artifacts: object metadata, link plans, executable metadata
+// - projection runtime boundary: forbidden C runtime calls in cached projections
 
 fn bin() -> Command {
     Command::cargo_bin("codedb").expect("codedb binary")
@@ -137,6 +146,43 @@ fn verify_rejects_bad_dependency_indexes() {
 }
 
 #[test]
+fn verify_rejects_bad_root_name_indexes() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("bad-root-names.sqlite");
+    setup_shop(&db);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "DELETE FROM root_names
+         WHERE rowid = (SELECT rowid FROM root_names ORDER BY root_hash LIMIT 1)",
+        [],
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_index: root_names mismatch"));
+}
+
+#[test]
+fn verify_rejects_bad_root_export_indexes() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("bad-root-exports.sqlite");
+    setup_shop(&db);
+    run(&["set-export", db.to_str().unwrap(), "tax", "public_tax"]);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "DELETE FROM root_exports
+         WHERE rowid = (SELECT rowid FROM root_exports ORDER BY root_hash LIMIT 1)",
+        [],
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_index: root_exports mismatch"));
+}
+
+#[test]
 fn verify_rejects_bad_history_hashes() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("bad-history.sqlite");
@@ -153,6 +199,159 @@ fn verify_rejects_bad_history_hashes() {
 
     let stderr = run_failure(&["verify", db.to_str().unwrap()]);
     assert!(stderr.contains("bad_history_link"));
+}
+
+#[test]
+fn verify_replay_does_not_repair_corrupt_indexes() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("verify-readonly.sqlite");
+    setup_shop(&db);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "DELETE FROM root_symbols WHERE rowid = (SELECT rowid FROM root_symbols LIMIT 1)",
+        [],
+    )
+    .unwrap();
+
+    let first = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(first.contains("bad_index: root_symbols mismatch"));
+    let second = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(second.contains("bad_index: root_symbols mismatch"));
+}
+
+#[test]
+fn verify_rejects_unknown_cache_artifact_kinds() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("unknown-cache-kind.sqlite");
+    setup_shop(&db);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE compile_cache
+         SET artifact_kind = 'unknown_artifact'
+         WHERE cache_key = (SELECT cache_key FROM compile_cache ORDER BY cache_key LIMIT 1)",
+        [],
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_cache_entry"));
+    assert!(stderr.contains("unknown artifact kind"));
+}
+
+#[test]
+fn verify_rejects_cache_key_payload_mismatch() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("cache-mismatch.sqlite");
+    setup_shop(&db);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, cache_key_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, cache_key_json FROM compile_cache
+             WHERE artifact_kind = 'interface_hash'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&cache_key_json).unwrap();
+    value["target_triple"] = JsonValue::String("aarch64-apple-darwin".to_string());
+    conn.execute(
+        "UPDATE compile_cache SET cache_key_json = ?1 WHERE cache_key = ?2",
+        (test_canonical_json(&value), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_cache_entry"));
+    assert!(stderr.contains("cache key mismatch"));
+}
+
+#[test]
+fn verify_rejects_implementation_hash_metadata_mismatch() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("implementation-metadata-mismatch.sqlite");
+    setup_shop(&db);
+
+    let conn = Connection::open(&db).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'implementation_hash'
+             ORDER BY cache_key",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap();
+    let (cache_key, mut value) = rows
+        .map(|row| {
+            let (cache_key, artifact_json) = row.unwrap();
+            let value = serde_json::from_str::<JsonValue>(&artifact_json).unwrap();
+            (cache_key, value)
+        })
+        .find(|(_, value)| {
+            value["metadata"]["direct_dependency_interface_hashes"]
+                .as_array()
+                .is_some_and(|hashes| !hashes.is_empty())
+        })
+        .expect("implementation cache entry with dependencies");
+
+    value["metadata"]["direct_dependency_interface_hashes"] = serde_json::json!([]);
+    let metadata_hash = test_metadata_hash(&value["metadata"]);
+    value["metadata_hash"] = JsonValue::String(metadata_hash.clone());
+    conn.execute(
+        "UPDATE compile_cache
+         SET artifact_json = ?1, artifact_hash = ?2
+         WHERE cache_key = ?3",
+        (test_canonical_json(&value), metadata_hash, cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_implementation_hash"));
+    assert!(stderr.contains("dependency interface metadata does not match cache key"));
+}
+
+#[test]
+fn verify_rejects_artifact_metadata_backend_mismatch() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("artifact-metadata-mismatch.sqlite");
+    let c_file = temp.path().join("projection.c");
+    setup_shop(&db);
+    run(&[
+        "emit-c",
+        db.to_str().unwrap(),
+        "main",
+        "--out",
+        c_file.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'c_projection'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    value["backend_id"] = JsonValue::String("wrong-backend".to_string());
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (test_canonical_json(&value), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_cache_entry"));
+    assert!(stderr.contains("artifact metadata backend mismatch"));
 }
 
 #[test]
@@ -195,6 +394,86 @@ fn verify_rejects_malformed_native_artifact_metadata() {
 }
 
 #[test]
+fn verify_rejects_native_object_metadata_mismatch() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("object-metadata-mismatch.sqlite");
+    let tax_obj = temp.path().join("tax.o");
+    setup_shop(&db);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "tax",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        tax_obj.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'object_file'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    value["metadata"]["target_triple"] = JsonValue::String("bad-target".to_string());
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (test_canonical_json(&value), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_object_artifact"));
+    assert!(stderr.contains("target"));
+}
+
+#[test]
+fn verify_rejects_native_object_metadata_that_disagrees_with_function_def() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("object-function-def-mismatch.sqlite");
+    let tax_obj = temp.path().join("tax.o");
+    setup_shop(&db);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "tax",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        tax_obj.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'object_file'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    value["metadata"]["typed_body_expr_hash"] = JsonValue::String(
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+    );
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (test_canonical_json(&value), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_object_artifact"));
+    assert!(stderr.contains("typed body metadata does not match FunctionDef"));
+}
+
+#[test]
 fn verify_rejects_mismatched_object_bytes_hashes() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("bad-object-bytes.sqlite");
@@ -226,6 +505,41 @@ fn verify_rejects_mismatched_object_bytes_hashes() {
 
     let stderr = run_failure(&["verify", db.to_str().unwrap()]);
     assert!(stderr.contains("bad_artifact_bytes"));
+}
+
+#[test]
+fn verify_rejects_missing_native_object_bytes() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("missing-object-bytes.sqlite");
+    let object = temp.path().join("tax.o");
+    setup_shop(&db);
+    run(&[
+        "emit-object",
+        db.to_str().unwrap(),
+        "tax",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        object.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE compile_cache
+         SET artifact_bytes = NULL
+         WHERE artifact_kind = 'object_file'
+           AND cache_key = (
+             SELECT cache_key FROM compile_cache
+             WHERE artifact_kind = 'object_file'
+             ORDER BY cache_key LIMIT 1
+           )",
+        [],
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_artifact_bytes"));
+    assert!(stderr.contains("missing artifact bytes"));
 }
 
 #[test]
@@ -269,6 +583,143 @@ fn verify_rejects_c_projection_forbidden_runtime_calls() {
 }
 
 #[test]
+fn verify_rejects_cached_link_plan_metadata_mismatch() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("link-plan-metadata-mismatch.sqlite");
+    let plan_path = temp.path().join("main.link.json");
+    setup_shop(&db);
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_path.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'link_plan'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    value["metadata"]["external_symbols"] = serde_json::json!(["puts"]);
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (test_canonical_json(&value), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_link_plan"));
+    assert!(stderr.contains("external symbols"));
+}
+
+#[test]
+fn verify_rejects_link_plan_object_metadata_that_disagrees_with_cached_object() {
+    let temp = tempdir().unwrap();
+    let db = temp
+        .path()
+        .join("link-plan-object-metadata-mismatch.sqlite");
+    let plan_path = temp.path().join("main.link.json");
+    setup_shop(&db);
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_path.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'object_file'
+             ORDER BY cache_key",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    drop(stmt);
+    let (cache_key, mut value) = rows
+        .into_iter()
+        .find_map(|(cache_key, artifact_json)| {
+            let value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+            let has_relocations = value["metadata"]["relocations"]
+                .as_array()
+                .is_some_and(|relocations| !relocations.is_empty());
+            has_relocations.then_some((cache_key, value))
+        })
+        .expect("object with relocations");
+    value["metadata"]["relocations"] = serde_json::json!([]);
+    value["metadata"]["called_symbols"] = serde_json::json!([]);
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (test_canonical_json(&value), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_link_plan"));
+    assert!(stderr.contains("does not match object artifact metadata"));
+}
+
+#[test]
+fn verify_rejects_link_plan_that_cannot_be_recomputed_from_a_root() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("link-plan-root-mismatch.sqlite");
+    let plan_path = temp.path().join("main.link.json");
+    setup_shop(&db);
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_path.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'link_plan'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    value["metadata"]["objects"][0]["definition_hash"] = JsonValue::String(
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+    );
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (test_canonical_json(&value), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_link_plan"));
+    assert!(stderr.contains("cannot be recomputed from any indexed root"));
+}
+
+#[test]
 fn verify_rejects_link_plans_that_reference_missing_object_artifacts() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("missing-link-object.sqlite");
@@ -302,11 +753,64 @@ fn verify_rejects_link_plans_that_reference_missing_object_artifacts() {
     assert!(stderr.contains("references missing object"));
 }
 
+#[test]
+fn verify_rejects_executable_metadata_that_loses_link_plan_dependency() {
+    if !can_build_default_native_target() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("bad-executable-metadata.sqlite");
+    let executable = temp.path().join("shop");
+    setup_shop(&db);
+    run(&[
+        "build",
+        db.to_str().unwrap(),
+        "main",
+        "--out",
+        executable.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'executable'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    value["metadata"]["link_plan_hash"] = JsonValue::String(
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+    );
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (test_canonical_json(&value), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_executable_artifact"));
+    assert!(stderr.contains("missing link plan dependency"));
+}
+
 fn test_bytes_hash(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"codedb/bytes/v1\0");
     hasher.update(bytes);
     format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn test_metadata_hash(value: &JsonValue) -> String {
+    test_bytes_hash(test_canonical_json(value).as_bytes())
+}
+
+fn can_build_default_native_target() -> bool {
+    let native_target = (std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64")
+        || (std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64");
+    native_target && ProcessCommand::new("cc").arg("--version").output().is_ok()
 }
 
 fn test_canonical_json(value: &JsonValue) -> String {
