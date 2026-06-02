@@ -193,6 +193,7 @@ fn dispatch_workspace_method(
         "symbols.callers" => symbols_callers(db, params),
         "roots.diff" => roots_diff(db, params),
         "roots.export_projection" => roots_export_projection(db, params),
+        "ops.apply" => ops_apply(db, params),
         "build.plan" => build_plan(db, params),
         "history.list" => history_list(db, params),
         "verify.run" => verify_run(db, params),
@@ -360,6 +361,21 @@ fn roots_export_projection(
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 
+fn ops_apply(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let apply_document = apply_document_param(params)?;
+    let result = parse_json_payload(
+        db.apply_json_str(&canonical_json(&apply_document))
+            .map_err(|err| WorkspaceMethodError::new("invalid_operation", format!("{err:#}")))?,
+    )?;
+    let branch = result
+        .get("branch")
+        .and_then(JsonValue::as_str)
+        .unwrap_or(MAIN_BRANCH);
+    let snapshot =
+        workspace_snapshot(db, branch).or_else(|_| workspace_snapshot(db, MAIN_BRANCH))?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
 fn build_plan(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
     require_main_branch(params, "build.plan")?;
     let object = params_object(params)?;
@@ -436,6 +452,19 @@ fn branch_param(params: &JsonValue) -> MethodResult<String> {
     Ok(optional_str(object, "branch")?
         .unwrap_or(MAIN_BRANCH)
         .to_string())
+}
+
+fn apply_document_param(params: &JsonValue) -> MethodResult<JsonValue> {
+    let object = params_object(params)?;
+    if let Some(apply) = object.get("apply") {
+        if apply.is_object() {
+            return Ok(apply.clone());
+        }
+        return Err(WorkspaceMethodError::invalid_params(
+            "ops.apply field apply must be a JSON object",
+        ));
+    }
+    Ok(params.clone())
 }
 
 fn require_main_branch(params: &JsonValue, method: &str) -> MethodResult<()> {

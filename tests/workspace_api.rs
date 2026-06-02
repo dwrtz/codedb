@@ -188,6 +188,108 @@ fn workspace_server_exposes_read_only_workspace_methods() {
 }
 
 #[test]
+fn workspace_server_applies_structural_operations_atomically() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("workspace-apply.sqlite");
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    let server = start_server(&db);
+
+    let before = workspace_call(&server, "workspace.current", json!({}));
+    let old_root = before["snapshot"]["root_hash"].as_str().unwrap();
+
+    let applied = workspace_call(
+        &server,
+        "ops.apply",
+        json!({
+            "schema": "codedb/apply/v1",
+            "branch": "main",
+            "expect_root_hash": old_root,
+            "operations": [
+                {
+                    "kind": "rename_symbol",
+                    "name": "tax",
+                    "new_name": "vat"
+                }
+            ]
+        }),
+    );
+    assert_eq!(applied["schema"], "codedb/response/v1");
+    assert_eq!(applied["status"], "ok");
+    assert_eq!(applied["result"]["schema"], "codedb/apply-result/v1");
+    assert_eq!(applied["result"]["status"], "applied");
+    assert_eq!(applied["result"]["committed"], true);
+    assert_eq!(applied["result"]["old_root_hash"], old_root);
+    assert_ne!(applied["result"]["new_root_hash"], old_root);
+    assert_eq!(
+        applied["snapshot"]["root_hash"],
+        applied["result"]["new_root_hash"]
+    );
+    assert_eq!(
+        applied["result"]["results"][0]["summary"]["build_impact"]["kind"],
+        "metadata_only"
+    );
+    assert!(
+        applied["result"]["history_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+
+    let show_vat = workspace_call(&server, "symbols.show", json!({"name": "vat"}));
+    assert_eq!(show_vat["status"], "ok");
+    assert_eq!(show_vat["result"]["name"], "vat");
+
+    let current_after_apply = workspace_call(&server, "workspace.current", json!({}));
+    let root_after_apply = current_after_apply["snapshot"]["root_hash"].clone();
+    let history_after_apply = current_after_apply["snapshot"]["history_hash"].clone();
+
+    let stale_conflict = workspace_call(
+        &server,
+        "ops.apply",
+        json!({
+            "apply": {
+                "schema": "codedb/apply/v1",
+                "branch": "main",
+                "expect_root_hash": old_root,
+                "operations": [
+                    {
+                        "kind": "rename_symbol",
+                        "name": "tax",
+                        "new_name": "gst"
+                    }
+                ]
+            }
+        }),
+    );
+    assert_eq!(stale_conflict["status"], "ok");
+    assert_eq!(stale_conflict["result"]["status"], "conflict");
+    assert_eq!(stale_conflict["result"]["committed"], false);
+    assert_eq!(stale_conflict["snapshot"]["root_hash"], root_after_apply);
+    assert_eq!(
+        stale_conflict["snapshot"]["history_hash"],
+        history_after_apply
+    );
+
+    let invalid = workspace_call(
+        &server,
+        "ops.apply",
+        json!({
+            "schema": "codedb/apply/v1",
+            "operations": [
+                {
+                    "kind": "not_real",
+                    "name": "vat"
+                }
+            ]
+        }),
+    );
+    assert_eq!(invalid["status"], "error");
+    assert_eq!(invalid["error"]["kind"], "invalid_operation");
+    assert_eq!(invalid["snapshot"]["root_hash"], root_after_apply);
+}
+
+#[test]
 fn workspace_server_returns_stable_error_envelopes() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("workspace-errors.sqlite");

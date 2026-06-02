@@ -140,10 +140,11 @@ cargo run -- serve "$DB" --addr 127.0.0.1:8787
 
 The server accepts HTTP `POST /` JSON requests with `method`, `params`, and
 optional JSON-RPC `id` fields. Responses use the stable
-`codedb/response/v1` envelope. The first v1 slice exposes read-only workspace
-methods: `workspace.current`, `workspace.branches`, `symbols.list`,
-`symbols.show`, `symbols.resolve`, `symbols.callers`, `roots.diff`,
-`roots.export_projection`, `build.plan`, `history.list`, and `verify.run`.
+`codedb/response/v1` envelope. The workspace API exposes read methods:
+`workspace.current`, `workspace.branches`, `symbols.list`, `symbols.show`,
+`symbols.resolve`, `symbols.callers`, `roots.diff`, `roots.export_projection`,
+`build.plan`, `history.list`, and `verify.run`. It also exposes `ops.apply`
+for atomic `codedb/apply/v1` structural writes.
 
 ## Documentation Map
 
