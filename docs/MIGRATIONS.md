@@ -358,9 +358,9 @@ if flag then 1 else 0
 Capture roots before and after a migration:
 
 ```bash
-OLD_ROOT=$(cargo run -- show "$DB" vat | awk '/^root / { print $2 }')
-cargo run -- replace-body "$DB" vat "subtotal * 19 / 100"
-NEW_ROOT=$(cargo run -- show "$DB" vat | awk '/^root / { print $2 }')
+REPLACE_OUT=$(cargo run -- replace-body "$DB" vat "subtotal * 19 / 100")
+OLD_ROOT=$(printf '%s\n' "$REPLACE_OUT" | awk '/^old_root / { print $2 }')
+NEW_ROOT=$(printf '%s\n' "$REPLACE_OUT" | awk '/^new_root / { print $2 }')
 cargo run -- diff "$DB" "$OLD_ROOT" "$NEW_ROOT"
 cargo run -- diff "$DB" "$OLD_ROOT" "$NEW_ROOT" --json
 ```

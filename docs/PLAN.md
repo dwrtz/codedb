@@ -521,6 +521,20 @@ Acceptance checks:
 Goal: keep the Phase 13 documentation executable enough that command examples
 fail quickly when the CLI, artifact model, or examples drift.
 
+Initial implementation status:
+
+- `tests/smoke_examples.rs` provides a dedicated
+  `cargo test --test smoke_examples` target for the README quickstart and main
+  cookbook flows.
+- The smoke target covers text import, structural apply, JSON inspection,
+  rename/body/alias/export mutations, diffs, projections, lowered IR, native
+  object emission, link plans, build plans, history export/import, and
+  verification.
+- Host-native executable builds are gated on default target linkability and
+  `cc` availability; all generated smoke artifacts are under temporary
+  directories.
+- README names the smoke command for contributors.
+
 Deliverables:
 
 - Add a docs/example smoke runner that exercises the README quickstart and the

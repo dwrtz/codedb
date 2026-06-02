@@ -70,6 +70,12 @@ cargo run -- eval "$APPLY_DB" main
 cargo run -- verify "$APPLY_DB"
 ```
 
+Run the docs/example smoke target with:
+
+```bash
+cargo test --test smoke_examples
+```
+
 Export and import replayable history:
 
 ```bash
@@ -184,7 +190,8 @@ cargo run -- build-plan <db> <entry-name> --target <triple> --json
 cargo run -- build <db> <entry-name> --target <triple> --out <executable>
 ```
 
-The integration suite in [tests/demo.rs](tests/demo.rs) and
-[tests/corruption.rs](tests/corruption.rs) exercises these command examples,
-including object artifact reuse, link plan determinism, history import/export,
-structural apply, and verification failures.
+The integration suite in [tests/smoke_examples.rs](tests/smoke_examples.rs),
+[tests/demo.rs](tests/demo.rs), and [tests/corruption.rs](tests/corruption.rs)
+exercises these command examples, including docs smoke flows, object artifact
+reuse, link plan determinism, history import/export, structural apply, and
+verification failures.
