@@ -370,7 +370,9 @@ Initial implementation status:
 - Apply documents can contain structural `create_function`, `rename_symbol`, `replace_function_body`, `change_function_signature`, `delete_symbol`, `create_alias`, `remove_alias`, `set_export`, and `remove_export` operations.
 - Function bodies in apply documents are structural `RawExpr` JSON values, not projection text.
 - Apply results are canonical JSON and include per-operation migration summaries with root hashes, migration/history hashes, type-check status, semantic impact, and structured build impact.
+- Apply batches are atomic; conflict and error outcomes roll back the entire batch.
 - The shop demo can be built and replayed from JSON operations.
+- `list`, `show`, `export-map`, and `history` have JSON output modes for agent inspection.
 
 Deliverables:
 

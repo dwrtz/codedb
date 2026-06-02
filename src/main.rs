@@ -90,10 +90,14 @@ enum Command {
     },
     List {
         db: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
     Show {
         db: PathBuf,
         symbol_or_name: String,
+        #[arg(long)]
+        json: bool,
     },
     Callers {
         db: PathBuf,
@@ -174,6 +178,8 @@ enum Command {
     },
     ExportMap {
         db: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
     Diff {
         db: PathBuf,
@@ -184,6 +190,8 @@ enum Command {
     },
     History {
         db: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
     Replay {
         db: PathBuf,
@@ -295,13 +303,25 @@ fn main() -> Result<()> {
             make_executable(&out)?;
             println!("built native executable {}", out.display());
         }
-        Command::List { db } => {
+        Command::List { db, json } => {
             let codedb = codedb::CodeDb::open(db)?;
-            print!("{}", codedb.list_main_branch()?);
+            if json {
+                print!("{}", codedb.list_main_branch_json()?);
+            } else {
+                print!("{}", codedb.list_main_branch()?);
+            }
         }
-        Command::Show { db, symbol_or_name } => {
+        Command::Show {
+            db,
+            symbol_or_name,
+            json,
+        } => {
             let codedb = codedb::CodeDb::open(db)?;
-            print!("{}", codedb.show_main_branch(&symbol_or_name)?);
+            if json {
+                print!("{}", codedb.show_main_branch_json(&symbol_or_name)?);
+            } else {
+                print!("{}", codedb.show_main_branch(&symbol_or_name)?);
+            }
         }
         Command::Callers { db, symbol_or_name } => {
             let codedb = codedb::CodeDb::open(db)?;
@@ -451,9 +471,13 @@ fn main() -> Result<()> {
                 )?
             );
         }
-        Command::ExportMap { db } => {
+        Command::ExportMap { db, json } => {
             let codedb = codedb::CodeDb::open(db)?;
-            print!("{}", codedb.export_map_main_branch()?);
+            if json {
+                print!("{}", codedb.export_map_main_branch_json()?);
+            } else {
+                print!("{}", codedb.export_map_main_branch()?);
+            }
         }
         Command::Diff {
             db,
@@ -468,9 +492,13 @@ fn main() -> Result<()> {
                 print!("{}", codedb.diff_roots(&root_a, &root_b)?);
             }
         }
-        Command::History { db } => {
+        Command::History { db, json } => {
             let codedb = codedb::CodeDb::open(db)?;
-            print!("{}", codedb.history_main_branch()?);
+            if json {
+                print!("{}", codedb.history_main_branch_json()?);
+            } else {
+                print!("{}", codedb.history_main_branch()?);
+            }
         }
         Command::Replay { db, from_genesis } => {
             if !from_genesis {

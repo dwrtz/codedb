@@ -1427,13 +1427,7 @@ fn apply_json_builds_shop_demo_from_structural_operations() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("apply-shop.sqlite");
     let replay_db = temp.path().join("apply-shop-replay.sqlite");
-    let ops = temp.path().join("shop.apply.json");
-
-    std::fs::write(
-        &ops,
-        serde_json::to_string_pretty(&shop_apply_document()).unwrap(),
-    )
-    .unwrap();
+    let ops = Path::new("examples/shop.apply.json");
 
     run(&["init", db.to_str().unwrap()]);
     let applied = run(&[
@@ -1445,7 +1439,10 @@ fn apply_json_builds_shop_demo_from_structural_operations() {
     let applied: JsonValue = serde_json::from_str(&applied).unwrap();
     assert_eq!(applied["schema"], "codedb/apply-result/v1");
     assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["atomic"], true);
+    assert_eq!(applied["committed"], true);
     assert_eq!(applied["operation_count"], 3);
+    assert_eq!(applied["processed_operation_count"], 3);
     assert_eq!(applied["applied_operation_count"], 3);
     assert_eq!(applied["results"][0]["summary"]["typecheck"], "checked");
     assert_eq!(
@@ -1475,6 +1472,38 @@ fn apply_json_builds_shop_demo_from_structural_operations() {
         .success()
         .stdout("verify ok\n");
 
+    let listed: JsonValue =
+        serde_json::from_str(&run(&["list", db.to_str().unwrap(), "--json"])).unwrap();
+    assert_eq!(listed["branch"], "main");
+    assert_eq!(listed["root_hash"], applied["new_root_hash"]);
+    assert_eq!(listed["symbols"].as_array().unwrap().len(), 3);
+    assert!(
+        listed["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["name"] == "tax")
+    );
+
+    let shown: JsonValue =
+        serde_json::from_str(&run(&["show", db.to_str().unwrap(), "tax", "--json"])).unwrap();
+    assert_eq!(shown["name"], "tax");
+    assert_eq!(shown["signature"], "(subtotal: i64) -> i64");
+    assert_eq!(shown["exported_abi_symbols"].as_array().unwrap().len(), 0);
+
+    let export_map: JsonValue =
+        serde_json::from_str(&run(&["export-map", db.to_str().unwrap(), "--json"])).unwrap();
+    assert_eq!(export_map["exports"].as_array().unwrap().len(), 3);
+
+    let history: JsonValue =
+        serde_json::from_str(&run(&["history", db.to_str().unwrap(), "--json"])).unwrap();
+    assert_eq!(history["history_hash"], applied["history_hash"]);
+    assert_eq!(history["migrations"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        history["migrations"][0]["operation"]["kind"],
+        "create_function"
+    );
+
     let branch_before_retry = branch_state(&db);
     let counts_before_retry = mutation_guard_counts(&db);
     let retry = run(&[
@@ -1485,6 +1514,8 @@ fn apply_json_builds_shop_demo_from_structural_operations() {
     ]);
     let retry: JsonValue = serde_json::from_str(&retry).unwrap();
     assert_eq!(retry["status"], "already_applied");
+    assert_eq!(retry["committed"], false);
+    assert_eq!(retry["applied_operation_count"], 0);
     assert_eq!(branch_state(&db), branch_before_retry);
     assert_eq!(mutation_guard_counts(&db), counts_before_retry);
 
@@ -1501,6 +1532,130 @@ fn apply_json_builds_shop_demo_from_structural_operations() {
 }
 
 #[test]
+fn apply_json_covers_all_structural_operation_kinds() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("apply-all.sqlite");
+    let seed = temp.path().join("seed.apply.json");
+    let all_ops = temp.path().join("all-ops.apply.json");
+
+    std::fs::write(
+        &seed,
+        serde_json::to_string_pretty(&seed_apply_document()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &all_ops,
+        serde_json::to_string_pretty(&all_structural_ops_apply_document()).unwrap(),
+    )
+    .unwrap();
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&[
+        "apply",
+        db.to_str().unwrap(),
+        "--json",
+        seed.to_str().unwrap(),
+    ]);
+    let applied = run(&[
+        "apply",
+        db.to_str().unwrap(),
+        "--json",
+        all_ops.to_str().unwrap(),
+    ]);
+    let applied: JsonValue = serde_json::from_str(&applied).unwrap();
+
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["committed"], true);
+    assert_eq!(applied["operation_count"], 9);
+    assert_eq!(applied["processed_operation_count"], 9);
+    assert_eq!(applied["applied_operation_count"], 9);
+    let kinds = applied["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["summary"]["kind"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            "create_function",
+            "delete_symbol",
+            "change_function_signature",
+            "replace_function_body",
+            "create_alias",
+            "remove_alias",
+            "set_export",
+            "remove_export",
+            "rename_symbol",
+        ]
+    );
+
+    bin()
+        .args(["eval", db.to_str().unwrap(), "main"])
+        .assert()
+        .success()
+        .stdout("6\n");
+    let show = run(&["show", db.to_str().unwrap(), "adjusted"]);
+    assert!(show.contains("name main.adjusted"));
+    assert!(run_failure(&["show", db.to_str().unwrap(), "unused"]).contains("unknown name"));
+    assert!(run_failure(&["show", db.to_str().unwrap(), "ignored"]).contains("unknown name"));
+    assert!(show.contains("exported_abi_symbols none"));
+
+    bin()
+        .args(["verify", db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+}
+
+#[test]
+fn apply_json_conflict_rolls_back_whole_batch() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("apply-conflict.sqlite");
+    let conflict_ops = temp.path().join("conflict.apply.json");
+
+    std::fs::write(
+        &conflict_ops,
+        serde_json::to_string_pretty(&atomic_conflict_apply_document()).unwrap(),
+    )
+    .unwrap();
+
+    run(&["init", db.to_str().unwrap()]);
+    run(&[
+        "apply",
+        db.to_str().unwrap(),
+        "--json",
+        "examples/shop.apply.json",
+    ]);
+    let branch_before = branch_state(&db);
+    let counts_before = mutation_guard_counts(&db);
+
+    let conflict = run(&[
+        "apply",
+        db.to_str().unwrap(),
+        "--json",
+        conflict_ops.to_str().unwrap(),
+    ]);
+    let conflict: JsonValue = serde_json::from_str(&conflict).unwrap();
+    assert_eq!(conflict["status"], "conflict");
+    assert_eq!(conflict["committed"], false);
+    assert_eq!(conflict["rollback_reason"], "conflict");
+    assert_eq!(conflict["processed_operation_count"], 2);
+    assert_eq!(conflict["applied_operation_count"], 0);
+    assert_eq!(conflict["old_root_hash"], branch_before.0);
+    assert_eq!(conflict["new_root_hash"], branch_before.0);
+    assert_eq!(branch_state(&db), branch_before);
+    assert_eq!(mutation_guard_counts(&db), counts_before);
+    assert!(run_failure(&["show", db.to_str().unwrap(), "sales_tax"]).contains("unknown name"));
+
+    bin()
+        .args(["verify", db.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+}
+
+#[test]
 fn invalid_apply_json_operation_rolls_back_partial_writes() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("apply-invalid.sqlite");
@@ -1508,17 +1663,7 @@ fn invalid_apply_json_operation_rolls_back_partial_writes() {
 
     std::fs::write(
         &ops,
-        serde_json::to_string_pretty(&serde_json::json!({
-            "schema": "codedb/apply/v1",
-            "operations": [{
-                "kind": "create_function",
-                "name": "bad",
-                "params": [],
-                "return_type": "i64",
-                "body": { "kind": "literal_bool", "value": true }
-            }]
-        }))
-        .unwrap(),
+        serde_json::to_string_pretty(&invalid_after_write_apply_document()).unwrap(),
     )
     .unwrap();
     run(&["init", db.to_str().unwrap()]);
@@ -1532,6 +1677,7 @@ fn invalid_apply_json_operation_rolls_back_partial_writes() {
         ops.to_str().unwrap(),
     ]);
     assert!(stderr.contains("function main.bad body type bool does not match return type i64"));
+    assert!(run_failure(&["show", db.to_str().unwrap(), "ok"]).contains("unknown name"));
     assert_eq!(branch_state(&db), branch_before);
     assert_eq!(mutation_guard_counts(&db), counts_before);
 
@@ -2107,41 +2253,92 @@ fn c_projection_boolean_ops_are_strict_like_the_reference_evaluator() {
     assert!(!c_source.contains("&&"));
 }
 
-fn shop_apply_document() -> JsonValue {
+fn seed_apply_document() -> JsonValue {
     serde_json::json!({
         "schema": "codedb/apply/v1",
         "operations": [
             {
                 "kind": "create_function",
-                "name": "tax",
-                "birth_seed": "json-shop-tax",
-                "params": [{ "name": "subtotal", "type": "i64" }],
+                "name": "ignore",
+                "birth_seed": "json-all-ignore",
+                "params": [{ "name": "x", "type": "i64" }],
                 "return_type": "i64",
-                "body": expr_bin(
-                    "/",
-                    expr_bin("*", param("subtotal"), lit_i64(20)),
-                    lit_i64(100)
-                )
-            },
-            {
-                "kind": "create_function",
-                "name": "total",
-                "birth_seed": "json-shop-total",
-                "params": [{ "name": "subtotal", "type": "i64" }],
-                "return_type": "i64",
-                "body": expr_bin(
-                    "+",
-                    param("subtotal"),
-                    call("tax", vec![param("subtotal")])
-                )
+                "body": lit_i64(1)
             },
             {
                 "kind": "create_function",
                 "name": "main",
-                "birth_seed": "json-shop-main",
+                "birth_seed": "json-all-main",
                 "params": [],
                 "return_type": "i64",
-                "body": call("total", vec![lit_i64(100)])
+                "body": call("ignore", vec![lit_i64(5)])
+            }
+        ]
+    })
+}
+
+fn all_structural_ops_apply_document() -> JsonValue {
+    serde_json::json!({
+        "schema": "codedb/apply/v1",
+        "operations": [
+            {
+                "kind": "create_function",
+                "name": "unused",
+                "birth_seed": "json-all-unused",
+                "params": [],
+                "return_type": "i64",
+                "body": lit_i64(99)
+            },
+            { "kind": "delete_symbol", "name": "unused" },
+            {
+                "kind": "change_function_signature",
+                "name": "ignore",
+                "params": [{ "name": "y", "type": "i64" }],
+                "return_type": "i64"
+            },
+            {
+                "kind": "replace_function_body",
+                "name": "ignore",
+                "body": expr_bin("+", param("y"), lit_i64(1))
+            },
+            { "kind": "create_alias", "name": "ignore", "alias": "ignored" },
+            { "kind": "remove_alias", "name": "ignore", "alias": "ignored" },
+            { "kind": "set_export", "name": "ignore", "exported_name": "public_ignore" },
+            { "kind": "remove_export", "name": "ignore", "exported_name": "public_ignore" },
+            { "kind": "rename_symbol", "name": "ignore", "new_name": "adjusted" }
+        ]
+    })
+}
+
+fn atomic_conflict_apply_document() -> JsonValue {
+    serde_json::json!({
+        "schema": "codedb/apply/v1",
+        "operations": [
+            { "kind": "create_alias", "name": "tax", "alias": "sales_tax" },
+            { "kind": "rename_symbol", "name": "tax", "new_name": "total" }
+        ]
+    })
+}
+
+fn invalid_after_write_apply_document() -> JsonValue {
+    serde_json::json!({
+        "schema": "codedb/apply/v1",
+        "operations": [
+            {
+                "kind": "create_function",
+                "name": "ok",
+                "birth_seed": "json-invalid-ok",
+                "params": [],
+                "return_type": "i64",
+                "body": lit_i64(1)
+            },
+            {
+                "kind": "create_function",
+                "name": "bad",
+                "birth_seed": "json-invalid-bad",
+                "params": [],
+                "return_type": "i64",
+                "body": { "kind": "literal_bool", "value": true }
             }
         ]
     })

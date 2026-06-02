@@ -1,0 +1,84 @@
+{
+  "schema": "codedb/apply/v1",
+  "operations": [
+    {
+      "kind": "create_function",
+      "name": "tax",
+      "birth_seed": "json-shop-tax",
+      "params": [
+        {
+          "name": "subtotal",
+          "type": "i64"
+        }
+      ],
+      "return_type": "i64",
+      "body": {
+        "kind": "binary",
+        "op": "/",
+        "left": {
+          "kind": "binary",
+          "op": "*",
+          "left": {
+            "kind": "param_name",
+            "name": "subtotal"
+          },
+          "right": {
+            "kind": "literal_i64",
+            "value": "20"
+          }
+        },
+        "right": {
+          "kind": "literal_i64",
+          "value": "100"
+        }
+      }
+    },
+    {
+      "kind": "create_function",
+      "name": "total",
+      "birth_seed": "json-shop-total",
+      "params": [
+        {
+          "name": "subtotal",
+          "type": "i64"
+        }
+      ],
+      "return_type": "i64",
+      "body": {
+        "kind": "binary",
+        "op": "+",
+        "left": {
+          "kind": "param_name",
+          "name": "subtotal"
+        },
+        "right": {
+          "kind": "call",
+          "name": "tax",
+          "args": [
+            {
+              "kind": "param_name",
+              "name": "subtotal"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "kind": "create_function",
+      "name": "main",
+      "birth_seed": "json-shop-main",
+      "params": [],
+      "return_type": "i64",
+      "body": {
+        "kind": "call",
+        "name": "total",
+        "args": [
+          {
+            "kind": "literal_i64",
+            "value": "100"
+          }
+        ]
+      }
+    }
+  ]
+}

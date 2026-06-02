@@ -644,145 +644,8 @@ impl CodeDb {
         expected_root: &str,
         op: Operation,
     ) -> Result<MigrationOutcome> {
-        let fallback_summary = self.migration_summary(&op);
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| {
-            let branch = self.branch(MAIN_BRANCH)?;
-            let old_root = branch.root_hash.clone();
-            let preconditions = self.preconditions_for(expected_root, &op);
-            let failed_preconditions = self.failed_preconditions(&old_root, &preconditions)?;
-            if !failed_preconditions.is_empty() {
-                let current_postconditions = self.postconditions_for(&old_root, &op);
-                let failed_postconditions =
-                    self.failed_postconditions(&old_root, &current_postconditions)?;
-                if failed_postconditions.is_empty() {
-                    let stale_expected_root = failed_preconditions.iter().any(|precondition| {
-                        matches!(precondition, Precondition::RootIsCurrent { .. })
-                    });
-                    if stale_expected_root
-                        && !self.recorded_operation_output_matches(expected_root, &old_root, &op)?
-                    {
-                        return Ok((
-                            MigrationOutcome::Conflict(MigrationConflict {
-                                current_root: old_root,
-                                expected_root: expected_root.to_string(),
-                                summary: fallback_summary.clone(),
-                                failed_preconditions,
-                                failed_postconditions,
-                            }),
-                            false,
-                        ));
-                    }
-                    if !stale_expected_root && !self.recorded_operation_exists(&op)? {
-                        return Ok((
-                            MigrationOutcome::Conflict(MigrationConflict {
-                                current_root: old_root,
-                                expected_root: expected_root.to_string(),
-                                summary: fallback_summary.clone(),
-                                failed_preconditions,
-                                failed_postconditions,
-                            }),
-                            false,
-                        ));
-                    }
-                    let summary = self.migration_summary_for_roots(&op, &old_root, &old_root)?;
-                    return Ok((
-                        MigrationOutcome::AlreadyApplied(MigrationReport {
-                            old_root: old_root.clone(),
-                            new_root: old_root,
-                            migration_hash: None,
-                            history_hash: branch.history_hash,
-                            summary,
-                        }),
-                        false,
-                    ));
-                }
-
-                return Ok((
-                    MigrationOutcome::Conflict(MigrationConflict {
-                        current_root: old_root,
-                        expected_root: expected_root.to_string(),
-                        summary: fallback_summary.clone(),
-                        failed_preconditions,
-                        failed_postconditions,
-                    }),
-                    false,
-                ));
-            }
-
-            let new_root =
-                self.apply_operation_to_root(&old_root, branch.history_hash.as_deref(), &op)?;
-            let postconditions = self.postconditions_for(&new_root, &op);
-            let failed_postconditions = self.failed_postconditions(&new_root, &postconditions)?;
-            if !failed_postconditions.is_empty() {
-                bail!(
-                    "postcondition failed for {}: {}",
-                    op.kind_name(),
-                    condition_names(&failed_postconditions)
-                );
-            }
-            if new_root == old_root {
-                let summary = self.migration_summary_for_roots(&op, &old_root, &old_root)?;
-                return Ok((
-                    MigrationOutcome::AlreadyApplied(MigrationReport {
-                        old_root: old_root.clone(),
-                        new_root: old_root,
-                        migration_hash: None,
-                        history_hash: branch.history_hash.clone(),
-                        summary,
-                    }),
-                    false,
-                ));
-            }
-            let operation_json = serde_json::to_value(&op)?;
-            let preconditions_json = serde_json::to_value(&preconditions)?;
-            let postconditions_json = serde_json::to_value(&postconditions)?;
-            let migration_hash = migration_hash(
-                branch.history_hash.as_deref(),
-                &old_root,
-                &new_root,
-                &operation_json,
-                &preconditions_json,
-                &postconditions_json,
-            );
-            let history_hash =
-                history_hash(branch.history_hash.as_deref(), &migration_hash, &new_root);
-            let summary = self.migration_summary_for_roots(&op, &old_root, &new_root)?;
-
-            self.conn.execute(
-                "INSERT OR IGNORE INTO migrations
-                 (hash, parent_history_hash, input_root_hash, output_root_hash,
-                  operation_kind, operation_json, preconditions_json, postconditions_json, agent_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '{}')",
-                params![
-                    migration_hash,
-                    branch.history_hash,
-                    old_root,
-                    new_root,
-                    op.kind_name(),
-                    canonical_json(&operation_json),
-                    canonical_json(&preconditions_json),
-                    canonical_json(&postconditions_json),
-                ],
-            )?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO histories
-                 (history_hash, parent_history_hash, migration_hash, output_root_hash)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![history_hash, branch.history_hash, migration_hash, new_root],
-            )?;
-            self.update_branch(MAIN_BRANCH, &new_root, &history_hash)?;
-            Ok((
-                MigrationOutcome::Applied(MigrationReport {
-                    old_root,
-                    new_root,
-                    migration_hash: Some(migration_hash),
-                    history_hash: Some(history_hash),
-                    summary,
-                }),
-                true,
-            ))
-        })();
+        let result = self.apply_and_record_expected_in_tx(expected_root, op);
 
         match result {
             Ok((outcome, should_commit)) => {
@@ -800,6 +663,148 @@ impl CodeDb {
                 Err(err)
             }
         }
+    }
+
+    pub(crate) fn apply_and_record_expected_in_tx(
+        &mut self,
+        expected_root: &str,
+        op: Operation,
+    ) -> Result<(MigrationOutcome, bool)> {
+        let fallback_summary = self.migration_summary(&op);
+        let branch = self.branch(MAIN_BRANCH)?;
+        let old_root = branch.root_hash.clone();
+        let preconditions = self.preconditions_for(expected_root, &op);
+        let failed_preconditions = self.failed_preconditions(&old_root, &preconditions)?;
+        if !failed_preconditions.is_empty() {
+            let current_postconditions = self.postconditions_for(&old_root, &op);
+            let failed_postconditions =
+                self.failed_postconditions(&old_root, &current_postconditions)?;
+            if failed_postconditions.is_empty() {
+                let stale_expected_root = failed_preconditions
+                    .iter()
+                    .any(|precondition| matches!(precondition, Precondition::RootIsCurrent { .. }));
+                if stale_expected_root
+                    && !self.recorded_operation_output_matches(expected_root, &old_root, &op)?
+                {
+                    return Ok((
+                        MigrationOutcome::Conflict(MigrationConflict {
+                            current_root: old_root,
+                            expected_root: expected_root.to_string(),
+                            summary: fallback_summary.clone(),
+                            failed_preconditions,
+                            failed_postconditions,
+                        }),
+                        false,
+                    ));
+                }
+                if !stale_expected_root && !self.recorded_operation_exists(&op)? {
+                    return Ok((
+                        MigrationOutcome::Conflict(MigrationConflict {
+                            current_root: old_root,
+                            expected_root: expected_root.to_string(),
+                            summary: fallback_summary.clone(),
+                            failed_preconditions,
+                            failed_postconditions,
+                        }),
+                        false,
+                    ));
+                }
+                let summary = self.migration_summary_for_roots(&op, &old_root, &old_root)?;
+                return Ok((
+                    MigrationOutcome::AlreadyApplied(MigrationReport {
+                        old_root: old_root.clone(),
+                        new_root: old_root,
+                        migration_hash: None,
+                        history_hash: branch.history_hash,
+                        summary,
+                    }),
+                    false,
+                ));
+            }
+
+            return Ok((
+                MigrationOutcome::Conflict(MigrationConflict {
+                    current_root: old_root,
+                    expected_root: expected_root.to_string(),
+                    summary: fallback_summary.clone(),
+                    failed_preconditions,
+                    failed_postconditions,
+                }),
+                false,
+            ));
+        }
+
+        let new_root =
+            self.apply_operation_to_root(&old_root, branch.history_hash.as_deref(), &op)?;
+        let postconditions = self.postconditions_for(&new_root, &op);
+        let failed_postconditions = self.failed_postconditions(&new_root, &postconditions)?;
+        if !failed_postconditions.is_empty() {
+            bail!(
+                "postcondition failed for {}: {}",
+                op.kind_name(),
+                condition_names(&failed_postconditions)
+            );
+        }
+        if new_root == old_root {
+            let summary = self.migration_summary_for_roots(&op, &old_root, &old_root)?;
+            return Ok((
+                MigrationOutcome::AlreadyApplied(MigrationReport {
+                    old_root: old_root.clone(),
+                    new_root: old_root,
+                    migration_hash: None,
+                    history_hash: branch.history_hash.clone(),
+                    summary,
+                }),
+                false,
+            ));
+        }
+        let operation_json = serde_json::to_value(&op)?;
+        let preconditions_json = serde_json::to_value(&preconditions)?;
+        let postconditions_json = serde_json::to_value(&postconditions)?;
+        let migration_hash = migration_hash(
+            branch.history_hash.as_deref(),
+            &old_root,
+            &new_root,
+            &operation_json,
+            &preconditions_json,
+            &postconditions_json,
+        );
+        let history_hash = history_hash(branch.history_hash.as_deref(), &migration_hash, &new_root);
+        let summary = self.migration_summary_for_roots(&op, &old_root, &new_root)?;
+
+        self.conn.execute(
+            "INSERT OR IGNORE INTO migrations
+             (hash, parent_history_hash, input_root_hash, output_root_hash,
+              operation_kind, operation_json, preconditions_json, postconditions_json, agent_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '{}')",
+            params![
+                migration_hash,
+                branch.history_hash,
+                old_root,
+                new_root,
+                op.kind_name(),
+                canonical_json(&operation_json),
+                canonical_json(&preconditions_json),
+                canonical_json(&postconditions_json),
+            ],
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO histories
+             (history_hash, parent_history_hash, migration_hash, output_root_hash)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![history_hash, branch.history_hash, migration_hash, new_root],
+        )?;
+        self.update_branch(MAIN_BRANCH, &new_root, &history_hash)?;
+        Ok((
+            MigrationOutcome::Applied(MigrationReport {
+                old_root,
+                new_root,
+                migration_hash: Some(migration_hash),
+                history_hash: Some(history_hash),
+                summary,
+            }),
+            true,
+        ))
     }
 
     pub(crate) fn preconditions_for(&self, input_root: &str, op: &Operation) -> Vec<Precondition> {
@@ -1705,6 +1710,33 @@ impl CodeDb {
             out.push_str("history empty\n");
         }
         Ok(out)
+    }
+
+    pub fn history_main_branch_json(&self) -> Result<String> {
+        let branch = self.branch(MAIN_BRANCH)?;
+        let chain = self.history_chain(MAIN_BRANCH)?;
+        let migrations = chain
+            .into_iter()
+            .map(|item| {
+                Ok(json!({
+                    "operation_kind": item.operation_kind,
+                    "input_root_hash": item.input_root,
+                    "output_root_hash": item.output_root,
+                    "migration_hash": item.migration_hash,
+                    "history_hash": item.history_hash,
+                    "operation": serde_json::to_value(item.operation)?,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(format!(
+            "{}\n",
+            canonical_json(&json!({
+                "branch": MAIN_BRANCH,
+                "root_hash": branch.root_hash,
+                "history_hash": branch.history_hash,
+                "migrations": migrations,
+            }))
+        ))
     }
 
     pub fn replay_main_branch(&mut self) -> Result<String> {

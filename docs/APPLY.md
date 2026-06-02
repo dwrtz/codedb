@@ -1,0 +1,99 @@
+# Structural Apply JSON
+
+`codedb apply <db> --json <file>` applies a `codedb/apply/v1` document to the
+`main` branch.
+
+Apply is atomic. If any operation errors or returns `conflict`, the whole batch
+is rolled back and the branch, history rows, materialized indexes, and caches
+remain unchanged.
+
+## Document
+
+```json
+{
+  "schema": "codedb/apply/v1",
+  "branch": "main",
+  "expect_root_hash": "sha256:optional-root",
+  "operations": []
+}
+```
+
+`branch` defaults to `main`. `expect_root_hash` may also be written as
+`expect_root`. A batch-level expectation applies to the first operation. Each
+operation may also set its own `expect_root_hash`.
+
+## Operations
+
+```json
+{
+  "kind": "create_function",
+  "module": "main",
+  "name": "tax",
+  "birth_seed": "stable-agent-seed",
+  "params": [{ "name": "subtotal", "type": "i64" }],
+  "return_type": "i64",
+  "body": { "kind": "literal_i64", "value": "1" }
+}
+```
+
+```json
+{ "kind": "rename_symbol", "name": "tax", "new_name": "vat" }
+```
+
+```json
+{
+  "kind": "replace_function_body",
+  "name": "tax",
+  "body": { "kind": "literal_i64", "value": "2" }
+}
+```
+
+```json
+{
+  "kind": "change_function_signature",
+  "name": "tax",
+  "params": [{ "name": "subtotal", "type": "i64" }],
+  "return_type": "i64"
+}
+```
+
+```json
+{ "kind": "delete_symbol", "name": "unused", "force": false }
+```
+
+```json
+{ "kind": "create_alias", "name": "tax", "alias": "sales_tax" }
+```
+
+```json
+{ "kind": "remove_alias", "name": "tax", "alias": "sales_tax" }
+```
+
+```json
+{ "kind": "set_export", "name": "tax", "exported_name": "public_tax" }
+```
+
+```json
+{ "kind": "remove_export", "name": "tax", "exported_name": "public_tax" }
+```
+
+For non-create operations, `module` defaults to `main`. `symbol` may be supplied
+to bind directly to stable identity; otherwise CodeDB resolves `name` in the
+expected root.
+
+## Expressions
+
+Bodies use structural `RawExpr` JSON:
+
+```json
+{ "kind": "literal_i64", "value": "100" }
+{ "kind": "literal_bool", "value": true }
+{ "kind": "param_name", "name": "subtotal" }
+{ "kind": "param_ref", "index": 0 }
+{ "kind": "call", "name": "tax", "args": [] }
+{ "kind": "binary", "op": "+", "left": {}, "right": {} }
+{ "kind": "if", "cond": {}, "then": {}, "else": {} }
+```
+
+See [examples/shop.apply.json](../examples/shop.apply.json) for a complete
+program built without projection text.

@@ -191,6 +191,27 @@ impl CodeDb {
     }
 
     fn apply_batch(&mut self, request: ApplyBatch) -> Result<String> {
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = self.apply_batch_in_tx(request);
+        match result {
+            Ok((json, should_commit)) => {
+                if should_commit {
+                    self.conn.execute_batch("COMMIT")?;
+                } else {
+                    self.conn.execute_batch("ROLLBACK")?;
+                }
+                Ok(json)
+            }
+            Err(err) => {
+                if let Err(rollback_err) = self.conn.execute_batch("ROLLBACK") {
+                    return Err(err).context(format!("rollback failed: {rollback_err}"));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn apply_batch_in_tx(&mut self, request: ApplyBatch) -> Result<(String, bool)> {
         if let Some(schema) = &request.schema
             && schema != APPLY_SCHEMA
         {
@@ -205,12 +226,15 @@ impl CodeDb {
 
         let initial_branch = self.branch(MAIN_BRANCH)?;
         let initial_root = initial_branch.root_hash;
+        let initial_history = initial_branch.history_hash;
         let mut results = Vec::new();
-        let mut applied_operation_count = 0usize;
+        let mut tentative_applied_operation_count = 0usize;
         let mut aggregate_status = MigrationStatus::AlreadyApplied;
 
         for (idx, api_operation) in request.operations.iter().enumerate() {
             let branch = self.branch(MAIN_BRANCH)?;
+            let savepoint = format!("codedb_apply_operation_{idx}");
+            self.conn.execute_batch(&format!("SAVEPOINT {savepoint}"))?;
             let expected_root = api_operation
                 .expect_root_hash()
                 .map(str::to_string)
@@ -225,33 +249,63 @@ impl CodeDb {
             let operation = self
                 .operation_from_api(&expected_root, api_operation)
                 .with_context(|| format!("operation {idx} is invalid"))?;
-            let outcome = self.apply_and_record_expected(branch, &expected_root, operation)?;
+            let (outcome, operation_changed_root) =
+                self.apply_and_record_expected_in_tx(&expected_root, operation)?;
             let status = outcome.status();
             if matches!(status, MigrationStatus::Applied) {
-                applied_operation_count += 1;
+                debug_assert!(operation_changed_root);
+                tentative_applied_operation_count += 1;
+                self.conn
+                    .execute_batch(&format!("RELEASE SAVEPOINT {savepoint}"))?;
+            } else {
+                self.conn.execute_batch(&format!(
+                    "ROLLBACK TO SAVEPOINT {savepoint}; RELEASE SAVEPOINT {savepoint}"
+                ))?;
             }
             aggregate_status = merge_status(aggregate_status, status);
             let stop = matches!(status, MigrationStatus::Conflict);
             results.push(outcome.to_json());
             if stop {
-                break;
+                let payload = apply_result_json(
+                    aggregate_status,
+                    false,
+                    Some("conflict"),
+                    &initial_root,
+                    &initial_root,
+                    initial_history.as_ref(),
+                    request.operations.len(),
+                    results.len(),
+                    0,
+                    results,
+                );
+                return Ok((format!("{}\n", canonical_json(&payload)), false));
             }
         }
 
-        let final_branch = self.branch(MAIN_BRANCH)?;
-        let payload = json!({
-            "schema": APPLY_RESULT_SCHEMA,
-            "status": aggregate_status.as_str(),
-            "branch": MAIN_BRANCH,
-            "old_root_hash": initial_root,
-            "new_root_hash": final_branch.root_hash,
-            "history_hash": final_branch.history_hash,
-            "operation_count": request.operations.len(),
-            "processed_operation_count": results.len(),
-            "applied_operation_count": applied_operation_count,
-            "results": results,
-        });
-        Ok(format!("{}\n", canonical_json(&payload)))
+        let should_commit = tentative_applied_operation_count > 0;
+        let (new_root, history_hash, applied_operation_count) = if should_commit {
+            let final_branch = self.branch(MAIN_BRANCH)?;
+            (
+                final_branch.root_hash,
+                final_branch.history_hash,
+                tentative_applied_operation_count,
+            )
+        } else {
+            (initial_root.clone(), initial_history.clone(), 0)
+        };
+        let payload = apply_result_json(
+            aggregate_status,
+            should_commit,
+            None,
+            &initial_root,
+            &new_root,
+            history_hash.as_ref(),
+            request.operations.len(),
+            results.len(),
+            applied_operation_count,
+            results,
+        );
+        Ok((format!("{}\n", canonical_json(&payload)), should_commit))
     }
 
     fn operation_from_api(
@@ -403,6 +457,36 @@ impl CodeDb {
             .unwrap_or_else(|| self.resolve_name(root_hash, module, name))
             .with_context(|| anyhow!("failed to resolve {module}.{name}"))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_result_json(
+    status: MigrationStatus,
+    committed: bool,
+    rollback_reason: Option<&str>,
+    old_root_hash: &str,
+    new_root_hash: &str,
+    history_hash: Option<&String>,
+    operation_count: usize,
+    processed_operation_count: usize,
+    applied_operation_count: usize,
+    results: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    json!({
+        "schema": APPLY_RESULT_SCHEMA,
+        "status": status.as_str(),
+        "branch": MAIN_BRANCH,
+        "atomic": true,
+        "committed": committed,
+        "rollback_reason": rollback_reason,
+        "old_root_hash": old_root_hash,
+        "new_root_hash": new_root_hash,
+        "history_hash": history_hash,
+        "operation_count": operation_count,
+        "processed_operation_count": processed_operation_count,
+        "applied_operation_count": applied_operation_count,
+        "results": results,
+    })
 }
 
 fn merge_status(current: MigrationStatus, next: MigrationStatus) -> MigrationStatus {

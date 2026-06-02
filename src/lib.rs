@@ -18,6 +18,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::params;
+use serde_json::json;
 
 pub use expr::{FunctionSource, RawExpr, Value};
 pub use store::CodeDb;
@@ -185,6 +186,37 @@ impl CodeDb {
         Ok(out)
     }
 
+    pub fn list_main_branch_json(&self) -> Result<String> {
+        let branch = self.branch(MAIN_BRANCH)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let mut symbols = Vec::new();
+        for binding in preferred_names(&root) {
+            let symbol = binding.symbol;
+            let root_symbol = root
+                .symbols
+                .iter()
+                .find(|entry| entry.symbol == symbol)
+                .ok_or_else(|| anyhow!("root name points to missing symbol {symbol}"))?;
+            symbols.push(json!({
+                "module": binding.module,
+                "name": binding.display_name,
+                "symbol_hash": symbol,
+                "signature_hash": root_symbol.signature,
+                "definition_hash": root_symbol.definition,
+                "signature": self.signature_source(&root_symbol.signature, &param_names(&root, &symbol))?,
+            }));
+        }
+        Ok(format!(
+            "{}\n",
+            store::canonical_json(&json!({
+                "branch": MAIN_BRANCH,
+                "root_hash": branch.root_hash,
+                "history_hash": branch.history_hash,
+                "symbols": symbols,
+            }))
+        ))
+    }
+
     pub fn show_main_branch(&self, symbol_or_name: &str) -> Result<String> {
         let branch = self.branch(MAIN_BRANCH)?;
         let symbol = self.resolve_symbol_or_name(&branch.root_hash, symbol_or_name)?;
@@ -234,6 +266,47 @@ impl CodeDb {
             }
         }
         Ok(out)
+    }
+
+    pub fn show_main_branch_json(&self, symbol_or_name: &str) -> Result<String> {
+        let branch = self.branch(MAIN_BRANCH)?;
+        let symbol = self.resolve_symbol_or_name(&branch.root_hash, symbol_or_name)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let binding = self
+            .preferred_binding(&root, &symbol)
+            .ok_or_else(|| anyhow!("symbol has no preferred name {symbol}"))?;
+        let root_symbol = self
+            .root_symbol(&root, &symbol)
+            .ok_or_else(|| anyhow!("symbol missing from root {symbol}"))?;
+        let body_hash = self.function_body_hash(&root_symbol.definition)?;
+        let deps = self.dependencies_for_symbol(&branch.root_hash, &symbol)?;
+        let dependencies = deps
+            .iter()
+            .map(|dep| {
+                Ok(json!({
+                    "name": self.symbol_display(&root, dep)?,
+                    "symbol_hash": dep,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let local_param_names = param_names(&root, &symbol);
+        let payload = json!({
+            "branch": MAIN_BRANCH,
+            "root_hash": branch.root_hash,
+            "history_hash": branch.history_hash,
+            "symbol_hash": symbol,
+            "module": binding.module,
+            "name": binding.display_name,
+            "signature_hash": root_symbol.signature,
+            "definition_hash": root_symbol.definition,
+            "body_hash": body_hash,
+            "internal_abi_symbol": abi::internal_abi_symbol(&symbol)?,
+            "exported_abi_symbols": abi::exported_abi_names(&root, &symbol),
+            "signature": self.signature_source(&root_symbol.signature, &local_param_names)?,
+            "body_source": self.expr_to_source(&body_hash, &root, &local_param_names, 0)?,
+            "dependencies": dependencies,
+        });
+        Ok(format!("{}\n", store::canonical_json(&payload)))
     }
 
     pub fn callers_main_branch(&self, symbol_or_name: &str) -> Result<String> {
@@ -556,6 +629,30 @@ impl CodeDb {
             ));
         }
         Ok(out)
+    }
+
+    pub fn export_map_main_branch_json(&self) -> Result<String> {
+        let branch = self.branch(MAIN_BRANCH)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let mut entries = Vec::new();
+        for binding in preferred_names(&root) {
+            entries.push(json!({
+                "module": binding.module,
+                "name": binding.display_name,
+                "symbol_hash": binding.symbol,
+                "internal_abi_symbol": abi::internal_abi_symbol(&binding.symbol)?,
+                "exported_abi_symbols": abi::exported_abi_names(&root, &binding.symbol),
+            }));
+        }
+        Ok(format!(
+            "{}\n",
+            store::canonical_json(&json!({
+                "branch": MAIN_BRANCH,
+                "root_hash": branch.root_hash,
+                "history_hash": branch.history_hash,
+                "exports": entries,
+            }))
+        ))
     }
 }
 

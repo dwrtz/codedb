@@ -7,7 +7,7 @@
 ```bash
 cargo run -- init demo.codedb.sqlite
 cargo run -- import demo.codedb.sqlite examples/shop.cdb
-cargo run -- apply demo.codedb.sqlite --json operations.json
+cargo run -- apply demo.codedb.sqlite --json examples/shop.apply.json
 cargo run -- eval demo.codedb.sqlite main
 cargo run -- callers demo.codedb.sqlite tax
 cargo run -- show demo.codedb.sqlite tax
@@ -28,8 +28,11 @@ Structural mutation commands return `applied`, `already_applied`, or `conflict`.
 Use `--expect-root <root>` on mutation commands when an agent needs to reject
 stale writes instead of applying against a branch that has moved.
 
-`codedb apply <db> --json <file>` accepts a structural `codedb/apply/v1` JSON
-document with operations such as `create_function`, `rename_symbol`,
-`replace_function_body`, `create_alias`, and `set_export`. Function bodies are
-structural expression JSON objects, so agents do not need to write projection
-text to mutate the database.
+`codedb apply <db> --json <file>` accepts an atomic structural
+`codedb/apply/v1` JSON document with operations such as `create_function`,
+`rename_symbol`, `replace_function_body`, `create_alias`, and `set_export`.
+Function bodies are structural expression JSON objects, so agents do not need
+to write projection text to mutate the database. See
+[docs/APPLY.md](docs/APPLY.md) and [examples/shop.apply.json](examples/shop.apply.json).
+Use `--json` on `list`, `show`, `export-map`, and `history` for machine-readable
+inspection output.
