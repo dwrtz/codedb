@@ -14,8 +14,8 @@ use crate::diff::dependency_pairs;
 use crate::migrations::{history_hash, migration_hash};
 use crate::model::{ProgramRootPayload, validate_projection_identifier};
 use crate::store::{
-    CodeDb, cache_key_for_input, canonical_json, function_interface_metadata, hash_bytes,
-    hash_object_canonical,
+    CodeDb, cache_key_for_input, canonical_json, extract_hash_strings, function_interface_metadata,
+    hash_bytes, hash_object_canonical,
 };
 use crate::{BYTES_DOMAIN, SCHEMA_VERSION};
 
@@ -110,6 +110,68 @@ impl CodeDb {
             errors.push(format!(
                 "missing_object: object_edges missing parents={missing_parent} children={missing_child}"
             ));
+        }
+
+        let mut expected = BTreeSet::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT hash, payload_json FROM objects ORDER BY hash")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (parent_hash, payload_json) = row?;
+            let payload = match serde_json::from_str::<JsonValue>(&payload_json) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    errors.push(format!(
+                        "corrupt_object: cannot recompute edges for {parent_hash}: {err}"
+                    ));
+                    continue;
+                }
+            };
+            let mut refs = Vec::new();
+            extract_hash_strings(&payload, &mut refs);
+            let mut seen = BTreeSet::new();
+            for (position, child_hash) in refs.into_iter().enumerate() {
+                if !seen.insert(child_hash.clone()) || child_hash == parent_hash {
+                    continue;
+                }
+                let exists: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM objects WHERE hash = ?1)",
+                    params![&child_hash],
+                    |row| row.get(0),
+                )?;
+                if exists {
+                    expected.insert((
+                        parent_hash.clone(),
+                        child_hash,
+                        "ref".to_string(),
+                        Some(position as i64),
+                    ));
+                }
+            }
+        }
+        drop(stmt);
+
+        let actual = {
+            let mut stmt = self.conn.prepare(
+                "SELECT parent_hash, child_hash, edge_label, edge_position
+                 FROM object_edges
+                 ORDER BY parent_hash, child_hash, edge_label, edge_position",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?
+        };
+        if expected != actual {
+            errors.push("bad_index: object_edges mismatch".to_string());
         }
         Ok(())
     }
@@ -1029,6 +1091,19 @@ impl CodeDb {
             errors.push(format!(
                 "bad_object_artifact: {cache_key} invalid symbol hash"
             ));
+        }
+        for field in [
+            "defined_symbols",
+            "called_symbols",
+            "relocations",
+            "dependency_interface_hashes",
+            "dependency_closure",
+        ] {
+            if metadata.get(field).and_then(JsonValue::as_array).is_none() {
+                errors.push(format!(
+                    "bad_object_artifact: {cache_key} malformed metadata: {field} must be an array"
+                ));
+            }
         }
         if json_string_set(metadata.get("dependency_interface_hashes"))
             != key_input

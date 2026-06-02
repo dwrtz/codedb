@@ -707,7 +707,7 @@ pub(crate) fn canonical_json(value: &JsonValue) -> String {
     }
 }
 
-fn extract_hash_strings(value: &JsonValue, out: &mut Vec<String>) {
+pub(crate) fn extract_hash_strings(value: &JsonValue, out: &mut Vec<String>) {
     match value {
         JsonValue::String(value) => {
             if value.starts_with("sha256:") {
