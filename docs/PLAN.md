@@ -516,15 +516,71 @@ Acceptance checks:
 - Documentation stays aligned with current behavior.
 - The docs never imply that C source is the primary native backend.
 
+## Phase 14: Docs-as-Tests and Example Smoke Runner
+
+Goal: keep the Phase 13 documentation executable enough that command examples
+fail quickly when the CLI, artifact model, or examples drift.
+
+Deliverables:
+
+- Add a docs/example smoke runner that exercises the README quickstart and the
+  main cookbook flows in a temporary directory.
+- Prefer a maintained smoke script or integration test that mirrors the docs
+  over parsing arbitrary Markdown, so examples can stay readable while still
+  being checked.
+- Cover at least:
+  - text import of `examples/shop.cdb`;
+  - structural apply of `examples/shop.apply.json`;
+  - `eval`, `list --json`, `show`, `history --json`, `branches --json`,
+    `export-map`, and `verify`;
+  - rename, body replacement, alias creation/removal, export set/removal, and
+    diff;
+  - source export, C projection, lowered IR, native object emission,
+    `link-native`, and `build-plan --json`;
+  - history export/import into a fresh database;
+  - native `build` only when the requested target is linkable on the host.
+- Assert expected outputs and schemas instead of only checking command success:
+  `eval main` is `120` for the shop demo, body replacement changes it to
+  `118`, apply results use `codedb/apply-result/v1`, link plans use
+  `codedb/link-plan/v1`, and rebuilt histories reach the same branch pointers.
+- Ensure smoke runs never leave generated databases, objects, projections,
+  binaries, or history files in the repository root.
+- Add a README note naming the smoke command once it exists.
+- Keep expensive or host-specific checks gated so normal `cargo test` remains
+  reliable on Linux and Apple Silicon.
+
+Files likely touched:
+
+- `README.md`
+- `docs/MIGRATIONS.md`
+- `docs/ARTIFACTS.md`
+- `tests/demo.rs` or new `tests/smoke_examples.rs`
+- optional new `scripts/smoke_examples.sh`
+
+Acceptance checks:
+
+- A single command, for example `cargo test --test smoke_examples`, validates
+  the README quickstart and cookbook examples.
+- The smoke runner fails if a documented command changes name, argument shape,
+  JSON schema, expected eval result, or output artifact behavior.
+- Host-native build checks run where supported and are skipped with an explicit
+  reason where unsupported.
+- All smoke artifacts are created under temporary directories.
+- `cargo test` remains deterministic and passes with the smoke runner included.
+
 ## Near-Term Recommendation
 
-The next useful phase is Phase 9. The prototype now has native objects, link plans, and host executable builds, so verification needs to become stricter about binary artifacts:
+The next useful phase is Phase 14. Phase 13 added substantial user-facing docs,
+and the prototype already has a broad integration suite. The highest-leverage
+next step is to turn the README and cookbook walkthroughs into a smoke target
+that catches documentation drift before contributors hit it manually:
 
 ```text
-object bytes hash matches metadata
-link plans reference existing cached objects
-executable cache entries match their link inputs
-Apple Silicon and Linux target metadata is well-formed
+README quickstart remains runnable
+apply/history/native examples keep matching current CLI behavior
+host-specific native build checks are gated
+generated smoke artifacts stay out of the repo root
 ```
 
-After that, Phase 10 can expose structural operations through a stable JSON API without relying on projection text.
+After that, the next larger implementation choices are broader branch/history
+semantics or deeper native backend work.
