@@ -2032,6 +2032,96 @@ fn invalid_apply_json_operation_rolls_back_partial_writes() {
 }
 
 #[test]
+fn apply_json_rejects_bad_single_operation_schema_and_unknown_fields() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("apply-schema-validation.sqlite");
+    let ops = temp.path().join("bad.apply.json");
+
+    run(&["init", db.to_str().unwrap()]);
+    let branch_before = branch_state(&db);
+    let counts_before = mutation_guard_counts(&db);
+
+    std::fs::write(
+        &ops,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "codedb/apply/v999",
+            "kind": "create_function",
+            "name": "answer",
+            "params": [],
+            "return_type": "i64",
+            "body": { "kind": "literal_i64", "value": "42" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let stderr = run_failure(&[
+        "apply",
+        db.to_str().unwrap(),
+        "--json",
+        ops.to_str().unwrap(),
+    ]);
+    assert!(stderr.contains("unsupported apply schema"));
+    assert_eq!(branch_state(&db), branch_before);
+    assert_eq!(mutation_guard_counts(&db), counts_before);
+
+    std::fs::write(
+        &ops,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "codedb/apply/v1",
+            "kind": "create_function",
+            "name": "answer",
+            "params": [],
+            "return_type": "i64",
+            "body": { "kind": "literal_i64", "value": "42" },
+            "surprise": "ignored-before-this-test"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let stderr = run_failure(&[
+        "apply",
+        db.to_str().unwrap(),
+        "--json",
+        ops.to_str().unwrap(),
+    ]);
+    assert!(stderr.contains("unknown field"));
+    assert!(stderr.contains("surprise"));
+    assert_eq!(branch_state(&db), branch_before);
+    assert_eq!(mutation_guard_counts(&db), counts_before);
+
+    std::fs::write(
+        &ops,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "codedb/apply/v1",
+            "operations": [{
+                "kind": "create_function",
+                "name": "answer",
+                "params": [{ "name": "x", "type": "i64", "extra": "ignored-before-this-test" }],
+                "return_type": "i64",
+                "body": {
+                    "kind": "literal_i64",
+                    "value": "42",
+                    "extra": "ignored-before-this-test"
+                }
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let stderr = run_failure(&[
+        "apply",
+        db.to_str().unwrap(),
+        "--json",
+        ops.to_str().unwrap(),
+    ]);
+    assert!(stderr.contains("unknown field"));
+    assert!(stderr.contains("extra"));
+    assert_eq!(branch_state(&db), branch_before);
+    assert_eq!(mutation_guard_counts(&db), counts_before);
+    assert!(run_failure(&["show", db.to_str().unwrap(), "answer"]).contains("unknown name"));
+}
+
+#[test]
 fn apply_json_rejects_invalid_let_binding_names_before_commit() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("apply-invalid-let.sqlite");

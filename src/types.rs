@@ -11,6 +11,7 @@ use crate::store::{CodeDb, canonical_json, hash_object_canonical};
 use crate::{ABI_TAG, SCHEMA_VERSION};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ParamSpec {
     pub name: String,
     #[serde(rename = "type")]

@@ -22,6 +22,11 @@ remain unchanged.
 `expect_root`. A batch-level expectation applies to the first operation. Each
 operation may also set its own `expect_root_hash`.
 
+A single operation may also be provided as the whole file. In that shorthand,
+`schema` may be omitted, but if it is present it must be `codedb/apply/v1`.
+Unknown fields in documents, operations, parameter specs, or expression bodies
+are rejected.
+
 ## Operations
 
 ```json

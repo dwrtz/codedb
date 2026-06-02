@@ -14,13 +14,7 @@ const APPLY_SCHEMA: &str = "codedb/apply/v1";
 const APPLY_RESULT_SCHEMA: &str = "codedb/apply-result/v1";
 
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum ApplyDocument {
-    Batch(ApplyBatch),
-    Operation(ApiOperation),
-}
-
-#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ApplyBatch {
     #[serde(default)]
     schema: Option<String>,
@@ -32,7 +26,7 @@ struct ApplyBatch {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum ApiOperation {
     CreateFunction {
         #[serde(default = "default_module")]
@@ -176,16 +170,34 @@ impl CodeDb {
 
     pub fn apply_json_str(&mut self, text: &str) -> Result<String> {
         self.ensure_initialized()?;
-        let document: ApplyDocument =
-            serde_json::from_str(text).context("apply JSON must match codedb/apply/v1")?;
-        let request = match document {
-            ApplyDocument::Batch(batch) => batch,
-            ApplyDocument::Operation(operation) => ApplyBatch {
+        let value: JsonValue =
+            serde_json::from_str(text).context("apply JSON must be a JSON object")?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| anyhow!("apply JSON must be an object"))?;
+        let request = if object.contains_key("operations") {
+            serde_json::from_value::<ApplyBatch>(value)
+                .context("apply JSON must match codedb/apply/v1")?
+        } else {
+            let mut operation_value = value;
+            if let JsonValue::Object(map) = &mut operation_value
+                && let Some(schema) = map.remove("schema")
+            {
+                let schema = schema
+                    .as_str()
+                    .ok_or_else(|| anyhow!("apply schema must be {APPLY_SCHEMA:?}"))?;
+                if schema != APPLY_SCHEMA {
+                    bail!("unsupported apply schema {schema:?}; expected {APPLY_SCHEMA}");
+                }
+            }
+            let operation = serde_json::from_value::<ApiOperation>(operation_value)
+                .context("apply JSON must match codedb/apply/v1 operation schema")?;
+            ApplyBatch {
                 schema: Some(APPLY_SCHEMA.to_string()),
                 branch: MAIN_BRANCH.to_string(),
                 expect_root_hash: operation.expect_root_hash().map(str::to_string),
                 operations: vec![operation],
-            },
+            }
         };
         self.apply_batch(request)
     }

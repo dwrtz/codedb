@@ -305,6 +305,10 @@ Effects:
 }
 ```
 
+Single-operation shorthand may omit `schema`; if `schema` is present it must be
+`codedb/apply/v1`. Unknown fields are rejected so schema drift fails before any
+root or history rows are created.
+
 If any operation conflicts or errors, the whole batch rolls back. The result is
 canonical `codedb/apply-result/v1` JSON with:
 
