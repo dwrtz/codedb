@@ -66,6 +66,15 @@ fn wait_for_server(server: &mut WorkspaceServer) {
 }
 
 fn workspace_call(server: &WorkspaceServer, method: &str, params: JsonValue) -> JsonValue {
+    workspace_call_with_read_timeout(server, method, params, None)
+}
+
+fn workspace_call_with_read_timeout(
+    server: &WorkspaceServer,
+    method: &str,
+    params: JsonValue,
+    read_timeout: Option<Duration>,
+) -> JsonValue {
     let request = json!({
         "jsonrpc": "2.0",
         "method": method,
@@ -74,6 +83,11 @@ fn workspace_call(server: &WorkspaceServer, method: &str, params: JsonValue) -> 
     });
     let body = serde_json::to_string(&request).expect("request json");
     let mut stream = TcpStream::connect(&server.addr).expect("connect workspace server");
+    if let Some(read_timeout) = read_timeout {
+        stream
+            .set_read_timeout(Some(read_timeout))
+            .expect("set read timeout");
+    }
     write!(
         stream,
         "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -93,6 +107,42 @@ fn workspace_call(server: &WorkspaceServer, method: &str, params: JsonValue) -> 
         .split_once("\r\n\r\n")
         .unwrap_or_else(|| panic!("missing HTTP body:\n{response}"));
     serde_json::from_str(body).unwrap_or_else(|err| panic!("invalid response JSON: {err}\n{body}"))
+}
+
+#[test]
+fn workspace_server_handles_slow_clients_concurrently() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("workspace-concurrent-server.sqlite");
+    run(&["init", db.to_str().unwrap()]);
+    let server = start_server(&db);
+
+    let slow_request = json!({
+        "jsonrpc": "2.0",
+        "method": "workspace.current",
+        "params": {},
+        "id": "slow",
+    });
+    let slow_body = serde_json::to_string(&slow_request).expect("slow request json");
+    let mut slow_stream = TcpStream::connect(&server.addr).expect("connect slow client");
+    write!(
+        slow_stream,
+        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        server.addr,
+        slow_body.len(),
+    )
+    .expect("write slow request headers");
+
+    let current = workspace_call_with_read_timeout(
+        &server,
+        "workspace.current",
+        json!({}),
+        Some(Duration::from_secs(2)),
+    );
+    assert_eq!(current["schema"], "codedb/response/v1");
+    assert_eq!(current["status"], "ok");
+    assert_eq!(current["snapshot"]["branch"], "main");
+
+    drop(slow_stream);
 }
 
 #[test]

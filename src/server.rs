@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::thread;
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -17,9 +18,12 @@ pub fn serve_workspace(db_path: impl AsRef<Path>, addr: &str) -> Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(err) = handle_connection(stream, &db_path) {
-                    eprintln!("workspace request failed: {err:#}");
-                }
+                let db_path = db_path.clone();
+                thread::spawn(move || {
+                    if let Err(err) = handle_connection(stream, &db_path) {
+                        eprintln!("workspace request failed: {err:#}");
+                    }
+                });
             }
             Err(err) => eprintln!("workspace connection failed: {err}"),
         }
