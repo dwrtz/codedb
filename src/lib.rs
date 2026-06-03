@@ -51,7 +51,7 @@ pub const DEFAULT_NATIVE_TARGET: &str = APPLE_ARM64_TARGET;
 pub const DEFAULT_NATIVE_TARGET: &str = LINUX_X86_64_TARGET;
 pub(crate) const ABI_TAG: &str = "codedb-v0-internal";
 pub(crate) const COMPILER_VERSION: &str = concat!("codedb-", env!("CARGO_PKG_VERSION"));
-pub(crate) const PIPELINE_VERSION: &str = "pipeline:v0";
+pub(crate) const PIPELINE_VERSION: &str = "pipeline:v1";
 
 pub(crate) fn parse_eval_arg(arg: &str, type_name: &str, idx: usize) -> Result<Value> {
     match type_name {

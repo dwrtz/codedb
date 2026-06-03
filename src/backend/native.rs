@@ -10,7 +10,10 @@ use crate::abi::internal_abi_symbol;
 use crate::artifact::CacheKeyInput;
 use crate::backend::{ArtifactKind, ObjectBackend, ObjectBackendArtifact, ObjectBackendInput};
 use crate::jobs::{ArtifactJobClaim, artifact_job_error, new_worker_id};
-use crate::lowering::{LoweredBlock, LoweredFunctionIr, LoweredOp};
+use crate::lowering::{
+    LoweredBlock, LoweredDebugOp, LoweredFunctionIr, LoweredOp, lowered_op_value_id,
+    lowered_value_debug_ops,
+};
 use crate::model::ProgramRootPayload;
 use crate::store::{
     CodeDb, cache_key_for_input, canonical_json, function_interface_metadata, hash_bytes,
@@ -21,6 +24,7 @@ use crate::{APPLE_ARM64_TARGET, BYTES_DOMAIN, LINUX_X86_64_TARGET, MAIN_BRANCH};
 pub(crate) const ELF_BACKEND_ID: &str = "native-elf-x86_64-v0";
 pub(crate) const MACHO_BACKEND_ID: &str = "native-macho-arm64-v0";
 const OBJECT_METADATA_SCHEMA: &str = "codedb/native-object/v1";
+const NATIVE_DEBUG_METADATA_SCHEMA: &str = "codedb/native-debug-metadata/v1";
 const ELF_OBJECT_FORMAT: &str = "elf64-x86-64-relocatable";
 const MACHO_OBJECT_FORMAT: &str = "macho64-arm64-relocatable";
 const R_X86_64_PLT32: u32 = 4;
@@ -111,6 +115,7 @@ impl ObjectBackend for ElfObjectBackend {
             "defined_symbols": [function_symbol],
             "called_symbols": called_symbols,
             "relocations": relocations,
+            "debug_metadata": native_debug_metadata(&compiled),
         });
 
         Ok(ObjectBackendArtifact {
@@ -171,6 +176,7 @@ impl ObjectBackend for MachOArm64ObjectBackend {
             "object_symbols": [object_symbol],
             "called_symbols": called_symbols,
             "relocations": relocations,
+            "debug_metadata": native_debug_metadata(&compiled),
         });
 
         Ok(ObjectBackendArtifact {
@@ -611,10 +617,47 @@ fn validate_native_ops(
     Ok(())
 }
 
+fn native_debug_metadata(compiled: &CompiledFunction) -> JsonValue {
+    json!({
+        "schema": NATIVE_DEBUG_METADATA_SCHEMA,
+        "text_section": ".text",
+        "text_size": compiled.text.len(),
+        "ranges": compiled
+            .debug_ranges
+            .iter()
+            .map(|range| {
+                json!({
+                    "symbol_hash": &range.symbol_hash,
+                    "function_def_hash": &range.function_def_hash,
+                    "lowered_op_id": &range.lowered_op_id,
+                    "value_id": &range.value_id,
+                    "lowered_op_kind": &range.lowered_op_kind,
+                    "expr_hash": &range.expr_hash,
+                    "text_offset_start": range.text_offset_start,
+                    "text_offset_end": range.text_offset_end,
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
 #[derive(Debug, Clone)]
 struct CompiledFunction {
     text: Vec<u8>,
     relocations: Vec<TextRelocation>,
+    debug_ranges: Vec<NativeDebugRange>,
+}
+
+#[derive(Debug, Clone)]
+struct NativeDebugRange {
+    symbol_hash: String,
+    function_def_hash: String,
+    lowered_op_id: String,
+    value_id: String,
+    lowered_op_kind: String,
+    expr_hash: String,
+    text_offset_start: u64,
+    text_offset_end: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -640,6 +683,10 @@ fn compile_x86_64_function(
         layout,
         text: Vec::new(),
         relocations: Vec::new(),
+        debug_ops: lowered_value_debug_ops(ir)?,
+        debug_ranges: Vec::new(),
+        symbol_hash: ir.symbol_hash.clone(),
+        function_def_hash: ir.function_def_hash.clone(),
     };
 
     emitter.emit_prologue(ir.params.len())?;
@@ -666,6 +713,7 @@ fn compile_x86_64_function(
     Ok(CompiledFunction {
         text: emitter.text,
         relocations: emitter.relocations,
+        debug_ranges: emitter.debug_ranges,
     })
 }
 
@@ -744,6 +792,10 @@ struct FunctionEmitter {
     layout: StackLayout,
     text: Vec<u8>,
     relocations: Vec<TextRelocation>,
+    debug_ops: BTreeMap<String, LoweredDebugOp>,
+    debug_ranges: Vec<NativeDebugRange>,
+    symbol_hash: String,
+    function_def_hash: String,
 }
 
 impl FunctionEmitter {
@@ -777,6 +829,8 @@ impl FunctionEmitter {
     }
 
     fn emit_op(&mut self, op: &LoweredOp) -> Result<()> {
+        let debug_value_id = lowered_op_value_id(op).map(str::to_string);
+        let debug_start = self.text.len();
         match op {
             LoweredOp::Param { id, slot, .. } => {
                 let param = *self
@@ -853,6 +907,30 @@ impl FunctionEmitter {
                 bail!("return is only valid as the final lowered operation");
             }
         }
+        if let Some(value_id) = debug_value_id {
+            self.record_debug_range(&value_id, debug_start, self.text.len())?;
+        }
+        Ok(())
+    }
+
+    fn record_debug_range(&mut self, value_id: &str, start: usize, end: usize) -> Result<()> {
+        if end <= start {
+            return Ok(());
+        }
+        let op = self
+            .debug_ops
+            .get(value_id)
+            .ok_or_else(|| anyhow!("missing lowered debug op for value id {value_id}"))?;
+        self.debug_ranges.push(NativeDebugRange {
+            symbol_hash: self.symbol_hash.clone(),
+            function_def_hash: self.function_def_hash.clone(),
+            lowered_op_id: op.lowered_op_id.clone(),
+            value_id: op.value_id.clone(),
+            lowered_op_kind: op.lowered_op_kind.clone(),
+            expr_hash: op.expr_hash.clone(),
+            text_offset_start: start as u64,
+            text_offset_end: end as u64,
+        });
         Ok(())
     }
 
@@ -1038,6 +1116,10 @@ fn compile_arm64_function(
         layout,
         text: Vec::new(),
         relocations: Vec::new(),
+        debug_ops: lowered_value_debug_ops(ir)?,
+        debug_ranges: Vec::new(),
+        symbol_hash: ir.symbol_hash.clone(),
+        function_def_hash: ir.function_def_hash.clone(),
     };
 
     emitter.emit_prologue(ir.params.len())?;
@@ -1064,6 +1146,7 @@ fn compile_arm64_function(
     Ok(CompiledFunction {
         text: emitter.text,
         relocations: emitter.relocations,
+        debug_ranges: emitter.debug_ranges,
     })
 }
 
@@ -1102,6 +1185,10 @@ struct Arm64Emitter {
     layout: Arm64StackLayout,
     text: Vec<u8>,
     relocations: Vec<TextRelocation>,
+    debug_ops: BTreeMap<String, LoweredDebugOp>,
+    debug_ranges: Vec<NativeDebugRange>,
+    symbol_hash: String,
+    function_def_hash: String,
 }
 
 impl Arm64Emitter {
@@ -1134,6 +1221,8 @@ impl Arm64Emitter {
     }
 
     fn emit_op(&mut self, op: &LoweredOp) -> Result<()> {
+        let debug_value_id = lowered_op_value_id(op).map(str::to_string);
+        let debug_start = self.text.len();
         match op {
             LoweredOp::Param { id, slot, .. } => {
                 let param = *self
@@ -1208,6 +1297,30 @@ impl Arm64Emitter {
                 bail!("return is only valid as the final lowered operation");
             }
         }
+        if let Some(value_id) = debug_value_id {
+            self.record_debug_range(&value_id, debug_start, self.text.len())?;
+        }
+        Ok(())
+    }
+
+    fn record_debug_range(&mut self, value_id: &str, start: usize, end: usize) -> Result<()> {
+        if end <= start {
+            return Ok(());
+        }
+        let op = self
+            .debug_ops
+            .get(value_id)
+            .ok_or_else(|| anyhow!("missing lowered debug op for value id {value_id}"))?;
+        self.debug_ranges.push(NativeDebugRange {
+            symbol_hash: self.symbol_hash.clone(),
+            function_def_hash: self.function_def_hash.clone(),
+            lowered_op_id: op.lowered_op_id.clone(),
+            value_id: op.value_id.clone(),
+            lowered_op_kind: op.lowered_op_kind.clone(),
+            expr_hash: op.expr_hash.clone(),
+            text_offset_start: start as u64,
+            text_offset_end: end as u64,
+        });
         Ok(())
     }
 

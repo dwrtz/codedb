@@ -14,7 +14,9 @@ use crate::backend::native::{
 use crate::backend::{ArtifactKind, ObjectBackend, ObjectBackendInput};
 use crate::backend_c::ensure_no_forbidden_runtime_calls;
 use crate::diff::dependency_pairs;
-use crate::lowering::{LoweredFunctionIr, LoweredOp};
+use crate::lowering::{
+    LoweredFunctionIr, LoweredOp, lowered_op_id_for_value, lowered_value_debug_ops,
+};
 use crate::migrations::{Operation, history_hash, migration_hash};
 use crate::model::{
     ProgramRootPayload, param_names, preferred_names, validate_projection_identifier,
@@ -1833,6 +1835,9 @@ impl CodeDb {
         }
         let uses_builtin_native_backend =
             object_artifact_uses_builtin_native_backend(key_input, metadata);
+        if uses_builtin_native_backend || metadata.get("debug_metadata").is_some() {
+            verify_native_debug_metadata_shape(errors, cache_key, metadata);
+        }
         if uses_builtin_native_backend {
             self.verify_object_artifact_matches_indexed_root(
                 errors,
@@ -1938,6 +1943,12 @@ impl CodeDb {
                 &dependencies,
                 &expected_relocation_targets,
             );
+            verify_object_debug_metadata_matches_lowered_ir(
+                errors,
+                cache_key,
+                metadata,
+                &expected_ir,
+            );
             if let Some(bytes) = artifact_bytes {
                 verify_builtin_native_object_bytes_reemit(
                     errors,
@@ -1945,6 +1956,7 @@ impl CodeDb {
                     key_input,
                     &expected_ir,
                     bytes,
+                    metadata,
                 );
             }
             return Ok(());
@@ -2710,6 +2722,169 @@ fn verify_object_relocations_match_dependencies(
     }
 }
 
+fn verify_native_debug_metadata_shape(
+    errors: &mut Vec<String>,
+    cache_key: &str,
+    metadata: &JsonValue,
+) {
+    let Some(debug_metadata) = metadata.get("debug_metadata") else {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} missing debug metadata"
+        ));
+        return;
+    };
+    if debug_metadata.get("schema").and_then(JsonValue::as_str)
+        != Some("codedb/native-debug-metadata/v1")
+    {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} bad debug metadata schema"
+        ));
+    }
+    if debug_metadata
+        .get("text_section")
+        .and_then(JsonValue::as_str)
+        != Some(".text")
+    {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} debug metadata text section mismatch"
+        ));
+    }
+    let Some(text_size) = debug_metadata.get("text_size").and_then(JsonValue::as_u64) else {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} debug metadata missing text_size"
+        ));
+        return;
+    };
+    let Some(ranges) = debug_metadata.get("ranges").and_then(JsonValue::as_array) else {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} debug metadata ranges must be an array"
+        ));
+        return;
+    };
+    if ranges.is_empty() {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} debug metadata has no ranges"
+        ));
+    }
+    let symbol_hash = metadata.get("symbol_hash").and_then(JsonValue::as_str);
+    let function_def_hash = metadata
+        .get("function_def_hash")
+        .and_then(JsonValue::as_str);
+    for range in ranges {
+        let value_id = range.get("value_id").and_then(JsonValue::as_str);
+        let lowered_op_id = range.get("lowered_op_id").and_then(JsonValue::as_str);
+        match (value_id, lowered_op_id) {
+            (Some(value_id), Some(lowered_op_id)) => {
+                if lowered_op_id != lowered_op_id_for_value(value_id) {
+                    errors.push(format!(
+                        "bad_object_artifact: {cache_key} debug range op id does not match value id"
+                    ));
+                }
+            }
+            _ => errors.push(format!(
+                "bad_object_artifact: {cache_key} malformed debug range identity"
+            )),
+        }
+        if range
+            .get("lowered_op_kind")
+            .and_then(JsonValue::as_str)
+            .is_none()
+            || range.get("expr_hash").and_then(JsonValue::as_str).is_none()
+        {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} malformed debug range semantic identity"
+            ));
+        }
+        if range.get("symbol_hash").and_then(JsonValue::as_str) != symbol_hash {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} debug range symbol mismatch"
+            ));
+        }
+        if range.get("function_def_hash").and_then(JsonValue::as_str) != function_def_hash {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} debug range function definition mismatch"
+            ));
+        }
+        let start = range
+            .get("text_offset_start")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(u64::MAX);
+        let end = range
+            .get("text_offset_end")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(u64::MAX);
+        if start >= end || end > text_size {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} malformed debug text range"
+            ));
+        }
+    }
+}
+
+fn verify_object_debug_metadata_matches_lowered_ir(
+    errors: &mut Vec<String>,
+    cache_key: &str,
+    metadata: &JsonValue,
+    ir: &LoweredFunctionIr,
+) {
+    let Some(debug_metadata) = metadata.get("debug_metadata") else {
+        return;
+    };
+    let Some(ranges) = debug_metadata.get("ranges").and_then(JsonValue::as_array) else {
+        return;
+    };
+    let expected_debug_ops = match lowered_value_debug_ops(ir) {
+        Ok(ops) => ops,
+        Err(err) => {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} cannot read lowered debug map: {err:#}"
+            ));
+            return;
+        }
+    };
+    let range_value_ids = ranges
+        .iter()
+        .filter_map(|range| range.get("value_id").and_then(JsonValue::as_str))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let expected_value_ids = expected_debug_ops.keys().cloned().collect::<BTreeSet<_>>();
+    if range_value_ids != expected_value_ids {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} debug ranges do not cover lowered operations"
+        ));
+        return;
+    }
+    let mut seen_values = BTreeSet::new();
+    for range in ranges {
+        let Some(value_id) = range.get("value_id").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        if !seen_values.insert(value_id.to_string()) {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} duplicate debug range for lowered value"
+            ));
+            continue;
+        }
+        let Some(expected) = expected_debug_ops.get(value_id) else {
+            continue;
+        };
+        if range.get("symbol_hash").and_then(JsonValue::as_str) != Some(ir.symbol_hash.as_str())
+            || range.get("function_def_hash").and_then(JsonValue::as_str)
+                != Some(ir.function_def_hash.as_str())
+            || range.get("lowered_op_id").and_then(JsonValue::as_str)
+                != Some(expected.lowered_op_id.as_str())
+            || range.get("lowered_op_kind").and_then(JsonValue::as_str)
+                != Some(expected.lowered_op_kind.as_str())
+            || range.get("expr_hash").and_then(JsonValue::as_str)
+                != Some(expected.expr_hash.as_str())
+        {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} debug range does not match lowered IR"
+            ));
+        }
+    }
+}
+
 fn lowered_call_targets(ir: &LoweredFunctionIr) -> Vec<String> {
     let mut targets = Vec::new();
     collect_lowered_call_targets(&ir.operations, &mut targets);
@@ -2777,6 +2952,7 @@ fn verify_builtin_native_object_bytes_reemit(
     key_input: &CacheKeyInput,
     ir: &LoweredFunctionIr,
     bytes: &[u8],
+    metadata: &JsonValue,
 ) {
     let emitted = match key_input.backend_id.as_str() {
         ELF_BACKEND_ID => ElfObjectBackend.emit_object(ObjectBackendInput {
@@ -2794,6 +2970,11 @@ fn verify_builtin_native_object_bytes_reemit(
             if emitted.bytes != bytes {
                 errors.push(format!(
                     "bad_object_artifact: {cache_key} object bytes do not match deterministic native backend output"
+                ));
+            }
+            if emitted.metadata.get("debug_metadata") != metadata.get("debug_metadata") {
+                errors.push(format!(
+                    "bad_object_artifact: {cache_key} debug metadata does not match deterministic native backend output"
                 ));
             }
         }
@@ -2960,6 +3141,7 @@ fn verify_link_plan_object_matches_object_metadata(
         ("defined symbols", "defined_symbols", "defined_symbols"),
         ("called symbols", "called_symbols", "called_symbols"),
         ("relocations", "relocations", "relocations"),
+        ("debug metadata", "debug_metadata", "debug_metadata"),
     ] {
         if object.get(plan_key) != metadata.get(metadata_key) {
             errors.push(format!(

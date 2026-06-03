@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, anyhow, bail};
 use rusqlite::params;
@@ -13,6 +13,7 @@ use crate::types::type_hash_for;
 use crate::{BYTES_DOMAIN, MAIN_BRANCH};
 
 pub(crate) const LOWERED_IR_SCHEMA: &str = "codedb/lowered-function-ir/v1";
+pub(crate) const LOWERED_DEBUG_MAP_SCHEMA: &str = "codedb/lowered-debug-map/v1";
 const LOWERED_IR_INSPECTION_SCHEMA: &str = "codedb/lowered-ir-inspection/v1";
 const LOWERING_BACKEND_ID: &str = "lowering-v0";
 const LOWERING_TARGET: &str = "target-independent-ir-v0";
@@ -27,6 +28,8 @@ pub(crate) struct LoweredFunctionIr {
     pub(crate) params: Vec<LoweredParamSlot>,
     pub(crate) return_type_hash: String,
     pub(crate) operations: Vec<LoweredOp>,
+    #[serde(default)]
+    pub(crate) debug_map: LoweredDebugMap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +42,37 @@ pub(crate) struct LoweredParamSlot {
 pub(crate) struct LoweredBlock {
     pub(crate) operations: Vec<LoweredOp>,
     pub(crate) result: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LoweredDebugMap {
+    pub(crate) schema: String,
+    pub(crate) operations: Vec<LoweredDebugOp>,
+    pub(crate) expr_to_ops: Vec<LoweredExprOpMap>,
+}
+
+impl Default for LoweredDebugMap {
+    fn default() -> Self {
+        Self {
+            schema: LOWERED_DEBUG_MAP_SCHEMA.to_string(),
+            operations: Vec::new(),
+            expr_to_ops: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LoweredDebugOp {
+    pub(crate) lowered_op_id: String,
+    pub(crate) value_id: String,
+    pub(crate) lowered_op_kind: String,
+    pub(crate) expr_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LoweredExprOpMap {
+    pub(crate) expr_hash: String,
+    pub(crate) lowered_op_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +157,7 @@ struct LocalLoweredBinding {
 #[derive(Default)]
 struct LowerCtx {
     next_value: usize,
+    debug_operations: Vec<LoweredDebugOp>,
 }
 
 impl LowerCtx {
@@ -130,6 +165,36 @@ impl LowerCtx {
         let value = format!("v{}", self.next_value);
         self.next_value += 1;
         value
+    }
+
+    fn push_debug_op(&mut self, expr_hash: &str, lowered_op_kind: &str, value_id: &str) {
+        self.debug_operations.push(LoweredDebugOp {
+            lowered_op_id: lowered_op_id_for_value(value_id),
+            value_id: value_id.to_string(),
+            lowered_op_kind: lowered_op_kind.to_string(),
+            expr_hash: expr_hash.to_string(),
+        });
+    }
+
+    fn into_debug_map(self) -> LoweredDebugMap {
+        let mut by_expr: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for op in &self.debug_operations {
+            by_expr
+                .entry(op.expr_hash.clone())
+                .or_default()
+                .push(op.lowered_op_id.clone());
+        }
+        LoweredDebugMap {
+            schema: LOWERED_DEBUG_MAP_SCHEMA.to_string(),
+            operations: self.debug_operations,
+            expr_to_ops: by_expr
+                .into_iter()
+                .map(|(expr_hash, lowered_op_ids)| LoweredExprOpMap {
+                    expr_hash,
+                    lowered_op_ids,
+                })
+                .collect(),
+        }
     }
 }
 
@@ -258,6 +323,7 @@ impl CodeDb {
 
         let mut ctx = LowerCtx::default();
         let mut lowered = self.lower_expr(root, &body, &param_types, &mut ctx, &mut Vec::new())?;
+        let debug_map = ctx.into_debug_map();
         lowered.operations.push(LoweredOp::Return {
             value: lowered.value,
             type_hash: return_type.clone(),
@@ -279,6 +345,7 @@ impl CodeDb {
                 .collect(),
             return_type_hash: return_type,
             operations: lowered.operations,
+            debug_map,
         })
     }
 
@@ -305,6 +372,7 @@ impl CodeDb {
                     .to_string();
                 value.parse::<i64>()?;
                 let id = ctx.value();
+                ctx.push_debug_op(expr_hash, "const_i64", &id);
                 Ok(LoweredExpr {
                     operations: vec![LoweredOp::ConstI64 {
                         id: id.clone(),
@@ -321,6 +389,7 @@ impl CodeDb {
                     .and_then(JsonValue::as_bool)
                     .ok_or_else(|| anyhow!("literal_bool missing value"))?;
                 let id = ctx.value();
+                ctx.push_debug_op(expr_hash, "const_bool", &id);
                 Ok(LoweredExpr {
                     operations: vec![LoweredOp::ConstBool {
                         id: id.clone(),
@@ -336,6 +405,7 @@ impl CodeDb {
                     bail!("literal_unit type mismatch");
                 }
                 let id = ctx.value();
+                ctx.push_debug_op(expr_hash, "const_unit", &id);
                 Ok(LoweredExpr {
                     operations: vec![LoweredOp::ConstUnit {
                         id: id.clone(),
@@ -358,6 +428,7 @@ impl CodeDb {
                     bail!("parameter slot {slot} type mismatch");
                 }
                 let id = ctx.value();
+                ctx.push_debug_op(expr_hash, "param", &id);
                 Ok(LoweredExpr {
                     operations: vec![LoweredOp::Param {
                         id: id.clone(),
@@ -409,6 +480,7 @@ impl CodeDb {
                     arg_values.push(lowered.value);
                 }
                 let id = ctx.value();
+                ctx.push_debug_op(expr_hash, "call", &id);
                 operations.push(LoweredOp::Call {
                     id: id.clone(),
                     target_symbol_hash,
@@ -440,6 +512,7 @@ impl CodeDb {
                     lower_binary_kind(source_op, &left.type_hash, &right.type_hash, &type_hash)?;
                 let trap = trap_for_binary(&kind);
                 let id = ctx.value();
+                ctx.push_debug_op(expr_hash, "binary", &id);
                 let mut operations = left.operations;
                 operations.extend(right.operations);
                 operations.push(LoweredOp::Binary {
@@ -468,6 +541,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("unary missing op"))?;
                 let kind = lower_unary_kind(source_op, &child.type_hash, &type_hash)?;
                 let id = ctx.value();
+                ctx.push_debug_op(expr_hash, "unary", &id);
                 let mut operations = child.operations;
                 operations.push(LoweredOp::Unary {
                     id: id.clone(),
@@ -537,6 +611,7 @@ impl CodeDb {
                     bail!("if branch type mismatch while lowering");
                 }
                 let id = ctx.value();
+                ctx.push_debug_op(expr_hash, "if", &id);
                 let mut operations = cond.operations;
                 operations.push(LoweredOp::If {
                     id: id.clone(),
@@ -680,6 +755,75 @@ impl CodeDb {
         }
         if ir.operations.is_empty() {
             bail!("lowered IR has no return operation");
+        }
+        self.verify_lowered_debug_map(ir)?;
+        Ok(())
+    }
+
+    fn verify_lowered_debug_map(&self, ir: &LoweredFunctionIr) -> Result<()> {
+        if ir.debug_map.schema != LOWERED_DEBUG_MAP_SCHEMA {
+            bail!("lowered debug map schema must be {LOWERED_DEBUG_MAP_SCHEMA}");
+        }
+        let expected_ops = lowered_value_debug_infos(&ir.operations)?;
+        if expected_ops.is_empty() {
+            bail!("lowered debug map has no value-producing operations");
+        }
+        let mut seen_op_ids = BTreeSet::new();
+        let mut seen_value_ids = BTreeSet::new();
+        let mut actual_ops = BTreeMap::new();
+        let mut actual_by_expr: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for op in &ir.debug_map.operations {
+            if op.lowered_op_id != lowered_op_id_for_value(&op.value_id) {
+                bail!(
+                    "lowered debug map op id does not match value id {}",
+                    op.value_id
+                );
+            }
+            if !seen_op_ids.insert(op.lowered_op_id.clone()) {
+                bail!("duplicate lowered debug op id {}", op.lowered_op_id);
+            }
+            if !seen_value_ids.insert(op.value_id.clone()) {
+                bail!("duplicate lowered debug value id {}", op.value_id);
+            }
+            if !is_hash(&op.expr_hash) {
+                bail!("lowered debug map expression is not a hash");
+            }
+            if self.get_kind(&op.expr_hash)? != "Expression" {
+                bail!("lowered debug map expression is not an Expression");
+            }
+            actual_by_expr
+                .entry(op.expr_hash.clone())
+                .or_default()
+                .push(op.lowered_op_id.clone());
+            actual_ops.insert(
+                op.value_id.clone(),
+                (op.lowered_op_kind.clone(), op.lowered_op_id.clone()),
+            );
+        }
+
+        let expected_value_ids = expected_ops.keys().cloned().collect::<BTreeSet<_>>();
+        if expected_value_ids != seen_value_ids {
+            bail!("lowered debug map does not cover all value-producing operations");
+        }
+        for (value_id, expected_kind) in expected_ops {
+            match actual_ops.get(&value_id) {
+                Some((actual_kind, _)) if actual_kind == &expected_kind => {}
+                Some((actual_kind, _)) => bail!(
+                    "lowered debug map kind {actual_kind} does not match operation kind {expected_kind} for {value_id}"
+                ),
+                None => bail!("lowered debug map missing value id {value_id}"),
+            }
+        }
+
+        let expected_expr_to_ops = actual_by_expr
+            .into_iter()
+            .map(|(expr_hash, lowered_op_ids)| LoweredExprOpMap {
+                expr_hash,
+                lowered_op_ids,
+            })
+            .collect::<Vec<_>>();
+        if ir.debug_map.expr_to_ops != expected_expr_to_ops {
+            bail!("lowered debug map expr_to_ops index mismatch");
         }
         Ok(())
     }
@@ -1015,6 +1159,85 @@ fn value_type<'a>(values: &'a BTreeMap<String, String>, id: &str) -> Result<&'a 
     values
         .get(id)
         .ok_or_else(|| anyhow!("unknown lowered value id {id}"))
+}
+
+pub(crate) fn lowered_op_id_for_value(value_id: &str) -> String {
+    format!("op:{value_id}")
+}
+
+pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
+    match op {
+        LoweredOp::Param { id, .. }
+        | LoweredOp::ConstI64 { id, .. }
+        | LoweredOp::ConstBool { id, .. }
+        | LoweredOp::ConstUnit { id, .. }
+        | LoweredOp::Unary { id, .. }
+        | LoweredOp::Binary { id, .. }
+        | LoweredOp::Call { id, .. }
+        | LoweredOp::If { id, .. } => Some(id),
+        LoweredOp::Return { .. } => None,
+    }
+}
+
+pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
+    match op {
+        LoweredOp::Param { .. } => "param",
+        LoweredOp::ConstI64 { .. } => "const_i64",
+        LoweredOp::ConstBool { .. } => "const_bool",
+        LoweredOp::ConstUnit { .. } => "const_unit",
+        LoweredOp::Unary { .. } => "unary",
+        LoweredOp::Binary { .. } => "binary",
+        LoweredOp::Call { .. } => "call",
+        LoweredOp::If { .. } => "if",
+        LoweredOp::Return { .. } => "return",
+    }
+}
+
+pub(crate) fn lowered_value_debug_ops(
+    ir: &LoweredFunctionIr,
+) -> Result<BTreeMap<String, LoweredDebugOp>> {
+    let expected_values = lowered_value_debug_infos(&ir.operations)?
+        .into_keys()
+        .collect::<BTreeSet<_>>();
+    let mut out = BTreeMap::new();
+    for op in &ir.debug_map.operations {
+        if expected_values.contains(&op.value_id) {
+            out.insert(op.value_id.clone(), op.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn lowered_value_debug_infos(operations: &[LoweredOp]) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    collect_lowered_value_debug_infos(operations, &mut out)?;
+    Ok(out)
+}
+
+fn collect_lowered_value_debug_infos(
+    operations: &[LoweredOp],
+    out: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    for op in operations {
+        if let Some(value_id) = lowered_op_value_id(op) {
+            if out
+                .insert(value_id.to_string(), lowered_op_kind_name(op).to_string())
+                .is_some()
+            {
+                bail!("duplicate lowered value id {value_id}");
+            }
+        }
+        if let LoweredOp::If {
+            then_block,
+            else_block,
+            ..
+        } = op
+        {
+            collect_lowered_value_debug_infos(&then_block.operations, out)?;
+            collect_lowered_value_debug_infos(&else_block.operations, out)?;
+        }
+    }
+    Ok(())
 }
 
 fn is_hash(value: &str) -> bool {

@@ -310,7 +310,7 @@ implementation_hash
   "code_model": "code-model:default",
   "optimization_level": "opt:none",
   "compiler_version": "codedb-0.1.0",
-  "pipeline_version": "pipeline:v0",
+  "pipeline_version": "pipeline:v1",
   "runtime_sentinel": "runtime:none"
 }
 ```
@@ -381,13 +381,31 @@ Lowered functions use `codedb/lowered-function-ir/v1`:
   "typed_body_expr_hash": "sha256:expression",
   "params": [{ "slot": 0, "type_hash": "sha256:type" }],
   "return_type_hash": "sha256:type",
-  "operations": []
+  "operations": [],
+  "debug_map": {
+    "schema": "codedb/lowered-debug-map/v1",
+    "operations": [
+      {
+        "lowered_op_id": "op:v0",
+        "value_id": "v0",
+        "lowered_op_kind": "const_i64",
+        "expr_hash": "sha256:expression"
+      }
+    ],
+    "expr_to_ops": [
+      {
+        "expr_hash": "sha256:expression",
+        "lowered_op_ids": ["op:v0"]
+      }
+    ]
+  }
 }
 ```
 
 Operations include `param`, `const_i64`, `const_bool`, `const_unit`, `unary`,
 `binary`, `call`, `if`, and `return`. Calls target `target_symbol_hash`; they
-do not target display names.
+do not target display names. `debug_map` records stable lowered operation IDs
+for value-producing operations and maps expression hashes back to those IDs.
 
 Inspect lowered IR:
 
@@ -426,7 +444,24 @@ Metadata for native objects uses `codedb/native-object/v1`:
       "target_symbol_hash": "sha256:callee-symbol",
       "target_abi_symbol": "codedb_fedcba9876543210"
     }
-  ]
+  ],
+  "debug_metadata": {
+    "schema": "codedb/native-debug-metadata/v1",
+    "text_section": ".text",
+    "text_size": 64,
+    "ranges": [
+      {
+        "symbol_hash": "sha256:symbol",
+        "function_def_hash": "sha256:function-def",
+        "lowered_op_id": "op:v0",
+        "value_id": "v0",
+        "lowered_op_kind": "const_i64",
+        "expr_hash": "sha256:expression",
+        "text_offset_start": 12,
+        "text_offset_end": 24
+      }
+    ]
+  }
 }
 ```
 
@@ -439,7 +474,9 @@ Internal ABI symbols are derived only from symbol identity:
 codedb_<first 16 hex characters of symbol_hash>
 ```
 
-Renames and aliases do not change native object identity.
+Renames and aliases do not change native object identity or native debug
+metadata. Body changes can change expression hashes, lowered operation ranges,
+and object bytes.
 
 ## Link Plans and Executables
 
@@ -452,7 +489,19 @@ Renames and aliases do not change native object identity.
   "target_triple": "x86_64-unknown-linux-gnu",
   "entry_symbol_hash": "sha256:symbol",
   "entry_abi_symbol": "codedb_0123456789abcdef",
-  "objects": [],
+  "objects": [
+    {
+      "symbol_hash": "sha256:symbol",
+      "object_cache_key": "sha256:cache-key",
+      "object_artifact_hash": "sha256:bytes",
+      "debug_metadata": {
+        "schema": "codedb/native-debug-metadata/v1",
+        "text_section": ".text",
+        "text_size": 64,
+        "ranges": []
+      }
+    }
+  ],
   "export_map": [],
   "external_symbols": [],
   "output_kind": "executable",
@@ -496,8 +545,8 @@ Disposable artifact cache:
   `artifact_bytes`.
 
 Verification recomputes object hashes, object edges, materialized indexes,
-cache key hashes, artifact metadata hashes, native object byte hashes, link
-plans, and executable metadata where possible.
+cache key hashes, artifact metadata hashes, native object byte hashes, native
+debug metadata, link plans, and executable metadata where possible.
 
 ## Common Artifact Commands
 
