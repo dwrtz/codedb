@@ -208,6 +208,52 @@ fn failed_object_jobs_record_structured_errors_and_retry() {
 }
 
 #[test]
+fn succeeded_jobs_retry_after_disposable_cache_entries_are_deleted() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("disposable-cache.sqlite");
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), "examples/shop.cdb"]);
+
+    run(&[
+        "link-native",
+        path(&db),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        path(&temp.path().join("main.link.json")),
+    ]);
+    assert_eq!(cache_count_by_kind(&db, "object_file"), 3);
+    assert_eq!(cache_count_by_kind(&db, "link_plan"), 1);
+    assert!(
+        job_statuses(&db, "object_file")
+            .iter()
+            .all(|status| status == "succeeded")
+    );
+    assert_eq!(job_statuses(&db, "link_plan"), vec!["succeeded"]);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("DELETE FROM compile_cache", []).unwrap();
+    drop(conn);
+    assert_eq!(cache_count_by_kind(&db, "object_file"), 0);
+    assert_eq!(cache_count_by_kind(&db, "link_plan"), 0);
+    run(&["verify", path(&db)]);
+
+    run(&[
+        "link-native",
+        path(&db),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        path(&temp.path().join("main-rebuilt.link.json")),
+    ]);
+    assert_eq!(cache_count_by_kind(&db, "object_file"), 3);
+    assert_eq!(cache_count_by_kind(&db, "link_plan"), 1);
+    run(&["verify", path(&db)]);
+}
+
+#[test]
 fn rename_reuses_object_jobs_and_body_change_enqueues_changed_object_and_link_work() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("artifact-impact.sqlite");

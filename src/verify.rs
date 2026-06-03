@@ -1047,14 +1047,12 @@ impl CodeDb {
                             |row| row.get::<_, String>(0),
                         )
                         .optional()?;
-                    match cache_artifact_kind {
-                        Some(cache_artifact_kind) if cache_artifact_kind == artifact_kind => {}
-                        Some(cache_artifact_kind) => errors.push(format!(
+                    if let Some(cache_artifact_kind) = cache_artifact_kind
+                        && cache_artifact_kind != artifact_kind
+                    {
+                        errors.push(format!(
                             "bad_artifact_job: {cache_key} succeeded job kind {artifact_kind} does not match cache kind {cache_artifact_kind}"
-                        )),
-                        None => errors.push(format!(
-                            "bad_artifact_job: {cache_key} succeeded job is missing cache entry"
-                        )),
+                        ));
                     }
                 }
                 "failed" | "abandoned" => {

@@ -442,7 +442,7 @@ fn verify_rejects_malformed_workspace_transaction_response() {
 }
 
 #[test]
-fn verify_rejects_succeeded_artifact_job_without_cache_entry() {
+fn verify_allows_succeeded_artifact_job_without_disposable_cache_entry() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("artifact-job-missing-cache.sqlite");
     let plan = temp.path().join("main.link.json");
@@ -473,9 +473,7 @@ fn verify_rejects_succeeded_artifact_job_without_cache_entry() {
     )
     .unwrap();
 
-    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
-    assert!(stderr.contains("bad_artifact_job"));
-    assert!(stderr.contains("succeeded job is missing cache entry"));
+    run(&["verify", db.to_str().unwrap()]);
 }
 
 #[test]

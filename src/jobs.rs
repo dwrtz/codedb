@@ -138,7 +138,15 @@ impl CodeDb {
                      error_json = NULL
                  WHERE cache_key = ?1
                    AND artifact_kind = ?3
-                   AND status IN ('queued', 'failed', 'abandoned')",
+                   AND (
+                        status IN ('queued', 'failed', 'abandoned')
+                        OR (
+                            status = 'succeeded'
+                            AND NOT EXISTS (
+                                SELECT 1 FROM compile_cache WHERE cache_key = ?1
+                            )
+                        )
+                   )",
                 params![cache_key, worker_id, artifact_kind.as_str()],
             )?;
             let changed = self.conn.changes();
@@ -256,6 +264,27 @@ impl CodeDb {
                     }
                     "queued" | "running" | "succeeded" => {}
                     other => bail!("artifact job {cache_key} has unknown status {other:?}"),
+                }
+                if record.status == "succeeded" {
+                    self.conn.execute(
+                        "UPDATE artifact_jobs
+                         SET status = 'queued',
+                             worker_id = NULL,
+                             started_at = NULL,
+                             finished_at = NULL,
+                             error_json = NULL
+                         WHERE cache_key = ?1
+                           AND status = 'succeeded'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM compile_cache WHERE cache_key = ?1
+                           )",
+                        params![cache_key],
+                    )?;
+                    if self.conn.changes() == 1 {
+                        bail!(
+                            "artifact job {cache_key} succeeded but its disposable cache entry is missing; retry the build"
+                        );
+                    }
                 }
             }
             thread::sleep(JOB_WAIT_POLL);
@@ -382,6 +411,7 @@ fn finish_job_transaction<T>(conn: &mut rusqlite::Connection, result: Result<T>)
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::params;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -411,6 +441,29 @@ mod tests {
         db.complete_artifact_job(cache_key, "worker-a").unwrap();
         assert_eq!(
             db.claim_artifact_job(cache_key, ArtifactKind::ObjectFile, "worker-b")
+                .unwrap(),
+            ArtifactJobClaim::Claimed
+        );
+
+        let succeeded_key = "sha256:succeeded-job";
+        let input_hash = db.put_object("TestInput", &json!({})).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO compile_cache
+                 (cache_key, cache_key_json, input_hash, backend, target, compiler_version,
+                  artifact_kind, artifact_hash)
+                 VALUES (?1, '{}', ?2, 'test', 'test', 'test', ?3, 'sha256:artifact')",
+                params![succeeded_key, input_hash, ArtifactKind::ObjectFile.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            db.claim_artifact_job(succeeded_key, ArtifactKind::ObjectFile, "worker-a")
+                .unwrap(),
+            ArtifactJobClaim::Claimed
+        );
+        db.complete_artifact_job(succeeded_key, "worker-a").unwrap();
+        assert_eq!(
+            db.claim_artifact_job(succeeded_key, ArtifactKind::ObjectFile, "worker-b")
                 .unwrap(),
             ArtifactJobClaim::Succeeded
         );
