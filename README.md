@@ -145,7 +145,8 @@ optional JSON-RPC `id` fields. Responses use the stable
 `workspace.current`, `workspace.branches`, `symbols.list`, `symbols.show`,
 `symbols.resolve`, `symbols.callers`, `roots.diff`, `roots.export_projection`,
 `build.plan`, `build.execute`, `build.artifact_status`, `trace.run`,
-`debug.run`, `history.list`, and `verify.run`. It also exposes
+`debug.run`, `tests.list`, `tests.run`, `tests.impact`, `history.list`, and
+`verify.run`. It also exposes
 `workspace.branch.create`, `workspace.branch.fast_forward`,
 `workspace.branch.delete`, `workspace.branch.compare`, `ops.apply` for atomic
 `codedb/apply/v1` structural writes, and `ops.preview` for rollback-only
@@ -205,6 +206,15 @@ cargo run -- branch compare <db> <branch-a> <branch-b> [--json]
 cargo run -- branch fast-forward <db> <target> <source> --expect-root <root> [--json]
 cargo run -- branch delete <db> <name> [--expect-root <root>] [--json]
 cargo run -- export-map <db> [--json]
+```
+
+Semantic tests:
+
+```bash
+cargo run -- test <db> [--list] [--json]
+cargo run -- create-test <db> <name> --entry <function> [--arg <value>] --expect-i64 <value> [--category behavior|projection|export] [--expect-root <root>] [--json]
+cargo run -- delete-test <db> <name> [--expect-root <root>] [--json]
+cargo run -- test-impact <db> <old-root> <new-root> [--json]
 ```
 
 Structural mutations:

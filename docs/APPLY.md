@@ -83,9 +83,27 @@ are rejected.
 { "kind": "remove_export", "name": "tax", "exported_name": "public_tax" }
 ```
 
+```json
+{
+  "kind": "create_test",
+  "name": "main_returns_120",
+  "entry": "main",
+  "expected": { "kind": "i64", "value": "120" },
+  "category": "behavior"
+}
+```
+
+```json
+{ "kind": "delete_test", "name": "main_returns_120" }
+```
+
 For non-create operations, `module` defaults to `main`. `symbol` may be supplied
 to bind directly to stable identity; otherwise CodeDB resolves `name` in the
 expected root.
+
+`create_test` categories are `behavior` (default), `projection`, and `export`.
+Incremental test impact uses the category to decide whether rename/export-only
+changes should select a test.
 
 ## Expressions
 

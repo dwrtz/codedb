@@ -77,6 +77,8 @@ enum Command {
         #[arg(long)]
         expect_unit: bool,
         #[arg(long)]
+        category: Option<String>,
+        #[arg(long)]
         native_agreement: bool,
         #[arg(long)]
         expect_root: Option<String>,
@@ -89,6 +91,14 @@ enum Command {
         name: String,
         #[arg(long)]
         expect_root: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Select semantic tests affected between two roots")]
+    TestImpact {
+        db: PathBuf,
+        old_root: String,
+        new_root: String,
         #[arg(long)]
         json: bool,
     },
@@ -413,6 +423,7 @@ fn main() -> Result<()> {
             expect_i64,
             expect_bool,
             expect_unit,
+            category,
             native_agreement,
             expect_root,
             json,
@@ -427,6 +438,7 @@ fn main() -> Result<()> {
                     expect_i64.as_deref(),
                     expect_bool,
                     expect_unit,
+                    category.as_deref(),
                     native_agreement,
                     expect_root.as_deref(),
                     json,
@@ -448,6 +460,19 @@ fn main() -> Result<()> {
                     json,
                 )?
             );
+        }
+        Command::TestImpact {
+            db,
+            old_root,
+            new_root,
+            json,
+        } => {
+            let codedb = codedb::CodeDb::open(db)?;
+            if json {
+                print!("{}", codedb.test_impact_json(&old_root, &new_root)?);
+            } else {
+                print!("{}", codedb.test_impact(&old_root, &new_root)?);
+            }
         }
         Command::Trace {
             db,

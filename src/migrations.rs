@@ -11,8 +11,8 @@ use crate::build_plan::{BuildImpact, BuildImpactKind, BuildImpactReason, project
 use crate::expr::RawExpr;
 use crate::model::{
     BranchState, ExportBinding, NameBinding, ParamNames, ProgramRootPayload, RootSymbolPayload,
-    RootTestBinding, TestCasePayload, TestValue, param_names, root_symbol_index, test_binding_for,
-    upsert_param_names, validate_projection_identifier,
+    RootTestBinding, TestCasePayload, TestCategory, TestValue, param_names, root_symbol_index,
+    test_binding_for, upsert_param_names, validate_projection_identifier,
 };
 use crate::store::{CodeDb, canonical_json, hash_bytes};
 use crate::tests::{test_points_to_entry_symbol, validate_test_value_type};
@@ -87,6 +87,8 @@ pub(crate) enum Operation {
         entry_module: String,
         entry_name: String,
         entry_symbol: String,
+        #[serde(default, skip_serializing_if = "TestCategory::is_behavior")]
+        category: TestCategory,
         #[serde(default)]
         args: Vec<TestValue>,
         expected: TestValue,
@@ -593,6 +595,7 @@ fn operation_summary_parts(op: &Operation) -> (String, SemanticImpact, Typecheck
             name,
             entry_module,
             entry_name,
+            category: _,
             ..
         } => (
             format!("{name} for {entry_module}.{entry_name}"),
@@ -1031,6 +1034,7 @@ impl CodeDb {
                 entry_module,
                 entry_name,
                 entry_symbol,
+                category: _,
                 ..
             } => vec![
                 Precondition::RootIsCurrent {
@@ -1527,6 +1531,7 @@ impl CodeDb {
                 entry_module,
                 entry_name,
                 entry_symbol,
+                category,
                 args,
                 expected,
                 native_agreement,
@@ -1536,6 +1541,7 @@ impl CodeDb {
                 entry_module,
                 entry_name,
                 entry_symbol,
+                *category,
                 args,
                 expected,
                 *native_agreement,
@@ -1883,6 +1889,7 @@ impl CodeDb {
         entry_module: &str,
         entry_name: &str,
         entry_symbol: &str,
+        category: TestCategory,
         args: &[TestValue],
         expected: &TestValue,
         native_agreement: bool,
@@ -1910,6 +1917,7 @@ impl CodeDb {
         validate_test_value_type(expected, self.type_name(&return_type)?, "expected value")?;
         let case = TestCasePayload {
             schema: crate::model::TEST_CASE_SCHEMA.to_string(),
+            category,
             entry_symbol: entry_symbol.to_string(),
             args: args.to_vec(),
             expected: expected.clone(),

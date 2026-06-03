@@ -469,6 +469,7 @@ fn dispatch_workspace_method(
         "debug.run" => debug_run(db, params),
         "tests.list" => tests_list(db, params),
         "tests.run" => tests_run(db, params),
+        "tests.impact" => tests_impact(db, params),
         "history.list" => history_list(db, params),
         "verify.run" => verify_run(db, params),
         _ => Err(WorkspaceMethodError::new(
@@ -1095,6 +1096,19 @@ fn tests_run(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMetho
             snapshot,
         ));
     }
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn tests_impact(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let branch = branch_param(params)?;
+    let object = params_object(params)?;
+    let old_root = required_str_any(object, &["old_root_hash", "old_root", "root_a"])?;
+    let new_root = required_str_any(object, &["new_root_hash", "new_root", "root_b"])?;
+    let result = parse_json_payload(
+        db.test_impact_json(old_root, new_root)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, &branch)?;
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 

@@ -7,7 +7,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::MAIN_BRANCH;
 use crate::expr::RawExpr;
 use crate::migrations::{MigrationStatus, Operation};
-use crate::model::TestValue;
+use crate::model::{TestCategory, TestValue};
 use crate::store::{CodeDb, canonical_json};
 use crate::types::ParamSpec;
 
@@ -138,6 +138,8 @@ enum ApiOperation {
         args: Vec<TestValue>,
         #[serde(alias = "expect")]
         expected: TestValue,
+        #[serde(default)]
+        category: TestCategory,
         #[serde(default)]
         native_agreement: bool,
         #[serde(default, alias = "expect_root")]
@@ -581,6 +583,7 @@ impl CodeDb {
                 entry_name,
                 args,
                 expected,
+                category,
                 native_agreement,
                 ..
             } => self.create_test_operation_from_values(
@@ -591,6 +594,7 @@ impl CodeDb {
                 symbol.as_deref(),
                 args.clone(),
                 expected.clone(),
+                *category,
                 *native_agreement,
             ),
             ApiOperation::DeleteTest { name, test, .. } => Ok(Operation::DeleteTest {

@@ -55,11 +55,41 @@ pub(crate) struct RootTestBinding {
 pub(crate) struct TestCasePayload {
     #[serde(default = "default_test_case_schema")]
     pub(crate) schema: String,
+    #[serde(default, skip_serializing_if = "TestCategory::is_behavior")]
+    pub(crate) category: TestCategory,
     pub(crate) entry_symbol: String,
     pub(crate) args: Vec<TestValue>,
     pub(crate) expected: TestValue,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) native_agreement: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TestCategory {
+    Behavior,
+    Projection,
+    Export,
+}
+
+impl Default for TestCategory {
+    fn default() -> Self {
+        Self::Behavior
+    }
+}
+
+impl TestCategory {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            TestCategory::Behavior => "behavior",
+            TestCategory::Projection => "projection",
+            TestCategory::Export => "export",
+        }
+    }
+
+    pub(crate) fn is_behavior(&self) -> bool {
+        matches!(self, TestCategory::Behavior)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
