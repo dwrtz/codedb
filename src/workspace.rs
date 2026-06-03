@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 use crate::model::{BranchState, aliases_for, param_names};
-use crate::store::{BranchFastForwardOutcome, CodeDb, canonical_json};
+use crate::store::{BranchDeleteOutcome, BranchFastForwardOutcome, CodeDb, canonical_json};
 use crate::{DEFAULT_NATIVE_TARGET, MAIN_BRANCH};
 
 pub const WORKSPACE_REQUEST_SCHEMA: &str = "codedb/request/v1";
@@ -612,24 +612,54 @@ fn workspace_branch_delete(
 ) -> MethodResult<WorkspaceMethodResult> {
     let object = params_object(params)?;
     let name = required_str_any(object, &["name", "branch"])?;
+    let expected_root = optional_str_any(
+        object,
+        &[
+            "expect_root_hash",
+            "expected_root_hash",
+            "expect_root",
+            "expected_root",
+        ],
+    )?;
     if name == MAIN_BRANCH {
         return Err(WorkspaceMethodError::new(
             "invalid_params",
             "workspace.branch.delete cannot delete the main branch",
         ));
     }
-    let deleted = db
-        .delete_branch_pointer(name)
-        .map_err(WorkspaceMethodError::method)?;
-    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
-    let result = json!({
-        "schema": "codedb/branch-operation-result/v1",
-        "status": "deleted",
-        "branch": name,
-        "old_root_hash": deleted.root_hash,
-        "old_history_hash": deleted.history_hash,
-    });
-    Ok(WorkspaceMethodResult::new(result, snapshot))
+    match db
+        .delete_branch_pointer_expected(name, expected_root)
+        .map_err(WorkspaceMethodError::method)?
+    {
+        BranchDeleteOutcome::Deleted(deleted) => {
+            let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+            let result = json!({
+                "schema": "codedb/branch-operation-result/v1",
+                "status": "deleted",
+                "branch": name,
+                "old_root_hash": deleted.root_hash,
+                "old_history_hash": deleted.history_hash,
+            });
+            Ok(WorkspaceMethodResult::new(result, snapshot))
+        }
+        BranchDeleteOutcome::StaleRoot { current } => {
+            let snapshot = WorkspaceSnapshot {
+                branch: name.to_string(),
+                root_hash: current.root_hash.clone(),
+                history_hash: current.history_hash,
+            };
+            Err(WorkspaceMethodError::stale_root(
+                format!(
+                    "branch {name:?} moved before delete; expected root {}, actual root {}",
+                    expected_root.unwrap_or(""),
+                    current.root_hash
+                ),
+                snapshot,
+                expected_root.unwrap_or(""),
+                current.root_hash,
+            ))
+        }
+    }
 }
 
 fn workspace_branch_compare(
@@ -996,6 +1026,14 @@ fn trace_run(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodRes
     )?;
     let diagnostics = trace_workspace_diagnostics(&result);
     let snapshot = workspace_snapshot(db, &branch)?;
+    if result.get("status").and_then(JsonValue::as_str) == Some("error") {
+        return Err(nested_result_workspace_error(
+            "trace_error",
+            &result,
+            diagnostics,
+            snapshot,
+        ));
+    }
     Ok(WorkspaceMethodResult {
         result,
         diagnostics,
@@ -1015,6 +1053,14 @@ fn debug_run(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodRes
     )?;
     let diagnostics = trace_workspace_diagnostics(&result);
     let snapshot = workspace_snapshot(db, &branch)?;
+    if result.get("status").and_then(JsonValue::as_str) == Some("error") {
+        return Err(nested_result_workspace_error(
+            "debug_error",
+            &result,
+            diagnostics,
+            snapshot,
+        ));
+    }
     Ok(WorkspaceMethodResult {
         result,
         diagnostics,
@@ -1484,4 +1530,38 @@ fn trace_workspace_diagnostics(result: &JsonValue) -> Vec<WorkspaceDiagnostic> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn nested_result_workspace_error(
+    kind: &'static str,
+    result: &JsonValue,
+    mut diagnostics: Vec<WorkspaceDiagnostic>,
+    snapshot: WorkspaceSnapshot,
+) -> WorkspaceMethodError {
+    let message = diagnostics
+        .first()
+        .map(|diagnostic| diagnostic.message.clone())
+        .or_else(|| first_debug_command_error_message(result))
+        .unwrap_or_else(|| format!("{kind} returned an error result"));
+    if diagnostics.is_empty() {
+        diagnostics.push(WorkspaceDiagnostic {
+            kind: kind.to_string(),
+            message: message.clone(),
+            details: Some(result.clone()),
+        });
+    }
+    WorkspaceMethodError::new(kind, message)
+        .with_snapshot(snapshot)
+        .with_diagnostics(diagnostics)
+}
+
+fn first_debug_command_error_message(result: &JsonValue) -> Option<String> {
+    result
+        .get("commands")
+        .and_then(JsonValue::as_array)?
+        .iter()
+        .find(|command| command.get("status").and_then(JsonValue::as_str) == Some("error"))
+        .and_then(|command| command.get("message"))
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
 }

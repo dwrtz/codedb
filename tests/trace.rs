@@ -226,3 +226,31 @@ fn workspace_api_runs_semantic_trace() {
         response["result"]["root_hash"]
     );
 }
+
+#[test]
+fn workspace_api_returns_error_envelope_for_trace_failures() {
+    let temp = tempdir().unwrap();
+    let db_path = temp.path().join("trace-api-trap.sqlite");
+    let source = temp.path().join("trap.cdb");
+    std::fs::write(&source, "fn main() -> i64 = 1 / 0\n").unwrap();
+    let mut db = CodeDb::open(&db_path).unwrap();
+    db.init().unwrap();
+    db.import_file(&source).unwrap();
+
+    let response = workspace_call(&mut db, "trace.run", json!({"entry": "main", "args": []}));
+    assert_eq!(response["schema"], "codedb/response/v1");
+    assert_eq!(response["status"], "error");
+    assert_eq!(response["error"]["kind"], "trace_error");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("division by zero")
+    );
+    assert_eq!(response["diagnostics"][0]["kind"], "trap");
+    assert_eq!(
+        response["diagnostics"][0]["details"]["location"]["root_hash"],
+        response["snapshot"]["root_hash"]
+    );
+    assert_eq!(response["result"], JsonValue::Null);
+}

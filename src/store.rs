@@ -45,6 +45,12 @@ pub(crate) enum BranchFastForwardOutcome {
     },
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum BranchDeleteOutcome {
+    Deleted(BranchState),
+    StaleRoot { current: BranchState },
+}
+
 impl CodeDb {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -218,14 +224,23 @@ impl CodeDb {
         Ok(false)
     }
 
-    pub(crate) fn delete_branch_pointer(&mut self, name: &str) -> Result<BranchState> {
+    pub(crate) fn delete_branch_pointer_expected(
+        &mut self,
+        name: &str,
+        expected_root_hash: Option<&str>,
+    ) -> Result<BranchDeleteOutcome> {
         validate_branch_name(name)?;
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| {
             let state = self.branch(name)?;
+            if let Some(expected_root_hash) = expected_root_hash
+                && state.root_hash != expected_root_hash
+            {
+                return Ok(BranchDeleteOutcome::StaleRoot { current: state });
+            }
             self.conn
                 .execute("DELETE FROM branches WHERE name = ?1", params![name])?;
-            Ok(state)
+            Ok(BranchDeleteOutcome::Deleted(state))
         })();
         finish_immediate_transaction(&mut self.conn, result)
     }

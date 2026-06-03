@@ -3,7 +3,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::MAIN_BRANCH;
 use crate::model::BranchState;
-use crate::store::{BranchFastForwardOutcome, CodeDb, canonical_json};
+use crate::store::{BranchDeleteOutcome, BranchFastForwardOutcome, CodeDb, canonical_json};
 
 const BRANCH_OPERATION_RESULT_SCHEMA: &str = "codedb/branch-operation-result/v1";
 const BRANCH_COMPARE_SCHEMA: &str = "codedb/branch-compare/v1";
@@ -99,18 +99,33 @@ impl CodeDb {
         }
     }
 
-    pub fn delete_branch(&mut self, name: &str, json_format: bool) -> Result<String> {
+    pub fn delete_branch(
+        &mut self,
+        name: &str,
+        expected_root_hash: Option<&str>,
+        json_format: bool,
+    ) -> Result<String> {
         if name == MAIN_BRANCH {
             bail!("cannot delete the main branch");
         }
-        let deleted = self.delete_branch_pointer(name)?;
-        let payload = json!({
-            "schema": BRANCH_OPERATION_RESULT_SCHEMA,
-            "status": "deleted",
-            "branch": name,
-            "old_root_hash": deleted.root_hash,
-            "old_history_hash": deleted.history_hash,
-        });
+        let outcome = self.delete_branch_pointer_expected(name, expected_root_hash)?;
+        let payload = match outcome {
+            BranchDeleteOutcome::Deleted(deleted) => json!({
+                "schema": BRANCH_OPERATION_RESULT_SCHEMA,
+                "status": "deleted",
+                "branch": name,
+                "old_root_hash": deleted.root_hash,
+                "old_history_hash": deleted.history_hash,
+            }),
+            BranchDeleteOutcome::StaleRoot { current } => json!({
+                "schema": BRANCH_OPERATION_RESULT_SCHEMA,
+                "status": "stale_root",
+                "branch": name,
+                "expected_root_hash": expected_root_hash,
+                "actual_root_hash": current.root_hash,
+                "current_history_hash": current.history_hash,
+            }),
+        };
         if json_format {
             Ok(json_line(&payload))
         } else {

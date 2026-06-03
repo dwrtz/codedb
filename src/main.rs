@@ -289,6 +289,8 @@ enum BranchCommand {
         db: PathBuf,
         name: String,
         #[arg(long)]
+        expect_root: Option<String>,
+        #[arg(long)]
         json: bool,
     },
     Compare {
@@ -707,9 +709,17 @@ fn main() -> Result<()> {
                     codedb.fast_forward_branch(&target, &source, &expect_root, json)?
                 );
             }
-            BranchCommand::Delete { db, name, json } => {
+            BranchCommand::Delete {
+                db,
+                name,
+                expect_root,
+                json,
+            } => {
                 let mut codedb = codedb::CodeDb::open(db)?;
-                print!("{}", codedb.delete_branch(&name, json)?);
+                print!(
+                    "{}",
+                    codedb.delete_branch(&name, expect_root.as_deref(), json)?
+                );
             }
             BranchCommand::Compare {
                 db,

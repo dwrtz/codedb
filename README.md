@@ -151,6 +151,14 @@ optional JSON-RPC `id` fields. Responses use the stable
 `codedb/apply/v1` structural writes, and `ops.preview` for rollback-only
 previews.
 
+`ops.apply` responses include both `operations` and the older `results` field
+for the per-operation records. `trace.run` and `debug.run` return a top-level
+workspace `error` envelope when the nested trace/debug report has
+`status: "error"`, with the nested diagnostics copied into the envelope.
+Branch fast-forward requires `expect_root`; branch delete accepts optional
+`expect_root`, and root-bound branch creation should use `from_root` when the
+caller wants to pin the exact source root.
+
 ## Documentation Map
 
 - [docs/SPEC.md](docs/SPEC.md): v0 design contract and current implemented
@@ -195,7 +203,7 @@ cargo run -- branch create <db> <name> --from main [--json]
 cargo run -- branch create <db> <name> --from-root <root> [--json]
 cargo run -- branch compare <db> <branch-a> <branch-b> [--json]
 cargo run -- branch fast-forward <db> <target> <source> --expect-root <root> [--json]
-cargo run -- branch delete <db> <name> [--json]
+cargo run -- branch delete <db> <name> [--expect-root <root>] [--json]
 cargo run -- export-map <db> [--json]
 ```
 

@@ -345,3 +345,37 @@ fn workspace_api_runs_debugger_commands() {
         response["result"]["root_hash"]
     );
 }
+
+#[test]
+fn workspace_api_returns_error_envelope_for_debugger_command_errors() {
+    let temp = tempdir().unwrap();
+    let db_path = temp.path().join("debug-api-error.sqlite");
+    let mut db = CodeDb::open(&db_path).unwrap();
+    db.init().unwrap();
+    db.import_file(Path::new("examples/shop.cdb")).unwrap();
+
+    let response = workspace_call(
+        &mut db,
+        "debug.run",
+        json!({
+            "entry": "main",
+            "args": [],
+            "commands": ["break line 10"]
+        }),
+    );
+    assert_eq!(response["schema"], "codedb/response/v1");
+    assert_eq!(response["status"], "error");
+    assert_eq!(response["error"]["kind"], "debug_error");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown debug command")
+    );
+    assert_eq!(response["diagnostics"][0]["kind"], "debug_error");
+    assert_eq!(
+        response["diagnostics"][0]["details"]["commands"][0]["status"],
+        "error"
+    );
+    assert_eq!(response["result"], JsonValue::Null);
+}

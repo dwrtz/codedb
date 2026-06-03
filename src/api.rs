@@ -629,6 +629,7 @@ fn apply_result_json(
     error: Option<&str>,
     results: Vec<serde_json::Value>,
 ) -> serde_json::Value {
+    let operations = results.clone();
     json!({
         "schema": APPLY_RESULT_SCHEMA,
         "status": status,
@@ -645,6 +646,7 @@ fn apply_result_json(
         "operation_count": operation_count,
         "processed_operation_count": processed_operation_count,
         "applied_operation_count": applied_operation_count,
+        "operations": operations,
         "results": results,
     })
 }

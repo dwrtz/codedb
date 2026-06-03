@@ -405,11 +405,27 @@ fn branch_cli_operations_isolate_writes_and_fast_forward_by_expected_root() {
     assert_eq!(branch(&db, "main")["root_hash"], sibling_a_root);
 
     let objects_before_agent_delete = row_count(&db, "objects");
+    let stale_delete = parse_json(&run(&[
+        "branch",
+        "delete",
+        path(&db),
+        "agent/demo",
+        "--expect-root",
+        &old_main_root,
+        "--json",
+    ]));
+    assert_eq!(stale_delete["status"], "stale_root");
+    assert_eq!(stale_delete["expected_root_hash"], old_main_root);
+    assert_eq!(stale_delete["actual_root_hash"], new_agent_root);
+    assert_eq!(row_count(&db, "objects"), objects_before_agent_delete);
+
     let deleted = parse_json(&run(&[
         "branch",
         "delete",
         path(&db),
         "agent/demo",
+        "--expect-root",
+        &new_agent_root,
         "--json",
     ]));
     assert_eq!(deleted["status"], "deleted");

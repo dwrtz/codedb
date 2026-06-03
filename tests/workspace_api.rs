@@ -470,10 +470,21 @@ fn workspace_server_manages_branch_pointers() {
     assert_eq!(stale_fast_forward["snapshot"]["branch"], "main");
     assert_eq!(stale_fast_forward["snapshot"]["root_hash"], new_agent_root);
 
+    let stale_delete = workspace_call(
+        &server,
+        "workspace.branch.delete",
+        json!({"branch": "agent/demo", "expect_root_hash": old_main_root}),
+    );
+    assert_eq!(stale_delete["status"], "error");
+    assert_eq!(stale_delete["error"]["kind"], "stale_root");
+    assert_eq!(stale_delete["error"]["expected_root_hash"], old_main_root);
+    assert_eq!(stale_delete["error"]["actual_root_hash"], new_agent_root);
+    assert_eq!(stale_delete["snapshot"]["branch"], "agent/demo");
+
     let deleted = workspace_call(
         &server,
         "workspace.branch.delete",
-        json!({"branch": "agent/demo"}),
+        json!({"branch": "agent/demo", "expect_root_hash": new_agent_root}),
     );
     assert_eq!(deleted["status"], "ok");
     assert_eq!(deleted["result"]["status"], "deleted");
@@ -533,6 +544,10 @@ fn workspace_server_applies_structural_operations_atomically() {
     assert_eq!(applied["result"]["committed"], true);
     assert_eq!(applied["result"]["old_root_hash"], old_root);
     assert_ne!(applied["result"]["new_root_hash"], old_root);
+    assert_eq!(
+        applied["result"]["operations"],
+        applied["result"]["results"]
+    );
     assert_eq!(applied["result"]["old_history_hash"], old_history);
     assert_ne!(applied["result"]["new_history_hash"], old_history);
     assert_eq!(
