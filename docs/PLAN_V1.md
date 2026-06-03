@@ -241,10 +241,12 @@ branch API methods and CLI commands if useful
 Initial commands:
 
 ```bash
-codedb branch create <name> --from main
-codedb branch list --json
-codedb branch fast-forward main agent/foo --expect-root <old-main-root>
-codedb branch delete agent/foo
+codedb branch create <db> <name> --from main
+codedb branch create <db> <name> --from-root <root>
+codedb branch list <db> --json
+codedb branch compare <db> main agent/foo --json
+codedb branch fast-forward <db> main agent/foo --expect-root <old-main-root>
+codedb branch delete <db> agent/foo
 ```
 
 Files likely touched:

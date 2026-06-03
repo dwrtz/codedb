@@ -385,6 +385,36 @@ fn verify_rejects_history_output_that_disagrees_with_migration_output() {
 }
 
 #[test]
+fn verify_rejects_branch_history_head_that_outputs_a_different_root() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("branch-history-root-mismatch.sqlite");
+    setup_shop(&db);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let previous_root: String = conn
+        .query_row(
+            "SELECT m.input_root_hash
+             FROM branches b
+             JOIN histories h ON h.history_hash = b.history_hash
+             JOIN migrations m ON m.hash = h.migration_hash
+             WHERE b.name = 'main'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE branches SET root_hash = ?1 WHERE name = 'main'",
+        [&previous_root],
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_history_link"));
+    assert!(stderr.contains("branch histories output wrong root"));
+}
+
+#[test]
 fn verify_replay_does_not_repair_corrupt_indexes() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("verify-readonly.sqlite");

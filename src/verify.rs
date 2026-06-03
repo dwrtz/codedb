@@ -468,6 +468,20 @@ impl CodeDb {
                 "bad_history_link: branch histories missing {missing_histories}"
             ));
         }
+        let mismatched_histories: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM branches b
+             JOIN histories h ON h.history_hash = b.history_hash
+             WHERE b.history_hash IS NOT NULL
+               AND h.output_root_hash != b.root_hash",
+            [],
+            |row| row.get(0),
+        )?;
+        if mismatched_histories > 0 {
+            errors.push(format!(
+                "bad_history_link: branch histories output wrong root {mismatched_histories}"
+            ));
+        }
         Ok(())
     }
 

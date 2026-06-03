@@ -1,10 +1,10 @@
 # Structural Apply JSON
 
 `codedb apply <db> --json <file>` applies a `codedb/apply/v1` document to the
-`main` branch.
+selected semantic branch. The document `branch` field defaults to `main`.
 
 Apply is atomic. If any operation errors or returns `conflict`, the whole batch
-is rolled back and the branch, history rows, materialized indexes, and caches
+is rolled back and the selected branch, history rows, materialized indexes, and caches
 remain unchanged. Per-operation errors return canonical `codedb/apply-result/v1`
 JSON with `status: "error"` and `committed: false`.
 

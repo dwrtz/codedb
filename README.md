@@ -123,7 +123,8 @@ stale writes instead of applying against a branch that has moved.
 `codedb/apply/v1` JSON document with operations such as `create_function`,
 `rename_symbol`, `replace_function_body`, `create_alias`, and `set_export`.
 Function bodies are structural expression JSON objects, so agents do not need
-to write projection text to mutate the database. See
+to write projection text to mutate the database. The document `branch` field
+selects the branch to mutate and defaults to `main`. See
 [docs/APPLY.md](docs/APPLY.md) and [examples/shop.apply.json](examples/shop.apply.json).
 Use `--json` on `list`, `show`, `export-map`, and `history` for machine-readable
 inspection output.
@@ -145,8 +146,9 @@ optional JSON-RPC `id` fields. Responses use the stable
 `symbols.resolve`, `symbols.callers`, `roots.diff`, `roots.export_projection`,
 `build.plan`, `history.list`, and `verify.run`. It also exposes
 `workspace.branch.create`, `workspace.branch.fast_forward`,
-`workspace.branch.delete`, `ops.apply` for atomic `codedb/apply/v1` structural
-writes, and `ops.preview` for rollback-only previews.
+`workspace.branch.delete`, `workspace.branch.compare`, `ops.apply` for atomic
+`codedb/apply/v1` structural writes, and `ops.preview` for rollback-only
+previews.
 
 ## Documentation Map
 
@@ -187,6 +189,12 @@ cargo run -- callers <db> <symbol-or-name>
 cargo run -- diff <db> <root-a> <root-b> [--json]
 cargo run -- history <db> [--json]
 cargo run -- branches <db> [--json]
+cargo run -- branch list <db> [--json]
+cargo run -- branch create <db> <name> --from main [--json]
+cargo run -- branch create <db> <name> --from-root <root> [--json]
+cargo run -- branch compare <db> <branch-a> <branch-b> [--json]
+cargo run -- branch fast-forward <db> <target> <source> --expect-root <root> [--json]
+cargo run -- branch delete <db> <name> [--json]
 cargo run -- export-map <db> [--json]
 ```
 

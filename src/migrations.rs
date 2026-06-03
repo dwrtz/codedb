@@ -649,7 +649,7 @@ impl CodeDb {
         op: Operation,
     ) -> Result<MigrationOutcome> {
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = self.apply_and_record_expected_in_tx(expected_root, op);
+        let result = self.apply_and_record_expected_in_tx_on_branch(MAIN_BRANCH, expected_root, op);
 
         match result {
             Ok((outcome, should_commit)) => {
@@ -669,13 +669,14 @@ impl CodeDb {
         }
     }
 
-    pub(crate) fn apply_and_record_expected_in_tx(
+    pub(crate) fn apply_and_record_expected_in_tx_on_branch(
         &mut self,
+        branch_name: &str,
         expected_root: &str,
         op: Operation,
     ) -> Result<(MigrationOutcome, bool)> {
         let fallback_summary = self.migration_summary(&op);
-        let branch = self.branch(MAIN_BRANCH)?;
+        let branch = self.branch(branch_name)?;
         let old_root = branch.root_hash.clone();
         let preconditions = self.preconditions_for(expected_root, &op);
         let failed_preconditions = self.failed_preconditions(&old_root, &preconditions)?;
@@ -798,7 +799,7 @@ impl CodeDb {
              VALUES (?1, ?2, ?3, ?4)",
             params![history_hash, branch.history_hash, migration_hash, new_root],
         )?;
-        self.update_branch(MAIN_BRANCH, &new_root, &history_hash)?;
+        self.update_branch(branch_name, &new_root, &history_hash)?;
         Ok((
             MigrationOutcome::Applied(MigrationReport {
                 old_root,

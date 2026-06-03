@@ -476,6 +476,7 @@ fn dispatch_workspace_method(
         "workspace.branch.create" => workspace_branch_create(db, params),
         "workspace.branch.fast_forward" => workspace_branch_fast_forward(db, params),
         "workspace.branch.delete" => workspace_branch_delete(db, params),
+        "workspace.branch.compare" => workspace_branch_compare(db, params),
         "symbols.list" => symbols_list(db, params),
         "symbols.show" => symbols_show(db, params),
         "symbols.resolve" => symbols_resolve(db, params),
@@ -628,6 +629,27 @@ fn workspace_branch_delete(
         "old_root_hash": deleted.root_hash,
         "old_history_hash": deleted.history_hash,
     });
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn workspace_branch_compare(
+    db: &CodeDb,
+    params: &JsonValue,
+) -> MethodResult<WorkspaceMethodResult> {
+    let object = params_object(params)?;
+    let branch_a = required_str_any(
+        object,
+        &["branch_a", "left", "from_branch", "old_branch", "base"],
+    )?;
+    let branch_b = required_str_any(
+        object,
+        &["branch_b", "right", "to_branch", "new_branch", "head"],
+    )?;
+    let result = parse_json_payload(
+        db.compare_branches_json(branch_a, branch_b)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, branch_b)?;
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 
@@ -812,11 +834,16 @@ fn ops_apply(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMetho
 
 fn ops_preview(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
     let apply_document = apply_document_param(params, false)?;
+    let branch = apply_document
+        .as_object()
+        .and_then(|object| object.get("branch"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or(MAIN_BRANCH);
     let result = parse_json_payload(
         db.preview_apply_json_str(&canonical_json(&apply_document))
             .map_err(|err| WorkspaceMethodError::new("invalid_operation", format!("{err:#}")))?,
     )?;
-    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    let snapshot = workspace_snapshot(db, branch)?;
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 

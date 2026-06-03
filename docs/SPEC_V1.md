@@ -179,6 +179,7 @@ workspace.branches
 workspace.branch.create
 workspace.branch.fast_forward
 workspace.branch.delete
+workspace.branch.compare
 
 symbols.list
 symbols.show
@@ -341,6 +342,7 @@ V1 should support cheap branch pointers:
 branch create <new> --from <root-or-branch>
 branch fast-forward <target> <source> --expect-root <old-target-root>
 branch delete <branch>
+branch compare <left> <right>
 ```
 
 The first merge operation should be fast-forward only. Semantic merge comes later.

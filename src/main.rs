@@ -211,6 +211,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Manage semantic branch pointers")]
+    Branch {
+        #[command(subcommand)]
+        command: BranchCommand,
+    },
     Replay {
         db: PathBuf,
         #[arg(long)]
@@ -224,6 +229,49 @@ enum Command {
         db: PathBuf,
         #[arg(long, default_value = "127.0.0.1:8787")]
         addr: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BranchCommand {
+    Create {
+        db: PathBuf,
+        name: String,
+        #[arg(long = "from")]
+        from: Option<String>,
+        #[arg(long)]
+        from_root: Option<String>,
+        #[arg(long)]
+        from_history: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    List {
+        db: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    FastForward {
+        db: PathBuf,
+        target: String,
+        source: String,
+        #[arg(long)]
+        expect_root: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Delete {
+        db: PathBuf,
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Compare {
+        db: PathBuf,
+        branch_a: String,
+        branch_b: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -542,6 +590,62 @@ fn main() -> Result<()> {
                 print!("{}", codedb.branches()?);
             }
         }
+        Command::Branch { command } => match command {
+            BranchCommand::Create {
+                db,
+                name,
+                from,
+                from_root,
+                from_history,
+                json,
+            } => {
+                let mut codedb = codedb::CodeDb::open(db)?;
+                print!(
+                    "{}",
+                    codedb.create_branch_from(
+                        &name,
+                        from.as_deref(),
+                        from_root.as_deref(),
+                        from_history.as_deref(),
+                        json
+                    )?
+                );
+            }
+            BranchCommand::List { db, json } => {
+                let codedb = codedb::CodeDb::open(db)?;
+                if json {
+                    print!("{}", codedb.branches_json()?);
+                } else {
+                    print!("{}", codedb.branches()?);
+                }
+            }
+            BranchCommand::FastForward {
+                db,
+                target,
+                source,
+                expect_root,
+                json,
+            } => {
+                let mut codedb = codedb::CodeDb::open(db)?;
+                print!(
+                    "{}",
+                    codedb.fast_forward_branch(&target, &source, &expect_root, json)?
+                );
+            }
+            BranchCommand::Delete { db, name, json } => {
+                let mut codedb = codedb::CodeDb::open(db)?;
+                print!("{}", codedb.delete_branch(&name, json)?);
+            }
+            BranchCommand::Compare {
+                db,
+                branch_a,
+                branch_b,
+                json,
+            } => {
+                let codedb = codedb::CodeDb::open(db)?;
+                print!("{}", codedb.compare_branches(&branch_a, &branch_b, json)?);
+            }
+        },
         Command::Replay { db, from_genesis } => {
             if !from_genesis {
                 anyhow::bail!("replay currently requires --from-genesis");

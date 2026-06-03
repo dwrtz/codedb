@@ -224,14 +224,8 @@ impl CodeDb {
         {
             bail!("unsupported apply schema {schema:?}; expected {APPLY_SCHEMA}");
         }
-        if request.branch != MAIN_BRANCH {
-            bail!(
-                "only branch {MAIN_BRANCH:?} is supported by apply, got {:?}",
-                request.branch
-            );
-        }
-
-        let initial_branch = self.branch(MAIN_BRANCH)?;
+        let branch_name = request.branch.clone();
+        let initial_branch = self.branch(&branch_name)?;
         let initial_root = initial_branch.root_hash;
         let initial_history = initial_branch.history_hash;
         let mut results = Vec::new();
@@ -239,7 +233,7 @@ impl CodeDb {
         let mut aggregate_status = MigrationStatus::AlreadyApplied;
 
         for (idx, api_operation) in request.operations.iter().enumerate() {
-            let branch = self.branch(MAIN_BRANCH)?;
+            let branch = self.branch(&branch_name)?;
             let savepoint = format!("codedb_apply_operation_{idx}");
             self.conn.execute_batch(&format!("SAVEPOINT {savepoint}"))?;
             let expected_root = api_operation
@@ -268,6 +262,7 @@ impl CodeDb {
                         None,
                     ));
                     let payload = apply_result_json(
+                        &branch_name,
                         "error",
                         false,
                         Some("error"),
@@ -284,37 +279,39 @@ impl CodeDb {
                 }
             };
             let summary = self.migration_summary(&operation);
-            let (outcome, operation_changed_root) =
-                match self.apply_and_record_expected_in_tx(&expected_root, operation) {
-                    Ok(result) => result,
-                    Err(err) => {
-                        self.conn.execute_batch(&format!(
-                            "ROLLBACK TO SAVEPOINT {savepoint}; RELEASE SAVEPOINT {savepoint}"
-                        ))?;
-                        let mut results = mark_rolled_back_results(results);
-                        let message = format!("operation {idx} failed: {err:#}");
-                        results.push(apply_error_result_json(
-                            idx,
-                            &branch.root_hash,
-                            &message,
-                            Some(&summary),
-                        ));
-                        let payload = apply_result_json(
-                            "error",
-                            false,
-                            Some("error"),
-                            &initial_root,
-                            &initial_root,
-                            initial_history.as_ref(),
-                            request.operations.len(),
-                            results.len(),
-                            0,
-                            Some(&message),
-                            results,
-                        );
-                        return Ok((format!("{}\n", canonical_json(&payload)), false));
-                    }
-                };
+            let (outcome, operation_changed_root) = match self
+                .apply_and_record_expected_in_tx_on_branch(&branch_name, &expected_root, operation)
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    self.conn.execute_batch(&format!(
+                        "ROLLBACK TO SAVEPOINT {savepoint}; RELEASE SAVEPOINT {savepoint}"
+                    ))?;
+                    let mut results = mark_rolled_back_results(results);
+                    let message = format!("operation {idx} failed: {err:#}");
+                    results.push(apply_error_result_json(
+                        idx,
+                        &branch.root_hash,
+                        &message,
+                        Some(&summary),
+                    ));
+                    let payload = apply_result_json(
+                        &branch_name,
+                        "error",
+                        false,
+                        Some("error"),
+                        &initial_root,
+                        &initial_root,
+                        initial_history.as_ref(),
+                        request.operations.len(),
+                        results.len(),
+                        0,
+                        Some(&message),
+                        results,
+                    );
+                    return Ok((format!("{}\n", canonical_json(&payload)), false));
+                }
+            };
             let status = outcome.status();
             if matches!(status, MigrationStatus::Applied) {
                 debug_assert!(operation_changed_root);
@@ -332,6 +329,7 @@ impl CodeDb {
             if stop {
                 let results = mark_rolled_back_results(results);
                 let payload = apply_result_json(
+                    &branch_name,
                     aggregate_status.as_str(),
                     false,
                     Some("conflict"),
@@ -350,7 +348,7 @@ impl CodeDb {
 
         let should_commit = tentative_applied_operation_count > 0;
         let (new_root, history_hash, applied_operation_count) = if should_commit {
-            let final_branch = self.branch(MAIN_BRANCH)?;
+            let final_branch = self.branch(&branch_name)?;
             (
                 final_branch.root_hash,
                 final_branch.history_hash,
@@ -360,6 +358,7 @@ impl CodeDb {
             (initial_root.clone(), initial_history.clone(), 0)
         };
         let payload = apply_result_json(
+            &branch_name,
             aggregate_status.as_str(),
             should_commit,
             None,
@@ -579,6 +578,7 @@ fn preview_apply_result_json(text: &str, would_commit: bool) -> Result<String> {
 
 #[allow(clippy::too_many_arguments)]
 fn apply_result_json(
+    branch: &str,
     status: &str,
     committed: bool,
     rollback_reason: Option<&str>,
@@ -594,7 +594,7 @@ fn apply_result_json(
     json!({
         "schema": APPLY_RESULT_SCHEMA,
         "status": status,
-        "branch": MAIN_BRANCH,
+        "branch": branch,
         "atomic": true,
         "committed": committed,
         "rollback_reason": rollback_reason,

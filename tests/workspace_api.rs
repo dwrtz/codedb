@@ -228,7 +228,7 @@ fn workspace_server_manages_branch_pointers() {
         "ops.apply",
         json!({
             "schema": "codedb/apply/v1",
-            "branch": "main",
+            "branch": "agent/demo",
             "expect_root_hash": old_main_root,
             "operations": [
                 {
@@ -240,9 +240,20 @@ fn workspace_server_manages_branch_pointers() {
         }),
     );
     assert_eq!(applied["status"], "ok");
-    let new_main_root = applied["snapshot"]["root_hash"].as_str().unwrap();
-    let new_main_history = applied["snapshot"]["history_hash"].clone();
-    assert_ne!(new_main_root, old_main_root);
+    assert_eq!(applied["snapshot"]["branch"], "agent/demo");
+    let new_agent_root = applied["snapshot"]["root_hash"].as_str().unwrap();
+    let new_agent_history = applied["snapshot"]["history_hash"].clone();
+    assert_ne!(new_agent_root, old_main_root);
+
+    let main_after_agent_write = workspace_call(&server, "workspace.current", json!({}));
+    assert_eq!(
+        main_after_agent_write["snapshot"]["root_hash"],
+        old_main_root
+    );
+    assert_eq!(
+        main_after_agent_write["snapshot"]["history_hash"],
+        old_main_history
+    );
 
     let agent_before = workspace_call(
         &server,
@@ -250,31 +261,46 @@ fn workspace_server_manages_branch_pointers() {
         json!({"branch": "agent/demo"}),
     );
     assert_eq!(agent_before["status"], "ok");
-    assert_eq!(agent_before["snapshot"]["root_hash"], old_main_root);
+    assert_eq!(agent_before["snapshot"]["root_hash"], new_agent_root);
+
+    let compared = workspace_call(
+        &server,
+        "workspace.branch.compare",
+        json!({"branch_a": "main", "branch_b": "agent/demo"}),
+    );
+    assert_eq!(compared["status"], "ok");
+    assert_eq!(compared["result"]["schema"], "codedb/branch-compare/v1");
+    assert_eq!(compared["result"]["branch_a"]["root_hash"], old_main_root);
+    assert_eq!(compared["result"]["branch_b"]["root_hash"], new_agent_root);
+    assert_eq!(compared["result"]["same_root"], false);
+    assert_eq!(compared["result"]["changes"][0]["kind"], "symbol_renamed");
 
     let fast_forwarded = workspace_call(
         &server,
         "workspace.branch.fast_forward",
         json!({
-            "branch": "agent/demo",
-            "source_branch": "main",
+            "branch": "main",
+            "source_branch": "agent/demo",
             "expect_root_hash": old_main_root
         }),
     );
     assert_eq!(fast_forwarded["status"], "ok");
     assert_eq!(fast_forwarded["result"]["status"], "fast_forwarded");
     assert_eq!(fast_forwarded["result"]["old_root_hash"], old_main_root);
-    assert_eq!(fast_forwarded["result"]["new_root_hash"], new_main_root);
-    assert_eq!(fast_forwarded["snapshot"]["branch"], "agent/demo");
-    assert_eq!(fast_forwarded["snapshot"]["root_hash"], new_main_root);
-    assert_eq!(fast_forwarded["snapshot"]["history_hash"], new_main_history);
+    assert_eq!(fast_forwarded["result"]["new_root_hash"], new_agent_root);
+    assert_eq!(fast_forwarded["snapshot"]["branch"], "main");
+    assert_eq!(fast_forwarded["snapshot"]["root_hash"], new_agent_root);
+    assert_eq!(
+        fast_forwarded["snapshot"]["history_hash"],
+        new_agent_history
+    );
 
     let stale_fast_forward = workspace_call(
         &server,
         "workspace.branch.fast_forward",
         json!({
-            "branch": "agent/demo",
-            "source_branch": "main",
+            "branch": "main",
+            "source_branch": "agent/demo",
             "expect_root_hash": old_main_root
         }),
     );
@@ -286,10 +312,10 @@ fn workspace_server_manages_branch_pointers() {
     );
     assert_eq!(
         stale_fast_forward["error"]["actual_root_hash"],
-        new_main_root
+        new_agent_root
     );
-    assert_eq!(stale_fast_forward["snapshot"]["branch"], "agent/demo");
-    assert_eq!(stale_fast_forward["snapshot"]["root_hash"], new_main_root);
+    assert_eq!(stale_fast_forward["snapshot"]["branch"], "main");
+    assert_eq!(stale_fast_forward["snapshot"]["root_hash"], new_agent_root);
 
     let deleted = workspace_call(
         &server,
