@@ -1,6 +1,7 @@
 //! Native object backends for the v0 lowered IR targets.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::thread;
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value as JsonValue, json};
@@ -8,6 +9,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::abi::internal_abi_symbol;
 use crate::artifact::CacheKeyInput;
 use crate::backend::{ArtifactKind, ObjectBackend, ObjectBackendArtifact, ObjectBackendInput};
+use crate::jobs::{ArtifactJobClaim, artifact_job_error, new_worker_id};
 use crate::lowering::{LoweredBlock, LoweredFunctionIr, LoweredOp};
 use crate::model::ProgramRootPayload;
 use crate::store::{
@@ -27,11 +29,39 @@ const ARM64_RELOC_BRANCH26: u32 = 2;
 pub(crate) struct ElfObjectBackend;
 pub(crate) struct MachOArm64ObjectBackend;
 
+#[derive(Debug, Clone)]
 pub(crate) struct NativeObjectArtifact {
     pub(crate) artifact_hash: String,
     pub(crate) cache_key: String,
     pub(crate) metadata: JsonValue,
     pub(crate) bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct NativeObjectJobInput {
+    key_input: CacheKeyInput,
+    cache_key: String,
+    ir: LoweredFunctionIr,
+    dependency_interface_hashes: Vec<String>,
+    dependency_closure: Vec<String>,
+    target_triple: String,
+}
+
+struct ClaimedNativeObjectJob {
+    index: usize,
+    input: NativeObjectJobInput,
+    worker_id: String,
+}
+
+struct WaitingNativeObjectJob {
+    index: usize,
+    input: NativeObjectJobInput,
+}
+
+struct NativeObjectCompileOutput {
+    artifact_hash: String,
+    metadata: JsonValue,
+    bytes: Vec<u8>,
 }
 
 impl ObjectBackend for ElfObjectBackend {
@@ -182,6 +212,104 @@ impl CodeDb {
         symbol: &str,
         target_triple: &str,
     ) -> Result<NativeObjectArtifact> {
+        let input = self.native_object_job_input(root_hash, symbol, target_triple)?;
+        self.emit_prepared_native_object(input)
+    }
+
+    pub(crate) fn emit_objects_for_symbols_parallel(
+        &mut self,
+        root_hash: &str,
+        symbols: &[String],
+        target_triple: &str,
+    ) -> Result<Vec<NativeObjectArtifact>> {
+        let mut results = (0..symbols.len()).map(|_| None).collect::<Vec<_>>();
+        let mut handles = Vec::new();
+        let mut waiting = Vec::new();
+
+        for (index, symbol) in symbols.iter().enumerate() {
+            let input = self.native_object_job_input(root_hash, symbol, target_triple)?;
+            if let Some(cache_entry) = self.lookup_cache(&input.key_input)? {
+                results[index] = Some(self.native_object_from_cache_entry(&input, cache_entry)?);
+                continue;
+            }
+            let worker_id = new_worker_id("object");
+            match self.claim_artifact_job(&input.cache_key, ArtifactKind::ObjectFile, &worker_id)? {
+                ArtifactJobClaim::Claimed => {
+                    let job = ClaimedNativeObjectJob {
+                        index,
+                        input,
+                        worker_id,
+                    };
+                    handles.push(thread::spawn(move || {
+                        let output = compile_native_object_job(&job.input);
+                        (job, output)
+                    }));
+                }
+                ArtifactJobClaim::Succeeded
+                | ArtifactJobClaim::Busy {
+                    status: _,
+                    worker_id: _,
+                } => waiting.push(WaitingNativeObjectJob { index, input }),
+            }
+        }
+
+        let mut first_error = None;
+        for handle in handles {
+            let (job, output) = handle
+                .join()
+                .map_err(|_| anyhow!("native object worker thread panicked"))?;
+            match output {
+                Ok(output) => {
+                    let artifact = self.finish_claimed_native_object(&job, output);
+                    match artifact {
+                        Ok(artifact) => results[job.index] = Some(artifact),
+                        Err(err) => {
+                            let _ = self.fail_artifact_job(
+                                &job.input.cache_key,
+                                &job.worker_id,
+                                &artifact_job_error("cache_write_failed", format!("{err:#}")),
+                            );
+                            if first_error.is_none() {
+                                first_error = Some(err);
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = self.fail_artifact_job(
+                        &job.input.cache_key,
+                        &job.worker_id,
+                        &artifact_job_error("compile_failed", format!("{err:#}")),
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
+        for job in waiting {
+            let cache_entry =
+                self.wait_for_artifact_cache(&job.input.key_input, &job.input.cache_key)?;
+            results[job.index] =
+                Some(self.native_object_from_cache_entry(&job.input, cache_entry)?);
+        }
+
+        results
+            .into_iter()
+            .map(|artifact| artifact.ok_or_else(|| anyhow!("missing native object result")))
+            .collect()
+    }
+
+    fn native_object_job_input(
+        &mut self,
+        root_hash: &str,
+        symbol: &str,
+        target_triple: &str,
+    ) -> Result<NativeObjectJobInput> {
         let root = self.load_root(root_hash)?;
         let lowered = self.lower_symbol(root_hash, symbol)?;
         let dependency_interface_hashes = self.dependency_interface_hashes(&root, &lowered.ir)?;
@@ -196,52 +324,97 @@ impl CodeDb {
         .with_dependency_interface_hashes(dependency_interface_hashes.clone());
         let object_cache_key = cache_key_for_input(&key_input)?;
 
-        if let Some(cache_entry) = self.lookup_cache(&key_input)? {
-            let bytes = cache_entry
-                .artifact_bytes
-                .ok_or_else(|| anyhow!("object cache entry missing artifact_bytes"))?;
-            let artifact_json = cache_entry
-                .artifact_json
-                .ok_or_else(|| anyhow!("object cache entry missing artifact_json"))?;
-            let mut metadata = object_metadata_from_cache(&artifact_json)?;
-            let original_metadata = metadata.clone();
-            add_native_object_dependency_metadata(
-                &mut metadata,
-                &dependency_interface_hashes,
-                &dependency_closure,
-            )?;
-            if metadata != original_metadata {
-                self.write_cache_bytes(key_input.clone(), &metadata, &bytes)?;
-            }
-            return Ok(NativeObjectArtifact {
-                artifact_hash: cache_entry.artifact_hash,
-                cache_key: object_cache_key,
-                metadata,
-                bytes,
-            });
-        }
+        Ok(NativeObjectJobInput {
+            key_input,
+            cache_key: object_cache_key,
+            ir: lowered.ir,
+            dependency_interface_hashes,
+            dependency_closure,
+            target_triple: target_triple.to_string(),
+        })
+    }
 
-        let input = ObjectBackendInput {
-            ir: &lowered.ir,
-            target_triple,
-        };
-        let emitted = match target_triple {
-            LINUX_X86_64_TARGET => ElfObjectBackend.emit_object(input)?,
-            APPLE_ARM64_TARGET => MachOArm64ObjectBackend.emit_object(input)?,
-            _ => unreachable!("unsupported target was checked by backend_id_for_target"),
-        };
-        let mut metadata = emitted.metadata;
+    fn emit_prepared_native_object(
+        &mut self,
+        input: NativeObjectJobInput,
+    ) -> Result<NativeObjectArtifact> {
+        if let Some(cache_entry) = self.lookup_cache(&input.key_input)? {
+            return self.native_object_from_cache_entry(&input, cache_entry);
+        }
+        let worker_id = new_worker_id("object");
+        match self.claim_artifact_job(&input.cache_key, ArtifactKind::ObjectFile, &worker_id)? {
+            ArtifactJobClaim::Claimed => {
+                let output = match compile_native_object_job(&input) {
+                    Ok(output) => output,
+                    Err(err) => {
+                        let _ = self.fail_artifact_job(
+                            &input.cache_key,
+                            &worker_id,
+                            &artifact_job_error("compile_failed", format!("{err:#}")),
+                        );
+                        return Err(err);
+                    }
+                };
+                let job = ClaimedNativeObjectJob {
+                    index: 0,
+                    input,
+                    worker_id,
+                };
+                self.finish_claimed_native_object(&job, output)
+            }
+            ArtifactJobClaim::Succeeded
+            | ArtifactJobClaim::Busy {
+                status: _,
+                worker_id: _,
+            } => {
+                let cache_entry =
+                    self.wait_for_artifact_cache(&input.key_input, &input.cache_key)?;
+                self.native_object_from_cache_entry(&input, cache_entry)
+            }
+        }
+    }
+
+    fn finish_claimed_native_object(
+        &mut self,
+        job: &ClaimedNativeObjectJob,
+        output: NativeObjectCompileOutput,
+    ) -> Result<NativeObjectArtifact> {
+        self.write_cache_bytes(job.input.key_input.clone(), &output.metadata, &output.bytes)?;
+        self.complete_artifact_job(&job.input.cache_key, &job.worker_id)?;
+        Ok(NativeObjectArtifact {
+            artifact_hash: output.artifact_hash,
+            cache_key: job.input.cache_key.clone(),
+            metadata: output.metadata,
+            bytes: output.bytes,
+        })
+    }
+
+    fn native_object_from_cache_entry(
+        &mut self,
+        input: &NativeObjectJobInput,
+        cache_entry: crate::store::CacheEntry,
+    ) -> Result<NativeObjectArtifact> {
+        let bytes = cache_entry
+            .artifact_bytes
+            .ok_or_else(|| anyhow!("object cache entry missing artifact_bytes"))?;
+        let artifact_json = cache_entry
+            .artifact_json
+            .ok_or_else(|| anyhow!("object cache entry missing artifact_json"))?;
+        let mut metadata = object_metadata_from_cache(&artifact_json)?;
+        let original_metadata = metadata.clone();
         add_native_object_dependency_metadata(
             &mut metadata,
-            &dependency_interface_hashes,
-            &dependency_closure,
+            &input.dependency_interface_hashes,
+            &input.dependency_closure,
         )?;
-        self.write_cache_bytes(key_input, &metadata, &emitted.bytes)?;
+        if metadata != original_metadata {
+            self.write_cache_bytes(input.key_input.clone(), &metadata, &bytes)?;
+        }
         Ok(NativeObjectArtifact {
-            artifact_hash: emitted.artifact_hash,
-            cache_key: object_cache_key,
+            artifact_hash: cache_entry.artifact_hash,
+            cache_key: input.cache_key.clone(),
             metadata,
-            bytes: emitted.bytes,
+            bytes,
         })
     }
 
@@ -306,6 +479,29 @@ fn add_native_object_dependency_metadata(
     );
     object.insert("dependency_closure".to_string(), json!(dependency_closure));
     Ok(())
+}
+
+fn compile_native_object_job(input: &NativeObjectJobInput) -> Result<NativeObjectCompileOutput> {
+    let backend_input = ObjectBackendInput {
+        ir: &input.ir,
+        target_triple: &input.target_triple,
+    };
+    let emitted = match input.target_triple.as_str() {
+        LINUX_X86_64_TARGET => ElfObjectBackend.emit_object(backend_input)?,
+        APPLE_ARM64_TARGET => MachOArm64ObjectBackend.emit_object(backend_input)?,
+        _ => unreachable!("unsupported target was checked by backend_id_for_target"),
+    };
+    let mut metadata = emitted.metadata;
+    add_native_object_dependency_metadata(
+        &mut metadata,
+        &input.dependency_interface_hashes,
+        &input.dependency_closure,
+    )?;
+    Ok(NativeObjectCompileOutput {
+        artifact_hash: emitted.artifact_hash,
+        metadata,
+        bytes: emitted.bytes,
+    })
 }
 
 pub(crate) fn object_metadata_from_cache(artifact_json: &JsonValue) -> Result<JsonValue> {

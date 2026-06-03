@@ -486,6 +486,8 @@ fn dispatch_workspace_method(
         "ops.apply" => ops_apply(db, params),
         "ops.preview" => ops_preview(db, params),
         "build.plan" => build_plan(db, params),
+        "build.execute" => build_execute(db, params),
+        "build.artifact_status" => build_artifact_status(db, params),
         "history.list" => history_list(db, params),
         "verify.run" => verify_run(db, params),
         _ => Err(WorkspaceMethodError::new(
@@ -854,6 +856,36 @@ fn build_plan(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMeth
     let target = optional_str(object, "target")?.unwrap_or(DEFAULT_NATIVE_TARGET);
     let result = parse_json_payload(
         db.build_plan_main_branch(entry_name, target)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn build_execute(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    require_main_branch(params, "build.execute")?;
+    let object = params_object(params)?;
+    let entry_name = required_str_alias(object, "entry_name", "entry")?;
+    let target = optional_str(object, "target")?.unwrap_or(DEFAULT_NATIVE_TARGET);
+    let build = db
+        .build_main_branch(entry_name, target)
+        .map_err(WorkspaceMethodError::method)?;
+    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    let result = json!({
+        "schema": "codedb/build-execute-result/v1",
+        "target_triple": target,
+        "entry_name": entry_name,
+        "executable_cache_key": build.cache_key,
+        "executable_artifact_hash": build.artifact_hash,
+        "executable_size_bytes": build.executable.len(),
+    });
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn build_artifact_status(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    params_object(params)?;
+    let result = parse_json_payload(
+        db.artifact_status_json()
             .map_err(WorkspaceMethodError::method)?,
     )?;
     let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;

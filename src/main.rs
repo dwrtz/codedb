@@ -101,6 +101,12 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    #[command(about = "Show artifact job and cache status as JSON")]
+    ArtifactStatus {
+        db: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     List {
         db: PathBuf,
         #[arg(long)]
@@ -384,6 +390,13 @@ fn main() -> Result<()> {
             std::fs::write(&out, build.executable)?;
             make_executable(&out)?;
             println!("built native executable {}", out.display());
+        }
+        Command::ArtifactStatus { db, json } => {
+            if !json {
+                anyhow::bail!("artifact-status currently requires --json");
+            }
+            let codedb = codedb::CodeDb::open(db)?;
+            print!("{}", codedb.artifact_status_json()?);
         }
         Command::List { db, json } => {
             let codedb = codedb::CodeDb::open(db)?;

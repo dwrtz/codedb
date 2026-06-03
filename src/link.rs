@@ -9,8 +9,9 @@ use crate::abi::{export_map, internal_abi_symbol, validate_exported_abi_name};
 use crate::artifact::CacheKeyInput;
 use crate::backend::ArtifactKind;
 use crate::backend::native::NativeObjectArtifact;
+use crate::jobs::{ArtifactJobClaim, artifact_job_error, new_worker_id};
 use crate::model::ProgramRootPayload;
-use crate::store::{CodeDb, canonical_json, hash_bytes};
+use crate::store::{CodeDb, cache_key_for_input, canonical_json, hash_bytes};
 use crate::types::type_hash_for;
 use crate::{
     APPLE_ARM64_TARGET, BYTES_DOMAIN, DEFAULT_NATIVE_TARGET, LINUX_X86_64_TARGET, MAIN_BRANCH,
@@ -24,10 +25,13 @@ const EXTERNAL_CC_LINKER_BACKEND_ID: &str = "external-cc-linker-v0";
 
 pub struct NativeBuild {
     pub executable: Vec<u8>,
+    pub cache_key: String,
+    pub artifact_hash: String,
 }
 
 struct PreparedLink {
     input_hash: String,
+    link_plan_cache_key: String,
     plan: JsonValue,
     plan_hash: String,
     objects: Vec<PreparedObject>,
@@ -37,6 +41,16 @@ struct PreparedObject {
     artifact_hash: String,
     cache_key: String,
     bytes: Vec<u8>,
+}
+
+impl PreparedLink {
+    fn job_cache_keys(&self) -> Vec<String> {
+        self.objects
+            .iter()
+            .map(|object| object.cache_key.clone())
+            .chain(std::iter::once(self.link_plan_cache_key.clone()))
+            .collect()
+    }
 }
 
 impl CodeDb {
@@ -58,14 +72,17 @@ impl CodeDb {
         target_triple: &str,
     ) -> Result<String> {
         let prepared = self.prepare_link_plan_main_branch(entry_name, target_triple)?;
+        let jobs = self.artifact_job_json_for_cache_keys(&prepared.job_cache_keys())?;
         let payload = json!({
             "schema": "codedb/native-build-plan/v1",
             "target_triple": prepared.plan["target_triple"].clone(),
             "entry_symbol_hash": prepared.plan["entry_symbol_hash"].clone(),
             "entry_abi_symbol": prepared.plan["entry_abi_symbol"].clone(),
             "link_plan_input_hash": prepared.input_hash,
+            "link_plan_cache_key": prepared.link_plan_cache_key,
             "link_plan_hash": prepared.plan_hash,
             "artifact_kinds": ["object_file", "link_plan", "executable"],
+            "jobs": jobs,
             "objects": prepared.plan["objects"].clone(),
             "export_map": prepared.plan["export_map"].clone(),
             "external_symbols": prepared.plan["external_symbols"].clone(),
@@ -85,13 +102,49 @@ impl CodeDb {
         let linker_identity = host_linker_identity_for_target(target_triple)?;
         let linker_identity_hash = hash_bytes(BYTES_DOMAIN, linker_identity.as_bytes());
         let key_input = executable_cache_key(&prepared, &linker_identity_hash);
+        let cache_key = cache_key_for_input(&key_input)?;
         if let Some(cache_entry) = self.lookup_cache(&key_input)?
             && let Some(bytes) = cache_entry.artifact_bytes
         {
-            return Ok(NativeBuild { executable: bytes });
+            return Ok(NativeBuild {
+                executable: bytes,
+                cache_key,
+                artifact_hash: cache_entry.artifact_hash,
+            });
         }
 
-        let executable = link_with_cc(&prepared)?;
+        let worker_id = new_worker_id("executable");
+        match self.claim_artifact_job(&cache_key, ArtifactKind::Executable, &worker_id)? {
+            ArtifactJobClaim::Succeeded
+            | ArtifactJobClaim::Busy {
+                status: _,
+                worker_id: _,
+            } => {
+                let cache_entry = self.wait_for_artifact_cache(&key_input, &cache_key)?;
+                let bytes = cache_entry
+                    .artifact_bytes
+                    .ok_or_else(|| anyhow!("executable cache entry missing artifact_bytes"))?;
+                return Ok(NativeBuild {
+                    executable: bytes,
+                    cache_key,
+                    artifact_hash: cache_entry.artifact_hash,
+                });
+            }
+            ArtifactJobClaim::Claimed => {}
+        }
+
+        let executable = match link_with_cc(&prepared) {
+            Ok(executable) => executable,
+            Err(err) => {
+                let _ = self.fail_artifact_job(
+                    &cache_key,
+                    &worker_id,
+                    &artifact_job_error("link_failed", format!("{err:#}")),
+                );
+                return Err(err);
+            }
+        };
+        let artifact_hash = hash_bytes(BYTES_DOMAIN, &executable);
         let metadata = json!({
             "schema": EXECUTABLE_METADATA_SCHEMA,
             "target_triple": target_triple,
@@ -109,8 +162,20 @@ impl CodeDb {
                 .map(|object| object.cache_key.clone())
                 .collect::<Vec<_>>(),
         });
-        self.write_cache_bytes(key_input, &metadata, &executable)?;
-        Ok(NativeBuild { executable })
+        if let Err(err) = self.write_cache_bytes(key_input, &metadata, &executable) {
+            let _ = self.fail_artifact_job(
+                &cache_key,
+                &worker_id,
+                &artifact_job_error("cache_write_failed", format!("{err:#}")),
+            );
+            return Err(err);
+        }
+        self.complete_artifact_job(&cache_key, &worker_id)?;
+        Ok(NativeBuild {
+            executable,
+            cache_key,
+            artifact_hash,
+        })
     }
 
     fn prepare_link_plan_main_branch(
@@ -136,15 +201,16 @@ impl CodeDb {
     ) -> Result<PreparedLink> {
         let symbols = self.reachable_symbols(root_hash, entry_symbol)?;
         let linked_symbols = symbols.iter().cloned().collect::<BTreeSet<_>>();
+        let native_objects =
+            self.emit_objects_for_symbols_parallel(root_hash, &symbols, target_triple)?;
         let mut objects = Vec::new();
         let mut object_entries = Vec::new();
-        for symbol in symbols {
+        for (symbol, object) in symbols.into_iter().zip(native_objects.into_iter()) {
             let root_entry = self
                 .root_symbol(root, &symbol)
                 .ok_or_else(|| anyhow!("link plan symbol missing from root {symbol}"))?;
             let (param_type_hashes, return_type_hash) =
                 self.signature_parts(&root_entry.signature)?;
-            let object = self.emit_object_for_symbol(root_hash, &symbol, target_triple)?;
             let object_metadata = object.metadata.clone();
             let internal_abi = internal_abi_symbol(&symbol)?;
             object_entries.push(json!({
@@ -220,6 +286,7 @@ impl CodeDb {
             target_triple,
         )
         .with_dependency_implementation_hashes(object_cache_keys);
+        let plan_cache_key = cache_key_for_input(&key_input)?;
         let plan_hash;
         if let Some(cache_entry) = self.lookup_cache(&key_input)?
             && let Some(artifact_json) = cache_entry.artifact_json
@@ -231,11 +298,44 @@ impl CodeDb {
             plan = cached_plan;
             plan_hash = cache_entry.artifact_hash;
         } else {
-            plan_hash = self.write_cache_json_for_key(key_input, &plan)?;
+            let worker_id = new_worker_id("link-plan");
+            match self.claim_artifact_job(&plan_cache_key, ArtifactKind::LinkPlan, &worker_id)? {
+                ArtifactJobClaim::Claimed => {
+                    plan_hash = match self.write_cache_json_for_key(key_input.clone(), &plan) {
+                        Ok(plan_hash) => plan_hash,
+                        Err(err) => {
+                            let _ = self.fail_artifact_job(
+                                &plan_cache_key,
+                                &worker_id,
+                                &artifact_job_error("cache_write_failed", format!("{err:#}")),
+                            );
+                            return Err(err);
+                        }
+                    };
+                    self.complete_artifact_job(&plan_cache_key, &worker_id)?;
+                }
+                ArtifactJobClaim::Succeeded
+                | ArtifactJobClaim::Busy {
+                    status: _,
+                    worker_id: _,
+                } => {
+                    let cache_entry = self.wait_for_artifact_cache(&key_input, &plan_cache_key)?;
+                    let artifact_json = cache_entry
+                        .artifact_json
+                        .ok_or_else(|| anyhow!("link plan cache entry missing artifact_json"))?;
+                    let cached_plan = json_metadata(&artifact_json)?;
+                    if cached_plan != plan {
+                        bail!("cached link plan does not match recomputed link plan");
+                    }
+                    plan = cached_plan;
+                    plan_hash = cache_entry.artifact_hash;
+                }
+            }
         }
 
         Ok(PreparedLink {
             input_hash,
+            link_plan_cache_key: plan_cache_key,
             plan,
             plan_hash,
             objects,

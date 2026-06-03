@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -38,6 +39,7 @@ pub(crate) enum BranchFastForwardOutcome {
 impl CodeDb {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(30))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA_SQL)?;
         migrate_compile_cache_schema(&conn)?;
@@ -674,24 +676,90 @@ impl CodeDb {
         }
         let cache_key_json = cache_key_json(&key_input)?;
         let cache_key = hash_bytes(CACHE_DOMAIN, cache_key_json.as_bytes());
+        let artifact_json_canonical = artifact_json.map(canonical_json);
         self.conn.execute(
-            "INSERT OR REPLACE INTO compile_cache
+            "INSERT OR IGNORE INTO compile_cache
              (cache_key, cache_key_json, input_hash, backend, target, compiler_version, artifact_kind,
               artifact_hash, artifact_json, artifact_bytes)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
-                cache_key,
-                cache_key_json,
+                &cache_key,
+                &cache_key_json,
                 key_input.input_hash,
                 key_input.backend_id,
                 key_input.target_triple,
                 key_input.compiler_version,
                 key_input.artifact_kind.as_str(),
                 artifact_hash,
-                artifact_json.map(canonical_json),
+                artifact_json_canonical.as_deref(),
                 artifact_bytes,
             ],
         )?;
+        if self.conn.changes() == 1 {
+            return Ok(());
+        }
+
+        let (
+            existing_key_json,
+            existing_artifact_hash,
+            existing_artifact_json,
+            existing_artifact_bytes,
+        ) = self
+            .conn
+            .query_row(
+                "SELECT cache_key_json, artifact_hash, artifact_json, artifact_bytes
+                 FROM compile_cache WHERE cache_key = ?1",
+                params![&cache_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("cache key {cache_key} was not inserted and cannot be read"))?;
+        if existing_key_json != cache_key_json {
+            bail!("cache conflict: cache key {cache_key} has mismatched key input JSON");
+        }
+        if existing_artifact_hash != artifact_hash {
+            if existing_artifact_bytes.is_none() && artifact_bytes.is_none() {
+                self.conn.execute(
+                    "UPDATE compile_cache
+                     SET artifact_hash = ?2,
+                         artifact_json = ?3,
+                         artifact_bytes = NULL
+                     WHERE cache_key = ?1",
+                    params![
+                        &cache_key,
+                        artifact_hash,
+                        artifact_json_canonical.as_deref()
+                    ],
+                )?;
+                return Ok(());
+            }
+            bail!(
+                "cache conflict: cache key {cache_key} already stores artifact {existing_artifact_hash}, not {artifact_hash}"
+            );
+        }
+        if existing_artifact_bytes.as_deref() != artifact_bytes {
+            bail!("cache conflict: cache key {cache_key} has different bytes for {artifact_hash}");
+        }
+        if existing_artifact_json != artifact_json_canonical {
+            self.conn.execute(
+                "UPDATE compile_cache
+                 SET artifact_json = ?2,
+                     artifact_bytes = ?3
+                 WHERE cache_key = ?1",
+                params![
+                    &cache_key,
+                    artifact_json_canonical.as_deref(),
+                    artifact_bytes
+                ],
+            )?;
+        }
         Ok(())
     }
 
@@ -993,5 +1061,31 @@ mod tests {
         assert_eq!(entry.artifact_bytes.as_deref(), Some(&b"\x7fELF"[..]));
         assert!(db.lookup_cache(&darwin_key).unwrap().is_none());
         db.verify().unwrap();
+    }
+
+    #[test]
+    fn cache_write_rejects_same_key_with_different_artifact_hash() {
+        let temp = tempdir().unwrap();
+        let mut db = CodeDb::open(temp.path().join("cache-conflict.sqlite")).unwrap();
+        db.init().unwrap();
+        let input_hash = db
+            .put_object("CacheInput", &json!({"schema": "test/input"}))
+            .unwrap();
+        let key = CacheKeyInput::new(
+            ArtifactKind::ObjectFile,
+            &input_hash,
+            "native-elf-v0",
+            "x86_64-unknown-linux-gnu",
+        );
+
+        db.write_cache_bytes(key.clone(), &json!({"version": 1}), b"one")
+            .unwrap();
+        let err = db
+            .write_cache_bytes(key.clone(), &json!({"version": 2}), b"two")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("cache conflict"));
+
+        let entry = db.lookup_cache(&key).unwrap().unwrap();
+        assert_eq!(entry.artifact_bytes.as_deref(), Some(&b"one"[..]));
     }
 }

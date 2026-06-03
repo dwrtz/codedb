@@ -7,6 +7,7 @@ mod branches;
 mod build_plan;
 mod diff;
 mod expr;
+mod jobs;
 mod link;
 mod lowering;
 mod migrations;

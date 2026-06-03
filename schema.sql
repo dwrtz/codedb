@@ -116,5 +116,15 @@ CREATE TABLE IF NOT EXISTS compile_cache (
     FOREIGN KEY (input_hash) REFERENCES objects(hash)
 );
 
+CREATE TABLE IF NOT EXISTS artifact_jobs (
+    cache_key TEXT PRIMARY KEY,
+    artifact_kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    worker_id TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    error_json TEXT
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS source_search
 USING fts5(root_hash, symbol_hash, rendered_source);
