@@ -475,6 +475,8 @@ fn dispatch_workspace_method(
         "tests.run" => tests_run(db, params),
         "tests.impact" => tests_impact(db, params),
         "history.list" => history_list(db, params),
+        "history.bisect" | "bisect.history" => history_bisect(db, params),
+        "why.run" | "provenance.why" | "history.why" => why_run(db, params),
         "verify.run" => verify_run(db, params),
         _ => Err(WorkspaceMethodError::new(
             "unknown_method",
@@ -1232,6 +1234,45 @@ fn history_list(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethod
     let branch = branch_param(params)?;
     let result = parse_json_payload(
         db.history_branch_json(&branch)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, &branch)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn history_bisect(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let branch = branch_param(params)?;
+    let object = params_object(params)?;
+    let result = if let Some(test_name) = optional_str_any(object, &["test", "test_name"])? {
+        let expected_status =
+            optional_str_any(object, &["expect_test", "expected_status", "expect_status"])?
+                .unwrap_or("passed");
+        parse_json_payload(
+            db.bisect_history_test_branch_json(&branch, test_name, expected_status)
+                .map_err(WorkspaceMethodError::method)?,
+        )?
+    } else {
+        let entry_name = required_str_any(object, &["entry_name", "entry", "name"])?;
+        let args = optional_string_array(object, "args")?.unwrap_or_default();
+        let expected_output = required_str_any(object, &["expect_output", "expected_output"])?;
+        parse_json_payload(
+            db.bisect_history_output_branch_json(&branch, entry_name, &args, expected_output)
+                .map_err(WorkspaceMethodError::method)?,
+        )?
+    };
+    let snapshot = workspace_snapshot(db, &branch)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn why_run(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let branch = branch_param(params)?;
+    let object = params_object(params)?;
+    let entry_name = required_str_any(object, &["entry_name", "entry", "name"])?;
+    let args = optional_string_array(object, "args")?.unwrap_or_default();
+    let from_root = required_str_any(object, &["from", "from_root", "old_root_hash", "root_a"])?;
+    let to_root = required_str_any(object, &["to", "to_root", "new_root_hash", "root_b"])?;
+    let result = parse_json_payload(
+        db.why_roots_branch_json(&branch, entry_name, &args, from_root, to_root)
             .map_err(WorkspaceMethodError::method)?,
     )?;
     let snapshot = workspace_snapshot(db, &branch)?;

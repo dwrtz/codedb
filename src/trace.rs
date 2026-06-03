@@ -271,6 +271,18 @@ impl CodeDb {
         self.trace_root_text_args(&mut state, entry_name, args)
     }
 
+    pub(crate) fn trace_root_text_args_report(
+        &self,
+        root_hash: &str,
+        history_hash: Option<String>,
+        entry_name: &str,
+        args: &[String],
+    ) -> Result<TraceReport> {
+        let root = self.load_root(root_hash)?;
+        let mut state = TraceState::new("root", root_hash.to_string(), history_hash, root);
+        self.trace_root_text_args(&mut state, entry_name, args)
+    }
+
     fn trace_root_text_args(
         &self,
         state: &mut TraceState,

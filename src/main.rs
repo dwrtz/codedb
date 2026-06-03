@@ -209,6 +209,38 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Find the first history migration where a semantic predicate changes")]
+    BisectHistory {
+        db: PathBuf,
+        entry_name: Option<String>,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        #[arg(long)]
+        expect_output: Option<String>,
+        #[arg(long)]
+        test: Option<String>,
+        #[arg(long, default_value = "passed")]
+        expect_test: String,
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Explain why behavior changed between two semantic roots")]
+    Why {
+        db: PathBuf,
+        entry_name: String,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        #[arg(long = "from")]
+        from_root: String,
+        #[arg(long = "to")]
+        to_root: String,
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
     Rename {
         db: PathBuf,
         old_name: String,
@@ -678,6 +710,87 @@ fn main() -> Result<()> {
                 print!("{}", codedb.blame_expr_branch_json(&branch, &expr_hash)?);
             } else {
                 print!("{}", codedb.blame_expr_branch(&branch, &expr_hash)?);
+            }
+        }
+        Command::BisectHistory {
+            db,
+            entry_name,
+            branch,
+            expect_output,
+            test,
+            expect_test,
+            args,
+            json,
+        } => {
+            let codedb = codedb::CodeDb::open(db)?;
+            if let Some(test) = test {
+                if json {
+                    print!(
+                        "{}",
+                        codedb.bisect_history_test_branch_json(&branch, &test, &expect_test)?
+                    );
+                } else {
+                    print!(
+                        "{}",
+                        codedb.bisect_history_test_branch(&branch, &test, &expect_test)?
+                    );
+                }
+            } else {
+                let entry_name = entry_name.ok_or_else(|| {
+                    anyhow::anyhow!("bisect-history requires an entry name unless --test is used")
+                })?;
+                let expect_output = expect_output.ok_or_else(|| {
+                    anyhow::anyhow!("bisect-history requires --expect-output unless --test is used")
+                })?;
+                if json {
+                    print!(
+                        "{}",
+                        codedb.bisect_history_output_branch_json(
+                            &branch,
+                            &entry_name,
+                            &args,
+                            &expect_output,
+                        )?
+                    );
+                } else {
+                    print!(
+                        "{}",
+                        codedb.bisect_history_output_branch(
+                            &branch,
+                            &entry_name,
+                            &args,
+                            &expect_output,
+                        )?
+                    );
+                }
+            }
+        }
+        Command::Why {
+            db,
+            entry_name,
+            branch,
+            from_root,
+            to_root,
+            args,
+            json,
+        } => {
+            let codedb = codedb::CodeDb::open(db)?;
+            if json {
+                print!(
+                    "{}",
+                    codedb.why_roots_branch_json(
+                        &branch,
+                        &entry_name,
+                        &args,
+                        &from_root,
+                        &to_root
+                    )?
+                );
+            } else {
+                print!(
+                    "{}",
+                    codedb.why_roots_branch(&branch, &entry_name, &args, &from_root, &to_root)?
+                );
             }
         }
         Command::Rename {

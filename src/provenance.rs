@@ -1,16 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value as JsonValue, json};
 
 use crate::MAIN_BRANCH;
 use crate::migrations::Operation;
-use crate::model::{aliases_for, param_names};
+use crate::model::{ProgramRootPayload, aliases_for, param_names, test_binding_for};
 use crate::store::{CodeDb, canonical_json};
+use crate::tests::{test_value_from_value, value_from_test_value};
 
 const BLAME_SYMBOL_SCHEMA: &str = "codedb/blame-symbol/v1";
 const BLAME_EXPR_SCHEMA: &str = "codedb/blame-expr/v1";
+const BISECT_HISTORY_SCHEMA: &str = "codedb/bisect-history/v1";
+const WHY_SCHEMA: &str = "codedb/why/v1";
 
 impl CodeDb {
     pub fn blame_symbol_main_branch_json(&self, symbol_or_name: &str) -> Result<String> {
@@ -264,6 +267,275 @@ impl CodeDb {
         }))
     }
 
+    pub fn bisect_history_output_branch_json(
+        &self,
+        branch_name: &str,
+        entry_name: &str,
+        args: &[String],
+        expected_output: &str,
+    ) -> Result<String> {
+        let expected = parse_expected_output_value(expected_output)?;
+        let predicate = HistoryPredicate::EvalOutput {
+            entry_name: entry_name.to_string(),
+            args: args.to_vec(),
+            expected,
+        };
+        let payload = self.bisect_history_branch_value(branch_name, predicate)?;
+        Ok(format!("{}\n", canonical_json(&payload)))
+    }
+
+    pub fn bisect_history_output_branch(
+        &self,
+        branch_name: &str,
+        entry_name: &str,
+        args: &[String],
+        expected_output: &str,
+    ) -> Result<String> {
+        let payload: JsonValue = serde_json::from_str(
+            self.bisect_history_output_branch_json(branch_name, entry_name, args, expected_output)?
+                .trim_end(),
+        )?;
+        Ok(format_bisect_history(&payload))
+    }
+
+    pub fn bisect_history_test_branch_json(
+        &self,
+        branch_name: &str,
+        test_name: &str,
+        expected_status: &str,
+    ) -> Result<String> {
+        validate_expected_test_status(expected_status)?;
+        let predicate = HistoryPredicate::SemanticTest {
+            test_name: test_name.to_string(),
+            expected_status: expected_status.to_string(),
+        };
+        let payload = self.bisect_history_branch_value(branch_name, predicate)?;
+        Ok(format!("{}\n", canonical_json(&payload)))
+    }
+
+    pub fn bisect_history_test_branch(
+        &self,
+        branch_name: &str,
+        test_name: &str,
+        expected_status: &str,
+    ) -> Result<String> {
+        let payload: JsonValue = serde_json::from_str(
+            self.bisect_history_test_branch_json(branch_name, test_name, expected_status)?
+                .trim_end(),
+        )?;
+        Ok(format_bisect_history(&payload))
+    }
+
+    fn bisect_history_branch_value(
+        &self,
+        branch_name: &str,
+        predicate: HistoryPredicate,
+    ) -> Result<JsonValue> {
+        let branch = self.branch(branch_name)?;
+        let states = self.history_root_states(branch_name)?;
+        let mut evaluated = BTreeMap::<usize, JsonValue>::new();
+
+        let mut eval_at = |idx: usize| -> Result<JsonValue> {
+            if let Some(cached) = evaluated.get(&idx) {
+                return Ok(cached.clone());
+            }
+            let state = states
+                .get(idx)
+                .ok_or_else(|| anyhow!("bisect state index out of bounds: {idx}"))?;
+            let evaluation = self.evaluate_history_predicate(state, &predicate)?;
+            evaluated.insert(idx, evaluation.clone());
+            Ok(evaluation)
+        };
+
+        let mut first_matching = None;
+        for idx in 0..states.len() {
+            if predicate_matches(&eval_at(idx)?) {
+                first_matching = Some(idx);
+                break;
+            }
+        }
+
+        let mut status = "predicate_never_matched";
+        let mut first_changed = JsonValue::Null;
+        let mut previous = JsonValue::Null;
+        if let Some(first_matching) = first_matching {
+            let final_idx = states.len().saturating_sub(1);
+            if predicate_matches(&eval_at(final_idx)?) {
+                status = "unchanged";
+            } else {
+                status = "changed";
+                let mut low = first_matching + 1;
+                let mut high = final_idx;
+                while low < high {
+                    let mid = (low + high) / 2;
+                    if predicate_matches(&eval_at(mid)?) {
+                        low = mid + 1;
+                    } else {
+                        high = mid;
+                    }
+                }
+                previous = eval_at(low.saturating_sub(1))?;
+                let state = &states[low];
+                first_changed = json!({
+                    "sequence": state.sequence,
+                    "root_hash": state.root_hash,
+                    "history_hash": state.history_hash,
+                    "migration": state.migration_from_parent,
+                    "previous_evaluation": previous,
+                    "changed_evaluation": eval_at(low)?,
+                });
+            }
+        }
+
+        let mut evaluations = evaluated.into_values().collect::<Vec<_>>();
+        evaluations.sort_by_key(|value| {
+            value
+                .get("sequence")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(u64::MAX)
+        });
+
+        Ok(json!({
+            "schema": BISECT_HISTORY_SCHEMA,
+            "branch": branch_name,
+            "root_hash": branch.root_hash,
+            "history_hash": branch.history_hash,
+            "status": status,
+            "search_strategy": "binary_search_after_first_match",
+            "predicate": predicate.to_json(),
+            "root_count": states.len(),
+            "first_matching_sequence": first_matching,
+            "first_changed": first_changed,
+            "previous": previous,
+            "evaluations": evaluations,
+        }))
+    }
+
+    pub fn why_roots_branch_json(
+        &self,
+        branch_name: &str,
+        entry_name: &str,
+        args: &[String],
+        from_root: &str,
+        to_root: &str,
+    ) -> Result<String> {
+        let payload =
+            self.why_roots_branch_value(branch_name, entry_name, args, from_root, to_root)?;
+        Ok(format!("{}\n", canonical_json(&payload)))
+    }
+
+    pub fn why_roots_branch(
+        &self,
+        branch_name: &str,
+        entry_name: &str,
+        args: &[String],
+        from_root: &str,
+        to_root: &str,
+    ) -> Result<String> {
+        let payload: JsonValue = serde_json::from_str(
+            self.why_roots_branch_json(branch_name, entry_name, args, from_root, to_root)?
+                .trim_end(),
+        )?;
+        Ok(format_why(&payload))
+    }
+
+    fn why_roots_branch_value(
+        &self,
+        branch_name: &str,
+        entry_name: &str,
+        args: &[String],
+        from_root: &str,
+        to_root: &str,
+    ) -> Result<JsonValue> {
+        self.load_root(from_root)
+            .with_context(|| format!("why --from is not a program root: {from_root}"))?;
+        self.load_root(to_root)
+            .with_context(|| format!("why --to is not a program root: {to_root}"))?;
+        let branch = self.branch(branch_name)?;
+        let from_history = self.history_hash_for_root_in_branch(branch_name, from_root)?;
+        let to_history = self.history_hash_for_root_in_branch(branch_name, to_root)?;
+        let before_trace = serde_json::to_value(self.trace_root_text_args_report(
+            from_root,
+            from_history.clone(),
+            entry_name,
+            args,
+        )?)?;
+        let after_trace = serde_json::to_value(self.trace_root_text_args_report(
+            to_root,
+            to_history.clone(),
+            entry_name,
+            args,
+        )?)?;
+        let diff: JsonValue =
+            serde_json::from_str(self.diff_roots_json(from_root, to_root)?.trim_end())?;
+        let changed_functions = self.changed_functions_between_roots(from_root, to_root)?;
+        let migration_path = self.migration_path_between_roots(branch_name, from_root, to_root)?;
+        let direct_migration = if migration_path.len() == 1 {
+            migration_path[0].clone()
+        } else {
+            JsonValue::Null
+        };
+        let before_result = before_trace
+            .get("result")
+            .cloned()
+            .unwrap_or(JsonValue::Null);
+        let after_result = after_trace
+            .get("result")
+            .cloned()
+            .unwrap_or(JsonValue::Null);
+        let trace_summary = json!({
+            "entry_name": entry_name,
+            "args": args,
+            "before": {
+                "root_hash": from_root,
+                "history_hash": from_history,
+                "status": before_trace.get("status").cloned().unwrap_or(JsonValue::Null),
+                "result": before_result,
+            },
+            "after": {
+                "root_hash": to_root,
+                "history_hash": to_history,
+                "status": after_trace.get("status").cloned().unwrap_or(JsonValue::Null),
+                "result": after_result,
+            },
+            "result_changed": before_trace.get("result") != after_trace.get("result"),
+            "event_count_before": before_trace
+                .get("events")
+                .and_then(JsonValue::as_array)
+                .map(Vec::len)
+                .unwrap_or(0),
+            "event_count_after": after_trace
+                .get("events")
+                .and_then(JsonValue::as_array)
+                .map(Vec::len)
+                .unwrap_or(0),
+        });
+
+        Ok(json!({
+            "schema": WHY_SCHEMA,
+            "branch": branch_name,
+            "branch_root_hash": branch.root_hash,
+            "branch_history_hash": branch.history_hash,
+            "from_root_hash": from_root,
+            "to_root_hash": to_root,
+            "from_history_hash": from_history,
+            "to_history_hash": to_history,
+            "entry_name": entry_name,
+            "args": args,
+            "status": "ok",
+            "summary": {
+                "result_changed": trace_summary["result_changed"],
+                "changed_function_count": changed_functions.len(),
+                "migration_count": migration_path.len(),
+            },
+            "trace_summary": trace_summary,
+            "changed_functions": changed_functions,
+            "diff": diff,
+            "migration_path": migration_path,
+            "direct_migration": direct_migration,
+        }))
+    }
+
     fn resolve_symbol_for_blame(&self, root_hash: &str, symbol_or_name: &str) -> Result<String> {
         if symbol_or_name.starts_with("sha256:") {
             let kind = self.get_kind(symbol_or_name)?;
@@ -489,6 +761,486 @@ impl CodeDb {
         }
         Ok(items)
     }
+
+    fn history_root_states(&self, branch_name: &str) -> Result<Vec<HistoryRootState>> {
+        let branch = self.branch(branch_name)?;
+        let items = self.provenance_history_chain(branch_name)?;
+        let mut states = Vec::new();
+        if let Some(first) = items.first() {
+            states.push(HistoryRootState {
+                sequence: 0,
+                root_hash: first.input_root.clone(),
+                history_hash: first.parent_history_hash.clone(),
+                migration_from_parent: JsonValue::Null,
+            });
+        } else {
+            states.push(HistoryRootState {
+                sequence: 0,
+                root_hash: branch.root_hash,
+                history_hash: branch.history_hash,
+                migration_from_parent: JsonValue::Null,
+            });
+            return Ok(states);
+        }
+        for (idx, item) in items.iter().enumerate() {
+            states.push(HistoryRootState {
+                sequence: idx + 1,
+                root_hash: item.output_root.clone(),
+                history_hash: Some(item.history_hash.clone()),
+                migration_from_parent: item.to_json_with_reasons(&["history_step"])?,
+            });
+        }
+        Ok(states)
+    }
+
+    fn evaluate_history_predicate(
+        &self,
+        state: &HistoryRootState,
+        predicate: &HistoryPredicate,
+    ) -> Result<JsonValue> {
+        match predicate {
+            HistoryPredicate::EvalOutput {
+                entry_name,
+                args,
+                expected,
+            } => {
+                let trace = self.trace_root_text_args_report(
+                    &state.root_hash,
+                    state.history_hash.clone(),
+                    entry_name,
+                    args,
+                )?;
+                let trace_json = serde_json::to_value(&trace)?;
+                let actual = trace_json.get("result").cloned().unwrap_or(JsonValue::Null);
+                let matched = trace_json.get("status").and_then(JsonValue::as_str) == Some("ok")
+                    && actual == *expected;
+                Ok(json!({
+                    "sequence": state.sequence,
+                    "root_hash": state.root_hash,
+                    "history_hash": state.history_hash,
+                    "status": trace_json.get("status").cloned().unwrap_or(JsonValue::Null),
+                    "matched": matched,
+                    "predicate_kind": "eval_output",
+                    "entry_name": entry_name,
+                    "args": args,
+                    "expected": expected,
+                    "actual": actual,
+                    "diagnostics": trace_json.get("diagnostics").cloned().unwrap_or_else(|| json!([])),
+                }))
+            }
+            HistoryPredicate::SemanticTest {
+                test_name,
+                expected_status,
+            } => {
+                let result = self.evaluate_semantic_test_at_root(&state.root_hash, test_name)?;
+                let actual_status = result
+                    .get("status")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("error");
+                Ok(json!({
+                    "sequence": state.sequence,
+                    "root_hash": state.root_hash,
+                    "history_hash": state.history_hash,
+                    "status": if actual_status == "error" { "error" } else { "ok" },
+                    "matched": actual_status == expected_status,
+                    "predicate_kind": "semantic_test",
+                    "test_name": test_name,
+                    "expected_status": expected_status,
+                    "actual_status": actual_status,
+                    "test_result": result,
+                }))
+            }
+        }
+    }
+
+    fn evaluate_semantic_test_at_root(
+        &self,
+        root_hash: &str,
+        test_name: &str,
+    ) -> Result<JsonValue> {
+        let root = self.load_root(root_hash)?;
+        let Some(binding) = test_binding_for(&root, test_name) else {
+            return Ok(json!({
+                "status": "error",
+                "kind": "test_not_found",
+                "message": format!("test {test_name:?} is not present in root {root_hash}"),
+            }));
+        };
+        let case = self.load_test_case(&binding.test)?;
+        let expected = value_from_test_value(&case.expected)?;
+        let args = case
+            .args
+            .iter()
+            .map(value_from_test_value)
+            .collect::<Result<Vec<_>>>()?;
+        match self.eval_symbol(root_hash, &case.entry_symbol, args) {
+            Ok(actual) => {
+                let status = if actual == expected {
+                    "passed"
+                } else {
+                    "failed"
+                };
+                Ok(json!({
+                    "status": status,
+                    "name": binding.name,
+                    "test_hash": binding.test,
+                    "entry_symbol": case.entry_symbol,
+                    "entry_name": self.symbol_display(&root, &case.entry_symbol)?,
+                    "category": case.category.as_str(),
+                    "expected": case.expected,
+                    "actual": test_value_from_value(&actual),
+                }))
+            }
+            Err(err) => Ok(json!({
+                "status": "error",
+                "name": binding.name,
+                "test_hash": binding.test,
+                "entry_symbol": case.entry_symbol,
+                "category": case.category.as_str(),
+                "expected": case.expected,
+                "error": format!("{err:#}"),
+            })),
+        }
+    }
+
+    fn history_hash_for_root_in_branch(
+        &self,
+        branch_name: &str,
+        root_hash: &str,
+    ) -> Result<Option<String>> {
+        for state in self.history_root_states(branch_name)? {
+            if state.root_hash == root_hash {
+                return Ok(state.history_hash);
+            }
+        }
+        Ok(None)
+    }
+
+    fn migration_path_between_roots(
+        &self,
+        branch_name: &str,
+        from_root: &str,
+        to_root: &str,
+    ) -> Result<Vec<JsonValue>> {
+        if from_root == to_root {
+            return Ok(Vec::new());
+        }
+        let mut active = false;
+        let mut path = Vec::new();
+        for item in self.provenance_history_chain(branch_name)? {
+            if !active && item.input_root == from_root {
+                active = true;
+            }
+            if active {
+                path.push(item.to_json_with_reasons(&["why_path"])?);
+                if item.output_root == to_root {
+                    return Ok(path);
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    fn changed_functions_between_roots(
+        &self,
+        from_root_hash: &str,
+        to_root_hash: &str,
+    ) -> Result<Vec<JsonValue>> {
+        let from_root = self.load_root(from_root_hash)?;
+        let to_root = self.load_root(to_root_hash)?;
+        let from_symbols = from_root
+            .symbols
+            .iter()
+            .map(|entry| (entry.symbol.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let to_symbols = to_root
+            .symbols
+            .iter()
+            .map(|entry| (entry.symbol.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let all_symbols = from_symbols
+            .keys()
+            .chain(to_symbols.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut changed = Vec::new();
+        for symbol in all_symbols {
+            match (from_symbols.get(&symbol), to_symbols.get(&symbol)) {
+                (Some(from_entry), Some(to_entry)) => {
+                    let mut reasons = Vec::new();
+                    if from_entry.signature != to_entry.signature {
+                        reasons.push("signature");
+                    }
+                    if from_entry.definition != to_entry.definition {
+                        reasons.push("body");
+                    }
+                    let from_name = self.symbol_display(&from_root, &symbol).ok();
+                    let to_name = self.symbol_display(&to_root, &symbol).ok();
+                    if from_name != to_name {
+                        reasons.push("name");
+                    }
+                    if reasons.is_empty() {
+                        continue;
+                    }
+                    let from_body = self.function_body_hash(&from_entry.definition)?;
+                    let to_body = self.function_body_hash(&to_entry.definition)?;
+                    let mut expression_changes = Vec::new();
+                    if from_body != to_body {
+                        self.collect_expression_changes(
+                            &from_root,
+                            &to_root,
+                            &from_body,
+                            &to_body,
+                            "body",
+                            &mut expression_changes,
+                        )?;
+                    }
+                    changed.push(json!({
+                        "kind": "function_changed",
+                        "symbol_hash": symbol,
+                        "function": to_name.or(from_name).unwrap_or_else(|| symbol.clone()),
+                        "reasons": reasons,
+                        "from_signature_hash": from_entry.signature,
+                        "to_signature_hash": to_entry.signature,
+                        "from_definition_hash": from_entry.definition,
+                        "to_definition_hash": to_entry.definition,
+                        "from_body_hash": from_body,
+                        "to_body_hash": to_body,
+                        "expression_changes": expression_changes,
+                    }));
+                }
+                (None, Some(to_entry)) => changed.push(json!({
+                    "kind": "function_added",
+                    "symbol_hash": symbol,
+                    "function": self.symbol_display(&to_root, &symbol).unwrap_or_else(|_| symbol.clone()),
+                    "to_signature_hash": to_entry.signature,
+                    "to_definition_hash": to_entry.definition,
+                    "to_body_hash": self.function_body_hash(&to_entry.definition)?,
+                })),
+                (Some(from_entry), None) => changed.push(json!({
+                    "kind": "function_removed",
+                    "symbol_hash": symbol,
+                    "function": self.symbol_display(&from_root, &symbol).unwrap_or_else(|_| symbol.clone()),
+                    "from_signature_hash": from_entry.signature,
+                    "from_definition_hash": from_entry.definition,
+                    "from_body_hash": self.function_body_hash(&from_entry.definition)?,
+                })),
+                (None, None) => unreachable!(),
+            }
+        }
+        Ok(changed)
+    }
+
+    fn collect_expression_changes(
+        &self,
+        from_root: &ProgramRootPayload,
+        to_root: &ProgramRootPayload,
+        from_expr: &str,
+        to_expr: &str,
+        path: &str,
+        changes: &mut Vec<JsonValue>,
+    ) -> Result<()> {
+        if from_expr == to_expr {
+            return Ok(());
+        }
+        let from_payload = self.get_payload(from_expr)?;
+        let to_payload = self.get_payload(to_expr)?;
+        let from_kind = from_payload
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("unknown");
+        let to_kind = to_payload
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("unknown");
+        if from_kind != to_kind {
+            changes.push(json!({
+                "kind": "expression_replaced",
+                "path": path,
+                "from_expr_hash": from_expr,
+                "to_expr_hash": to_expr,
+                "from_expr_kind": from_kind,
+                "to_expr_kind": to_kind,
+            }));
+            return Ok(());
+        }
+
+        match from_kind {
+            "literal_i64" | "literal_bool" => {
+                if from_payload.get("value") != to_payload.get("value") {
+                    changes.push(json!({
+                        "kind": "literal_changed",
+                        "path": path,
+                        "from_expr_hash": from_expr,
+                        "to_expr_hash": to_expr,
+                        "expr_kind": from_kind,
+                        "from_value": from_payload.get("value").cloned().unwrap_or(JsonValue::Null),
+                        "to_value": to_payload.get("value").cloned().unwrap_or(JsonValue::Null),
+                    }));
+                }
+            }
+            "literal_unit" => changes.push(json!({
+                "kind": "literal_changed",
+                "path": path,
+                "from_expr_hash": from_expr,
+                "to_expr_hash": to_expr,
+                "expr_kind": "literal_unit",
+            })),
+            "call" => {
+                let from_symbol = from_payload.get("symbol").and_then(JsonValue::as_str);
+                let to_symbol = to_payload.get("symbol").and_then(JsonValue::as_str);
+                if from_symbol != to_symbol {
+                    changes.push(json!({
+                        "kind": "call_target_changed",
+                        "path": path,
+                        "from_expr_hash": from_expr,
+                        "to_expr_hash": to_expr,
+                        "from_symbol_hash": from_symbol,
+                        "to_symbol_hash": to_symbol,
+                        "from_function": from_symbol
+                            .map(|symbol| self.symbol_display(from_root, symbol).unwrap_or_else(|_| symbol.to_string())),
+                        "to_function": to_symbol
+                            .map(|symbol| self.symbol_display(to_root, symbol).unwrap_or_else(|_| symbol.to_string())),
+                    }));
+                }
+                let from_args = json_array_hashes(&from_payload, "args")?;
+                let to_args = json_array_hashes(&to_payload, "args")?;
+                for (idx, (from_arg, to_arg)) in from_args.iter().zip(to_args.iter()).enumerate() {
+                    self.collect_expression_changes(
+                        from_root,
+                        to_root,
+                        from_arg,
+                        to_arg,
+                        &format!("{path}.args[{idx}]"),
+                        changes,
+                    )?;
+                }
+            }
+            "binary" => {
+                if from_payload.get("op") != to_payload.get("op") {
+                    changes.push(json!({
+                        "kind": "operator_changed",
+                        "path": path,
+                        "from_expr_hash": from_expr,
+                        "to_expr_hash": to_expr,
+                        "from_op": from_payload.get("op").cloned().unwrap_or(JsonValue::Null),
+                        "to_op": to_payload.get("op").cloned().unwrap_or(JsonValue::Null),
+                    }));
+                }
+                for key in ["left", "right"] {
+                    if let (Some(from_child), Some(to_child)) = (
+                        from_payload.get(key).and_then(JsonValue::as_str),
+                        to_payload.get(key).and_then(JsonValue::as_str),
+                    ) {
+                        self.collect_expression_changes(
+                            from_root,
+                            to_root,
+                            from_child,
+                            to_child,
+                            &format!("{path}.{key}"),
+                            changes,
+                        )?;
+                    }
+                }
+            }
+            "unary" => {
+                if from_payload.get("op") != to_payload.get("op") {
+                    changes.push(json!({
+                        "kind": "operator_changed",
+                        "path": path,
+                        "from_expr_hash": from_expr,
+                        "to_expr_hash": to_expr,
+                        "from_op": from_payload.get("op").cloned().unwrap_or(JsonValue::Null),
+                        "to_op": to_payload.get("op").cloned().unwrap_or(JsonValue::Null),
+                    }));
+                }
+                if let (Some(from_child), Some(to_child)) = (
+                    from_payload.get("expr").and_then(JsonValue::as_str),
+                    to_payload.get("expr").and_then(JsonValue::as_str),
+                ) {
+                    self.collect_expression_changes(
+                        from_root,
+                        to_root,
+                        from_child,
+                        to_child,
+                        &format!("{path}.expr"),
+                        changes,
+                    )?;
+                }
+            }
+            "let" => {
+                for key in ["binding_name", "binding_type"] {
+                    if from_payload.get(key) != to_payload.get(key) {
+                        changes.push(json!({
+                            "kind": format!("let_{key}_changed"),
+                            "path": path,
+                            "from_expr_hash": from_expr,
+                            "to_expr_hash": to_expr,
+                            "from": from_payload.get(key).cloned().unwrap_or(JsonValue::Null),
+                            "to": to_payload.get(key).cloned().unwrap_or(JsonValue::Null),
+                        }));
+                    }
+                }
+                for key in ["value", "body"] {
+                    if let (Some(from_child), Some(to_child)) = (
+                        from_payload.get(key).and_then(JsonValue::as_str),
+                        to_payload.get(key).and_then(JsonValue::as_str),
+                    ) {
+                        self.collect_expression_changes(
+                            from_root,
+                            to_root,
+                            from_child,
+                            to_child,
+                            &format!("{path}.{key}"),
+                            changes,
+                        )?;
+                    }
+                }
+            }
+            "if" => {
+                for key in ["cond", "then", "else"] {
+                    if let (Some(from_child), Some(to_child)) = (
+                        from_payload.get(key).and_then(JsonValue::as_str),
+                        to_payload.get(key).and_then(JsonValue::as_str),
+                    ) {
+                        self.collect_expression_changes(
+                            from_root,
+                            to_root,
+                            from_child,
+                            to_child,
+                            &format!("{path}.{key}"),
+                            changes,
+                        )?;
+                    }
+                }
+            }
+            "param_ref" | "local_ref" => {
+                let key = if from_kind == "param_ref" {
+                    "index"
+                } else {
+                    "depth"
+                };
+                if from_payload.get(key) != to_payload.get(key) {
+                    changes.push(json!({
+                        "kind": format!("{from_kind}_changed"),
+                        "path": path,
+                        "from_expr_hash": from_expr,
+                        "to_expr_hash": to_expr,
+                        "from": from_payload.get(key).cloned().unwrap_or(JsonValue::Null),
+                        "to": to_payload.get(key).cloned().unwrap_or(JsonValue::Null),
+                    }));
+                }
+            }
+            _ => changes.push(json!({
+                "kind": "expression_changed",
+                "path": path,
+                "from_expr_hash": from_expr,
+                "to_expr_hash": to_expr,
+                "expr_kind": from_kind,
+            })),
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -519,6 +1271,236 @@ impl ProvenanceHistoryItem {
             "reasons": reasons,
         }))
     }
+}
+
+#[derive(Debug, Clone)]
+struct HistoryRootState {
+    sequence: usize,
+    root_hash: String,
+    history_hash: Option<String>,
+    migration_from_parent: JsonValue,
+}
+
+#[derive(Debug, Clone)]
+enum HistoryPredicate {
+    EvalOutput {
+        entry_name: String,
+        args: Vec<String>,
+        expected: JsonValue,
+    },
+    SemanticTest {
+        test_name: String,
+        expected_status: String,
+    },
+}
+
+impl HistoryPredicate {
+    fn to_json(&self) -> JsonValue {
+        match self {
+            HistoryPredicate::EvalOutput {
+                entry_name,
+                args,
+                expected,
+            } => json!({
+                "kind": "eval_output",
+                "entry_name": entry_name,
+                "args": args,
+                "expected": expected,
+            }),
+            HistoryPredicate::SemanticTest {
+                test_name,
+                expected_status,
+            } => json!({
+                "kind": "semantic_test",
+                "test_name": test_name,
+                "expected_status": expected_status,
+            }),
+        }
+    }
+}
+
+fn predicate_matches(evaluation: &JsonValue) -> bool {
+    evaluation
+        .get("matched")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+}
+
+fn parse_expected_output_value(text: &str) -> Result<JsonValue> {
+    if let Some(value) = text.strip_prefix("i64:") {
+        value
+            .parse::<i64>()
+            .with_context(|| format!("expected i64 output must be i64, got {value:?}"))?;
+        return Ok(json!({"kind": "i64", "value": value}));
+    }
+    if let Some(value) = text.strip_prefix("bool:") {
+        return match value {
+            "true" => Ok(json!({"kind": "bool", "value": true})),
+            "false" => Ok(json!({"kind": "bool", "value": false})),
+            _ => bail!("expected bool output must be true or false, got {value:?}"),
+        };
+    }
+    if matches!(text, "unit" | "()" | "unit:()") {
+        return Ok(json!({"kind": "unit"}));
+    }
+    match text {
+        "true" => Ok(json!({"kind": "bool", "value": true})),
+        "false" => Ok(json!({"kind": "bool", "value": false})),
+        value => {
+            value.parse::<i64>().with_context(|| {
+                format!("expected output must be i64, bool, or unit, got {value:?}")
+            })?;
+            Ok(json!({"kind": "i64", "value": value}))
+        }
+    }
+}
+
+fn validate_expected_test_status(status: &str) -> Result<()> {
+    match status {
+        "passed" | "failed" | "error" => Ok(()),
+        other => bail!("expected test status must be passed, failed, or error, got {other:?}"),
+    }
+}
+
+fn json_array_hashes(payload: &JsonValue, key: &str) -> Result<Vec<String>> {
+    Ok(payload
+        .get(key)
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| anyhow!("{key} must be an array"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("{key} entries must be hashes"))
+        })
+        .collect::<Result<Vec<_>>>()?)
+}
+
+fn format_bisect_history(payload: &JsonValue) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "bisect_history {}\n",
+        payload
+            .get("status")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("unknown")
+    ));
+    out.push_str(&format!(
+        "branch {}\n",
+        payload
+            .get("branch")
+            .and_then(JsonValue::as_str)
+            .unwrap_or(MAIN_BRANCH)
+    ));
+    if let Some(first_changed) = payload.get("first_changed")
+        && !first_changed.is_null()
+    {
+        let migration = &first_changed["migration"];
+        out.push_str(&format!(
+            "first_changed_migration {} {}\n",
+            migration
+                .get("migration_hash")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("none"),
+            migration
+                .get("operation_kind")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("unknown")
+        ));
+        out.push_str(&format!(
+            "from_root {}\n",
+            first_changed["previous_evaluation"]
+                .get("root_hash")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+        ));
+        out.push_str(&format!(
+            "to_root {}\n",
+            first_changed["changed_evaluation"]
+                .get("root_hash")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+        ));
+    }
+    out
+}
+
+fn format_why(payload: &JsonValue) -> String {
+    let mut out = String::new();
+    out.push_str("why ok\n");
+    out.push_str(&format!(
+        "from_root {}\n",
+        payload
+            .get("from_root_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+    ));
+    out.push_str(&format!(
+        "to_root {}\n",
+        payload
+            .get("to_root_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+    ));
+    let before = &payload["trace_summary"]["before"]["result"];
+    let after = &payload["trace_summary"]["after"]["result"];
+    out.push_str(&format!(
+        "result {} -> {}\n",
+        canonical_json(before),
+        canonical_json(after)
+    ));
+    for migration in payload
+        .get("migration_path")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+    {
+        out.push_str(&format!(
+            "migration {} {}\n",
+            migration
+                .get("migration_hash")
+                .and_then(JsonValue::as_str)
+                .unwrap_or(""),
+            migration
+                .get("operation_kind")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+        ));
+    }
+    for function in payload
+        .get("changed_functions")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+    {
+        out.push_str(&format!(
+            "changed_function {} {}\n",
+            function
+                .get("function")
+                .and_then(JsonValue::as_str)
+                .unwrap_or(""),
+            function
+                .get("symbol_hash")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+        ));
+        for expr in function
+            .get("expression_changes")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+        {
+            out.push_str(&format!(
+                "  {} {}\n",
+                expr.get("kind")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("expression_changed"),
+                expr.get("path").and_then(JsonValue::as_str).unwrap_or("")
+            ));
+        }
+    }
+    out
 }
 
 fn push_blame_line(out: &mut String, label: &str, value: &JsonValue) {
