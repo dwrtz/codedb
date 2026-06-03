@@ -489,6 +489,7 @@ fn dispatch_workspace_method(
         "build.execute" => build_execute(db, params),
         "build.artifact_status" => build_artifact_status(db, params),
         "trace.run" => trace_run(db, params),
+        "debug.run" => debug_run(db, params),
         "history.list" => history_list(db, params),
         "verify.run" => verify_run(db, params),
         _ => Err(WorkspaceMethodError::new(
@@ -900,6 +901,25 @@ fn trace_run(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodRes
     let args = optional_string_array(object, "args")?.unwrap_or_default();
     let result = parse_json_payload(
         db.trace_main_branch_text_args_json(entry_name, &args)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let diagnostics = trace_workspace_diagnostics(&result);
+    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    Ok(WorkspaceMethodResult {
+        result,
+        diagnostics,
+        snapshot,
+    })
+}
+
+fn debug_run(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    require_main_branch(params, "debug.run")?;
+    let object = params_object(params)?;
+    let entry_name = required_str_alias(object, "entry_name", "entry")?;
+    let args = optional_string_array(object, "args")?.unwrap_or_default();
+    let commands = optional_string_array(object, "commands")?.unwrap_or_default();
+    let result = parse_json_payload(
+        db.debug_main_branch_text_args_json(entry_name, &args, &commands)
             .map_err(WorkspaceMethodError::method)?,
     )?;
     let diagnostics = trace_workspace_diagnostics(&result);

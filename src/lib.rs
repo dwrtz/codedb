@@ -5,6 +5,7 @@ mod backend;
 mod backend_c;
 mod branches;
 mod build_plan;
+pub mod debugger;
 mod diff;
 mod expr;
 mod jobs;

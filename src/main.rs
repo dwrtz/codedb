@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -56,6 +57,16 @@ enum Command {
         db: PathBuf,
         entry_name: String,
         args: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Step through a semantic trace with breakpoints and frame inspection")]
+    Debug {
+        db: PathBuf,
+        entry_name: String,
+        args: Vec<String>,
+        #[arg(long = "cmd")]
+        commands: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -347,6 +358,34 @@ fn main() -> Result<()> {
                 "{}",
                 codedb.trace_main_branch_text_args_json(&entry_name, &args)?
             );
+        }
+        Command::Debug {
+            db,
+            entry_name,
+            args,
+            commands,
+            json,
+        } => {
+            let codedb = codedb::CodeDb::open(db)?;
+            if json {
+                print!(
+                    "{}",
+                    codedb.debug_main_branch_text_args_json(&entry_name, &args, &commands)?
+                );
+            } else {
+                let mut session = codedb.debug_session_main_branch_text_args(&entry_name, &args)?;
+                if commands.is_empty() {
+                    run_debug_repl(&codedb, &mut session)?;
+                } else {
+                    for command in commands {
+                        let record = session.execute_command(&codedb, &command)?;
+                        println!("{}", serde_json::to_string_pretty(&record)?);
+                        if session.is_quit() {
+                            break;
+                        }
+                    }
+                }
+            }
         }
         Command::EmitC {
             db,
@@ -695,6 +734,39 @@ fn main() -> Result<()> {
         }
         Command::Serve { db, addr } => {
             codedb::server::serve_workspace(db, &addr)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn run_debug_repl(
+    codedb: &codedb::CodeDb,
+    session: &mut codedb::debugger::DebugSession,
+) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&session.current_state(codedb)?)?
+    );
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    loop {
+        print!("debug> ");
+        stdout.flush()?;
+
+        let mut line = String::new();
+        if stdin.read_line(&mut line)? == 0 {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let record = session.execute_command(codedb, &line)?;
+        println!("{}", serde_json::to_string_pretty(&record)?);
+        if session.is_quit() {
+            break;
         }
     }
 

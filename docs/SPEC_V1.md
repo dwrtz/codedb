@@ -198,6 +198,7 @@ build.execute
 build.artifact_status
 
 trace.run
+debug.run
 trace.diff
 
 tests.list

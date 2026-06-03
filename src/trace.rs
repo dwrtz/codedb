@@ -118,6 +118,26 @@ pub enum TraceEvent {
         selected_branch: String,
         selected_expr_hash: String,
     },
+    LocalBind {
+        root_hash: String,
+        frame: usize,
+        symbol_hash: String,
+        function_def_hash: String,
+        expr_hash: String,
+        name: String,
+        type_hash: String,
+        value: TraceValue,
+    },
+    LocalUnbind {
+        root_hash: String,
+        frame: usize,
+        symbol_hash: String,
+        function_def_hash: String,
+        expr_hash: String,
+        name: String,
+        type_hash: String,
+        value: TraceValue,
+    },
     Trap {
         root_hash: String,
         frame: usize,
@@ -680,6 +700,16 @@ impl CodeDb {
                 )
             }
             "let" => {
+                let name = payload
+                    .get("binding_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing binding_name"))?
+                    .to_string();
+                let binding_type = payload
+                    .get("binding_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing binding_type"))?
+                    .to_string();
                 let value_hash = payload
                     .get("value")
                     .and_then(JsonValue::as_str)
@@ -697,6 +727,16 @@ impl CodeDb {
                     args,
                     locals,
                 )?;
+                state.events.push(TraceEvent::LocalBind {
+                    root_hash: state.root_hash.clone(),
+                    frame,
+                    symbol_hash: symbol_hash.to_string(),
+                    function_def_hash: function_def_hash.to_string(),
+                    expr_hash: expr_hash.to_string(),
+                    name: name.clone(),
+                    type_hash: binding_type.clone(),
+                    value: TraceValue::from_value(&value),
+                });
                 locals.push(value);
                 let body = self.trace_expr(
                     state,
@@ -707,7 +747,19 @@ impl CodeDb {
                     args,
                     locals,
                 );
-                locals.pop();
+                let popped = locals.pop();
+                if let Some(value) = &popped {
+                    state.events.push(TraceEvent::LocalUnbind {
+                        root_hash: state.root_hash.clone(),
+                        frame,
+                        symbol_hash: symbol_hash.to_string(),
+                        function_def_hash: function_def_hash.to_string(),
+                        expr_hash: expr_hash.to_string(),
+                        name,
+                        type_hash: binding_type,
+                        value: TraceValue::from_value(value),
+                    });
+                }
                 let body = body?;
                 state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &body);
                 Ok(body)
