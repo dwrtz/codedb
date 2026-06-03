@@ -52,6 +52,13 @@ pub(crate) enum Operation {
         params: Vec<ParamSpec>,
         return_type: String,
     },
+    AddParameter {
+        module: String,
+        symbol: String,
+        name: String,
+        param: ParamSpec,
+        default: Option<RawExpr>,
+    },
     DeleteSymbol {
         module: String,
         symbol: String,
@@ -118,6 +125,7 @@ impl Operation {
             Operation::RenameSymbol { .. } => "rename_symbol",
             Operation::ReplaceFunctionBody { .. } => "replace_function_body",
             Operation::ChangeFunctionSignature { .. } => "change_function_signature",
+            Operation::AddParameter { .. } => "add_parameter",
             Operation::DeleteSymbol { .. } => "delete_symbol",
             Operation::CreateAlias { .. } => "create_alias",
             Operation::RemoveAlias { .. } => "remove_alias",
@@ -539,6 +547,60 @@ fn condition_names<T: ConditionName>(conditions: &[T]) -> String {
         .join(",")
 }
 
+fn append_default_arg_to_calls(expr: &RawExpr, target_name: &str, default: &RawExpr) -> RawExpr {
+    match expr {
+        RawExpr::LiteralI64 { value } => RawExpr::LiteralI64 {
+            value: value.clone(),
+        },
+        RawExpr::LiteralBool { value } => RawExpr::LiteralBool { value: *value },
+        RawExpr::Unit => RawExpr::Unit,
+        RawExpr::ParamRef { index } => RawExpr::ParamRef { index: *index },
+        RawExpr::ParamName { name } => RawExpr::ParamName { name: name.clone() },
+        RawExpr::Call { name, args } => {
+            let mut args = args
+                .iter()
+                .map(|arg| append_default_arg_to_calls(arg, target_name, default))
+                .collect::<Vec<_>>();
+            if name == target_name {
+                args.push(default.clone());
+            }
+            RawExpr::Call {
+                name: name.clone(),
+                args,
+            }
+        }
+        RawExpr::Binary { op, left, right } => RawExpr::Binary {
+            op: op.clone(),
+            left: Box::new(append_default_arg_to_calls(left, target_name, default)),
+            right: Box::new(append_default_arg_to_calls(right, target_name, default)),
+        },
+        RawExpr::Unary { op, expr } => RawExpr::Unary {
+            op: op.clone(),
+            expr: Box::new(append_default_arg_to_calls(expr, target_name, default)),
+        },
+        RawExpr::Let {
+            name,
+            ty,
+            value,
+            body,
+        } => RawExpr::Let {
+            name: name.clone(),
+            ty: ty.clone(),
+            value: Box::new(append_default_arg_to_calls(value, target_name, default)),
+            body: Box::new(append_default_arg_to_calls(body, target_name, default)),
+        },
+        RawExpr::If {
+            cond,
+            then_expr,
+            else_expr,
+        } => RawExpr::If {
+            cond: Box::new(append_default_arg_to_calls(cond, target_name, default)),
+            then_expr: Box::new(append_default_arg_to_calls(then_expr, target_name, default)),
+            else_expr: Box::new(append_default_arg_to_calls(else_expr, target_name, default)),
+        },
+    }
+}
+
 fn operation_summary_parts(op: &Operation) -> (String, SemanticImpact, TypecheckImpact) {
     match op {
         Operation::CreateFunction { module, name, .. } => (
@@ -562,6 +624,11 @@ fn operation_summary_parts(op: &Operation) -> (String, SemanticImpact, Typecheck
             TypecheckImpact::BodyRechecked,
         ),
         Operation::ChangeFunctionSignature { module, name, .. } => (
+            format!("{module}.{name}"),
+            SemanticImpact::InterfaceChanged,
+            TypecheckImpact::RootRechecked,
+        ),
+        Operation::AddParameter { module, name, .. } => (
             format!("{module}.{name}"),
             SemanticImpact::InterfaceChanged,
             TypecheckImpact::RootRechecked,
@@ -667,7 +734,8 @@ fn fallback_build_impact(op: &Operation) -> BuildImpact {
                 BuildImpactReason::BodyExpressionHashChanged,
             ],
         ),
-        Operation::ChangeFunctionSignature { symbol, .. } => (
+        Operation::ChangeFunctionSignature { symbol, .. }
+        | Operation::AddParameter { symbol, .. } => (
             BuildImpactKind::RecompileDependents,
             vec![symbol.clone()],
             true,
@@ -932,6 +1000,43 @@ impl CodeDb {
         ))
     }
 
+    pub(crate) fn recorded_operation_sequence_outputs_root(
+        &self,
+        expected_root: &str,
+        actual_root: &str,
+        operations: &[Operation],
+    ) -> Result<bool> {
+        if operations.is_empty() {
+            return Ok(expected_root == actual_root);
+        }
+        let mut current_roots = BTreeSet::from([expected_root.to_string()]);
+        for operation in operations {
+            let operation_json = canonical_json(&serde_json::to_value(operation)?);
+            let mut next_roots = BTreeSet::new();
+            for root in &current_roots {
+                let mut stmt = self.conn.prepare(
+                    "SELECT output_root_hash
+                     FROM migrations
+                     WHERE input_root_hash = ?1
+                       AND operation_kind = ?2
+                       AND operation_json = ?3
+                     ORDER BY output_root_hash",
+                )?;
+                for row in stmt.query_map(
+                    params![root, operation.kind_name(), operation_json],
+                    |row| row.get::<_, String>(0),
+                )? {
+                    next_roots.insert(row?);
+                }
+            }
+            if next_roots.is_empty() {
+                return Ok(false);
+            }
+            current_roots = next_roots;
+        }
+        Ok(current_roots.contains(actual_root))
+    }
+
     pub(crate) fn preconditions_for(&self, input_root: &str, op: &Operation) -> Vec<Precondition> {
         match op {
             Operation::CreateFunction { module, name, .. } => vec![
@@ -969,6 +1074,12 @@ impl CodeDb {
                 ..
             }
             | Operation::ChangeFunctionSignature {
+                module,
+                symbol,
+                name,
+                ..
+            }
+            | Operation::AddParameter {
                 module,
                 symbol,
                 name,
@@ -1174,6 +1285,21 @@ impl CodeDb {
                     symbol: symbol.clone(),
                     params: params.clone(),
                     return_type: return_type.clone(),
+                },
+            ],
+            Operation::AddParameter {
+                module,
+                symbol,
+                name,
+                ..
+            } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::NamePointsToSymbol {
+                    module: module.clone(),
+                    name: name.clone(),
+                    symbol: symbol.clone(),
                 },
             ],
             Operation::DeleteSymbol { symbol, .. } => vec![
@@ -1538,6 +1664,15 @@ impl CodeDb {
                 params,
                 return_type,
             } => self.apply_change_signature(input_root, module, symbol, name, params, return_type),
+            Operation::AddParameter {
+                module,
+                symbol,
+                name,
+                param,
+                default,
+            } => {
+                self.apply_add_parameter(input_root, module, symbol, name, param, default.as_ref())
+            }
             Operation::DeleteSymbol {
                 module,
                 symbol,
@@ -1773,6 +1908,118 @@ impl CodeDb {
         self.index_root(&new_root)?;
         self.type_check_root(&new_root)
             .context("new signature invalidates existing root")?;
+        Ok(new_root)
+    }
+
+    pub(crate) fn apply_add_parameter(
+        &mut self,
+        input_root: &str,
+        module: &str,
+        symbol: &str,
+        name: &str,
+        param: &ParamSpec,
+        default: Option<&RawExpr>,
+    ) -> Result<String> {
+        let mut root = self.load_root(input_root)?;
+        self.assert_name_points(&root, module, name, symbol)?;
+        let callers = self.reverse_dependencies_for_root(&root, symbol)?;
+        if !callers.is_empty() && default.is_none() {
+            bail!(
+                "add_parameter for {module}.{name} requires default when call sites exist: {}",
+                callers
+                    .iter()
+                    .map(|caller| self.symbol_display(&root, caller))
+                    .collect::<Result<Vec<_>>>()?
+                    .join(", ")
+            );
+        }
+
+        let idx = root_symbol_index(&root, symbol)?;
+        let old_signature = root.symbols[idx].signature.clone();
+        let old_definition = root.symbols[idx].definition.clone();
+        let old_body_hash = self.function_body_hash(&old_definition)?;
+        let old_body = self.typed_expr_to_raw(&old_body_hash, &root)?;
+        let (mut param_types, return_type) = self.signature_parts(&old_signature)?;
+        let mut param_name_list = param_names(&root, symbol);
+        param_types.push(self.resolve_type(&param.ty)?);
+        param_name_list.push(param.name.clone());
+        let params = param_types
+            .iter()
+            .zip(param_name_list.iter())
+            .map(|(type_hash, name)| {
+                Ok(ParamSpec {
+                    name: name.clone(),
+                    ty: self.type_name(type_hash)?.to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        validate_param_names(&params)?;
+
+        let signature = self.put_signature(&param_types, &return_type)?;
+        root.symbols[idx].signature = signature.clone();
+        upsert_param_names(&mut root, symbol, param_name_list.clone());
+
+        let target_name = self.symbol_display(&root, symbol)?;
+        let target_body = if callers.iter().any(|caller| caller == symbol) {
+            append_default_arg_to_calls(
+                &old_body,
+                &target_name,
+                default.ok_or_else(|| anyhow!("add_parameter missing default"))?,
+            )
+        } else {
+            old_body
+        };
+        let typed_body = self.type_expr(&target_body, &root, &param_name_list, &param_types)?;
+        if typed_body.type_hash != return_type {
+            bail!(
+                "body type {} does not match new return type {}",
+                self.type_name(&typed_body.type_hash)?,
+                self.type_name(&return_type)?
+            );
+        }
+        let definition = self.put_function_def(symbol, &signature, &typed_body.expr_hash)?;
+        root.symbols[idx].definition = definition;
+
+        if let Some(default) = default {
+            for caller in callers {
+                if caller == symbol {
+                    continue;
+                }
+                let caller_idx = root_symbol_index(&root, &caller)?;
+                let caller_signature = root.symbols[caller_idx].signature.clone();
+                let caller_definition = root.symbols[caller_idx].definition.clone();
+                let caller_body_hash = self.function_body_hash(&caller_definition)?;
+                let caller_body = self.typed_expr_to_raw(&caller_body_hash, &root)?;
+                let patched_body = append_default_arg_to_calls(&caller_body, &target_name, default);
+                if patched_body == caller_body {
+                    continue;
+                }
+                let (caller_param_types, caller_return_type) =
+                    self.signature_parts(&caller_signature)?;
+                let caller_param_names = param_names(&root, &caller);
+                let typed_caller = self.type_expr(
+                    &patched_body,
+                    &root,
+                    &caller_param_names,
+                    &caller_param_types,
+                )?;
+                if typed_caller.type_hash != caller_return_type {
+                    bail!(
+                        "caller body type {} does not match return type {}",
+                        self.type_name(&typed_caller.type_hash)?,
+                        self.type_name(&caller_return_type)?
+                    );
+                }
+                let caller_new_definition =
+                    self.put_function_def(&caller, &caller_signature, &typed_caller.expr_hash)?;
+                root.symbols[caller_idx].definition = caller_new_definition;
+            }
+        }
+
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)
+            .context("added parameter invalidates existing root")?;
         Ok(new_root)
     }
 

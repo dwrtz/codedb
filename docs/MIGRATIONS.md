@@ -178,6 +178,27 @@ Effects:
   callee interface.
 - Build impact is `recompile_dependents`.
 
+## Add Parameter
+
+`add_parameter` is the atomic form for extending a function interface while
+keeping call sites valid:
+
+```json
+{
+  "kind": "add_parameter",
+  "name": "id",
+  "param": { "name": "scale", "type": "i64" },
+  "default": { "kind": "literal_i64", "value": "1" }
+}
+```
+
+Effects:
+
+- Creates a new `FunctionSignature` for the same symbol.
+- Appends `default` at direct call sites in the same semantic root update.
+- Fails before commit if live call sites exist and no default is supplied.
+- Build impact is `recompile_dependents`.
+
 ## Delete Symbol
 
 Create an unused symbol and delete it:

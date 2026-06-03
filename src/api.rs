@@ -75,6 +75,18 @@ enum ApiOperation {
         #[serde(default, alias = "expect_root")]
         expect_root_hash: Option<String>,
     },
+    AddParameter {
+        #[serde(default = "default_module")]
+        module: String,
+        #[serde(default)]
+        symbol: Option<String>,
+        name: String,
+        param: ParamSpec,
+        #[serde(default)]
+        default: Option<RawExpr>,
+        #[serde(default, alias = "expect_root")]
+        expect_root_hash: Option<String>,
+    },
     DeleteSymbol {
         #[serde(default = "default_module")]
         module: String,
@@ -167,6 +179,9 @@ impl ApiOperation {
                 expect_root_hash, ..
             }
             | ApiOperation::ChangeFunctionSignature {
+                expect_root_hash, ..
+            }
+            | ApiOperation::AddParameter {
                 expect_root_hash, ..
             }
             | ApiOperation::DeleteSymbol {
@@ -515,6 +530,20 @@ impl CodeDb {
                 name: name.clone(),
                 params: params.clone(),
                 return_type: return_type.clone(),
+            }),
+            ApiOperation::AddParameter {
+                module,
+                symbol,
+                name,
+                param,
+                default,
+                ..
+            } => Ok(Operation::AddParameter {
+                module: module.clone(),
+                symbol: self.symbol_or_resolve(expected_root, module, name, symbol)?,
+                name: name.clone(),
+                param: param.clone(),
+                default: default.clone(),
             }),
             ApiOperation::DeleteSymbol {
                 module,

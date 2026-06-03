@@ -618,10 +618,22 @@ impl CodeDb {
             }
             Operation::ChangeFunctionSignature {
                 symbol: changed, ..
+            }
+            | Operation::AddParameter {
+                symbol: changed, ..
             } => {
                 if changed == symbol {
-                    reasons.insert("signature");
-                    reasons.insert("body");
+                    let changed_reasons = self.classify_root_symbol_change_between(
+                        &item.input_root,
+                        &item.output_root,
+                        symbol,
+                    )?;
+                    if changed_reasons.contains("signature") {
+                        reasons.insert("signature");
+                    }
+                    if changed_reasons.contains("body") {
+                        reasons.insert("body");
+                    }
                 }
             }
             Operation::DeleteSymbol {
@@ -710,7 +722,9 @@ impl CodeDb {
                 {
                     reasons.insert("signature");
                 }
-                if old_entry.definition != new_entry.definition {
+                let old_body = self.function_body_hash(&old_entry.definition)?;
+                let new_body = self.function_body_hash(&new_entry.definition)?;
+                if old_body != new_body {
                     reasons.insert("body");
                 }
                 if old_names != new_names {
@@ -1079,11 +1093,13 @@ impl CodeDb {
         for symbol in all_symbols {
             match (from_symbols.get(&symbol), to_symbols.get(&symbol)) {
                 (Some(from_entry), Some(to_entry)) => {
+                    let from_body = self.function_body_hash(&from_entry.definition)?;
+                    let to_body = self.function_body_hash(&to_entry.definition)?;
                     let mut reasons = Vec::new();
                     if from_entry.signature != to_entry.signature {
                         reasons.push("signature");
                     }
-                    if from_entry.definition != to_entry.definition {
+                    if from_body != to_body {
                         reasons.push("body");
                     }
                     let from_name = self.symbol_display(&from_root, &symbol).ok();
@@ -1094,8 +1110,6 @@ impl CodeDb {
                     if reasons.is_empty() {
                         continue;
                     }
-                    let from_body = self.function_body_hash(&from_entry.definition)?;
-                    let to_body = self.function_body_hash(&to_entry.definition)?;
                     let mut expression_changes = Vec::new();
                     if from_body != to_body {
                         self.collect_expression_changes(

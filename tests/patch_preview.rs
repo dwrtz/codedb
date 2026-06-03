@@ -287,7 +287,7 @@ fn semantic_patch_preview_covers_initial_operation_surface() {
                     }
                 }
             }),
-            json!(["change_function_signature"]),
+            json!(["add_parameter"]),
         ),
         (
             "remove-unused.patch.json",

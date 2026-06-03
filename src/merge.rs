@@ -216,8 +216,30 @@ impl CodeDb {
         let object_payloads =
             self.collect_merge_object_payloads(&source_state.root_hash, &merged_root_payload)?;
         let merged_root_hash = self.put_program_root(&merged_root)?;
-        self.index_root(&merged_root_hash)?;
-        self.type_check_root(&merged_root_hash)?;
+        if let Err(err) = self
+            .index_root(&merged_root_hash)
+            .and_then(|_| self.type_check_root(&merged_root_hash))
+        {
+            return Ok(MergePlanOutcome::Conflict(MergeConflict {
+                kind: "dependency_conflict".to_string(),
+                message: "merged root failed semantic validation".to_string(),
+                symbols: target_changed_symbols
+                    .iter()
+                    .chain(source_changed_symbols.iter())
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+                details: json!({
+                    "target_branch": target_branch,
+                    "source_branch": source_branch,
+                    "target_root_hash": target_state.root_hash,
+                    "source_root_hash": source_state.root_hash,
+                    "merged_root_hash": merged_root_hash,
+                    "error": format!("{err:#}"),
+                }),
+            }));
+        }
         let diff: JsonValue = serde_json::from_str(
             self.diff_roots_json(&target_state.root_hash, &merged_root_hash)?
                 .trim_end(),

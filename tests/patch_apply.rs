@@ -252,6 +252,48 @@ fn semantic_patch_apply_retries_expected_root_without_duplicate_history() {
 }
 
 #[test]
+fn semantic_patch_apply_retries_multi_operation_patch_without_duplicate_history() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("extract-retry.sqlite");
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), "examples/shop.cdb"]);
+
+    let root = current_root(&db);
+    let patch = write_patch(
+        temp.path(),
+        "extract-retry.patch.json",
+        json!({
+            "schema": "codedb/semantic-patch/v1",
+            "branch": "main",
+            "expected_root": root,
+            "match": {
+                "kind": "literal_i64",
+                "value": "20",
+                "within_name": "tax"
+            },
+            "replace": {
+                "kind": "extract_function",
+                "name": "rate"
+            }
+        }),
+    );
+
+    let first = parse_json(&run(&["patch", "apply", path(&db), "--json", path(&patch)]));
+    assert_eq!(first["status"], "applied");
+    assert_eq!(first["planned_operation_count"], 2);
+    let migration_count = row_count(&db, "migrations");
+    let history_count = row_count(&db, "histories");
+
+    let retry = parse_json(&run(&["patch", "apply", path(&db), "--json", path(&patch)]));
+    assert_eq!(retry["status"], "already_applied");
+    assert_eq!(retry["committed"], false);
+    assert_eq!(retry["new_root_hash"], first["new_root_hash"]);
+    assert_eq!(retry["apply_result"]["processed_operation_count"], 2);
+    assert_eq!(row_count(&db, "migrations"), migration_count);
+    assert_eq!(row_count(&db, "histories"), history_count);
+}
+
+#[test]
 fn semantic_patch_apply_covers_initial_operation_surface() {
     let temp = tempdir().unwrap();
     let source = temp.path().join("patch-surface.cdb");
@@ -370,7 +412,7 @@ fn semantic_patch_apply_covers_initial_operation_surface() {
     assert_eq!(added_param["status"], "applied");
     assert_eq!(
         added_param["semantic_summary"]["operation_kinds"],
-        json!(["change_function_signature"])
+        json!(["add_parameter"])
     );
     let show_unused = parse_json(&run(&["show", path(&db), "unused", "--json"]));
     assert_eq!(show_unused["signature"], "(scale: i64) -> i64");
@@ -413,6 +455,69 @@ fn semantic_patch_apply_covers_initial_operation_surface() {
             .all(|symbol| symbol["name"] != "unused")
     );
     assert_eq!(run(&["eval", path(&db), "main"]).trim(), "120");
+}
+
+#[test]
+fn semantic_patch_add_parameter_default_updates_callers_atomically() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("add-param-callers.cdb");
+    std::fs::write(
+        &source,
+        "fn inc(x: i64) -> i64 = x + 1\n\
+         \n\
+         fn main() -> i64 = inc(2)\n",
+    )
+    .unwrap();
+    let db = temp.path().join("add-param-callers.sqlite");
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+
+    let root = current_root(&db);
+    let patch = write_patch(
+        temp.path(),
+        "add-param-callers.patch.json",
+        json!({
+            "schema": "codedb/semantic-patch/v1",
+            "branch": "main",
+            "expected_root": root,
+            "match": {
+                "kind": "symbol",
+                "name": "inc"
+            },
+            "replace": {
+                "kind": "add_parameter",
+                "name": "scale",
+                "type": "i64",
+                "default": {
+                    "kind": "literal_i64",
+                    "value": "1"
+                }
+            }
+        }),
+    );
+
+    let preview = parse_json(&run(&[
+        "patch",
+        "preview",
+        path(&db),
+        "--json",
+        path(&patch),
+    ]));
+    assert_eq!(preview["status"], "planned");
+    assert_eq!(preview["planned_operations"][0]["kind"], "add_parameter");
+    assert_eq!(preview["typecheck"]["status"], "ok");
+
+    let applied = parse_json(&run(&["patch", "apply", path(&db), "--json", path(&patch)]));
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(
+        applied["semantic_summary"]["operation_kinds"],
+        json!(["add_parameter"])
+    );
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "3");
+    let show_inc = parse_json(&run(&["show", path(&db), "inc", "--json"]));
+    assert_eq!(show_inc["signature"], "(x: i64, scale: i64) -> i64");
+    let show_main = parse_json(&run(&["show", path(&db), "main", "--json"]));
+    assert_eq!(show_main["body_source"], "inc(2, 1)");
 }
 
 #[test]

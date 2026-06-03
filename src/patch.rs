@@ -7,7 +7,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::MAIN_BRANCH;
 use crate::expr::RawExpr;
-use crate::migrations::Operation;
+use crate::migrations::{MigrationOutcome, MigrationReport, Operation};
 use crate::model::{ProgramRootPayload, resolve_name_in_root};
 use crate::store::{CodeDb, canonical_json, hash_bytes};
 use crate::types::ParamSpec;
@@ -408,6 +408,19 @@ impl CodeDb {
                     branch_before.history_hash.as_deref(),
                 ))
             }
+        } else if branch_before.root_hash != expected_root_hash
+            && self.recorded_operation_sequence_outputs_root(
+                &expected_root_hash,
+                &branch_before.root_hash,
+                &planned_operations,
+            )?
+        {
+            Some(self.already_applied_patch_apply_result(
+                &patch.branch,
+                &branch_before.root_hash,
+                branch_before.history_hash.as_deref(),
+                &planned_operations,
+            )?)
         } else {
             let apply_document = json!({
                 "schema": "codedb/apply/v1",
@@ -875,11 +888,9 @@ impl CodeDb {
                 args,
             ),
             PatchReplace::InlineFunction => self.plan_inline_function(root, matches, pattern),
-            PatchReplace::AddParameter {
-                name,
-                ty,
-                default: _,
-            } => self.plan_add_parameter(root, matches, name, ty),
+            PatchReplace::AddParameter { name, ty, default } => {
+                self.plan_add_parameter(matches, name, ty, default.as_ref())
+            }
             PatchReplace::RemoveUnusedSymbol => self.plan_remove_unused_symbol(matches),
             PatchReplace::SetExport { exported_name } => {
                 let mut operations = Vec::new();
@@ -1269,38 +1280,22 @@ impl CodeDb {
 
     fn plan_add_parameter(
         &self,
-        root: &ProgramRootPayload,
         matches: &MatchSet,
         name: &str,
         ty: &str,
+        default: Option<&RawExpr>,
     ) -> Result<Vec<Operation>> {
         let mut operations = Vec::new();
         for matched in &matches.symbols {
-            let (param_types, return_type) = self.signature_parts(&matched.signature_hash)?;
-            let param_names = crate::model::param_names(root, &matched.symbol_hash);
-            let mut params = param_types
-                .iter()
-                .enumerate()
-                .map(|(idx, type_hash)| {
-                    Ok(ParamSpec {
-                        name: param_names
-                            .get(idx)
-                            .cloned()
-                            .unwrap_or_else(|| format!("arg{idx}")),
-                        ty: self.type_name(type_hash)?.to_string(),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            params.push(ParamSpec {
-                name: name.to_string(),
-                ty: ty.to_string(),
-            });
-            operations.push(Operation::ChangeFunctionSignature {
+            operations.push(Operation::AddParameter {
                 module: matched.module.clone(),
                 symbol: matched.symbol_hash.clone(),
                 name: matched.name.clone(),
-                params,
-                return_type: self.type_name(&return_type)?.to_string(),
+                param: ParamSpec {
+                    name: name.to_string(),
+                    ty: ty.to_string(),
+                },
+                default: default.cloned(),
             });
         }
         Ok(operations)
@@ -1834,6 +1829,53 @@ impl CodeDb {
             bail!("type match requires type_hash or name");
         };
         self.resolve_type(name)
+    }
+}
+
+impl CodeDb {
+    fn already_applied_patch_apply_result(
+        &self,
+        branch: &str,
+        current_root_hash: &str,
+        current_history_hash: Option<&str>,
+        planned_operations: &[Operation],
+    ) -> Result<JsonValue> {
+        let results = planned_operations
+            .iter()
+            .map(|operation| {
+                Ok(MigrationOutcome::AlreadyApplied(MigrationReport {
+                    old_root: current_root_hash.to_string(),
+                    new_root: current_root_hash.to_string(),
+                    migration_hash: None,
+                    history_hash: current_history_hash.map(str::to_string),
+                    summary: self.migration_summary_for_roots(
+                        operation,
+                        current_root_hash,
+                        current_root_hash,
+                    )?,
+                })
+                .to_json())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(json!({
+            "schema": "codedb/apply-result/v1",
+            "status": "already_applied",
+            "branch": branch,
+            "atomic": true,
+            "committed": false,
+            "rollback_reason": JsonValue::Null,
+            "error": JsonValue::Null,
+            "old_root_hash": current_root_hash,
+            "new_root_hash": current_root_hash,
+            "old_history_hash": current_history_hash,
+            "new_history_hash": current_history_hash,
+            "history_hash": current_history_hash,
+            "operation_count": planned_operations.len(),
+            "processed_operation_count": planned_operations.len(),
+            "applied_operation_count": 0,
+            "operations": results.clone(),
+            "results": results,
+        }))
     }
 }
 

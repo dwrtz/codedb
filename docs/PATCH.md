@@ -128,9 +128,9 @@ Add a parameter to a matched function:
 }
 ```
 
-The first implementation plans the signature change directly. Existing call
-sites must already remain valid after that signature change; otherwise preview
-returns the normal structural apply type error.
+When live call sites exist, `default` is required. The patch applies the
+signature extension and appends the default argument at direct call sites in one
+semantic migration so the committed root remains type-valid.
 
 Remove a symbol only when it has no live references or semantic tests:
 

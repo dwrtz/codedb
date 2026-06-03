@@ -399,3 +399,53 @@ fn merge_branch_updates_last_symbol_blame_facets() {
         "replace_function_body"
     );
 }
+
+#[test]
+fn signature_only_change_does_not_update_body_blame() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("signature-only-provenance.sqlite");
+    let source = temp.path().join("signature-only.cdb");
+    std::fs::write(&source, "fn unused() -> i64 = 7\n").unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    let root = current_root(&db);
+    let before = parse_json(&run(&["blame-symbol", path(&db), "unused", "--json"]));
+    let body_hash = before["body_hash"].clone();
+
+    let patch = write_json(
+        temp.path(),
+        "add-param.json",
+        json!({
+            "schema": "codedb/semantic-patch/v1",
+            "branch": "main",
+            "expected_root": root,
+            "match": {
+                "kind": "symbol",
+                "name": "unused"
+            },
+            "replace": {
+                "kind": "add_parameter",
+                "name": "scale",
+                "type": "i64",
+                "default": {
+                    "kind": "literal_i64",
+                    "value": "1"
+                }
+            }
+        }),
+    );
+    let applied = parse_json(&run(&["patch", "apply", path(&db), "--json", path(&patch)]));
+    assert_eq!(applied["status"], "applied");
+
+    let after = parse_json(&run(&["blame-symbol", path(&db), "unused", "--json"]));
+    assert_eq!(after["body_hash"], body_hash);
+    assert_eq!(
+        after["last_signature_migration"]["operation_kind"],
+        "add_parameter"
+    );
+    assert_eq!(
+        after["last_body_migration"]["migration_hash"],
+        before["last_body_migration"]["migration_hash"]
+    );
+}

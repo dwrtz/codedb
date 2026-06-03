@@ -393,4 +393,67 @@ fn conservative_merge_reports_semantic_conflicts() {
     ]));
     assert_eq!(export_conflict["status"], "conflict");
     assert_eq!(export_conflict["conflicts"][0]["kind"], "export_conflict");
+
+    let delete_use_db = temp.path().join("delete-use-conflict.sqlite");
+    let delete_use_source = temp.path().join("delete-use-conflict.cdb");
+    std::fs::write(
+        &delete_use_source,
+        "fn helper() -> i64 = 7\n\
+         \n\
+         fn main() -> i64 = 1\n",
+    )
+    .unwrap();
+    run(&["init", path(&delete_use_db)]);
+    run(&["import", path(&delete_use_db), path(&delete_use_source)]);
+    let delete_use_base = current_root(&delete_use_db);
+    run(&[
+        "branch",
+        "create",
+        path(&delete_use_db),
+        "agent/delete",
+        "--from",
+        "main",
+        "--json",
+    ]);
+    apply_branch(
+        temp.path(),
+        &delete_use_db,
+        "delete-use-conflict.apply.json",
+        "agent/delete",
+        &delete_use_base,
+        json!({
+            "kind": "delete_symbol",
+            "name": "helper",
+            "force": true,
+        }),
+    );
+    run(&[
+        "replace-body",
+        path(&delete_use_db),
+        "main",
+        "helper()",
+        "--expect-root",
+        &delete_use_base,
+        "--json",
+    ]);
+    let delete_use_conflict = parse_json(&run(&[
+        "merge",
+        "preview",
+        path(&delete_use_db),
+        "main",
+        "agent/delete",
+        "--json",
+    ]));
+    assert_eq!(delete_use_conflict["status"], "conflict");
+    assert_eq!(
+        delete_use_conflict["conflicts"][0]["kind"],
+        "dependency_conflict"
+    );
+    assert!(
+        delete_use_conflict["conflicts"][0]["details"]["error"]
+            .as_str()
+            .unwrap()
+            .len()
+            > 0
+    );
 }

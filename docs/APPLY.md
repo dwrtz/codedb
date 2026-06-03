@@ -64,6 +64,15 @@ are rejected.
 ```
 
 ```json
+{
+  "kind": "add_parameter",
+  "name": "tax",
+  "param": { "name": "rate", "type": "i64" },
+  "default": { "kind": "literal_i64", "value": "20" }
+}
+```
+
+```json
 { "kind": "delete_symbol", "name": "unused", "force": false }
 ```
 
@@ -100,6 +109,10 @@ are rejected.
 For non-create operations, `module` defaults to `main`. `symbol` may be supplied
 to bind directly to stable identity; otherwise CodeDB resolves `name` in the
 expected root.
+
+`add_parameter` extends the target function signature and, when `default` is
+provided, appends that argument at direct call sites in the same atomic
+migration. If live call sites exist, `default` is required.
 
 `create_test` categories are `behavior` (default), `projection`, and `export`.
 Incremental test impact uses the category to decide whether rename/export-only
