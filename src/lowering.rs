@@ -1219,13 +1219,12 @@ fn collect_lowered_value_debug_infos(
     out: &mut BTreeMap<String, String>,
 ) -> Result<()> {
     for op in operations {
-        if let Some(value_id) = lowered_op_value_id(op) {
-            if out
+        if let Some(value_id) = lowered_op_value_id(op)
+            && out
                 .insert(value_id.to_string(), lowered_op_kind_name(op).to_string())
                 .is_some()
-            {
-                bail!("duplicate lowered value id {value_id}");
-            }
+        {
+            bail!("duplicate lowered value id {value_id}");
         }
         if let LoweredOp::If {
             then_block,

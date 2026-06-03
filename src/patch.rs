@@ -318,7 +318,7 @@ impl CodeDb {
             .clone()
             .unwrap_or_else(|| branch.root_hash.clone());
         let root = self.load_root(&root_hash)?;
-        let mut matches = self.match_semantic_patch(&root_hash, &root, &patch)?;
+        let mut matches = self.match_semantic_patch(&root, &patch)?;
         matches.sort_dedup();
         let planned_operations =
             self.plan_semantic_patch_operations(&root_hash, &root, &patch, &matches)?;
@@ -389,7 +389,7 @@ impl CodeDb {
         })?;
         let branch_before = self.branch(&patch.branch)?;
         let root = self.load_root(&expected_root_hash)?;
-        let mut matches = self.match_semantic_patch(&expected_root_hash, &root, &patch)?;
+        let mut matches = self.match_semantic_patch(&root, &patch)?;
         matches.sort_dedup();
         let planned_operations =
             self.plan_semantic_patch_operations(&expected_root_hash, &root, &patch, &matches)?;
@@ -398,7 +398,16 @@ impl CodeDb {
             .map(serde_json::to_value)
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let apply_result = if planned_operations.is_empty() {
-            None
+            if branch_before.root_hash == expected_root_hash {
+                None
+            } else {
+                Some(stale_root_patch_apply_result(
+                    &patch.branch,
+                    &expected_root_hash,
+                    &branch_before.root_hash,
+                    branch_before.history_hash.as_deref(),
+                ))
+            }
         } else {
             let apply_document = json!({
                 "schema": "codedb/apply/v1",
@@ -488,7 +497,6 @@ impl CodeDb {
 
     fn match_semantic_patch(
         &self,
-        root_hash: &str,
         root: &ProgramRootPayload,
         patch: &SemanticPatch,
     ) -> Result<MatchSet> {
@@ -546,13 +554,13 @@ impl CodeDb {
             }
             PatchMatch::Type { type_hash, name } => {
                 let wanted = self.resolve_patch_type(type_hash.as_deref(), name.as_deref())?;
-                self.collect_type_matches(root_hash, root, &wanted, &mut matches)?;
+                self.collect_type_matches(root, &wanted, &mut matches)?;
             }
             PatchMatch::Expr { .. }
             | PatchMatch::LiteralI64 { .. }
             | PatchMatch::LiteralBool { .. }
             | PatchMatch::Call { .. } => {
-                self.collect_expression_matches(root_hash, root, pattern, &mut matches)?;
+                self.collect_expression_matches(root, pattern, &mut matches)?;
             }
         }
         Ok(matches)
@@ -600,7 +608,6 @@ impl CodeDb {
 
     fn collect_type_matches(
         &self,
-        root_hash: &str,
         root: &ProgramRootPayload,
         wanted_type_hash: &str,
         matches: &mut MatchSet,
@@ -622,7 +629,6 @@ impl CodeDb {
             }
         }
         self.collect_expression_matches(
-            root_hash,
             root,
             &PatchMatch::Type {
                 type_hash: Some(wanted_type_hash.to_string()),
@@ -635,7 +641,6 @@ impl CodeDb {
 
     fn collect_expression_matches(
         &self,
-        root_hash: &str,
         root: &ProgramRootPayload,
         pattern: &PatchMatch,
         matches: &mut MatchSet,
@@ -647,7 +652,6 @@ impl CodeDb {
             let body = self.function_body_hash(&entry.definition)?;
             let symbol_name = self.symbol_display(root, &entry.symbol)?;
             self.visit_patch_expr(
-                root_hash,
                 root,
                 &entry.symbol,
                 &symbol_name,
@@ -663,7 +667,6 @@ impl CodeDb {
     #[allow(clippy::too_many_arguments)]
     fn visit_patch_expr(
         &self,
-        root_hash: &str,
         root: &ProgramRootPayload,
         owner_symbol: &str,
         owner_name: &str,
@@ -718,7 +721,6 @@ impl CodeDb {
 
         for child in expression_child_hashes(expr_kind, &payload)? {
             self.visit_patch_expr(
-                root_hash,
                 root,
                 owner_symbol,
                 owner_name,
@@ -1886,6 +1888,44 @@ fn semantic_patch_apply_status(
         .and_then(JsonValue::as_str)
         .unwrap_or("error")
         .to_string()
+}
+
+fn stale_root_patch_apply_result(
+    branch: &str,
+    expected_root_hash: &str,
+    current_root_hash: &str,
+    current_history_hash: Option<&str>,
+) -> JsonValue {
+    let conflict = json!({
+        "status": "conflict",
+        "current_root_hash": current_root_hash,
+        "expected_root_hash": expected_root_hash,
+        "failed_preconditions": ["root_is_current"],
+        "failed_postconditions": [],
+        "summary": {
+            "kind": "semantic_patch",
+            "display": "semantic patch apply",
+        },
+    });
+    json!({
+        "schema": "codedb/apply-result/v1",
+        "status": "conflict",
+        "branch": branch,
+        "atomic": true,
+        "committed": false,
+        "rollback_reason": "conflict",
+        "error": JsonValue::Null,
+        "old_root_hash": current_root_hash,
+        "new_root_hash": current_root_hash,
+        "old_history_hash": current_history_hash,
+        "new_history_hash": current_history_hash,
+        "history_hash": current_history_hash,
+        "operation_count": 0,
+        "processed_operation_count": 0,
+        "applied_operation_count": 0,
+        "operations": [conflict.clone()],
+        "results": [conflict],
+    })
 }
 
 fn semantic_patch_semantic_summary(

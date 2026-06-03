@@ -64,18 +64,13 @@ pub(crate) struct TestCasePayload {
     pub(crate) native_agreement: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TestCategory {
+    #[default]
     Behavior,
     Projection,
     Export,
-}
-
-impl Default for TestCategory {
-    fn default() -> Self {
-        Self::Behavior
-    }
 }
 
 impl TestCategory {

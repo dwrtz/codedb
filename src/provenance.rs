@@ -361,7 +361,21 @@ impl CodeDb {
         if let Some(first_matching) = first_matching {
             let final_idx = states.len().saturating_sub(1);
             if predicate_matches(&eval_at(final_idx)?) {
-                status = "unchanged";
+                if first_matching == 0 {
+                    status = "unchanged";
+                } else {
+                    status = "changed";
+                    previous = eval_at(first_matching - 1)?;
+                    let state = &states[first_matching];
+                    first_changed = json!({
+                        "sequence": state.sequence,
+                        "root_hash": state.root_hash,
+                        "history_hash": state.history_hash,
+                        "migration": state.migration_from_parent,
+                        "previous_evaluation": previous,
+                        "changed_evaluation": eval_at(first_matching)?,
+                    });
+                }
             } else {
                 status = "changed";
                 let mut low = first_matching + 1;
@@ -736,7 +750,7 @@ impl CodeDb {
                 }));
             }
         }
-        contexts.sort_by(|a, b| json_sort_key(a).cmp(&json_sort_key(b)));
+        contexts.sort_by_key(json_sort_key);
         Ok(contexts)
     }
 
@@ -1441,7 +1455,7 @@ fn validate_expected_test_status(status: &str) -> Result<()> {
 }
 
 fn json_array_hashes(payload: &JsonValue, key: &str) -> Result<Vec<String>> {
-    Ok(payload
+    payload
         .get(key)
         .and_then(JsonValue::as_array)
         .ok_or_else(|| anyhow!("{key} must be an array"))?
@@ -1452,7 +1466,7 @@ fn json_array_hashes(payload: &JsonValue, key: &str) -> Result<Vec<String>> {
                 .map(str::to_string)
                 .ok_or_else(|| anyhow!("{key} entries must be hashes"))
         })
-        .collect::<Result<Vec<_>>>()?)
+        .collect::<Result<Vec<_>>>()
 }
 
 fn format_bisect_history(payload: &JsonValue) -> String {

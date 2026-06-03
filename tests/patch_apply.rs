@@ -496,6 +496,30 @@ fn workspace_patch_apply_commits_and_reports_stale_root_conflict() {
     );
 
     let after_patch = branch_state(&db_path);
+    let stale_no_match = workspace_call(
+        &mut db,
+        "patch.apply",
+        json!({
+            "schema": "codedb/semantic-patch/v1",
+            "branch": "main",
+            "expected_root": before.0,
+            "match": {
+                "kind": "literal_i64",
+                "value": "18",
+                "within_name": "tax"
+            },
+            "replace": {
+                "kind": "literal_i64",
+                "value": "17"
+            }
+        }),
+    );
+    assert_eq!(stale_no_match["status"], "error");
+    assert_eq!(stale_no_match["error"]["kind"], "stale_root");
+    assert_eq!(stale_no_match["error"]["expected_root_hash"], before.0);
+    assert_eq!(stale_no_match["error"]["actual_root_hash"], after_patch.0);
+    assert_eq!(branch_state(&db_path), after_patch);
+
     let stale = workspace_call(
         &mut db,
         "patch.apply",

@@ -126,6 +126,29 @@ fn semantic_bisect_and_why_explain_behavior_change() {
         "failed"
     );
 
+    let failed_bisect = parse_json(&run(&[
+        "bisect-history",
+        path(&db),
+        "--test",
+        "main_returns_120",
+        "--expect-test",
+        "failed",
+        "--json",
+    ]));
+    assert_eq!(failed_bisect["status"], "changed");
+    assert_eq!(
+        failed_bisect["first_changed"]["migration"]["migration_hash"],
+        change_migration
+    );
+    assert_eq!(
+        failed_bisect["first_changed"]["previous_evaluation"]["actual_status"],
+        "passed"
+    );
+    assert_eq!(
+        failed_bisect["first_changed"]["changed_evaluation"]["actual_status"],
+        "failed"
+    );
+
     let why = parse_json(&run(&[
         "why",
         path(&db),

@@ -135,8 +135,7 @@ impl CodeDb {
                         report
                             .history_hash
                             .as_ref()
-                            .map(|_| plan.target_history_hash.clone())
-                            .flatten()
+                            .and_then(|_| plan.target_history_hash.clone())
                             .map(JsonValue::String)
                             .unwrap_or(JsonValue::Null),
                     );
@@ -224,7 +223,7 @@ impl CodeDb {
                 .trim_end(),
         )?;
 
-        Ok(MergePlanOutcome::Mergeable(MergePlan {
+        Ok(MergePlanOutcome::Mergeable(Box::new(MergePlan {
             target_branch: target_branch.to_string(),
             source_branch: source_branch.to_string(),
             ancestor_root_hash: ancestor.root_hash,
@@ -241,7 +240,7 @@ impl CodeDb {
             target_unique_migration_count: ancestor.target_unique_migration_count,
             source_unique_migration_count: ancestor.source_unique_migration_count,
             build_impact: diff.get("build_impact").cloned().unwrap_or(JsonValue::Null),
-        }))
+        })))
     }
 
     fn common_ancestor(
@@ -332,7 +331,7 @@ impl CodeDb {
 }
 
 enum MergePlanOutcome {
-    Mergeable(MergePlan),
+    Mergeable(Box<MergePlan>),
     Conflict(MergeConflict),
 }
 

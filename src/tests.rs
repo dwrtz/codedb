@@ -20,6 +20,7 @@ const TEST_RUN_SCHEMA: &str = "codedb/test-run/v1";
 const TEST_IMPACT_SCHEMA: &str = "codedb/test-impact/v1";
 
 impl CodeDb {
+    #[allow(clippy::too_many_arguments)]
     pub fn create_test_main_branch_expected_format(
         &mut self,
         name: &str,
@@ -81,6 +82,7 @@ impl CodeDb {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_test_operation_from_text_args(
         &self,
         root_hash: &str,
@@ -125,6 +127,7 @@ impl CodeDb {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_test_operation_from_values(
         &self,
         root_hash: &str,
