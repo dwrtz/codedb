@@ -347,45 +347,67 @@ impl CodeDb {
             Ok(evaluation)
         };
 
-        let mut first_matching = None;
-        for idx in 0..states.len() {
-            if predicate_matches(&eval_at(idx)?) {
-                first_matching = Some(idx);
-                break;
-            }
-        }
-
         let mut status = "predicate_never_matched";
         let mut first_changed = JsonValue::Null;
         let mut previous = JsonValue::Null;
-        if let Some(first_matching) = first_matching {
-            let final_idx = states.len().saturating_sub(1);
-            if predicate_matches(&eval_at(final_idx)?) {
-                if first_matching == 0 {
+        let mut first_matching = None;
+        let final_idx = states.len().saturating_sub(1);
+        let final_evaluation = eval_at(final_idx)?;
+
+        if predicate_evaluable(&final_evaluation) {
+            let mut low = 0;
+            let mut high = final_idx;
+            while low < high {
+                let mid = (low + high) / 2;
+                if predicate_evaluable(&eval_at(mid)?) {
+                    high = mid;
+                } else {
+                    low = mid + 1;
+                }
+            }
+            let first_evaluable = low;
+            let first_evaluation = eval_at(first_evaluable)?;
+            let final_matches = predicate_matches(&final_evaluation);
+
+            if final_matches {
+                if predicate_matches(&first_evaluation) {
                     status = "unchanged";
+                    first_matching = Some(first_evaluable);
                 } else {
                     status = "changed";
-                    previous = eval_at(first_matching - 1)?;
-                    let state = &states[first_matching];
+                    let mut low = first_evaluable + 1;
+                    let mut high = final_idx;
+                    while low < high {
+                        let mid = (low + high) / 2;
+                        if predicate_matches(&eval_at(mid)?) {
+                            high = mid;
+                        } else {
+                            low = mid + 1;
+                        }
+                    }
+                    first_matching = Some(low);
+                    previous = eval_at(low.saturating_sub(1))?;
+                    let state = &states[low];
                     first_changed = json!({
                         "sequence": state.sequence,
                         "root_hash": state.root_hash,
                         "history_hash": state.history_hash,
                         "migration": state.migration_from_parent,
                         "previous_evaluation": previous,
-                        "changed_evaluation": eval_at(first_matching)?,
+                        "changed_evaluation": eval_at(low)?,
                     });
                 }
-            } else {
+            } else if predicate_matches(&first_evaluation) {
                 status = "changed";
-                let mut low = first_matching + 1;
+                first_matching = Some(first_evaluable);
+                let mut low = first_evaluable + 1;
                 let mut high = final_idx;
                 while low < high {
                     let mid = (low + high) / 2;
-                    if predicate_matches(&eval_at(mid)?) {
-                        low = mid + 1;
-                    } else {
+                    if !predicate_matches(&eval_at(mid)?) {
                         high = mid;
+                    } else {
+                        low = mid + 1;
                     }
                 }
                 previous = eval_at(low.saturating_sub(1))?;
@@ -415,7 +437,7 @@ impl CodeDb {
             "root_hash": branch.root_hash,
             "history_hash": branch.history_hash,
             "status": status,
-            "search_strategy": "binary_search_after_first_match",
+            "search_strategy": "binary_search_after_first_evaluable",
             "predicate": predicate.to_json(),
             "root_count": states.len(),
             "first_matching_sequence": first_matching,
@@ -635,11 +657,9 @@ impl CodeDb {
                 }
             }
             Operation::DeleteTest { .. } => {}
-            Operation::MergeBranch {
-                ancestor_root_hash, ..
-            } => {
+            Operation::MergeBranch { .. } => {
                 let merged_reasons = self.classify_root_symbol_change_between(
-                    ancestor_root_hash,
+                    &item.input_root,
                     &item.output_root,
                     symbol,
                 )?;
@@ -1416,6 +1436,10 @@ fn predicate_matches(evaluation: &JsonValue) -> bool {
         .get("matched")
         .and_then(JsonValue::as_bool)
         .unwrap_or(false)
+}
+
+fn predicate_evaluable(evaluation: &JsonValue) -> bool {
+    evaluation.get("status").and_then(JsonValue::as_str) == Some("ok")
 }
 
 fn parse_expected_output_value(text: &str) -> Result<JsonValue> {

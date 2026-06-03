@@ -416,6 +416,60 @@ fn semantic_patch_apply_covers_initial_operation_surface() {
 }
 
 #[test]
+fn semantic_patch_inline_preserves_caller_locals_without_capture() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("inline-locals.cdb");
+    std::fs::write(
+        &source,
+        "fn add_one(x: i64) -> i64 = let y: i64 = 1 in x + y\n\
+         \n\
+         fn main() -> i64 = let y: i64 = 7 in add_one(y)\n",
+    )
+    .unwrap();
+    let db = temp.path().join("inline-locals.sqlite");
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "8");
+
+    let root = current_root(&db);
+    let inline_patch = write_patch(
+        temp.path(),
+        "inline-local.patch.json",
+        json!({
+            "schema": "codedb/semantic-patch/v1",
+            "branch": "main",
+            "expected_root": root,
+            "match": {
+                "kind": "call",
+                "target_name": "add_one",
+                "within_name": "main"
+            },
+            "replace": {
+                "kind": "inline_function"
+            }
+        }),
+    );
+
+    let applied = parse_json(&run(&[
+        "patch",
+        "apply",
+        path(&db),
+        "--json",
+        path(&inline_patch),
+    ]));
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(
+        applied["semantic_summary"]["operation_kinds"],
+        json!(["replace_function_body"])
+    );
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "8");
+    let show_main = parse_json(&run(&["show", path(&db), "main", "--json"]));
+    let body_source = show_main["body_source"].as_str().unwrap();
+    assert!(body_source.contains("let y: i64 = 7 in"));
+    assert!(body_source.contains("in y +"));
+}
+
+#[test]
 fn semantic_patch_apply_type_error_rolls_back_everything() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("literal-type-error.sqlite");

@@ -340,6 +340,19 @@ fn merge_branch_updates_last_symbol_blame_facets() {
     let branch_apply = parse_json(&run(&["apply", path(&db), "--json", path(&body_doc)]));
     assert_eq!(branch_apply["status"], "applied");
 
+    let target_change = parse_json(&run(&[
+        "replace-body",
+        path(&db),
+        "total",
+        "subtotal + tax(subtotal) + 1",
+        "--expect-root",
+        &base_root,
+        "--json",
+    ]));
+    assert_eq!(target_change["status"], "applied");
+    let target_migration = target_change["migration_hash"].as_str().unwrap();
+    let target_root = target_change["new_root_hash"].as_str().unwrap();
+
     let merged = parse_json(&run(&[
         "merge",
         "apply",
@@ -347,7 +360,7 @@ fn merge_branch_updates_last_symbol_blame_facets() {
         "main",
         "agent/body",
         "--expect-root",
-        &base_root,
+        target_root,
         "--json",
     ]));
     assert_eq!(merged["status"], "merged");
@@ -374,5 +387,15 @@ fn merge_branch_updates_last_symbol_blame_facets() {
             .as_array()
             .unwrap()
             .contains(&json!("merge"))
+    );
+
+    let blame_total = parse_json(&run(&["blame-symbol", path(&db), "total", "--json"]));
+    assert_eq!(
+        blame_total["last_body_migration"]["migration_hash"],
+        target_migration
+    );
+    assert_eq!(
+        blame_total["last_body_migration"]["operation_kind"],
+        "replace_function_body"
     );
 }
