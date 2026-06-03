@@ -144,7 +144,8 @@ optional JSON-RPC `id` fields. Responses use the stable
 `codedb/response/v1` envelope. The workspace API exposes read methods:
 `workspace.current`, `workspace.branches`, `symbols.list`, `symbols.show`,
 `symbols.resolve`, `symbols.callers`, `roots.diff`, `roots.export_projection`,
-`build.plan`, `history.list`, and `verify.run`. It also exposes
+`build.plan`, `build.execute`, `build.artifact_status`, `trace.run`,
+`debug.run`, `history.list`, and `verify.run`. It also exposes
 `workspace.branch.create`, `workspace.branch.fast_forward`,
 `workspace.branch.delete`, `workspace.branch.compare`, `ops.apply` for atomic
 `codedb/apply/v1` structural writes, and `ops.preview` for rollback-only

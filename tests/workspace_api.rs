@@ -458,6 +458,7 @@ fn workspace_server_applies_structural_operations_atomically() {
 
     let before = workspace_call(&server, "workspace.current", json!({}));
     let old_root = before["snapshot"]["root_hash"].as_str().unwrap();
+    let old_history = before["snapshot"]["history_hash"].clone();
 
     let applied = workspace_call(
         &server,
@@ -482,9 +483,19 @@ fn workspace_server_applies_structural_operations_atomically() {
     assert_eq!(applied["result"]["committed"], true);
     assert_eq!(applied["result"]["old_root_hash"], old_root);
     assert_ne!(applied["result"]["new_root_hash"], old_root);
+    assert_eq!(applied["result"]["old_history_hash"], old_history);
+    assert_ne!(applied["result"]["new_history_hash"], old_history);
+    assert_eq!(
+        applied["result"]["history_hash"],
+        applied["result"]["new_history_hash"]
+    );
     assert_eq!(
         applied["snapshot"]["root_hash"],
         applied["result"]["new_root_hash"]
+    );
+    assert_eq!(
+        applied["snapshot"]["history_hash"],
+        applied["result"]["new_history_hash"]
     );
     assert_eq!(
         applied["result"]["results"][0]["summary"]["build_impact"]["kind"],
@@ -595,6 +606,12 @@ fn workspace_server_previews_structural_operations_without_committing() {
     assert_eq!(preview["result"]["status"], "applied");
     assert_eq!(preview["result"]["old_root_hash"], old_root);
     assert_ne!(preview["result"]["new_root_hash"], old_root);
+    assert_eq!(preview["result"]["old_history_hash"], old_history);
+    assert_ne!(preview["result"]["new_history_hash"], old_history);
+    assert_eq!(
+        preview["result"]["history_hash"],
+        preview["result"]["new_history_hash"]
+    );
     assert_eq!(preview["result"]["applied_operation_count"], 1);
     assert_eq!(
         preview["result"]["results"][0]["summary"]["build_impact"]["kind"],
