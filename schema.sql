@@ -49,6 +49,16 @@ CREATE TABLE IF NOT EXISTS branches (
     FOREIGN KEY (root_hash) REFERENCES objects(hash)
 );
 
+CREATE TABLE IF NOT EXISTS workspace_transactions (
+    request_id TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL,
+    method TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    expected_root_hash TEXT,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS root_symbols (
     root_hash TEXT NOT NULL,
     symbol_hash TEXT NOT NULL,

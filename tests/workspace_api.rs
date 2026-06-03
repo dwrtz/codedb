@@ -394,9 +394,13 @@ fn workspace_server_applies_structural_operations_atomically() {
             }
         }),
     );
-    assert_eq!(stale_conflict["status"], "ok");
-    assert_eq!(stale_conflict["result"]["status"], "conflict");
-    assert_eq!(stale_conflict["result"]["committed"], false);
+    assert_eq!(stale_conflict["status"], "error");
+    assert_eq!(stale_conflict["error"]["kind"], "stale_root");
+    assert_eq!(stale_conflict["error"]["expected_root_hash"], old_root);
+    assert_eq!(
+        stale_conflict["error"]["actual_root_hash"],
+        root_after_apply
+    );
     assert_eq!(stale_conflict["snapshot"]["root_hash"], root_after_apply);
     assert_eq!(
         stale_conflict["snapshot"]["history_hash"],
@@ -408,6 +412,7 @@ fn workspace_server_applies_structural_operations_atomically() {
         "ops.apply",
         json!({
             "schema": "codedb/apply/v1",
+            "expect_root_hash": root_after_apply.clone(),
             "operations": [
                 {
                     "kind": "not_real",

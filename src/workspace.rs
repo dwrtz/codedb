@@ -8,6 +8,8 @@ use crate::{DEFAULT_NATIVE_TARGET, MAIN_BRANCH};
 
 pub const WORKSPACE_REQUEST_SCHEMA: &str = "codedb/request/v1";
 pub const WORKSPACE_RESPONSE_SCHEMA: &str = "codedb/response/v1";
+pub const WORKSPACE_TRANSACTION_SCHEMA: &str = "codedb/workspace-transaction/v1";
+const APPLY_SCHEMA: &str = "codedb/apply/v1";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkspaceRequest {
@@ -20,6 +22,25 @@ pub struct WorkspaceRequest {
     pub params: JsonValue,
     #[serde(default)]
     pub id: Option<JsonValue>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WorkspaceTransaction {
+    #[serde(default)]
+    pub schema: Option<String>,
+    #[serde(default = "default_branch")]
+    pub branch: String,
+    #[serde(
+        alias = "expected_root",
+        alias = "expect_root",
+        alias = "expect_root_hash"
+    )]
+    pub expected_root_hash: String,
+    pub operations: Vec<JsonValue>,
+    #[serde(default)]
+    pub agent: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,12 +54,18 @@ pub struct WorkspaceSnapshot {
 pub struct WorkspaceDiagnostic {
     pub kind: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceError {
     pub kind: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_root_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,15 +122,39 @@ impl WorkspaceResponse {
         expected_root_hash: Option<String>,
         actual_root_hash: Option<String>,
     ) -> Self {
+        Self::error_with_diagnostics_and_details(
+            kind,
+            message,
+            Vec::new(),
+            snapshot,
+            id,
+            expected_root_hash,
+            actual_root_hash,
+        )
+    }
+
+    pub fn error_with_diagnostics_and_details(
+        kind: impl Into<String>,
+        message: impl Into<String>,
+        diagnostics: Vec<WorkspaceDiagnostic>,
+        snapshot: Option<WorkspaceSnapshot>,
+        id: Option<JsonValue>,
+        expected_root_hash: Option<String>,
+        actual_root_hash: Option<String>,
+    ) -> Self {
+        let expected_root = expected_root_hash.clone();
+        let actual_root = actual_root_hash.clone();
         Self {
             schema: WORKSPACE_RESPONSE_SCHEMA.to_string(),
             status: "error".to_string(),
             result: None,
-            diagnostics: Vec::new(),
+            diagnostics,
             snapshot,
             error: Some(WorkspaceError {
                 kind: kind.into(),
                 message: message.into(),
+                expected_root,
+                actual_root,
                 expected_root_hash,
                 actual_root_hash,
             }),
@@ -142,22 +193,99 @@ pub fn execute_workspace_request(db: &mut CodeDb, request: WorkspaceRequest) -> 
         );
     }
 
-    match dispatch_workspace_method(db, &request.method, &request.params) {
+    let idempotency = match workspace_idempotency_request(&request) {
+        Ok(idempotency) => idempotency,
+        Err(err) => return workspace_method_error_response(db, err, id),
+    };
+    if let Some(idempotency) = &idempotency {
+        match db.cached_workspace_transaction_response(
+            &idempotency.request_id,
+            &idempotency.request_hash,
+        ) {
+            Ok(Some(cached_response)) => {
+                match serde_json::from_str::<WorkspaceResponse>(&cached_response) {
+                    Ok(mut response) => {
+                        response.id = id;
+                        return response;
+                    }
+                    Err(err) => {
+                        return WorkspaceResponse::error(
+                            "method_error",
+                            format!("cached workspace response is invalid JSON: {err}"),
+                            snapshot_or_none(db, MAIN_BRANCH),
+                            id,
+                        );
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return WorkspaceResponse::error(
+                    "invalid_request",
+                    format!("{err:#}"),
+                    snapshot_or_none(db, MAIN_BRANCH),
+                    id,
+                );
+            }
+        }
+    }
+
+    let mut response = match dispatch_workspace_method(db, &request.method, &request.params) {
         Ok(method_result) => WorkspaceResponse::ok(
             method_result.result,
             method_result.diagnostics,
             method_result.snapshot,
-            id,
+            id.clone(),
         ),
-        Err(err) => WorkspaceResponse::error_with_details(
-            err.kind,
-            err.message,
-            err.snapshot.or_else(|| snapshot_or_none(db, MAIN_BRANCH)),
-            id,
-            err.expected_root_hash,
-            err.actual_root_hash,
-        ),
+        Err(err) => workspace_method_error_response(db, err, id.clone()),
+    };
+
+    if let Some(idempotency) = idempotency {
+        let mut stored_response = response.clone();
+        stored_response.id = None;
+        match serde_json::to_value(&stored_response) {
+            Ok(value) => {
+                let response_json = canonical_json(&value);
+                if let Err(err) = db.record_workspace_transaction_response(
+                    &idempotency.request_id,
+                    &idempotency.request_hash,
+                    &request.method,
+                    &idempotency.branch,
+                    idempotency.expected_root_hash.as_deref(),
+                    &response_json,
+                ) {
+                    response.diagnostics.push(WorkspaceDiagnostic {
+                        kind: "idempotency_cache_error".to_string(),
+                        message: format!("{err:#}"),
+                        details: None,
+                    });
+                }
+            }
+            Err(err) => response.diagnostics.push(WorkspaceDiagnostic {
+                kind: "serialization_error".to_string(),
+                message: format!("failed to serialize workspace response for idempotency: {err}"),
+                details: None,
+            }),
+        }
     }
+
+    response
+}
+
+fn workspace_method_error_response(
+    db: &CodeDb,
+    err: WorkspaceMethodError,
+    id: Option<JsonValue>,
+) -> WorkspaceResponse {
+    WorkspaceResponse::error_with_diagnostics_and_details(
+        err.kind,
+        err.message,
+        err.diagnostics,
+        err.snapshot.or_else(|| snapshot_or_none(db, MAIN_BRANCH)),
+        id,
+        err.expected_root_hash,
+        err.actual_root_hash,
+    )
 }
 
 struct WorkspaceMethodResult {
@@ -180,6 +308,7 @@ impl WorkspaceMethodResult {
 struct WorkspaceMethodError {
     kind: &'static str,
     message: String,
+    diagnostics: Vec<WorkspaceDiagnostic>,
     snapshot: Option<WorkspaceSnapshot>,
     expected_root_hash: Option<String>,
     actual_root_hash: Option<String>,
@@ -190,6 +319,7 @@ impl WorkspaceMethodError {
         Self {
             kind,
             message: message.into(),
+            diagnostics: Vec::new(),
             snapshot: None,
             expected_root_hash: None,
             actual_root_hash: None,
@@ -213,14 +343,127 @@ impl WorkspaceMethodError {
         Self {
             kind: "stale_root",
             message: message.into(),
+            diagnostics: Vec::new(),
             snapshot: Some(snapshot),
             expected_root_hash: Some(expected_root_hash.into()),
             actual_root_hash: Some(actual_root_hash.into()),
         }
     }
+
+    fn with_diagnostics(mut self, diagnostics: Vec<WorkspaceDiagnostic>) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
+    fn with_snapshot(mut self, snapshot: WorkspaceSnapshot) -> Self {
+        self.snapshot = Some(snapshot);
+        self
+    }
+
+    fn with_roots(
+        mut self,
+        expected_root_hash: Option<String>,
+        actual_root_hash: Option<String>,
+    ) -> Self {
+        self.expected_root_hash = expected_root_hash;
+        self.actual_root_hash = actual_root_hash;
+        self
+    }
 }
 
 type MethodResult<T> = std::result::Result<T, WorkspaceMethodError>;
+
+struct WorkspaceIdempotencyRequest {
+    request_id: String,
+    request_hash: String,
+    branch: String,
+    expected_root_hash: Option<String>,
+}
+
+fn workspace_idempotency_request(
+    request: &WorkspaceRequest,
+) -> MethodResult<Option<WorkspaceIdempotencyRequest>> {
+    if request.method != "ops.apply" {
+        return Ok(None);
+    }
+    let Some(request_id) = workspace_request_id(request)? else {
+        return Ok(None);
+    };
+    let request_hash = canonical_json(&json!({
+        "method": &request.method,
+        "params": &request.params,
+    }));
+    let (branch, expected_root_hash) = workspace_transaction_metadata(&request.params);
+    Ok(Some(WorkspaceIdempotencyRequest {
+        request_id,
+        request_hash,
+        branch,
+        expected_root_hash,
+    }))
+}
+
+fn workspace_request_id(request: &WorkspaceRequest) -> MethodResult<Option<String>> {
+    if let Some(request_id) = &request.request_id {
+        return validate_request_id(request_id).map(Some);
+    }
+    let Some(object) = request.params.as_object() else {
+        return Ok(None);
+    };
+    if let Some(request_id) = request_id_from_value(object.get("request_id"))? {
+        return Ok(Some(request_id));
+    }
+    if let Some(request_id) = request_id_from_value(object.get("idempotency_key"))? {
+        return Ok(Some(request_id));
+    }
+    if let Some(agent) = object.get("agent").and_then(JsonValue::as_object)
+        && let Some(request_id) = request_id_from_value(agent.get("request_id"))?
+    {
+        return Ok(Some(request_id));
+    }
+    if let Some(apply) = object.get("apply").and_then(JsonValue::as_object)
+        && let Some(agent) = apply.get("agent").and_then(JsonValue::as_object)
+        && let Some(request_id) = request_id_from_value(agent.get("request_id"))?
+    {
+        return Ok(Some(request_id));
+    }
+    Ok(None)
+}
+
+fn request_id_from_value(value: Option<&JsonValue>) -> MethodResult<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let request_id = value
+        .as_str()
+        .ok_or_else(|| WorkspaceMethodError::invalid_params("request_id must be a string"))?;
+    validate_request_id(request_id).map(Some)
+}
+
+fn validate_request_id(request_id: &str) -> MethodResult<String> {
+    if request_id.trim().is_empty() {
+        return Err(WorkspaceMethodError::invalid_params(
+            "request_id must not be empty",
+        ));
+    }
+    Ok(request_id.to_string())
+}
+
+fn workspace_transaction_metadata(params: &JsonValue) -> (String, Option<String>) {
+    let Ok(apply_document) = apply_document_param(params, false) else {
+        return (MAIN_BRANCH.to_string(), None);
+    };
+    let branch = apply_document
+        .as_object()
+        .and_then(|object| object.get("branch"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or(MAIN_BRANCH)
+        .to_string();
+    let expected_root_hash = expected_root_hash_from_apply_document(&apply_document)
+        .ok()
+        .flatten()
+        .map(str::to_string);
+    (branch, expected_root_hash)
+}
 
 fn dispatch_workspace_method(
     db: &mut CodeDb,
@@ -529,7 +772,28 @@ fn roots_export_projection(
 }
 
 fn ops_apply(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
-    let apply_document = apply_document_param(params)?;
+    let apply_document = apply_document_param(params, true)?;
+    let expected_root = expected_root_hash_from_apply_document(&apply_document)?
+        .ok_or_else(|| WorkspaceMethodError::invalid_params("ops.apply requires expected_root"))?
+        .to_string();
+    let branch = apply_document
+        .as_object()
+        .and_then(|object| object.get("branch"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or(MAIN_BRANCH);
+    let current_snapshot = workspace_snapshot(db, branch)?;
+    if current_snapshot.root_hash != expected_root {
+        return Err(WorkspaceMethodError::stale_root(
+            format!(
+                "branch {branch:?} moved before ops.apply; expected root {expected_root}, actual root {}",
+                current_snapshot.root_hash
+            ),
+            current_snapshot.clone(),
+            expected_root,
+            current_snapshot.root_hash,
+        ));
+    }
+
     let result = parse_json_payload(
         db.apply_json_str(&canonical_json(&apply_document))
             .map_err(|err| WorkspaceMethodError::new("invalid_operation", format!("{err:#}")))?,
@@ -540,11 +804,14 @@ fn ops_apply(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMetho
         .unwrap_or(MAIN_BRANCH);
     let snapshot =
         workspace_snapshot(db, branch).or_else(|_| workspace_snapshot(db, MAIN_BRANCH))?;
+    if let Some(err) = apply_result_workspace_error(&result, snapshot.clone()) {
+        return Err(err);
+    }
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 
 fn ops_preview(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
-    let apply_document = apply_document_param(params)?;
+    let apply_document = apply_document_param(params, false)?;
     let result = parse_json_payload(
         db.preview_apply_json_str(&canonical_json(&apply_document))
             .map_err(|err| WorkspaceMethodError::new("invalid_operation", format!("{err:#}")))?,
@@ -618,6 +885,10 @@ fn empty_params() -> JsonValue {
     json!({})
 }
 
+fn default_branch() -> String {
+    MAIN_BRANCH.to_string()
+}
+
 fn params_object(params: &JsonValue) -> MethodResult<&JsonMap<String, JsonValue>> {
     params
         .as_object()
@@ -687,17 +958,230 @@ fn branch_source_state(
     Ok((source, state))
 }
 
-fn apply_document_param(params: &JsonValue) -> MethodResult<JsonValue> {
+fn apply_document_param(
+    params: &JsonValue,
+    require_expected_root: bool,
+) -> MethodResult<JsonValue> {
     let object = params_object(params)?;
-    if let Some(apply) = object.get("apply") {
-        if apply.is_object() {
-            return Ok(apply.clone());
+    let mut apply_document = if let Some(apply) = object.get("apply") {
+        if !apply.is_object() {
+            return Err(WorkspaceMethodError::invalid_params(
+                "ops apply/preview field apply must be a JSON object",
+            ));
         }
+        apply.clone()
+    } else if object.get("schema").and_then(JsonValue::as_str) == Some(WORKSPACE_TRANSACTION_SCHEMA)
+    {
+        let transaction =
+            serde_json::from_value::<WorkspaceTransaction>(params.clone()).map_err(|err| {
+                WorkspaceMethodError::invalid_params(format!(
+                    "workspace transaction must match {WORKSPACE_TRANSACTION_SCHEMA}: {err}"
+                ))
+            })?;
+        if let Some(schema) = &transaction.schema
+            && schema != WORKSPACE_TRANSACTION_SCHEMA
+        {
+            return Err(WorkspaceMethodError::invalid_params(format!(
+                "unsupported workspace transaction schema {schema:?}; expected {WORKSPACE_TRANSACTION_SCHEMA}",
+            )));
+        }
+        json!({
+            "schema": APPLY_SCHEMA,
+            "branch": transaction.branch,
+            "expect_root_hash": transaction.expected_root_hash,
+            "operations": transaction.operations,
+        })
+    } else {
+        params.clone()
+    };
+
+    normalize_apply_expected_root_aliases(&mut apply_document)?;
+    if require_expected_root && expected_root_hash_from_apply_document(&apply_document)?.is_none() {
         return Err(WorkspaceMethodError::invalid_params(
-            "ops apply/preview field apply must be a JSON object",
+            "ops.apply requires a batch-level expected_root",
         ));
     }
-    Ok(params.clone())
+    Ok(apply_document)
+}
+
+fn normalize_apply_expected_root_aliases(apply_document: &mut JsonValue) -> MethodResult<()> {
+    let object = apply_document
+        .as_object_mut()
+        .ok_or_else(|| WorkspaceMethodError::invalid_params("apply document must be an object"))?;
+    let root_aliases = [
+        "expect_root_hash",
+        "expected_root_hash",
+        "expect_root",
+        "expected_root",
+    ];
+    let mut expected_root: Option<String> = None;
+    for key in root_aliases {
+        let Some(value) = object.remove(key) else {
+            continue;
+        };
+        let value = value
+            .as_str()
+            .ok_or_else(|| WorkspaceMethodError::invalid_params(format!("{key} must be a string")))?
+            .to_string();
+        if let Some(previous) = &expected_root
+            && previous != &value
+        {
+            return Err(WorkspaceMethodError::invalid_params(
+                "conflicting expected root aliases",
+            ));
+        }
+        expected_root = Some(value);
+    }
+    if let Some(expected_root) = expected_root {
+        object.insert(
+            "expect_root_hash".to_string(),
+            JsonValue::String(expected_root),
+        );
+    }
+    Ok(())
+}
+
+fn expected_root_hash_from_apply_document(
+    apply_document: &JsonValue,
+) -> MethodResult<Option<&str>> {
+    let object = apply_document
+        .as_object()
+        .ok_or_else(|| WorkspaceMethodError::invalid_params("apply document must be an object"))?;
+    optional_str_any(
+        object,
+        &[
+            "expect_root_hash",
+            "expected_root_hash",
+            "expect_root",
+            "expected_root",
+        ],
+    )
+}
+
+fn apply_result_workspace_error(
+    result: &JsonValue,
+    snapshot: WorkspaceSnapshot,
+) -> Option<WorkspaceMethodError> {
+    let status = result.get("status").and_then(JsonValue::as_str)?;
+    match status {
+        "conflict" => Some(apply_conflict_workspace_error(result, snapshot)),
+        "error" => Some(apply_error_workspace_error(result, snapshot)),
+        _ => None,
+    }
+}
+
+fn apply_conflict_workspace_error(
+    result: &JsonValue,
+    snapshot: WorkspaceSnapshot,
+) -> WorkspaceMethodError {
+    let conflict = first_apply_result_with_status(result, "conflict").unwrap_or(result);
+    let expected_root_hash = conflict
+        .get("expected_root_hash")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string);
+    let actual_root_hash = conflict
+        .get("current_root_hash")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+        .or_else(|| Some(snapshot.root_hash.clone()));
+    let kind = classify_apply_conflict(conflict);
+    let operation = conflict
+        .get("summary")
+        .and_then(|summary| summary.get("kind"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("operation");
+    let display = conflict
+        .get("summary")
+        .and_then(|summary| summary.get("display"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("workspace apply");
+    WorkspaceMethodError::new(kind, format!("{operation} conflict: {display}"))
+        .with_snapshot(snapshot)
+        .with_roots(expected_root_hash, actual_root_hash)
+        .with_diagnostics(vec![WorkspaceDiagnostic {
+            kind: "apply_conflict".to_string(),
+            message: "codedb/apply/v1 returned conflict".to_string(),
+            details: Some(result.clone()),
+        }])
+}
+
+fn apply_error_workspace_error(
+    result: &JsonValue,
+    snapshot: WorkspaceSnapshot,
+) -> WorkspaceMethodError {
+    let error_result = first_apply_result_with_status(result, "error").unwrap_or(result);
+    let message = error_result
+        .get("error")
+        .or_else(|| result.get("error"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("ops.apply failed");
+    let kind = if message.to_ascii_lowercase().contains("type") {
+        "type_error"
+    } else {
+        "invalid_operation"
+    };
+    WorkspaceMethodError::new(kind, message.to_string())
+        .with_snapshot(snapshot)
+        .with_diagnostics(vec![WorkspaceDiagnostic {
+            kind: "apply_error".to_string(),
+            message: "codedb/apply/v1 returned error".to_string(),
+            details: Some(result.clone()),
+        }])
+}
+
+fn first_apply_result_with_status<'a>(
+    result: &'a JsonValue,
+    status: &str,
+) -> Option<&'a JsonValue> {
+    result
+        .get("results")
+        .and_then(JsonValue::as_array)?
+        .iter()
+        .find(|entry| entry.get("status").and_then(JsonValue::as_str) == Some(status))
+}
+
+fn classify_apply_conflict(conflict: &JsonValue) -> &'static str {
+    let failed_preconditions = string_array_field(conflict, "failed_preconditions");
+    let failed_postconditions = string_array_field(conflict, "failed_postconditions");
+    let operation_kind = conflict
+        .get("summary")
+        .and_then(|summary| summary.get("kind"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    if failed_preconditions.contains(&"root_is_current") {
+        return "stale_root";
+    }
+    if failed_preconditions
+        .iter()
+        .chain(failed_postconditions.iter())
+        .any(|condition| condition.contains("export"))
+    {
+        return "export_conflict";
+    }
+    if operation_kind == "change_function_signature"
+        || failed_postconditions.contains(&"signature_source_matches")
+    {
+        return "signature_conflict";
+    }
+    if operation_kind == "delete_symbol" || failed_postconditions.contains(&"symbol_absent") {
+        return "delete_conflict";
+    }
+    if failed_preconditions
+        .iter()
+        .chain(failed_postconditions.iter())
+        .any(|condition| condition.contains("name") || condition.contains("alias"))
+    {
+        return "name_conflict";
+    }
+    "dependency_conflict"
+}
+
+fn string_array_field<'a>(value: &'a JsonValue, key: &str) -> Vec<&'a str> {
+    value
+        .get(key)
+        .and_then(JsonValue::as_array)
+        .map(|values| values.iter().filter_map(JsonValue::as_str).collect())
+        .unwrap_or_default()
 }
 
 fn require_main_branch(params: &JsonValue, method: &str) -> MethodResult<()> {

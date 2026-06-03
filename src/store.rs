@@ -160,6 +160,61 @@ impl CodeDb {
         finish_immediate_transaction(&mut self.conn, result)
     }
 
+    pub(crate) fn cached_workspace_transaction_response(
+        &self,
+        request_id: &str,
+        request_hash: &str,
+    ) -> Result<Option<String>> {
+        let cached = self
+            .conn
+            .query_row(
+                "SELECT request_hash, response_json
+                 FROM workspace_transactions
+                 WHERE request_id = ?1",
+                params![request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((cached_hash, response_json)) = cached else {
+            return Ok(None);
+        };
+        if cached_hash != request_hash {
+            bail!("workspace request_id {request_id:?} was already used for a different request");
+        }
+        Ok(Some(response_json))
+    }
+
+    pub(crate) fn record_workspace_transaction_response(
+        &mut self,
+        request_id: &str,
+        request_hash: &str,
+        method: &str,
+        branch: &str,
+        expected_root_hash: Option<&str>,
+        response_json: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO workspace_transactions
+             (request_id, request_hash, method, branch, expected_root_hash, response_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(request_id) DO UPDATE SET
+                response_json = CASE
+                    WHEN workspace_transactions.request_hash = excluded.request_hash
+                    THEN excluded.response_json
+                    ELSE workspace_transactions.response_json
+                END",
+            params![
+                request_id,
+                request_hash,
+                method,
+                branch,
+                expected_root_hash,
+                response_json,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn update_branch(
         &mut self,
         name: &str,
