@@ -42,17 +42,23 @@ fn branch(db: &Path, name: &str) -> JsonValue {
 }
 
 #[test]
-fn branch_created_from_root_can_fast_forward_branch_with_history() {
+fn raw_root_branch_fast_forward_requires_target_history() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("root-fast-forward.sqlite");
-    let apply_path = temp.path().join("root-branch.apply.json");
+    let detached_apply_path = temp.path().join("detached-root-branch.apply.json");
+    let replayable_apply_path = temp.path().join("replayable-root-branch.apply.json");
+    let history_path = temp.path().join("history.ndjson");
+    let imported_db = temp.path().join("imported.sqlite");
 
     run(&["init", path(&db)]);
     run(&["import", path(&db), "examples/shop.cdb"]);
 
     let main_before = branch(&db, "main");
     let old_main_root = main_before["root_hash"].as_str().unwrap().to_string();
-    assert!(main_before["history_hash"].is_string());
+    let old_main_history = main_before["history_hash"]
+        .as_str()
+        .expect("main history")
+        .to_string();
 
     let created = parse_json(&run(&[
         "branch",
@@ -67,7 +73,7 @@ fn branch_created_from_root_can_fast_forward_branch_with_history() {
     assert_eq!(created["history_hash"], JsonValue::Null);
 
     std::fs::write(
-        &apply_path,
+        &detached_apply_path,
         serde_json::to_string_pretty(&json!({
             "schema": "codedb/apply/v1",
             "branch": "agent/root-work",
@@ -83,10 +89,9 @@ fn branch_created_from_root_can_fast_forward_branch_with_history() {
         .unwrap(),
     )
     .unwrap();
-    let applied = parse_json(&run(&["apply", path(&db), "--json", path(&apply_path)]));
-    let new_root = applied["new_root_hash"].as_str().unwrap().to_string();
+    run(&["apply", path(&db), "--json", path(&detached_apply_path)]);
 
-    let fast_forwarded = parse_json(&run(&[
+    let non_fast_forward = parse_json(&run(&[
         "branch",
         "fast-forward",
         path(&db),
@@ -96,10 +101,76 @@ fn branch_created_from_root_can_fast_forward_branch_with_history() {
         &old_main_root,
         "--json",
     ]));
+    assert_eq!(non_fast_forward["status"], "non_fast_forward");
+    assert_eq!(branch(&db, "main")["root_hash"], old_main_root);
+    run(&["verify", path(&db)]);
+
+    let replayable = parse_json(&run(&[
+        "branch",
+        "create",
+        path(&db),
+        "agent/root-work-with-history",
+        "--from-root",
+        &old_main_root,
+        "--from-history",
+        &old_main_history,
+        "--json",
+    ]));
+    assert_eq!(replayable["status"], "created");
+    assert_eq!(replayable["history_hash"], old_main_history);
+
+    std::fs::write(
+        &replayable_apply_path,
+        serde_json::to_string_pretty(&json!({
+            "schema": "codedb/apply/v1",
+            "branch": "agent/root-work-with-history",
+            "expect_root_hash": old_main_root,
+            "operations": [
+                {
+                    "kind": "rename_symbol",
+                    "name": "tax",
+                    "new_name": "vat"
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let applied = parse_json(&run(&[
+        "apply",
+        path(&db),
+        "--json",
+        path(&replayable_apply_path),
+    ]));
+    let new_root = applied["new_root_hash"].as_str().unwrap().to_string();
+
+    let fast_forwarded = parse_json(&run(&[
+        "branch",
+        "fast-forward",
+        path(&db),
+        "main",
+        "agent/root-work-with-history",
+        "--expect-root",
+        &old_main_root,
+        "--json",
+    ]));
     assert_eq!(fast_forwarded["status"], "fast_forwarded");
     assert_eq!(fast_forwarded["old_root_hash"], old_main_root);
     assert_eq!(fast_forwarded["new_root_hash"], new_root);
     assert_eq!(branch(&db, "main")["root_hash"], new_root);
+    run(&["verify", path(&db)]);
+
+    run(&[
+        "export-history",
+        path(&db),
+        "--branch",
+        "main",
+        "--out",
+        path(&history_path),
+    ]);
+    run(&["init", path(&imported_db)]);
+    run(&["import-history", path(&imported_db), path(&history_path)]);
+    assert_eq!(branch(&imported_db, "main"), branch(&db, "main"));
 }
 
 #[test]
