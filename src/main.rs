@@ -364,6 +364,11 @@ enum PatchCommand {
         #[arg(long)]
         json: PathBuf,
     },
+    Apply {
+        db: PathBuf,
+        #[arg(long)]
+        json: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -877,6 +882,10 @@ fn main() -> Result<()> {
             PatchCommand::Preview { db, json } => {
                 let mut codedb = codedb::CodeDb::open(db)?;
                 print!("{}", codedb.preview_semantic_patch_json_file(&json)?);
+            }
+            PatchCommand::Apply { db, json } => {
+                let mut codedb = codedb::CodeDb::open(db)?;
+                print!("{}", codedb.apply_semantic_patch_json_file(&json)?);
             }
         },
         Command::Replay { db, from_genesis } => {

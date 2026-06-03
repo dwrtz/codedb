@@ -2,19 +2,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::MAIN_BRANCH;
 use crate::expr::RawExpr;
 use crate::migrations::Operation;
 use crate::model::{ProgramRootPayload, resolve_name_in_root};
-use crate::store::{CodeDb, canonical_json};
+use crate::store::{CodeDb, canonical_json, hash_bytes};
 
 const SEMANTIC_PATCH_SCHEMA: &str = "codedb/semantic-patch/v1";
 const SEMANTIC_PATCH_PREVIEW_SCHEMA: &str = "codedb/semantic-patch-preview/v1";
+const SEMANTIC_PATCH_APPLY_RESULT_SCHEMA: &str = "codedb/semantic-patch-apply-result/v1";
+const SEMANTIC_PATCH_PROVENANCE_SCHEMA: &str = "codedb/semantic-patch-provenance/v1";
+const SEMANTIC_PATCH_HASH_DOMAIN: &[u8] = b"codedb/semantic-patch/v1\0";
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SemanticPatch {
     #[serde(default)]
@@ -32,9 +35,11 @@ struct SemanticPatch {
     match_pattern: Option<PatchMatch>,
     #[serde(default)]
     replace: Option<PatchReplace>,
+    #[serde(default)]
+    agent: Option<JsonValue>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum PatchMatch {
     Symbol {
@@ -117,7 +122,7 @@ enum PatchMatch {
     },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum PatchReplace {
     LiteralI64 {
@@ -260,6 +265,20 @@ impl CodeDb {
         self.preview_semantic_patch(patch)
     }
 
+    pub fn apply_semantic_patch_json_file(&mut self, path: &Path) -> Result<String> {
+        self.ensure_initialized()?;
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        self.apply_semantic_patch_json_str(&text)
+            .with_context(|| format!("failed to apply {}", path.display()))
+    }
+
+    pub fn apply_semantic_patch_json_str(&mut self, text: &str) -> Result<String> {
+        self.ensure_initialized()?;
+        let patch = parse_semantic_patch(text)?;
+        self.apply_semantic_patch(patch)
+    }
+
     fn preview_semantic_patch(&mut self, patch: SemanticPatch) -> Result<String> {
         if let Some(schema) = &patch.schema
             && schema != SEMANTIC_PATCH_SCHEMA
@@ -328,6 +347,114 @@ impl CodeDb {
             "conflicts": conflicts,
             "diagnostics": diagnostics,
             "apply_preview": apply_preview,
+        });
+        Ok(format!("{}\n", canonical_json(&payload)))
+    }
+
+    fn apply_semantic_patch(&mut self, patch: SemanticPatch) -> Result<String> {
+        if let Some(schema) = &patch.schema
+            && schema != SEMANTIC_PATCH_SCHEMA
+        {
+            bail!("unsupported semantic patch schema {schema:?}; expected {SEMANTIC_PATCH_SCHEMA}");
+        }
+        let expected_root_hash = patch.expected_root_hash.clone().ok_or_else(|| {
+            anyhow!("semantic patch apply requires expected_root or expected_root_hash")
+        })?;
+        let branch_before = self.branch(&patch.branch)?;
+        let root = self.load_root(&expected_root_hash)?;
+        let mut matches = self.match_semantic_patch(&expected_root_hash, &root, &patch)?;
+        matches.sort_dedup();
+        let planned_operations =
+            self.plan_semantic_patch_operations(&expected_root_hash, &root, &patch, &matches)?;
+        let planned_operations_json = planned_operations
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let apply_result = if planned_operations.is_empty() {
+            None
+        } else {
+            let apply_document = json!({
+                "schema": "codedb/apply/v1",
+                "branch": &patch.branch,
+                "expect_root_hash": &expected_root_hash,
+                "agent": semantic_patch_agent_metadata(
+                    &patch,
+                    &expected_root_hash,
+                    &matches,
+                    &planned_operations_json,
+                )?,
+                "operations": planned_operations_json,
+            });
+            let applied = self.apply_json_str(&canonical_json(&apply_document))?;
+            Some(serde_json::from_str::<JsonValue>(applied.trim_end())?)
+        };
+        let branch_after = self.branch(&patch.branch)?;
+        let status =
+            semantic_patch_apply_status(&matches, apply_result.as_ref(), patch.replace.is_some());
+        let typecheck = semantic_patch_typecheck_status(apply_result.as_ref());
+        let build_impacts = semantic_patch_build_impacts(apply_result.as_ref());
+        let build_impact = if build_impacts.len() == 1 {
+            build_impacts.first().cloned().unwrap_or(JsonValue::Null)
+        } else if build_impacts.is_empty() {
+            JsonValue::Null
+        } else {
+            json!({
+                "kind": "multiple",
+                "operation_impacts": build_impacts,
+            })
+        };
+        let conflicts = semantic_patch_conflicts(apply_result.as_ref());
+        let diagnostics = semantic_patch_diagnostics(&status, &matches, apply_result.as_ref());
+        let payload = json!({
+            "schema": SEMANTIC_PATCH_APPLY_RESULT_SCHEMA,
+            "status": status,
+            "branch": &patch.branch,
+            "expected_root_hash": &expected_root_hash,
+            "old_root_hash": apply_result
+                .as_ref()
+                .and_then(|result| result.get("old_root_hash"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or(&branch_before.root_hash),
+            "new_root_hash": apply_result
+                .as_ref()
+                .and_then(|result| result.get("new_root_hash"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or(&branch_after.root_hash),
+            "old_history_hash": apply_result
+                .as_ref()
+                .and_then(|result| result.get("old_history_hash"))
+                .cloned()
+                .unwrap_or_else(|| json!(&branch_before.history_hash)),
+            "new_history_hash": apply_result
+                .as_ref()
+                .and_then(|result| result.get("new_history_hash"))
+                .cloned()
+                .unwrap_or_else(|| json!(&branch_after.history_hash)),
+            "current_root_hash": &branch_after.root_hash,
+            "current_history_hash": &branch_after.history_hash,
+            "committed": apply_result
+                .as_ref()
+                .and_then(|result| result.get("committed"))
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+            "patch_hash": semantic_patch_hash(&patch)?,
+            "match_count": matches.match_count(),
+            "matched_symbols": symbol_matches_json(&matches.symbols),
+            "matched_expressions": expression_matches_json(&matches.expressions),
+            "matched_types": type_matches_json(&matches.types),
+            "matched_exports": export_matches_json(&matches.exports),
+            "planned_operation_count": planned_operations.len(),
+            "planned_operations": planned_operations_json,
+            "semantic_summary": semantic_patch_semantic_summary(
+                &matches,
+                apply_result.as_ref(),
+            ),
+            "typecheck": typecheck,
+            "build_impact": build_impact,
+            "build_impacts": build_impacts,
+            "conflicts": conflicts,
+            "diagnostics": diagnostics,
+            "apply_result": apply_result,
         });
         Ok(format!("{}\n", canonical_json(&payload)))
     }
@@ -1272,6 +1399,80 @@ fn semantic_patch_preview_status(matches: &MatchSet, apply_preview: Option<&Json
     .to_string()
 }
 
+fn semantic_patch_apply_status(
+    matches: &MatchSet,
+    apply_result: Option<&JsonValue>,
+    has_replace: bool,
+) -> String {
+    let Some(apply_result) = apply_result else {
+        if matches.match_count() == 0 {
+            return "no_match".to_string();
+        }
+        if !has_replace {
+            return "matched".to_string();
+        }
+        return "no_operation".to_string();
+    };
+    apply_result
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("error")
+        .to_string()
+}
+
+fn semantic_patch_semantic_summary(
+    matches: &MatchSet,
+    apply_result: Option<&JsonValue>,
+) -> JsonValue {
+    let operation_summaries = apply_result
+        .and_then(|result| result.get("results"))
+        .and_then(JsonValue::as_array)
+        .map(|results| {
+            results
+                .iter()
+                .filter_map(|result| result.get("summary").cloned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut operation_kinds = BTreeSet::new();
+    let mut changed_symbols = BTreeSet::new();
+    for summary in &operation_summaries {
+        if let Some(kind) = summary.get("kind").and_then(JsonValue::as_str) {
+            operation_kinds.insert(kind.to_string());
+        }
+    }
+    if let Some(results) = apply_result
+        .and_then(|result| result.get("results"))
+        .and_then(JsonValue::as_array)
+    {
+        for result in results {
+            if result.get("status").and_then(JsonValue::as_str) != Some("applied") {
+                continue;
+            }
+            if let Some(symbol) = result
+                .get("summary")
+                .and_then(|summary| summary.get("build_impact"))
+                .and_then(|impact| impact.get("changed_symbols"))
+                .and_then(JsonValue::as_array)
+            {
+                for symbol in symbol.iter().filter_map(JsonValue::as_str) {
+                    changed_symbols.insert(symbol.to_string());
+                }
+            }
+        }
+    }
+    json!({
+        "match_count": matches.match_count(),
+        "matched_symbol_count": matches.symbols.len(),
+        "matched_expression_count": matches.expressions.len(),
+        "matched_type_count": matches.types.len(),
+        "matched_export_count": matches.exports.len(),
+        "operation_kinds": operation_kinds.into_iter().collect::<Vec<_>>(),
+        "changed_symbols": changed_symbols.into_iter().collect::<Vec<_>>(),
+        "operation_summaries": operation_summaries,
+    })
+}
+
 fn semantic_patch_typecheck_status(apply_preview: Option<&JsonValue>) -> JsonValue {
     let Some(apply_preview) = apply_preview else {
         return json!({ "status": "not_run" });
@@ -1404,6 +1605,54 @@ fn apply_preview_error_message(apply_preview: &JsonValue) -> Option<String> {
         .or_else(|| apply_preview.get("error"))
         .and_then(JsonValue::as_str)
         .map(str::to_string)
+}
+
+fn semantic_patch_agent_metadata(
+    patch: &SemanticPatch,
+    expected_root_hash: &str,
+    matches: &MatchSet,
+    planned_operations: &[JsonValue],
+) -> Result<JsonValue> {
+    let mut agent = match patch.agent.clone().unwrap_or_else(|| json!({})) {
+        JsonValue::Object(object) => object,
+        other => {
+            let mut object = serde_json::Map::new();
+            object.insert("agent".to_string(), other);
+            object
+        }
+    };
+    let planned_operation_kinds = planned_operations
+        .iter()
+        .filter_map(|operation| operation.get("kind").and_then(JsonValue::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    agent.insert(
+        "semantic_patch".to_string(),
+        json!({
+            "schema": SEMANTIC_PATCH_PROVENANCE_SCHEMA,
+            "patch_schema": SEMANTIC_PATCH_SCHEMA,
+            "patch_hash": semantic_patch_hash(patch)?,
+            "branch": &patch.branch,
+            "expected_root_hash": expected_root_hash,
+            "match": serde_json::to_value(&patch.match_pattern)?,
+            "replace": serde_json::to_value(&patch.replace)?,
+            "match_count": matches.match_count(),
+            "matched_symbols": symbol_matches_json(&matches.symbols),
+            "matched_expressions": expression_matches_json(&matches.expressions),
+            "matched_exports": export_matches_json(&matches.exports),
+            "planned_operation_count": planned_operations.len(),
+            "planned_operation_kinds": planned_operation_kinds,
+        }),
+    );
+    Ok(JsonValue::Object(agent))
+}
+
+fn semantic_patch_hash(patch: &SemanticPatch) -> Result<String> {
+    let patch_json = serde_json::to_value(patch)?;
+    Ok(hash_bytes(
+        SEMANTIC_PATCH_HASH_DOMAIN,
+        canonical_json(&patch_json).as_bytes(),
+    ))
 }
 
 fn symbol_matches_json(matches: &[SymbolMatch]) -> Vec<JsonValue> {

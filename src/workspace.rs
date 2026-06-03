@@ -463,6 +463,7 @@ fn dispatch_workspace_method(
         "ops.apply" => ops_apply(db, params, idempotency),
         "ops.preview" => ops_preview(db, params),
         "patch.preview" => patch_preview(db, params),
+        "patch.apply" => patch_apply(db, params),
         "build.plan" => build_plan(db, params),
         "build.execute" => build_execute(db, params),
         "build.artifact_status" => build_artifact_status(db, params),
@@ -955,18 +956,78 @@ fn patch_preview(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceM
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 
+fn patch_apply(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let patch_document = patch_document_param(params)?;
+    expected_root_hash_from_patch_document(&patch_document)?.ok_or_else(|| {
+        WorkspaceMethodError::invalid_params("patch.apply requires expected_root")
+    })?;
+    let branch = patch_document
+        .as_object()
+        .and_then(|object| object.get("branch"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or(MAIN_BRANCH);
+    let result = parse_json_payload(
+        db.apply_semantic_patch_json_str(&canonical_json(&patch_document))
+            .map_err(|err| WorkspaceMethodError::new("invalid_operation", format!("{err:#}")))?,
+    )?;
+    let snapshot =
+        workspace_snapshot(db, branch).or_else(|_| workspace_snapshot(db, MAIN_BRANCH))?;
+    if matches!(
+        result.get("status").and_then(JsonValue::as_str),
+        Some("conflict" | "error")
+    ) {
+        if let Some(apply_result) = result.get("apply_result")
+            && !apply_result.is_null()
+            && let Some(err) = apply_result_workspace_error(apply_result, snapshot.clone())
+        {
+            return Err(err.with_diagnostics(vec![WorkspaceDiagnostic {
+                kind: "patch_apply_error".to_string(),
+                message: "codedb semantic patch apply returned an error".to_string(),
+                details: Some(result.clone()),
+            }]));
+        }
+        return Err(
+            WorkspaceMethodError::new("invalid_operation", "semantic patch apply failed")
+                .with_snapshot(snapshot)
+                .with_diagnostics(vec![WorkspaceDiagnostic {
+                    kind: "patch_apply_error".to_string(),
+                    message: "codedb semantic patch apply returned an error".to_string(),
+                    details: Some(result.clone()),
+                }]),
+        );
+    }
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
 fn patch_document_param(params: &JsonValue) -> MethodResult<JsonValue> {
     let object = params_object(params)?;
     if let Some(patch) = object.get("patch") {
         if !patch.is_object() {
             return Err(WorkspaceMethodError::invalid_params(
-                "patch.preview field patch must be a JSON object",
+                "patch field patch must be a JSON object",
             ));
         }
         Ok(patch.clone())
     } else {
         Ok(params.clone())
     }
+}
+
+fn expected_root_hash_from_patch_document(
+    patch_document: &JsonValue,
+) -> MethodResult<Option<&str>> {
+    let object = patch_document
+        .as_object()
+        .ok_or_else(|| WorkspaceMethodError::invalid_params("patch document must be an object"))?;
+    optional_str_any(
+        object,
+        &[
+            "expected_root_hash",
+            "expect_root_hash",
+            "expected_root",
+            "expect_root",
+        ],
+    )
 }
 
 fn record_idempotent_apply_response(

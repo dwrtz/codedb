@@ -1,10 +1,15 @@
-# Semantic Patch Preview
+# Semantic Patches
 
 `codedb patch preview <db> --json <file>` previews a
 `codedb/semantic-patch/v1` document. Preview matches semantic DAG structure,
 lowers the patch to ordinary `codedb/apply/v1` structural operations, runs the
 existing rollback-only apply preview, and leaves branch pointers, migrations,
 objects, indexes, and caches unchanged.
+
+`codedb patch apply <db> --json <file>` applies the same document as ordinary
+structural migrations. Apply requires `expected_root`, commits atomically
+through `codedb/apply/v1`, and records patch provenance in migration
+`agent_json`.
 
 ## Document
 
@@ -19,8 +24,9 @@ objects, indexes, and caches unchanged.
 ```
 
 `branch` defaults to `main`. `expected_root` may also be written as
-`expect_root`, `expected_root_hash`, or `expect_root_hash`. If omitted, the
-current branch root is matched and previewed.
+`expect_root`, `expected_root_hash`, or `expect_root_hash`. If omitted, preview
+matches the current branch root. Apply rejects documents without an expected
+root so retries and stale-root conflicts stay explicit.
 
 ## Expression Patches
 
@@ -62,8 +68,8 @@ Retarget calls while preserving arguments:
 Supported match kinds are `symbol`, `function_definition`, `expr`,
 `literal_i64`, `literal_bool`, `call`, `type`, and `export`.
 
-Supported preview replacements are `literal_i64`, `literal_bool`, `unit`,
-`call`, `rename_symbol`, `set_export`, and `remove_export`.
+Supported replacements are `literal_i64`, `literal_bool`, `unit`, `call`,
+`rename_symbol`, `set_export`, and `remove_export`.
 
 ## Result
 
@@ -84,3 +90,21 @@ diagnostics
 `apply_preview` is the nested rollback-only `codedb/apply-result/v1` report.
 If a patch would fail type checking, preview returns `status: "error"` with a
 type-check diagnostic and still leaves the branch unchanged.
+
+Apply returns `codedb/semantic-patch-apply-result/v1` JSON with the same match
+and planning fields plus:
+
+```text
+committed
+old_root_hash
+new_root_hash
+old_history_hash
+new_history_hash
+semantic_summary
+apply_result
+patch_hash
+```
+
+`apply_result` is the committed `codedb/apply-result/v1` report. Each committed
+migration stores `agent_json.semantic_patch` with the patch hash, match summary,
+replacement, planned operation kinds, branch, and expected root.
