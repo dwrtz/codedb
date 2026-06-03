@@ -624,49 +624,83 @@ impl CodeDb {
             Operation::MergeBranch {
                 ancestor_root_hash, ..
             } => {
-                if self.root_symbol_changed_between(
+                let merged_reasons = self.classify_root_symbol_change_between(
                     ancestor_root_hash,
                     &item.output_root,
                     symbol,
-                )? {
+                )?;
+                if !merged_reasons.is_empty() {
                     reasons.insert("merge");
+                    reasons.extend(merged_reasons);
                 }
             }
         }
         Ok(reasons.into_iter().collect())
     }
 
-    fn root_symbol_changed_between(
+    fn classify_root_symbol_change_between(
         &self,
         old_root_hash: &str,
         new_root_hash: &str,
         symbol: &str,
-    ) -> Result<bool> {
+    ) -> Result<BTreeSet<&'static str>> {
         let old_root = self.load_root(old_root_hash)?;
         let new_root = self.load_root(new_root_hash)?;
-        Ok(
-            self.root_symbol(&old_root, symbol) != self.root_symbol(&new_root, symbol)
-                || old_root
-                    .names
-                    .iter()
-                    .filter(|binding| binding.symbol == symbol)
-                    .collect::<Vec<_>>()
-                    != new_root
-                        .names
-                        .iter()
-                        .filter(|binding| binding.symbol == symbol)
-                        .collect::<Vec<_>>()
-                || old_root
-                    .exports
-                    .iter()
-                    .filter(|binding| binding.symbol == symbol)
-                    .collect::<Vec<_>>()
-                    != new_root
-                        .exports
-                        .iter()
-                        .filter(|binding| binding.symbol == symbol)
-                        .collect::<Vec<_>>(),
-        )
+        let old_entry = self.root_symbol(&old_root, symbol);
+        let new_entry = self.root_symbol(&new_root, symbol);
+        let old_names = sorted_symbol_names(&old_root, symbol);
+        let new_names = sorted_symbol_names(&new_root, symbol);
+        let old_param_names = sorted_symbol_param_names(&old_root, symbol);
+        let new_param_names = sorted_symbol_param_names(&new_root, symbol);
+        let old_exports = sorted_symbol_exports(&old_root, symbol);
+        let new_exports = sorted_symbol_exports(&new_root, symbol);
+        let mut reasons = BTreeSet::new();
+
+        match (old_entry, new_entry) {
+            (None, Some(_)) => {
+                reasons.insert("birth");
+                reasons.insert("signature");
+                reasons.insert("body");
+                if !new_names.is_empty() {
+                    reasons.insert("name");
+                }
+                if !new_exports.is_empty() {
+                    reasons.insert("export");
+                }
+            }
+            (Some(_), None) => {
+                reasons.insert("delete");
+            }
+            (Some(old_entry), Some(new_entry)) => {
+                if old_entry.signature != new_entry.signature || old_param_names != new_param_names
+                {
+                    reasons.insert("signature");
+                }
+                if old_entry.definition != new_entry.definition {
+                    reasons.insert("body");
+                }
+                if old_names != new_names {
+                    reasons.insert("name");
+                    if preferred_symbol_name(&old_root, symbol)
+                        != preferred_symbol_name(&new_root, symbol)
+                    {
+                        reasons.insert("rename");
+                    }
+                }
+                if old_exports != new_exports {
+                    reasons.insert("export");
+                }
+            }
+            (None, None) => {
+                if old_names != new_names {
+                    reasons.insert("name");
+                }
+                if old_exports != new_exports {
+                    reasons.insert("export");
+                }
+            }
+        }
+        Ok(reasons)
     }
 
     fn ensure_expression_object(&self, expr_hash: &str) -> Result<()> {
@@ -1625,6 +1659,52 @@ fn expression_child_hashes(expr_kind: &str, payload: &JsonValue) -> Result<Vec<S
         other => bail!("unknown expression kind {other}"),
     }
     Ok(children)
+}
+
+fn sorted_symbol_names(root: &ProgramRootPayload, symbol: &str) -> Vec<(String, String, bool)> {
+    let mut names = root
+        .names
+        .iter()
+        .filter(|binding| binding.symbol == symbol)
+        .map(|binding| {
+            (
+                binding.module.clone(),
+                binding.display_name.clone(),
+                binding.is_preferred,
+            )
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn sorted_symbol_param_names(root: &ProgramRootPayload, symbol: &str) -> Vec<Vec<String>> {
+    let mut param_names = root
+        .param_names
+        .iter()
+        .filter(|binding| binding.symbol == symbol)
+        .map(|binding| binding.names.clone())
+        .collect::<Vec<_>>();
+    param_names.sort();
+    param_names
+}
+
+fn sorted_symbol_exports(root: &ProgramRootPayload, symbol: &str) -> Vec<String> {
+    let mut exports = root
+        .exports
+        .iter()
+        .filter(|binding| binding.symbol == symbol)
+        .map(|binding| binding.exported_name.clone())
+        .collect::<Vec<_>>();
+    exports.sort();
+    exports
+}
+
+fn preferred_symbol_name(root: &ProgramRootPayload, symbol: &str) -> Option<String> {
+    root.names
+        .iter()
+        .find(|binding| binding.symbol == symbol && binding.is_preferred)
+        .map(|binding| binding.display_name.clone())
 }
 
 fn json_sort_key(value: &JsonValue) -> String {

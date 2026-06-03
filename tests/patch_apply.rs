@@ -252,6 +252,170 @@ fn semantic_patch_apply_retries_expected_root_without_duplicate_history() {
 }
 
 #[test]
+fn semantic_patch_apply_covers_initial_operation_surface() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("patch-surface.cdb");
+    std::fs::write(
+        &source,
+        "fn tax(subtotal: i64) -> i64 = subtotal * 20 / 100\n\
+         \n\
+         fn unused() -> i64 = 7\n\
+         \n\
+         fn total(subtotal: i64) -> i64 = subtotal + tax(subtotal)\n\
+         \n\
+         fn main() -> i64 = total(100)\n",
+    )
+    .unwrap();
+    let db = temp.path().join("patch-surface-apply.sqlite");
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+
+    let mut root = current_root(&db);
+    let extract_patch = write_patch(
+        temp.path(),
+        "extract.patch.json",
+        json!({
+            "schema": "codedb/semantic-patch/v1",
+            "branch": "main",
+            "expected_root": root,
+            "match": {
+                "kind": "literal_i64",
+                "value": "20",
+                "within_name": "tax"
+            },
+            "replace": {
+                "kind": "extract_function",
+                "name": "rate"
+            }
+        }),
+    );
+    let extracted = parse_json(&run(&[
+        "patch",
+        "apply",
+        path(&db),
+        "--json",
+        path(&extract_patch),
+    ]));
+    assert_eq!(extracted["status"], "applied");
+    assert_eq!(
+        extracted["semantic_summary"]["operation_kinds"],
+        json!(["create_function", "replace_function_body"])
+    );
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "120");
+    let show_tax = parse_json(&run(&["show", path(&db), "tax", "--json"]));
+    assert_eq!(show_tax["body_source"], "subtotal * rate() / 100");
+    root = extracted["new_root_hash"].as_str().unwrap().to_string();
+
+    let inline_patch = write_patch(
+        temp.path(),
+        "inline.patch.json",
+        json!({
+            "schema": "codedb/semantic-patch/v1",
+            "branch": "main",
+            "expected_root": root,
+            "match": {
+                "kind": "call",
+                "target_name": "tax",
+                "within_name": "total"
+            },
+            "replace": {
+                "kind": "inline_function"
+            }
+        }),
+    );
+    let inlined = parse_json(&run(&[
+        "patch",
+        "apply",
+        path(&db),
+        "--json",
+        path(&inline_patch),
+    ]));
+    assert_eq!(inlined["status"], "applied");
+    assert_eq!(
+        inlined["semantic_summary"]["operation_kinds"],
+        json!(["replace_function_body"])
+    );
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "120");
+    root = inlined["new_root_hash"].as_str().unwrap().to_string();
+
+    let add_param_patch = write_patch(
+        temp.path(),
+        "add-param.patch.json",
+        json!({
+            "schema": "codedb/semantic-patch/v1",
+            "branch": "main",
+            "expected_root": root,
+            "match": {
+                "kind": "symbol",
+                "name": "unused"
+            },
+            "replace": {
+                "kind": "add_parameter",
+                "name": "scale",
+                "type": "i64",
+                "default": {
+                    "kind": "literal_i64",
+                    "value": "1"
+                }
+            }
+        }),
+    );
+    let added_param = parse_json(&run(&[
+        "patch",
+        "apply",
+        path(&db),
+        "--json",
+        path(&add_param_patch),
+    ]));
+    assert_eq!(added_param["status"], "applied");
+    assert_eq!(
+        added_param["semantic_summary"]["operation_kinds"],
+        json!(["change_function_signature"])
+    );
+    let show_unused = parse_json(&run(&["show", path(&db), "unused", "--json"]));
+    assert_eq!(show_unused["signature"], "(scale: i64) -> i64");
+    root = added_param["new_root_hash"].as_str().unwrap().to_string();
+
+    let remove_patch = write_patch(
+        temp.path(),
+        "remove-unused.patch.json",
+        json!({
+            "schema": "codedb/semantic-patch/v1",
+            "branch": "main",
+            "expected_root": root,
+            "match": {
+                "kind": "symbol",
+                "name": "unused"
+            },
+            "replace": {
+                "kind": "remove_unused_symbol"
+            }
+        }),
+    );
+    let removed = parse_json(&run(&[
+        "patch",
+        "apply",
+        path(&db),
+        "--json",
+        path(&remove_patch),
+    ]));
+    assert_eq!(removed["status"], "applied");
+    assert_eq!(
+        removed["semantic_summary"]["operation_kinds"],
+        json!(["delete_symbol"])
+    );
+    let listed = parse_json(&run(&["list", path(&db), "--json"]));
+    assert!(
+        listed["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|symbol| symbol["name"] != "unused")
+    );
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "120");
+}
+
+#[test]
 fn semantic_patch_apply_type_error_rolls_back_everything() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("literal-type-error.sqlite");

@@ -10,6 +10,7 @@ use crate::expr::RawExpr;
 use crate::migrations::Operation;
 use crate::model::{ProgramRootPayload, resolve_name_in_root};
 use crate::store::{CodeDb, canonical_json, hash_bytes};
+use crate::types::ParamSpec;
 
 const SEMANTIC_PATCH_SCHEMA: &str = "codedb/semantic-patch/v1";
 const SEMANTIC_PATCH_PREVIEW_SCHEMA: &str = "codedb/semantic-patch-preview/v1";
@@ -145,6 +146,26 @@ enum PatchReplace {
     RenameSymbol {
         new_name: String,
     },
+    ExtractFunction {
+        name: String,
+        #[serde(default)]
+        birth_seed: Option<String>,
+        #[serde(default)]
+        params: Vec<ParamSpec>,
+        #[serde(default)]
+        return_type: Option<String>,
+        #[serde(default)]
+        args: Vec<RawExpr>,
+    },
+    InlineFunction,
+    AddParameter {
+        name: String,
+        #[serde(rename = "type")]
+        ty: String,
+        #[serde(default, alias = "default_arg")]
+        default: Option<RawExpr>,
+    },
+    RemoveUnusedSymbol,
     SetExport {
         exported_name: String,
     },
@@ -247,7 +268,13 @@ enum ExprReplacement {
     LiteralI64(String),
     LiteralBool(bool),
     Unit,
-    CallTarget { target_name: String },
+    CallTarget {
+        target_name: String,
+    },
+    NewCall {
+        target_name: String,
+        args: Vec<RawExpr>,
+    },
 }
 
 impl CodeDb {
@@ -829,6 +856,29 @@ impl CodeDb {
                 }
                 Ok(operations)
             }
+            PatchReplace::ExtractFunction {
+                name,
+                birth_seed,
+                params,
+                return_type,
+                args,
+            } => self.plan_extract_function(
+                root,
+                matches,
+                pattern,
+                name,
+                birth_seed.as_deref(),
+                params,
+                return_type.as_deref(),
+                args,
+            ),
+            PatchReplace::InlineFunction => self.plan_inline_function(root, matches, pattern),
+            PatchReplace::AddParameter {
+                name,
+                ty,
+                default: _,
+            } => self.plan_add_parameter(root, matches, name, ty),
+            PatchReplace::RemoveUnusedSymbol => self.plan_remove_unused_symbol(matches),
             PatchReplace::SetExport { exported_name } => {
                 let mut operations = Vec::new();
                 for matched in matched_symbols_for_export_replace(matches) {
@@ -865,6 +915,177 @@ impl CodeDb {
                 Ok(operations)
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_extract_function(
+        &self,
+        root: &ProgramRootPayload,
+        matches: &MatchSet,
+        pattern: &PatchMatch,
+        name: &str,
+        birth_seed: Option<&str>,
+        params: &[ParamSpec],
+        return_type: Option<&str>,
+        args: &[RawExpr],
+    ) -> Result<Vec<Operation>> {
+        if matches!(
+            pattern,
+            PatchMatch::Symbol { .. }
+                | PatchMatch::FunctionDefinition { .. }
+                | PatchMatch::Type { .. }
+                | PatchMatch::Export { .. }
+        ) {
+            bail!("extract_function requires an expression, literal, or call match");
+        }
+        if matches.expressions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let unique_exprs = matches
+            .expressions
+            .iter()
+            .map(|matched| matched.expr_hash.clone())
+            .collect::<BTreeSet<_>>();
+        if unique_exprs.len() != 1 {
+            bail!("extract_function requires all matched expressions to have the same expr_hash");
+        }
+        let matched = matches
+            .expressions
+            .first()
+            .ok_or_else(|| anyhow!("extract_function matched no expressions"))?;
+        let return_type = match return_type {
+            Some(return_type) => return_type.to_string(),
+            None => matched
+                .type_hash
+                .as_deref()
+                .map(|type_hash| self.type_name(type_hash).map(str::to_string))
+                .transpose()?
+                .ok_or_else(|| {
+                    anyhow!("extract_function requires return_type for untyped match")
+                })?,
+        };
+        let body = self.typed_expr_to_raw(&matched.expr_hash, root)?;
+        let mut operations = vec![Operation::CreateFunction {
+            module: MAIN_BRANCH.to_string(),
+            name: name.to_string(),
+            birth_seed: birth_seed
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("semantic-patch:extract-function:{name}")),
+            params: params.to_vec(),
+            return_type,
+            body,
+        }];
+        let replacement = ExprReplacement::NewCall {
+            target_name: name.to_string(),
+            args: args.to_vec(),
+        };
+        operations.extend(self.plan_expression_replacement(
+            "",
+            root,
+            matches,
+            pattern,
+            replacement,
+        )?);
+        Ok(operations)
+    }
+
+    fn plan_inline_function(
+        &self,
+        root: &ProgramRootPayload,
+        matches: &MatchSet,
+        pattern: &PatchMatch,
+    ) -> Result<Vec<Operation>> {
+        if !matches!(pattern, PatchMatch::Call { .. } | PatchMatch::Expr { .. }) {
+            bail!("inline_function requires a call or expression match");
+        }
+        let mut replacements = BTreeMap::<String, RawExpr>::new();
+        for matched in &matches.expressions {
+            if matched.expr_kind != "call" {
+                bail!(
+                    "inline_function matched non-call expression {}",
+                    matched.expr_hash
+                );
+            }
+            let call_payload = self.get_payload(&matched.expr_hash)?;
+            let target_symbol = call_payload
+                .get("symbol")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("call missing symbol"))?;
+            let target_entry = self
+                .root_symbol(root, target_symbol)
+                .ok_or_else(|| anyhow!("call target missing from root {target_symbol}"))?;
+            let target_body = self.function_body_hash(&target_entry.definition)?;
+            let target_raw_body = self.typed_expr_to_raw(&target_body, root)?;
+            let args = call_payload
+                .get("args")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| anyhow!("call missing args"))?
+                .iter()
+                .map(|arg| {
+                    let hash = arg
+                        .as_str()
+                        .ok_or_else(|| anyhow!("call arg must be hash"))?;
+                    self.typed_expr_to_raw(hash, root)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            replacements.insert(
+                matched.expr_hash.clone(),
+                substitute_param_refs(&target_raw_body, &args)?,
+            );
+        }
+        self.plan_specific_expression_replacements(root, matches, pattern, &replacements)
+    }
+
+    fn plan_add_parameter(
+        &self,
+        root: &ProgramRootPayload,
+        matches: &MatchSet,
+        name: &str,
+        ty: &str,
+    ) -> Result<Vec<Operation>> {
+        let mut operations = Vec::new();
+        for matched in &matches.symbols {
+            let (param_types, return_type) = self.signature_parts(&matched.signature_hash)?;
+            let param_names = crate::model::param_names(root, &matched.symbol_hash);
+            let mut params = param_types
+                .iter()
+                .enumerate()
+                .map(|(idx, type_hash)| {
+                    Ok(ParamSpec {
+                        name: param_names
+                            .get(idx)
+                            .cloned()
+                            .unwrap_or_else(|| format!("arg{idx}")),
+                        ty: self.type_name(type_hash)?.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            params.push(ParamSpec {
+                name: name.to_string(),
+                ty: ty.to_string(),
+            });
+            operations.push(Operation::ChangeFunctionSignature {
+                module: matched.module.clone(),
+                symbol: matched.symbol_hash.clone(),
+                name: matched.name.clone(),
+                params,
+                return_type: self.type_name(&return_type)?.to_string(),
+            });
+        }
+        Ok(operations)
+    }
+
+    fn plan_remove_unused_symbol(&self, matches: &MatchSet) -> Result<Vec<Operation>> {
+        let mut operations = Vec::new();
+        for matched in &matches.symbols {
+            operations.push(Operation::DeleteSymbol {
+                module: matched.module.clone(),
+                symbol: matched.symbol_hash.clone(),
+                name: matched.name.clone(),
+                force: false,
+            });
+        }
+        Ok(operations)
     }
 
     fn plan_expression_replacement(
@@ -956,6 +1177,10 @@ impl CodeDb {
                             .collect::<Result<Vec<_>>>()?,
                     })
                 }
+                ExprReplacement::NewCall { target_name, args } => Ok(RawExpr::Call {
+                    name: target_name.clone(),
+                    args: args.clone(),
+                }),
             };
         }
 
@@ -1137,6 +1362,249 @@ impl CodeDb {
                         root,
                         replacements,
                         replacement,
+                        local_names,
+                    )?,
+                ),
+            }),
+            other => bail!("unknown expression kind {other}"),
+        }
+    }
+
+    fn plan_specific_expression_replacements(
+        &self,
+        root: &ProgramRootPayload,
+        matches: &MatchSet,
+        pattern: &PatchMatch,
+        replacements: &BTreeMap<String, RawExpr>,
+    ) -> Result<Vec<Operation>> {
+        if matches!(
+            pattern,
+            PatchMatch::Symbol { .. }
+                | PatchMatch::FunctionDefinition { .. }
+                | PatchMatch::Type { .. }
+                | PatchMatch::Export { .. }
+        ) {
+            bail!("expression replacement requires an expression, literal, or call match");
+        }
+        let mut exprs_by_symbol: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for matched in &matches.expressions {
+            exprs_by_symbol
+                .entry(matched.symbol_hash.clone())
+                .or_default()
+                .insert(matched.expr_hash.clone());
+        }
+        let mut operations = Vec::new();
+        for (symbol, expr_hashes) in exprs_by_symbol {
+            let entry = self
+                .root_symbol(root, &symbol)
+                .ok_or_else(|| anyhow!("matched symbol missing from root {symbol}"))?;
+            let body = self.function_body_hash(&entry.definition)?;
+            let name = self.symbol_display(root, &symbol)?;
+            let scoped_replacements = expr_hashes
+                .iter()
+                .filter_map(|expr_hash| {
+                    replacements
+                        .get(expr_hash)
+                        .map(|replacement| (expr_hash.clone(), replacement.clone()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let patched =
+                self.patched_raw_expr_specific(&body, root, &scoped_replacements, &mut Vec::new())?;
+            operations.push(Operation::ReplaceFunctionBody {
+                module: MAIN_BRANCH.to_string(),
+                symbol,
+                name,
+                body: patched,
+            });
+        }
+        Ok(operations)
+    }
+
+    fn patched_raw_expr_specific(
+        &self,
+        expr_hash: &str,
+        root: &ProgramRootPayload,
+        replacements: &BTreeMap<String, RawExpr>,
+        local_names: &mut Vec<String>,
+    ) -> Result<RawExpr> {
+        if let Some(replacement) = replacements.get(expr_hash) {
+            return Ok(replacement.clone());
+        }
+        let payload = self.get_payload(expr_hash)?;
+        let expr_kind = payload
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?;
+        match expr_kind {
+            "literal_i64" => Ok(RawExpr::LiteralI64 {
+                value: payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("literal_i64 missing value"))?
+                    .to_string(),
+            }),
+            "literal_bool" => Ok(RawExpr::LiteralBool {
+                value: payload
+                    .get("value")
+                    .and_then(JsonValue::as_bool)
+                    .ok_or_else(|| anyhow!("literal_bool missing value"))?,
+            }),
+            "literal_unit" => Ok(RawExpr::Unit),
+            "param_ref" => Ok(RawExpr::ParamRef {
+                index: payload
+                    .get("index")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("param_ref missing index"))?
+                    as usize,
+            }),
+            "local_ref" => {
+                let depth = payload
+                    .get("depth")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
+                    as usize;
+                Ok(RawExpr::ParamName {
+                    name: local_at_depth(local_names, depth)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))?,
+                })
+            }
+            "call" => Ok(RawExpr::Call {
+                name: self.symbol_display(
+                    root,
+                    payload
+                        .get("symbol")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("call missing symbol"))?,
+                )?,
+                args: payload
+                    .get("args")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("call missing args"))?
+                    .iter()
+                    .map(|arg| {
+                        let hash = arg
+                            .as_str()
+                            .ok_or_else(|| anyhow!("call arg must be hash"))?;
+                        self.patched_raw_expr_specific(hash, root, replacements, local_names)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            }),
+            "binary" => Ok(RawExpr::Binary {
+                op: payload
+                    .get("op")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("binary missing op"))?
+                    .to_string(),
+                left: Box::new(
+                    self.patched_raw_expr_specific(
+                        payload
+                            .get("left")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("binary missing left"))?,
+                        root,
+                        replacements,
+                        local_names,
+                    )?,
+                ),
+                right: Box::new(
+                    self.patched_raw_expr_specific(
+                        payload
+                            .get("right")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("binary missing right"))?,
+                        root,
+                        replacements,
+                        local_names,
+                    )?,
+                ),
+            }),
+            "unary" => Ok(RawExpr::Unary {
+                op: payload
+                    .get("op")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unary missing op"))?
+                    .to_string(),
+                expr: Box::new(
+                    self.patched_raw_expr_specific(
+                        payload
+                            .get("expr")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("unary missing expr"))?,
+                        root,
+                        replacements,
+                        local_names,
+                    )?,
+                ),
+            }),
+            "let" => {
+                let name = payload
+                    .get("binding_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing binding_name"))?
+                    .to_string();
+                let binding_type = payload
+                    .get("binding_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing binding_type"))?;
+                let value = self.patched_raw_expr_specific(
+                    payload
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("let missing value"))?,
+                    root,
+                    replacements,
+                    local_names,
+                )?;
+                local_names.push(name.clone());
+                let body = self.patched_raw_expr_specific(
+                    payload
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("let missing body"))?,
+                    root,
+                    replacements,
+                    local_names,
+                );
+                local_names.pop();
+                Ok(RawExpr::Let {
+                    name,
+                    ty: self.type_name(binding_type)?.to_string(),
+                    value: Box::new(value),
+                    body: Box::new(body?),
+                })
+            }
+            "if" => Ok(RawExpr::If {
+                cond: Box::new(
+                    self.patched_raw_expr_specific(
+                        payload
+                            .get("cond")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("if missing cond"))?,
+                        root,
+                        replacements,
+                        local_names,
+                    )?,
+                ),
+                then_expr: Box::new(
+                    self.patched_raw_expr_specific(
+                        payload
+                            .get("then")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("if missing then"))?,
+                        root,
+                        replacements,
+                        local_names,
+                    )?,
+                ),
+                else_expr: Box::new(
+                    self.patched_raw_expr_specific(
+                        payload
+                            .get("else")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("if missing else"))?,
+                        root,
+                        replacements,
                         local_names,
                     )?,
                 ),
@@ -1717,6 +2185,60 @@ fn export_matches_json(matches: &[ExportMatch]) -> Vec<JsonValue> {
             })
         })
         .collect()
+}
+
+fn substitute_param_refs(expr: &RawExpr, args: &[RawExpr]) -> Result<RawExpr> {
+    Ok(match expr {
+        RawExpr::LiteralI64 { value } => RawExpr::LiteralI64 {
+            value: value.clone(),
+        },
+        RawExpr::LiteralBool { value } => RawExpr::LiteralBool { value: *value },
+        RawExpr::Unit => RawExpr::Unit,
+        RawExpr::ParamRef { index } => args
+            .get(*index)
+            .cloned()
+            .ok_or_else(|| anyhow!("inline_function missing argument for param_ref {index}"))?,
+        RawExpr::ParamName { name } => RawExpr::ParamName { name: name.clone() },
+        RawExpr::Call {
+            name,
+            args: call_args,
+        } => RawExpr::Call {
+            name: name.clone(),
+            args: call_args
+                .iter()
+                .map(|arg| substitute_param_refs(arg, args))
+                .collect::<Result<Vec<_>>>()?,
+        },
+        RawExpr::Binary { op, left, right } => RawExpr::Binary {
+            op: op.clone(),
+            left: Box::new(substitute_param_refs(left, args)?),
+            right: Box::new(substitute_param_refs(right, args)?),
+        },
+        RawExpr::Unary { op, expr } => RawExpr::Unary {
+            op: op.clone(),
+            expr: Box::new(substitute_param_refs(expr, args)?),
+        },
+        RawExpr::Let {
+            name,
+            ty,
+            value,
+            body,
+        } => RawExpr::Let {
+            name: name.clone(),
+            ty: ty.clone(),
+            value: Box::new(substitute_param_refs(value, args)?),
+            body: Box::new(substitute_param_refs(body, args)?),
+        },
+        RawExpr::If {
+            cond,
+            then_expr,
+            else_expr,
+        } => RawExpr::If {
+            cond: Box::new(substitute_param_refs(cond, args)?),
+            then_expr: Box::new(substitute_param_refs(then_expr, args)?),
+            else_expr: Box::new(substitute_param_refs(else_expr, args)?),
+        },
+    })
 }
 
 fn local_at_depth<T>(locals: &[T], depth: usize) -> Option<&T> {

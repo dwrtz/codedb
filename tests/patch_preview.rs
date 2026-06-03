@@ -210,6 +210,128 @@ fn semantic_patch_preview_finds_and_retargets_call_expressions() {
 }
 
 #[test]
+fn semantic_patch_preview_covers_initial_operation_surface() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("patch-surface.cdb");
+    std::fs::write(
+        &source,
+        "fn tax(subtotal: i64) -> i64 = subtotal * 20 / 100\n\
+         \n\
+         fn unused() -> i64 = 7\n\
+         \n\
+         fn total(subtotal: i64) -> i64 = subtotal + tax(subtotal)\n\
+         \n\
+         fn main() -> i64 = total(100)\n",
+    )
+    .unwrap();
+    let db = temp.path().join("patch-surface-preview.sqlite");
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+
+    let root = current_root(&db);
+    let branch_before = branch_state(&db);
+    let counts_before = mutation_counts(&db);
+    let cases = [
+        (
+            "extract.patch.json",
+            json!({
+                "schema": "codedb/semantic-patch/v1",
+                "branch": "main",
+                "expected_root": root,
+                "match": {
+                    "kind": "literal_i64",
+                    "value": "20",
+                    "within_name": "tax"
+                },
+                "replace": {
+                    "kind": "extract_function",
+                    "name": "rate"
+                }
+            }),
+            json!(["create_function", "replace_function_body"]),
+        ),
+        (
+            "inline.patch.json",
+            json!({
+                "schema": "codedb/semantic-patch/v1",
+                "branch": "main",
+                "expected_root": root,
+                "match": {
+                    "kind": "call",
+                    "target_name": "tax",
+                    "within_name": "total"
+                },
+                "replace": {
+                    "kind": "inline_function"
+                }
+            }),
+            json!(["replace_function_body"]),
+        ),
+        (
+            "add-param.patch.json",
+            json!({
+                "schema": "codedb/semantic-patch/v1",
+                "branch": "main",
+                "expected_root": root,
+                "match": {
+                    "kind": "symbol",
+                    "name": "unused"
+                },
+                "replace": {
+                    "kind": "add_parameter",
+                    "name": "scale",
+                    "type": "i64",
+                    "default": {
+                        "kind": "literal_i64",
+                        "value": "1"
+                    }
+                }
+            }),
+            json!(["change_function_signature"]),
+        ),
+        (
+            "remove-unused.patch.json",
+            json!({
+                "schema": "codedb/semantic-patch/v1",
+                "branch": "main",
+                "expected_root": root,
+                "match": {
+                    "kind": "symbol",
+                    "name": "unused"
+                },
+                "replace": {
+                    "kind": "remove_unused_symbol"
+                }
+            }),
+            json!(["delete_symbol"]),
+        ),
+    ];
+
+    for (file_name, patch, expected_kinds) in cases {
+        let patch = write_patch(temp.path(), file_name, patch);
+        let preview = parse_json(&run(&[
+            "patch",
+            "preview",
+            path(&db),
+            "--json",
+            path(&patch),
+        ]));
+        assert_eq!(preview["status"], "planned", "{file_name}");
+        assert_eq!(preview["typecheck"]["status"], "ok", "{file_name}");
+        let operation_kinds = preview["planned_operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|operation| operation["kind"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(json!(operation_kinds), expected_kinds, "{file_name}");
+    }
+
+    assert_eq!(branch_state(&db), branch_before);
+    assert_eq!(mutation_counts(&db), counts_before);
+}
+
+#[test]
 fn semantic_patch_preview_reports_type_errors_before_apply() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("type-error-preview.sqlite");

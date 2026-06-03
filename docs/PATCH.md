@@ -69,7 +69,83 @@ Supported match kinds are `symbol`, `function_definition`, `expr`,
 `literal_i64`, `literal_bool`, `call`, `type`, and `export`.
 
 Supported replacements are `literal_i64`, `literal_bool`, `unit`, `call`,
-`rename_symbol`, `set_export`, and `remove_export`.
+`rename_symbol`, `extract_function`, `inline_function`, `add_parameter`,
+`remove_unused_symbol`, `set_export`, and `remove_export`.
+
+Extract a matched expression into a new function and replace the expression
+with a call:
+
+```json
+{
+  "schema": "codedb/semantic-patch/v1",
+  "match": {
+    "kind": "literal_i64",
+    "value": "20",
+    "within_name": "tax"
+  },
+  "replace": {
+    "kind": "extract_function",
+    "name": "rate"
+  }
+}
+```
+
+`extract_function` accepts optional `birth_seed`, `params`, `return_type`, and
+call `args` fields. If `return_type` is omitted, CodeDB uses the matched
+expression type.
+
+Inline matched calls:
+
+```json
+{
+  "schema": "codedb/semantic-patch/v1",
+  "match": {
+    "kind": "call",
+    "target_name": "tax",
+    "within_name": "total"
+  },
+  "replace": {
+    "kind": "inline_function"
+  }
+}
+```
+
+Add a parameter to a matched function:
+
+```json
+{
+  "schema": "codedb/semantic-patch/v1",
+  "match": {
+    "kind": "symbol",
+    "name": "unused"
+  },
+  "replace": {
+    "kind": "add_parameter",
+    "name": "scale",
+    "type": "i64",
+    "default": { "kind": "literal_i64", "value": "1" }
+  }
+}
+```
+
+The first implementation plans the signature change directly. Existing call
+sites must already remain valid after that signature change; otherwise preview
+returns the normal structural apply type error.
+
+Remove a symbol only when it has no live references or semantic tests:
+
+```json
+{
+  "schema": "codedb/semantic-patch/v1",
+  "match": {
+    "kind": "symbol",
+    "name": "unused"
+  },
+  "replace": {
+    "kind": "remove_unused_symbol"
+  }
+}
+```
 
 ## Result
 

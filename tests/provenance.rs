@@ -283,3 +283,96 @@ fn symbol_and_expression_blame_follow_migration_history() {
         blame_new_body["introduced_migration"]["agent"]
     );
 }
+
+#[test]
+fn merge_branch_updates_last_symbol_blame_facets() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("merge-provenance.sqlite");
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), "examples/shop.cdb"]);
+    let base_root = current_root(&db);
+
+    run(&[
+        "branch",
+        "create",
+        path(&db),
+        "agent/body",
+        "--from",
+        "main",
+        "--json",
+    ]);
+    let body_doc = write_json(
+        temp.path(),
+        "branch-body.json",
+        json!({
+            "schema": "codedb/apply/v1",
+            "branch": "agent/body",
+            "expect_root_hash": base_root,
+            "operations": [
+                {
+                    "kind": "replace_function_body",
+                    "name": "tax",
+                    "body": {
+                        "kind": "binary",
+                        "op": "/",
+                        "left": {
+                            "kind": "binary",
+                            "op": "*",
+                            "left": {
+                                "kind": "param_name",
+                                "name": "subtotal"
+                            },
+                            "right": {
+                                "kind": "literal_i64",
+                                "value": "18"
+                            }
+                        },
+                        "right": {
+                            "kind": "literal_i64",
+                            "value": "100"
+                        }
+                    }
+                }
+            ]
+        }),
+    );
+    let branch_apply = parse_json(&run(&["apply", path(&db), "--json", path(&body_doc)]));
+    assert_eq!(branch_apply["status"], "applied");
+
+    let merged = parse_json(&run(&[
+        "merge",
+        "apply",
+        path(&db),
+        "main",
+        "agent/body",
+        "--expect-root",
+        &base_root,
+        "--json",
+    ]));
+    assert_eq!(merged["status"], "merged");
+    assert_eq!(merged["committed"], true);
+    let merge_migration = merged["migration_hash"].as_str().unwrap();
+
+    let blame_tax = parse_json(&run(&["blame-symbol", path(&db), "tax", "--json"]));
+    assert_eq!(
+        blame_tax["last_body_migration"]["operation_kind"],
+        "merge_branch"
+    );
+    assert_eq!(
+        blame_tax["last_body_migration"]["migration_hash"],
+        merge_migration
+    );
+    assert!(
+        blame_tax["last_body_migration"]["reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("body"))
+    );
+    assert!(
+        blame_tax["last_body_migration"]["reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("merge"))
+    );
+}
