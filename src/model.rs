@@ -11,6 +11,8 @@ pub(crate) struct ProgramRootPayload {
     pub(crate) param_names: Vec<ParamNames>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) exports: Vec<ExportBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tests: Vec<RootTestBinding>,
     pub(crate) metadata: BTreeMap<String, JsonValue>,
 }
 
@@ -41,6 +43,33 @@ pub(crate) struct ExportBinding {
     pub(crate) exported_name: String,
 }
 
+pub(crate) const TEST_CASE_SCHEMA: &str = "codedb/test-case/v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RootTestBinding {
+    pub(crate) name: String,
+    pub(crate) test: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TestCasePayload {
+    #[serde(default = "default_test_case_schema")]
+    pub(crate) schema: String,
+    pub(crate) entry_symbol: String,
+    pub(crate) args: Vec<TestValue>,
+    pub(crate) expected: TestValue,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) native_agreement: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum TestValue {
+    I64 { value: String },
+    Bool { value: bool },
+    Unit,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct BranchState {
     pub(crate) root_hash: String,
@@ -66,6 +95,8 @@ pub(crate) fn normalize_root(mut root: ProgramRootPayload) -> ProgramRootPayload
     root.param_names.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     root.exports
         .sort_by(|a, b| (&a.exported_name, &a.symbol).cmp(&(&b.exported_name, &b.symbol)));
+    root.tests
+        .sort_by(|a, b| (&a.name, &a.test).cmp(&(&b.name, &b.test)));
     root
 }
 
@@ -126,6 +157,13 @@ pub(crate) fn exports_for(root: &ProgramRootPayload, symbol: &str) -> BTreeSet<S
         .filter(|binding| binding.symbol == symbol)
         .map(|binding| binding.exported_name.clone())
         .collect()
+}
+
+pub(crate) fn test_binding_for<'a>(
+    root: &'a ProgramRootPayload,
+    name: &str,
+) -> Option<&'a RootTestBinding> {
+    root.tests.iter().find(|binding| binding.name == name)
 }
 
 pub(crate) fn resolve_name_in_root(
@@ -199,4 +237,12 @@ fn reserved_projection_identifier(name: &str) -> bool {
             | "volatile"
             | "while"
     )
+}
+
+fn default_test_case_schema() -> String {
+    TEST_CASE_SCHEMA.to_string()
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }

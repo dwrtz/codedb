@@ -383,6 +383,7 @@ fn raise_kind(current: &mut BuildImpactKind, candidate: BuildImpactKind) {
 fn root_metadata_changed(old_root: &ProgramRootPayload, new_root: &ProgramRootPayload) -> bool {
     old_root.names != new_root.names
         || old_root.param_names != new_root.param_names
+        || old_root.tests != new_root.tests
         || old_root.metadata != new_root.metadata
         || aliases_changed(old_root, new_root)
         || param_names_changed(old_root, new_root)
@@ -571,6 +572,7 @@ mod tests {
                 ],
                 param_names: vec![],
                 exports: vec![],
+                tests: vec![],
                 metadata: BTreeMap::new(),
             })
             .unwrap();
@@ -600,6 +602,7 @@ mod tests {
                 ],
                 param_names: vec![],
                 exports: vec![],
+                tests: vec![],
                 metadata: BTreeMap::new(),
             })
             .unwrap();
@@ -738,6 +741,7 @@ mod tests {
                 ],
                 param_names: vec![],
                 exports: vec![],
+                tests: vec![],
                 metadata: BTreeMap::new(),
             })
             .unwrap();
@@ -767,6 +771,7 @@ mod tests {
                 ],
                 param_names: vec![],
                 exports: vec![],
+                tests: vec![],
                 metadata: BTreeMap::new(),
             })
             .unwrap();

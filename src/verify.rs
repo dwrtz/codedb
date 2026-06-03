@@ -244,6 +244,28 @@ impl CodeDb {
                         errors,
                     )?;
                 }
+                for (idx, entry) in payload
+                    .get("tests")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("tests[{idx}].test"),
+                        entry.get("test"),
+                        errors,
+                    )?;
+                }
+            }
+            "TestCase" => {
+                self.check_hash_ref(
+                    parent_hash,
+                    "entry_symbol",
+                    payload.get("entry_symbol"),
+                    errors,
+                )?;
             }
             "LinkPlanInput" => {
                 self.check_hash_ref(

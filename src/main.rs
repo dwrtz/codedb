@@ -52,6 +52,46 @@ enum Command {
         function_name: String,
         args: Vec<String>,
     },
+    #[command(about = "Run semantic tests stored in the current root")]
+    Test {
+        db: PathBuf,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        #[arg(long)]
+        list: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Create a semantic test object for an entry function")]
+    CreateTest {
+        db: PathBuf,
+        name: String,
+        #[arg(long)]
+        entry: String,
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        #[arg(long)]
+        expect_i64: Option<String>,
+        #[arg(long)]
+        expect_bool: Option<bool>,
+        #[arg(long)]
+        expect_unit: bool,
+        #[arg(long)]
+        native_agreement: bool,
+        #[arg(long)]
+        expect_root: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Delete a semantic test object from the current root")]
+    DeleteTest {
+        db: PathBuf,
+        name: String,
+        #[arg(long)]
+        expect_root: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Run the reference evaluator and emit a deterministic semantic trace")]
     Trace {
         db: PathBuf,
@@ -345,6 +385,69 @@ fn main() -> Result<()> {
             let codedb = codedb::CodeDb::open(db)?;
             let value = codedb.eval_main_branch_text_args(&function_name, &args)?;
             println!("{value}");
+        }
+        Command::Test {
+            db,
+            branch,
+            list,
+            json,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            if list {
+                if json {
+                    print!("{}", codedb.list_tests_branch_json(&branch)?);
+                } else {
+                    print!("{}", codedb.list_tests_branch(&branch)?);
+                }
+            } else if json {
+                print!("{}", codedb.run_tests_branch_json(&branch)?);
+            } else {
+                print!("{}", codedb.run_tests_branch(&branch)?);
+            }
+        }
+        Command::CreateTest {
+            db,
+            name,
+            entry,
+            args,
+            expect_i64,
+            expect_bool,
+            expect_unit,
+            native_agreement,
+            expect_root,
+            json,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            print!(
+                "{}",
+                codedb.create_test_main_branch_expected_format(
+                    &name,
+                    &entry,
+                    &args,
+                    expect_i64.as_deref(),
+                    expect_bool,
+                    expect_unit,
+                    native_agreement,
+                    expect_root.as_deref(),
+                    json,
+                )?
+            );
+        }
+        Command::DeleteTest {
+            db,
+            name,
+            expect_root,
+            json,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            print!(
+                "{}",
+                codedb.delete_test_main_branch_expected_format(
+                    &name,
+                    expect_root.as_deref(),
+                    json,
+                )?
+            );
         }
         Command::Trace {
             db,

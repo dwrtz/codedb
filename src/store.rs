@@ -68,6 +68,7 @@ impl CodeDb {
             names: vec![],
             param_names: vec![],
             exports: vec![],
+            tests: vec![],
             metadata: BTreeMap::new(),
         })?;
         self.index_root(&root_hash)?;

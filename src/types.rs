@@ -530,6 +530,7 @@ impl CodeDb {
                 );
             }
         }
+        self.validate_tests_for_root(root_hash, &root)?;
         Ok(())
     }
 

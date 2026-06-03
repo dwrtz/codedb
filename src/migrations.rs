@@ -11,9 +11,11 @@ use crate::build_plan::{BuildImpact, BuildImpactKind, BuildImpactReason, project
 use crate::expr::RawExpr;
 use crate::model::{
     BranchState, ExportBinding, NameBinding, ParamNames, ProgramRootPayload, RootSymbolPayload,
-    param_names, root_symbol_index, upsert_param_names, validate_projection_identifier,
+    RootTestBinding, TestCasePayload, TestValue, param_names, root_symbol_index, test_binding_for,
+    upsert_param_names, validate_projection_identifier,
 };
 use crate::store::{CodeDb, canonical_json, hash_bytes};
+use crate::tests::{test_points_to_entry_symbol, validate_test_value_type};
 use crate::types::ParamSpec;
 use crate::{HISTORY_DOMAIN, MAIN_BRANCH, MIGRATION_DOMAIN};
 
@@ -80,6 +82,21 @@ pub(crate) enum Operation {
         name: String,
         exported_name: String,
     },
+    CreateTest {
+        name: String,
+        entry_module: String,
+        entry_name: String,
+        entry_symbol: String,
+        #[serde(default)]
+        args: Vec<TestValue>,
+        expected: TestValue,
+        #[serde(default)]
+        native_agreement: bool,
+    },
+    DeleteTest {
+        name: String,
+        test: String,
+    },
 }
 
 impl Operation {
@@ -94,6 +111,8 @@ impl Operation {
             Operation::RemoveAlias { .. } => "remove_alias",
             Operation::SetExport { .. } => "set_export",
             Operation::RemoveExport { .. } => "remove_export",
+            Operation::CreateTest { .. } => "create_test",
+            Operation::DeleteTest { .. } => "delete_test",
         }
     }
 }
@@ -300,6 +319,8 @@ pub(crate) enum SemanticImpact {
     AliasRemoved,
     ExportSet,
     ExportRemoved,
+    TestCreated,
+    TestDeleted,
 }
 
 impl SemanticImpact {
@@ -314,6 +335,8 @@ impl SemanticImpact {
             SemanticImpact::AliasRemoved => "alias_removed",
             SemanticImpact::ExportSet => "export_set",
             SemanticImpact::ExportRemoved => "export_removed",
+            SemanticImpact::TestCreated => "test_created",
+            SemanticImpact::TestDeleted => "test_deleted",
         }
     }
 }
@@ -369,6 +392,13 @@ pub(crate) enum Precondition {
         name: String,
         symbol: String,
     },
+    TestNameIsAvailable {
+        name: String,
+    },
+    TestNamePointsToTest {
+        name: String,
+        test: String,
+    },
 }
 
 impl Precondition {
@@ -381,6 +411,8 @@ impl Precondition {
             Precondition::AliasPointsToSymbol { .. } => "alias_points_to_symbol",
             Precondition::ExportNameIsAvailable { .. } => "export_name_is_available",
             Precondition::ExportPointsToSymbol { .. } => "export_points_to_symbol",
+            Precondition::TestNameIsAvailable { .. } => "test_name_is_available",
+            Precondition::TestNamePointsToTest { .. } => "test_name_points_to_test",
         }
     }
 }
@@ -430,6 +462,14 @@ pub(crate) enum Postcondition {
     ExportAbsent {
         name: String,
     },
+    TestNamePointsToTest {
+        name: String,
+        test: String,
+    },
+    TestAbsent {
+        name: String,
+        test: String,
+    },
 }
 
 impl Postcondition {
@@ -444,6 +484,8 @@ impl Postcondition {
             Postcondition::SymbolAbsent { .. } => "symbol_absent",
             Postcondition::ExportPointsToSymbol { .. } => "export_points_to_symbol",
             Postcondition::ExportAbsent { .. } => "export_absent",
+            Postcondition::TestNamePointsToTest { .. } => "test_name_points_to_test",
+            Postcondition::TestAbsent { .. } => "test_absent",
         }
     }
 }
@@ -547,6 +589,21 @@ fn operation_summary_parts(op: &Operation) -> (String, SemanticImpact, Typecheck
             SemanticImpact::ExportRemoved,
             TypecheckImpact::Unchanged,
         ),
+        Operation::CreateTest {
+            name,
+            entry_module,
+            entry_name,
+            ..
+        } => (
+            format!("{name} for {entry_module}.{entry_name}"),
+            SemanticImpact::TestCreated,
+            TypecheckImpact::Checked,
+        ),
+        Operation::DeleteTest { name, .. } => (
+            name.clone(),
+            SemanticImpact::TestDeleted,
+            TypecheckImpact::Unchanged,
+        ),
     }
 }
 
@@ -598,6 +655,13 @@ fn fallback_build_impact(op: &Operation) -> BuildImpact {
             true,
             vec![symbol.clone()],
             vec![BuildImpactReason::ExportMapChanged],
+        ),
+        Operation::CreateTest { .. } | Operation::DeleteTest { .. } => (
+            BuildImpactKind::MetadataOnly,
+            vec![],
+            false,
+            vec![],
+            vec![BuildImpactReason::MetadataChanged],
         ),
     };
     let projection_artifacts = projection_artifacts();
@@ -962,6 +1026,32 @@ impl CodeDb {
                     symbol: symbol.clone(),
                 },
             ],
+            Operation::CreateTest {
+                name,
+                entry_module,
+                entry_name,
+                entry_symbol,
+                ..
+            } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::TestNameIsAvailable { name: name.clone() },
+                Precondition::NamePointsToSymbol {
+                    module: entry_module.clone(),
+                    name: entry_name.clone(),
+                    symbol: entry_symbol.clone(),
+                },
+            ],
+            Operation::DeleteTest { name, test } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::TestNamePointsToTest {
+                    name: name.clone(),
+                    test: test.clone(),
+                },
+            ],
         }
     }
 
@@ -1096,6 +1186,33 @@ impl CodeDb {
                     name: exported_name.clone(),
                 },
             ],
+            Operation::CreateTest { name, .. } => {
+                let test = self
+                    .load_root(output_root)
+                    .ok()
+                    .and_then(|root| {
+                        test_binding_for(&root, name).map(|binding| binding.test.clone())
+                    })
+                    .unwrap_or_default();
+                vec![
+                    Postcondition::RootExists {
+                        root: output_root.to_string(),
+                    },
+                    Postcondition::TestNamePointsToTest {
+                        name: name.clone(),
+                        test,
+                    },
+                ]
+            }
+            Operation::DeleteTest { name, test } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::TestAbsent {
+                    name: name.clone(),
+                    test: test.clone(),
+                },
+            ],
         }
     }
 
@@ -1164,6 +1281,12 @@ impl CodeDb {
                     .any(|binding| binding.exported_name == *name),
                 Precondition::ExportPointsToSymbol { name, symbol } => {
                     export_points_to_symbol(&root, name, symbol)
+                }
+                Precondition::TestNameIsAvailable { name } => {
+                    !root.tests.iter().any(|binding| binding.name == *name)
+                }
+                Precondition::TestNamePointsToTest { name, test } => {
+                    test_name_points_to_test(&root, name, test)
                 }
             };
             if !holds {
@@ -1258,9 +1381,15 @@ impl CodeDb {
                 self.function_signature_source_matches(root, symbol, params, return_type)
             }
             Postcondition::SymbolAbsent { symbol } => {
+                let test_refs_symbol = root
+                    .tests
+                    .iter()
+                    .filter_map(|binding| self.load_test_case(&binding.test).ok())
+                    .any(|case| case.entry_symbol == *symbol);
                 Ok(!root.symbols.iter().any(|entry| entry.symbol == *symbol)
                     && !root.names.iter().any(|binding| binding.symbol == *symbol)
-                    && !root.exports.iter().any(|binding| binding.symbol == *symbol))
+                    && !root.exports.iter().any(|binding| binding.symbol == *symbol)
+                    && !test_refs_symbol)
             }
             Postcondition::ExportPointsToSymbol { name, symbol } => {
                 Ok(export_points_to_symbol(root, name, symbol))
@@ -1269,6 +1398,13 @@ impl CodeDb {
                 .exports
                 .iter()
                 .any(|binding| binding.exported_name == *name)),
+            Postcondition::TestNamePointsToTest { name, test } => {
+                Ok(test_name_points_to_test(root, name, test))
+            }
+            Postcondition::TestAbsent { name, test } => Ok(!root
+                .tests
+                .iter()
+                .any(|binding| binding.name == *name || binding.test == *test)),
         }
     }
 
@@ -1386,6 +1522,25 @@ impl CodeDb {
                 name,
                 exported_name,
             } => self.apply_remove_export(input_root, module, symbol, name, exported_name),
+            Operation::CreateTest {
+                name,
+                entry_module,
+                entry_name,
+                entry_symbol,
+                args,
+                expected,
+                native_agreement,
+            } => self.apply_create_test(
+                input_root,
+                name,
+                entry_module,
+                entry_name,
+                entry_symbol,
+                args,
+                expected,
+                *native_agreement,
+            ),
+            Operation::DeleteTest { name, test } => self.apply_delete_test(input_root, name, test),
         }
     }
 
@@ -1576,20 +1731,41 @@ impl CodeDb {
         let mut root = self.load_root(input_root)?;
         self.assert_name_points(&root, module, name, symbol)?;
         let deps = self.reverse_dependencies_for_root(&root, symbol)?;
-        if !force && !deps.is_empty() {
-            let names = deps
+        let live_tests = root
+            .tests
+            .iter()
+            .filter_map(
+                |binding| match test_points_to_entry_symbol(self, &binding.test, symbol) {
+                    Ok(true) => Some(Ok(binding.name.clone())),
+                    Ok(false) => None,
+                    Err(err) => Some(Err(err)),
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+        if !force && (!deps.is_empty() || !live_tests.is_empty()) {
+            let mut blockers = deps
                 .into_iter()
                 .map(|dep| self.symbol_display(&root, &dep))
                 .collect::<Result<Vec<_>>>()?;
+            blockers.extend(
+                live_tests
+                    .iter()
+                    .map(|test| format!("test:{test}"))
+                    .collect::<Vec<_>>(),
+            );
             bail!(
-                "cannot delete {module}.{name}; live callers: {}",
-                names.join(", ")
+                "cannot delete {module}.{name}; live references: {}",
+                blockers.join(", ")
             );
         }
         root.symbols.retain(|entry| entry.symbol != symbol);
         root.names.retain(|binding| binding.symbol != symbol);
         root.param_names.retain(|entry| entry.symbol != symbol);
         root.exports.retain(|binding| binding.symbol != symbol);
+        if force {
+            root.tests
+                .retain(|binding| !live_tests.iter().any(|test| test == &binding.name));
+        }
         let new_root = self.put_program_root(&root)?;
         self.index_root(&new_root)?;
         self.type_check_root(&new_root)?;
@@ -1696,6 +1872,77 @@ impl CodeDb {
         }
         let new_root = self.put_program_root(&root)?;
         self.index_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_create_test(
+        &mut self,
+        input_root: &str,
+        name: &str,
+        entry_module: &str,
+        entry_name: &str,
+        entry_symbol: &str,
+        args: &[TestValue],
+        expected: &TestValue,
+        native_agreement: bool,
+    ) -> Result<String> {
+        validate_projection_identifier("test name", name)?;
+        let mut root = self.load_root(input_root)?;
+        if root.tests.iter().any(|binding| binding.name == name) {
+            bail!("test already exists: {name}");
+        }
+        self.assert_name_points(&root, entry_module, entry_name, entry_symbol)?;
+        let entry = self
+            .root_symbol(&root, entry_symbol)
+            .ok_or_else(|| anyhow!("missing entry symbol {entry_symbol}"))?;
+        let (param_types, return_type) = self.signature_parts(&entry.signature)?;
+        if param_types.len() != args.len() {
+            bail!(
+                "test {name} entry {entry_module}.{entry_name} expects {} args, got {}",
+                param_types.len(),
+                args.len()
+            );
+        }
+        for (idx, (arg, type_hash)) in args.iter().zip(param_types.iter()).enumerate() {
+            validate_test_value_type(arg, self.type_name(type_hash)?, &format!("argument {idx}"))?;
+        }
+        validate_test_value_type(expected, self.type_name(&return_type)?, "expected value")?;
+        let case = TestCasePayload {
+            schema: crate::model::TEST_CASE_SCHEMA.to_string(),
+            entry_symbol: entry_symbol.to_string(),
+            args: args.to_vec(),
+            expected: expected.clone(),
+            native_agreement,
+        };
+        self.validate_test_case_for_root(input_root, &root, &case)?;
+        let test = self.put_test_case(&case)?;
+        root.tests.push(RootTestBinding {
+            name: name.to_string(),
+            test,
+        });
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    pub(crate) fn apply_delete_test(
+        &mut self,
+        input_root: &str,
+        name: &str,
+        test: &str,
+    ) -> Result<String> {
+        let mut root = self.load_root(input_root)?;
+        let original_len = root.tests.len();
+        root.tests
+            .retain(|binding| !(binding.name == name && binding.test == test));
+        if root.tests.len() == original_len {
+            bail!("test {name} does not point to {test}");
+        }
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)?;
         Ok(new_root)
     }
 
@@ -2156,6 +2403,7 @@ impl CodeDb {
             names: vec![],
             param_names: vec![],
             exports: vec![],
+            tests: vec![],
             metadata: BTreeMap::new(),
         })?;
         let mut current_history: Option<String> = None;
@@ -2418,6 +2666,12 @@ fn export_points_to_symbol(root: &ProgramRootPayload, name: &str, symbol: &str) 
     root.exports
         .iter()
         .any(|binding| binding.exported_name == name && binding.symbol == symbol)
+}
+
+fn test_name_points_to_test(root: &ProgramRootPayload, name: &str, test: &str) -> bool {
+    root.tests
+        .iter()
+        .any(|binding| binding.name == name && binding.test == test)
 }
 
 fn validate_param_names(params: &[ParamSpec]) -> Result<()> {

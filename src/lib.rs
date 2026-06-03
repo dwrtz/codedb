@@ -15,6 +15,7 @@ mod migrations;
 mod model;
 pub mod server;
 mod store;
+mod tests;
 pub mod trace;
 mod types;
 mod verify;

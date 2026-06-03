@@ -467,6 +467,8 @@ fn dispatch_workspace_method(
         "build.artifact_status" => build_artifact_status(db, params),
         "trace.run" => trace_run(db, params),
         "debug.run" => debug_run(db, params),
+        "tests.list" => tests_list(db, params),
+        "tests.run" => tests_run(db, params),
         "history.list" => history_list(db, params),
         "verify.run" => verify_run(db, params),
         _ => Err(WorkspaceMethodError::new(
@@ -1066,6 +1068,34 @@ fn debug_run(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodRes
         diagnostics,
         snapshot,
     })
+}
+
+fn tests_list(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let branch = branch_param(params)?;
+    let result = parse_json_payload(
+        db.list_tests_branch_json(&branch)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, &branch)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn tests_run(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let branch = branch_param(params)?;
+    let result = parse_json_payload(
+        db.run_tests_branch_json(&branch)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, &branch)?;
+    if result.get("status").and_then(JsonValue::as_str) == Some("error") {
+        return Err(nested_result_workspace_error(
+            "test_error",
+            &result,
+            Vec::new(),
+            snapshot,
+        ));
+    }
+    Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 
 fn history_list(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {

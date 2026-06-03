@@ -7,6 +7,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::MAIN_BRANCH;
 use crate::expr::RawExpr;
 use crate::migrations::{MigrationStatus, Operation};
+use crate::model::TestValue;
 use crate::store::{CodeDb, canonical_json};
 use crate::types::ParamSpec;
 
@@ -125,6 +126,30 @@ enum ApiOperation {
         #[serde(default, alias = "expect_root")]
         expect_root_hash: Option<String>,
     },
+    CreateTest {
+        name: String,
+        #[serde(default = "default_module", alias = "entry_module")]
+        module: String,
+        #[serde(default, alias = "entry_symbol")]
+        symbol: Option<String>,
+        #[serde(alias = "entry")]
+        entry_name: String,
+        #[serde(default)]
+        args: Vec<TestValue>,
+        #[serde(alias = "expect")]
+        expected: TestValue,
+        #[serde(default)]
+        native_agreement: bool,
+        #[serde(default, alias = "expect_root")]
+        expect_root_hash: Option<String>,
+    },
+    DeleteTest {
+        name: String,
+        #[serde(default)]
+        test: Option<String>,
+        #[serde(default, alias = "expect_root")]
+        expect_root_hash: Option<String>,
+    },
 }
 
 impl ApiOperation {
@@ -155,6 +180,12 @@ impl ApiOperation {
                 expect_root_hash, ..
             }
             | ApiOperation::RemoveExport {
+                expect_root_hash, ..
+            }
+            | ApiOperation::CreateTest {
+                expect_root_hash, ..
+            }
+            | ApiOperation::DeleteTest {
                 expect_root_hash, ..
             } => expect_root_hash.as_deref(),
         }
@@ -542,6 +573,32 @@ impl CodeDb {
                 symbol: self.symbol_or_resolve(expected_root, module, name, symbol)?,
                 name: name.clone(),
                 exported_name: exported_name.clone(),
+            }),
+            ApiOperation::CreateTest {
+                module,
+                symbol,
+                name,
+                entry_name,
+                args,
+                expected,
+                native_agreement,
+                ..
+            } => self.create_test_operation_from_values(
+                expected_root,
+                name,
+                module,
+                entry_name,
+                symbol.as_deref(),
+                args.clone(),
+                expected.clone(),
+                *native_agreement,
+            ),
+            ApiOperation::DeleteTest { name, test, .. } => Ok(Operation::DeleteTest {
+                name: name.clone(),
+                test: match test {
+                    Some(test) => test.clone(),
+                    None => self.test_hash_for_name(expected_root, name)?,
+                },
             }),
         }
     }

@@ -200,6 +200,7 @@ mod tests {
                 symbol: first,
                 exported_name: internal_abi_symbol(&second).unwrap(),
             }],
+            tests: vec![],
             metadata: Default::default(),
         };
 
