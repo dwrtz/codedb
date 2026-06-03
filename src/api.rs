@@ -170,36 +170,14 @@ impl CodeDb {
 
     pub fn apply_json_str(&mut self, text: &str) -> Result<String> {
         self.ensure_initialized()?;
-        let value: JsonValue =
-            serde_json::from_str(text).context("apply JSON must be a JSON object")?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| anyhow!("apply JSON must be an object"))?;
-        let request = if object.contains_key("operations") {
-            serde_json::from_value::<ApplyBatch>(value)
-                .context("apply JSON must match codedb/apply/v1")?
-        } else {
-            let mut operation_value = value;
-            if let JsonValue::Object(map) = &mut operation_value
-                && let Some(schema) = map.remove("schema")
-            {
-                let schema = schema
-                    .as_str()
-                    .ok_or_else(|| anyhow!("apply schema must be {APPLY_SCHEMA:?}"))?;
-                if schema != APPLY_SCHEMA {
-                    bail!("unsupported apply schema {schema:?}; expected {APPLY_SCHEMA}");
-                }
-            }
-            let operation = serde_json::from_value::<ApiOperation>(operation_value)
-                .context("apply JSON must match codedb/apply/v1 operation schema")?;
-            ApplyBatch {
-                schema: Some(APPLY_SCHEMA.to_string()),
-                branch: MAIN_BRANCH.to_string(),
-                expect_root_hash: operation.expect_root_hash().map(str::to_string),
-                operations: vec![operation],
-            }
-        };
+        let request = parse_apply_json_request(text)?;
         self.apply_batch(request)
+    }
+
+    pub fn preview_apply_json_str(&mut self, text: &str) -> Result<String> {
+        self.ensure_initialized()?;
+        let request = parse_apply_json_request(text)?;
+        self.preview_apply_batch(request)
     }
 
     fn apply_batch(&mut self, request: ApplyBatch) -> Result<String> {
@@ -213,6 +191,23 @@ impl CodeDb {
                     self.conn.execute_batch("ROLLBACK")?;
                 }
                 Ok(json)
+            }
+            Err(err) => {
+                if let Err(rollback_err) = self.conn.execute_batch("ROLLBACK") {
+                    return Err(err).context(format!("rollback failed: {rollback_err}"));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn preview_apply_batch(&mut self, request: ApplyBatch) -> Result<String> {
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = self.apply_batch_in_tx(request);
+        match result {
+            Ok((json, would_commit)) => {
+                self.conn.execute_batch("ROLLBACK")?;
+                preview_apply_result_json(&json, would_commit)
             }
             Err(err) => {
                 if let Err(rollback_err) = self.conn.execute_batch("ROLLBACK") {
@@ -529,6 +524,57 @@ impl CodeDb {
             .unwrap_or_else(|| self.resolve_name(root_hash, module, name))
             .with_context(|| anyhow!("failed to resolve {module}.{name}"))
     }
+}
+
+fn parse_apply_json_request(text: &str) -> Result<ApplyBatch> {
+    let value: JsonValue =
+        serde_json::from_str(text).context("apply JSON must be a JSON object")?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("apply JSON must be an object"))?;
+    let request = if object.contains_key("operations") {
+        serde_json::from_value::<ApplyBatch>(value)
+            .context("apply JSON must match codedb/apply/v1")?
+    } else {
+        let mut operation_value = value;
+        if let JsonValue::Object(map) = &mut operation_value
+            && let Some(schema) = map.remove("schema")
+        {
+            let schema = schema
+                .as_str()
+                .ok_or_else(|| anyhow!("apply schema must be {APPLY_SCHEMA:?}"))?;
+            if schema != APPLY_SCHEMA {
+                bail!("unsupported apply schema {schema:?}; expected {APPLY_SCHEMA}");
+            }
+        }
+        let operation = serde_json::from_value::<ApiOperation>(operation_value)
+            .context("apply JSON must match codedb/apply/v1 operation schema")?;
+        ApplyBatch {
+            schema: Some(APPLY_SCHEMA.to_string()),
+            branch: MAIN_BRANCH.to_string(),
+            expect_root_hash: operation.expect_root_hash().map(str::to_string),
+            operations: vec![operation],
+        }
+    };
+    Ok(request)
+}
+
+fn preview_apply_result_json(text: &str, would_commit: bool) -> Result<String> {
+    let mut payload: JsonValue =
+        serde_json::from_str(text.trim_end()).context("apply preview result must be JSON")?;
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("apply preview result must be a JSON object"))?;
+    object.insert("preview".to_string(), JsonValue::Bool(true));
+    object.insert("would_commit".to_string(), JsonValue::Bool(would_commit));
+    object.insert("committed".to_string(), JsonValue::Bool(false));
+    if would_commit {
+        object.insert(
+            "rollback_reason".to_string(),
+            JsonValue::String("preview".to_string()),
+        );
+    }
+    Ok(format!("{}\n", canonical_json(&payload)))
 }
 
 #[allow(clippy::too_many_arguments)]

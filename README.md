@@ -144,7 +144,8 @@ optional JSON-RPC `id` fields. Responses use the stable
 `workspace.current`, `workspace.branches`, `symbols.list`, `symbols.show`,
 `symbols.resolve`, `symbols.callers`, `roots.diff`, `roots.export_projection`,
 `build.plan`, `history.list`, and `verify.run`. It also exposes `ops.apply`
-for atomic `codedb/apply/v1` structural writes.
+for atomic `codedb/apply/v1` structural writes and `ops.preview` for
+rollback-only previews.
 
 ## Documentation Map
 

@@ -194,6 +194,7 @@ fn dispatch_workspace_method(
         "roots.diff" => roots_diff(db, params),
         "roots.export_projection" => roots_export_projection(db, params),
         "ops.apply" => ops_apply(db, params),
+        "ops.preview" => ops_preview(db, params),
         "build.plan" => build_plan(db, params),
         "history.list" => history_list(db, params),
         "verify.run" => verify_run(db, params),
@@ -376,6 +377,16 @@ fn ops_apply(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMetho
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 
+fn ops_preview(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let apply_document = apply_document_param(params)?;
+    let result = parse_json_payload(
+        db.preview_apply_json_str(&canonical_json(&apply_document))
+            .map_err(|err| WorkspaceMethodError::new("invalid_operation", format!("{err:#}")))?,
+    )?;
+    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
 fn build_plan(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
     require_main_branch(params, "build.plan")?;
     let object = params_object(params)?;
@@ -461,7 +472,7 @@ fn apply_document_param(params: &JsonValue) -> MethodResult<JsonValue> {
             return Ok(apply.clone());
         }
         return Err(WorkspaceMethodError::invalid_params(
-            "ops.apply field apply must be a JSON object",
+            "ops apply/preview field apply must be a JSON object",
         ));
     }
     Ok(params.clone())
