@@ -466,6 +466,8 @@ fn dispatch_workspace_method(
         "ops.preview" => ops_preview(db, params),
         "patch.preview" => patch_preview(db, params),
         "patch.apply" => patch_apply(db, params),
+        "merge.preview" | "workspace.merge.preview" => merge_preview(db, params),
+        "merge.apply" | "workspace.merge.apply" => merge_apply(db, params),
         "build.plan" => build_plan(db, params),
         "build.execute" => build_execute(db, params),
         "build.artifact_status" => build_artifact_status(db, params),
@@ -1024,6 +1026,99 @@ fn patch_apply(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMet
         );
     }
     Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn merge_preview(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let object = params_object(params)?;
+    let target = required_str_any(object, &["target_branch", "target", "branch"])?;
+    let source = required_str_any(object, &["source_branch", "source", "from_branch", "from"])?;
+    let result = parse_json_payload(
+        db.merge_preview_branches(target, source, true)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, target)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn merge_apply(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let object = params_object(params)?;
+    let target = required_str_any(object, &["target_branch", "target", "branch"])?;
+    let source = required_str_any(object, &["source_branch", "source", "from_branch", "from"])?;
+    let expected_root = required_str_any(
+        object,
+        &[
+            "expect_root_hash",
+            "expected_root_hash",
+            "expect_root",
+            "expected_root",
+        ],
+    )?;
+    let result = parse_json_payload(
+        db.merge_apply_branches(target, source, expected_root, true)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, target)?;
+    match result.get("status").and_then(JsonValue::as_str) {
+        Some("merged" | "already_current") => Ok(WorkspaceMethodResult::new(result, snapshot)),
+        Some("stale_root") => Err(WorkspaceMethodError::stale_root(
+            format!("branch {target:?} moved before merge apply"),
+            snapshot,
+            expected_root,
+            result
+                .get("actual_root_hash")
+                .and_then(JsonValue::as_str)
+                .unwrap_or(""),
+        )
+        .with_diagnostics(vec![WorkspaceDiagnostic {
+            kind: "merge_stale_root".to_string(),
+            message: "codedb merge apply returned stale_root".to_string(),
+            details: Some(result),
+        }])),
+        Some("conflict") => {
+            let kind = result
+                .get("conflicts")
+                .and_then(JsonValue::as_array)
+                .and_then(|conflicts| conflicts.first())
+                .and_then(|conflict| conflict.get("kind"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("dependency_conflict");
+            let kind = match kind {
+                "name_conflict" => "name_conflict",
+                "signature_conflict" => "signature_conflict",
+                "export_conflict" => "export_conflict",
+                "delete_conflict" => "delete_conflict",
+                "stale_root" => "stale_root",
+                _ => "dependency_conflict",
+            };
+            Err(WorkspaceMethodError::new(kind, "semantic merge conflict")
+                .with_snapshot(snapshot)
+                .with_diagnostics(vec![WorkspaceDiagnostic {
+                    kind: "merge_conflict".to_string(),
+                    message: "codedb merge apply returned conflict".to_string(),
+                    details: Some(result),
+                }]))
+        }
+        Some(other) => Err(WorkspaceMethodError::new(
+            "invalid_operation",
+            format!("merge apply returned unexpected status {other:?}"),
+        )
+        .with_snapshot(snapshot)
+        .with_diagnostics(vec![WorkspaceDiagnostic {
+            kind: "merge_apply_error".to_string(),
+            message: "codedb merge apply returned an unexpected result".to_string(),
+            details: Some(result),
+        }])),
+        None => Err(WorkspaceMethodError::new(
+            "serialization_error",
+            "merge apply result missing status",
+        )
+        .with_snapshot(snapshot)
+        .with_diagnostics(vec![WorkspaceDiagnostic {
+            kind: "merge_apply_error".to_string(),
+            message: "codedb merge apply returned an invalid result".to_string(),
+            details: Some(result),
+        }])),
+    }
 }
 
 fn patch_document_param(params: &JsonValue) -> MethodResult<JsonValue> {

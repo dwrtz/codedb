@@ -11,6 +11,7 @@ mod expr;
 mod jobs;
 mod link;
 mod lowering;
+mod merge;
 mod migrations;
 mod model;
 mod patch;

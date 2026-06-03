@@ -341,6 +341,11 @@ enum Command {
         #[command(subcommand)]
         command: BranchCommand,
     },
+    #[command(about = "Preview or apply a conservative semantic branch merge")]
+    Merge {
+        #[command(subcommand)]
+        command: MergeCommand,
+    },
     #[command(about = "Preview higher-level semantic patches")]
     Patch {
         #[command(subcommand)]
@@ -402,6 +407,26 @@ enum BranchCommand {
         db: PathBuf,
         branch_a: String,
         branch_b: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MergeCommand {
+    Preview {
+        db: PathBuf,
+        target: String,
+        source: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Apply {
+        db: PathBuf,
+        target: String,
+        source: String,
+        #[arg(long)]
+        expect_root: String,
         #[arg(long)]
         json: bool,
     },
@@ -1036,6 +1061,30 @@ fn main() -> Result<()> {
             } => {
                 let codedb = codedb::CodeDb::open(db)?;
                 print!("{}", codedb.compare_branches(&branch_a, &branch_b, json)?);
+            }
+        },
+        Command::Merge { command } => match command {
+            MergeCommand::Preview {
+                db,
+                target,
+                source,
+                json,
+            } => {
+                let mut codedb = codedb::CodeDb::open(db)?;
+                print!("{}", codedb.merge_preview_branches(&target, &source, json)?);
+            }
+            MergeCommand::Apply {
+                db,
+                target,
+                source,
+                expect_root,
+                json,
+            } => {
+                let mut codedb = codedb::CodeDb::open(db)?;
+                print!(
+                    "{}",
+                    codedb.merge_apply_branches(&target, &source, &expect_root, json)?
+                );
             }
         },
         Command::Patch { command } => match command {

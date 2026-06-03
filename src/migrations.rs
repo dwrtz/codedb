@@ -99,6 +99,16 @@ pub(crate) enum Operation {
         name: String,
         test: String,
     },
+    MergeBranch {
+        target_branch: String,
+        source_branch: String,
+        ancestor_root_hash: String,
+        ancestor_history_hash: Option<String>,
+        source_root_hash: String,
+        source_history_hash: Option<String>,
+        merged_root: ProgramRootPayload,
+        object_payloads: Vec<MergeObjectPayload>,
+    },
 }
 
 impl Operation {
@@ -115,8 +125,16 @@ impl Operation {
             Operation::RemoveExport { .. } => "remove_export",
             Operation::CreateTest { .. } => "create_test",
             Operation::DeleteTest { .. } => "delete_test",
+            Operation::MergeBranch { .. } => "merge_branch",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MergeObjectPayload {
+    pub(crate) hash: String,
+    pub(crate) kind: String,
+    pub(crate) payload: JsonValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,6 +341,7 @@ pub(crate) enum SemanticImpact {
     ExportRemoved,
     TestCreated,
     TestDeleted,
+    BranchMerged,
 }
 
 impl SemanticImpact {
@@ -339,6 +358,7 @@ impl SemanticImpact {
             SemanticImpact::ExportRemoved => "export_removed",
             SemanticImpact::TestCreated => "test_created",
             SemanticImpact::TestDeleted => "test_deleted",
+            SemanticImpact::BranchMerged => "branch_merged",
         }
     }
 }
@@ -607,6 +627,15 @@ fn operation_summary_parts(op: &Operation) -> (String, SemanticImpact, Typecheck
             SemanticImpact::TestDeleted,
             TypecheckImpact::Unchanged,
         ),
+        Operation::MergeBranch {
+            target_branch,
+            source_branch,
+            ..
+        } => (
+            format!("{target_branch} <- {source_branch}"),
+            SemanticImpact::BranchMerged,
+            TypecheckImpact::RootRechecked,
+        ),
     }
 }
 
@@ -665,6 +694,13 @@ fn fallback_build_impact(op: &Operation) -> BuildImpact {
             false,
             vec![],
             vec![BuildImpactReason::MetadataChanged],
+        ),
+        Operation::MergeBranch { .. } => (
+            BuildImpactKind::FullRebuild,
+            vec![],
+            true,
+            vec![],
+            vec![BuildImpactReason::UnclassifiedRootChange],
         ),
     };
     let projection_artifacts = projection_artifacts();
@@ -1056,6 +1092,9 @@ impl CodeDb {
                     test: test.clone(),
                 },
             ],
+            Operation::MergeBranch { .. } => vec![Precondition::RootIsCurrent {
+                root: input_root.to_string(),
+            }],
         }
     }
 
@@ -1217,6 +1256,9 @@ impl CodeDb {
                     test: test.clone(),
                 },
             ],
+            Operation::MergeBranch { .. } => vec![Postcondition::RootExists {
+                root: output_root.to_string(),
+            }],
         }
     }
 
@@ -1547,6 +1589,14 @@ impl CodeDb {
                 *native_agreement,
             ),
             Operation::DeleteTest { name, test } => self.apply_delete_test(input_root, name, test),
+            Operation::MergeBranch {
+                source_root_hash,
+                merged_root,
+                object_payloads,
+                ..
+            } => {
+                self.apply_merge_branch(input_root, source_root_hash, merged_root, object_payloads)
+            }
         }
     }
 
@@ -1949,6 +1999,41 @@ impl CodeDb {
             bail!("test {name} does not point to {test}");
         }
         let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    pub(crate) fn apply_merge_branch(
+        &mut self,
+        input_root: &str,
+        source_root_hash: &str,
+        merged_root: &ProgramRootPayload,
+        object_payloads: &[MergeObjectPayload],
+    ) -> Result<String> {
+        self.load_root(input_root)?;
+        for object in object_payloads {
+            let inserted = self.put_object(&object.kind, &object.payload)?;
+            if inserted != object.hash {
+                bail!(
+                    "merge object payload for {} recomputes to {inserted}",
+                    object.hash
+                );
+            }
+        }
+        for object in object_payloads {
+            self.refresh_edges(&object.hash, &object.payload)?;
+        }
+        for object in object_payloads {
+            if object.kind == "ProgramRoot" {
+                self.index_root(&object.hash)?;
+                self.type_check_root(&object.hash)?;
+            }
+        }
+        self.load_root(source_root_hash)
+            .with_context(|| format!("merge source root is not available: {source_root_hash}"))?;
+
+        let new_root = self.put_program_root(merged_root)?;
         self.index_root(&new_root)?;
         self.type_check_root(&new_root)?;
         Ok(new_root)
@@ -2504,7 +2589,7 @@ impl CodeDb {
         ))
     }
 
-    fn history_chain(&self, branch: &str) -> Result<Vec<HistoryItem>> {
+    pub(crate) fn history_chain(&self, branch: &str) -> Result<Vec<HistoryItem>> {
         let state = self.branch(branch)?;
         let mut items = Vec::new();
         let mut cursor = state.history_hash;
@@ -2576,13 +2661,13 @@ impl CodeDb {
 }
 
 #[derive(Debug)]
-struct HistoryItem {
-    history_hash: String,
-    migration_hash: String,
-    input_root: String,
-    output_root: String,
-    operation_kind: String,
-    operation: Operation,
+pub(crate) struct HistoryItem {
+    pub(crate) history_hash: String,
+    pub(crate) migration_hash: String,
+    pub(crate) input_root: String,
+    pub(crate) output_root: String,
+    pub(crate) operation_kind: String,
+    pub(crate) operation: Operation,
 }
 
 fn parse_canonical_ndjson_line(line: &str, label: &str) -> Result<JsonValue> {

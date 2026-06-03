@@ -621,8 +621,52 @@ impl CodeDb {
                 }
             }
             Operation::DeleteTest { .. } => {}
+            Operation::MergeBranch {
+                ancestor_root_hash, ..
+            } => {
+                if self.root_symbol_changed_between(
+                    ancestor_root_hash,
+                    &item.output_root,
+                    symbol,
+                )? {
+                    reasons.insert("merge");
+                }
+            }
         }
         Ok(reasons.into_iter().collect())
+    }
+
+    fn root_symbol_changed_between(
+        &self,
+        old_root_hash: &str,
+        new_root_hash: &str,
+        symbol: &str,
+    ) -> Result<bool> {
+        let old_root = self.load_root(old_root_hash)?;
+        let new_root = self.load_root(new_root_hash)?;
+        Ok(
+            self.root_symbol(&old_root, symbol) != self.root_symbol(&new_root, symbol)
+                || old_root
+                    .names
+                    .iter()
+                    .filter(|binding| binding.symbol == symbol)
+                    .collect::<Vec<_>>()
+                    != new_root
+                        .names
+                        .iter()
+                        .filter(|binding| binding.symbol == symbol)
+                        .collect::<Vec<_>>()
+                || old_root
+                    .exports
+                    .iter()
+                    .filter(|binding| binding.symbol == symbol)
+                    .collect::<Vec<_>>()
+                    != new_root
+                        .exports
+                        .iter()
+                        .filter(|binding| binding.symbol == symbol)
+                        .collect::<Vec<_>>(),
+        )
     }
 
     fn ensure_expression_object(&self, expr_hash: &str) -> Result<()> {
