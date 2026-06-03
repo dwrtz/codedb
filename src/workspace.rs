@@ -2,8 +2,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
-use crate::model::{aliases_for, param_names};
-use crate::store::{CodeDb, canonical_json};
+use crate::model::{BranchState, aliases_for, param_names};
+use crate::store::{BranchFastForwardOutcome, CodeDb, canonical_json};
 use crate::{DEFAULT_NATIVE_TARGET, MAIN_BRANCH};
 
 pub const WORKSPACE_REQUEST_SCHEMA: &str = "codedb/request/v1";
@@ -39,6 +39,10 @@ pub struct WorkspaceDiagnostic {
 pub struct WorkspaceError {
     pub kind: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_root_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_root_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +84,17 @@ impl WorkspaceResponse {
         snapshot: Option<WorkspaceSnapshot>,
         id: Option<JsonValue>,
     ) -> Self {
+        Self::error_with_details(kind, message, snapshot, id, None, None)
+    }
+
+    pub fn error_with_details(
+        kind: impl Into<String>,
+        message: impl Into<String>,
+        snapshot: Option<WorkspaceSnapshot>,
+        id: Option<JsonValue>,
+        expected_root_hash: Option<String>,
+        actual_root_hash: Option<String>,
+    ) -> Self {
         Self {
             schema: WORKSPACE_RESPONSE_SCHEMA.to_string(),
             status: "error".to_string(),
@@ -89,6 +104,8 @@ impl WorkspaceResponse {
             error: Some(WorkspaceError {
                 kind: kind.into(),
                 message: message.into(),
+                expected_root_hash,
+                actual_root_hash,
             }),
             id,
         }
@@ -132,9 +149,14 @@ pub fn execute_workspace_request(db: &mut CodeDb, request: WorkspaceRequest) -> 
             method_result.snapshot,
             id,
         ),
-        Err(err) => {
-            WorkspaceResponse::error(err.kind, err.message, snapshot_or_none(db, MAIN_BRANCH), id)
-        }
+        Err(err) => WorkspaceResponse::error_with_details(
+            err.kind,
+            err.message,
+            err.snapshot.or_else(|| snapshot_or_none(db, MAIN_BRANCH)),
+            id,
+            err.expected_root_hash,
+            err.actual_root_hash,
+        ),
     }
 }
 
@@ -158,6 +180,9 @@ impl WorkspaceMethodResult {
 struct WorkspaceMethodError {
     kind: &'static str,
     message: String,
+    snapshot: Option<WorkspaceSnapshot>,
+    expected_root_hash: Option<String>,
+    actual_root_hash: Option<String>,
 }
 
 impl WorkspaceMethodError {
@@ -165,6 +190,9 @@ impl WorkspaceMethodError {
         Self {
             kind,
             message: message.into(),
+            snapshot: None,
+            expected_root_hash: None,
+            actual_root_hash: None,
         }
     }
 
@@ -174,6 +202,21 @@ impl WorkspaceMethodError {
 
     fn invalid_params(message: impl Into<String>) -> Self {
         Self::new("invalid_params", message)
+    }
+
+    fn stale_root(
+        message: impl Into<String>,
+        snapshot: WorkspaceSnapshot,
+        expected_root_hash: impl Into<String>,
+        actual_root_hash: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: "stale_root",
+            message: message.into(),
+            snapshot: Some(snapshot),
+            expected_root_hash: Some(expected_root_hash.into()),
+            actual_root_hash: Some(actual_root_hash.into()),
+        }
     }
 }
 
@@ -187,6 +230,9 @@ fn dispatch_workspace_method(
     match method {
         "workspace.current" => workspace_current(db, params),
         "workspace.branches" => workspace_branches(db, params),
+        "workspace.branch.create" => workspace_branch_create(db, params),
+        "workspace.branch.fast_forward" => workspace_branch_fast_forward(db, params),
+        "workspace.branch.delete" => workspace_branch_delete(db, params),
         "symbols.list" => symbols_list(db, params),
         "symbols.show" => symbols_show(db, params),
         "symbols.resolve" => symbols_resolve(db, params),
@@ -219,6 +265,126 @@ fn workspace_branches(db: &CodeDb, params: &JsonValue) -> MethodResult<Workspace
     params_object(params)?;
     let result = parse_json_payload(db.branches_json().map_err(WorkspaceMethodError::method)?)?;
     let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn workspace_branch_create(
+    db: &mut CodeDb,
+    params: &JsonValue,
+) -> MethodResult<WorkspaceMethodResult> {
+    let object = params_object(params)?;
+    let name = required_str_any(object, &["name", "branch"])?;
+    if db
+        .branch_opt(name)
+        .map_err(WorkspaceMethodError::method)?
+        .is_some()
+    {
+        return Err(WorkspaceMethodError::new(
+            "name_conflict",
+            format!("branch already exists: {name}"),
+        ));
+    }
+    let (source, source_state) = branch_source_state(db, object, Some(MAIN_BRANCH))?;
+    let created = db
+        .create_branch_pointer(
+            name,
+            &source_state.root_hash,
+            source_state.history_hash.as_deref(),
+        )
+        .map_err(WorkspaceMethodError::method)?;
+    let snapshot = workspace_snapshot(db, name)?;
+    let result = json!({
+        "schema": "codedb/branch-operation-result/v1",
+        "status": "created",
+        "branch": name,
+        "root_hash": created.root_hash,
+        "history_hash": created.history_hash,
+        "source": source,
+    });
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn workspace_branch_fast_forward(
+    db: &mut CodeDb,
+    params: &JsonValue,
+) -> MethodResult<WorkspaceMethodResult> {
+    let object = params_object(params)?;
+    let target = required_str_any(object, &["branch", "target_branch", "target", "name"])?;
+    let expected_root = required_str_any(
+        object,
+        &[
+            "expect_root_hash",
+            "expected_root_hash",
+            "expect_root",
+            "expected_root",
+        ],
+    )?;
+    let (source, source_state) = branch_source_state(db, object, Some(MAIN_BRANCH))?;
+    let outcome = db
+        .fast_forward_branch_pointer(target, expected_root, &source_state)
+        .map_err(WorkspaceMethodError::method)?;
+    match outcome {
+        BranchFastForwardOutcome::Updated { old, new } => {
+            let snapshot = workspace_snapshot(db, target)?;
+            let status = if old.root_hash == new.root_hash && old.history_hash == new.history_hash {
+                "already_current"
+            } else {
+                "fast_forwarded"
+            };
+            let result = json!({
+                "schema": "codedb/branch-operation-result/v1",
+                "status": status,
+                "branch": target,
+                "old_root_hash": old.root_hash,
+                "new_root_hash": new.root_hash,
+                "old_history_hash": old.history_hash,
+                "new_history_hash": new.history_hash,
+                "source": source,
+            });
+            Ok(WorkspaceMethodResult::new(result, snapshot))
+        }
+        BranchFastForwardOutcome::StaleRoot { current } => {
+            let snapshot = WorkspaceSnapshot {
+                branch: target.to_string(),
+                root_hash: current.root_hash.clone(),
+                history_hash: current.history_hash,
+            };
+            Err(WorkspaceMethodError::stale_root(
+                format!(
+                    "branch {target:?} moved before fast-forward; expected root {expected_root}, actual root {}",
+                    current.root_hash
+                ),
+                snapshot,
+                expected_root,
+                current.root_hash,
+            ))
+        }
+    }
+}
+
+fn workspace_branch_delete(
+    db: &mut CodeDb,
+    params: &JsonValue,
+) -> MethodResult<WorkspaceMethodResult> {
+    let object = params_object(params)?;
+    let name = required_str_any(object, &["name", "branch"])?;
+    if name == MAIN_BRANCH {
+        return Err(WorkspaceMethodError::new(
+            "invalid_params",
+            "workspace.branch.delete cannot delete the main branch",
+        ));
+    }
+    let deleted = db
+        .delete_branch_pointer(name)
+        .map_err(WorkspaceMethodError::method)?;
+    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    let result = json!({
+        "schema": "codedb/branch-operation-result/v1",
+        "status": "deleted",
+        "branch": name,
+        "old_root_hash": deleted.root_hash,
+        "old_history_hash": deleted.history_hash,
+    });
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 
@@ -465,6 +631,62 @@ fn branch_param(params: &JsonValue) -> MethodResult<String> {
         .to_string())
 }
 
+fn branch_source_state(
+    db: &CodeDb,
+    object: &JsonMap<String, JsonValue>,
+    default_branch: Option<&str>,
+) -> MethodResult<(JsonValue, BranchState)> {
+    let source_branch = optional_str_any(object, &["from_branch", "source_branch", "from"])?;
+    let source_root =
+        optional_str_any(object, &["from_root_hash", "source_root_hash", "root_hash"])?;
+    if source_branch.is_some() && source_root.is_some() {
+        return Err(WorkspaceMethodError::invalid_params(
+            "branch source must use either source_branch/from_branch or source_root_hash/from_root_hash, not both",
+        ));
+    }
+
+    if let Some(root_hash) = source_root {
+        db.load_root(root_hash)
+            .map_err(WorkspaceMethodError::method)?;
+        let history_hash = optional_str_any(
+            object,
+            &["from_history_hash", "source_history_hash", "history_hash"],
+        )?
+        .map(str::to_string);
+        let source = json!({
+            "kind": "root",
+            "root_hash": root_hash,
+            "history_hash": &history_hash,
+        });
+        return Ok((
+            source,
+            BranchState {
+                root_hash: root_hash.to_string(),
+                history_hash,
+            },
+        ));
+    }
+
+    let branch = source_branch.or(default_branch).ok_or_else(|| {
+        WorkspaceMethodError::invalid_params(
+            "branch source requires source_branch/from_branch or source_root_hash/from_root_hash",
+        )
+    })?;
+    let state = db.branch(branch).map_err(|err| {
+        WorkspaceMethodError::new(
+            "branch_not_found",
+            format!("source branch {branch:?}: {err:#}"),
+        )
+    })?;
+    let source = json!({
+        "kind": "branch",
+        "branch": branch,
+        "root_hash": &state.root_hash,
+        "history_hash": &state.history_hash,
+    });
+    Ok((source, state))
+}
+
 fn apply_document_param(params: &JsonValue) -> MethodResult<JsonValue> {
     let object = params_object(params)?;
     if let Some(apply) = object.get("apply") {
@@ -517,6 +739,27 @@ fn optional_str<'a>(
             })
         })
         .transpose()
+}
+
+fn optional_str_any<'a>(
+    object: &'a JsonMap<String, JsonValue>,
+    keys: &[&str],
+) -> MethodResult<Option<&'a str>> {
+    for key in keys {
+        if let Some(value) = optional_str(object, key)? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+fn required_str_any<'a>(
+    object: &'a JsonMap<String, JsonValue>,
+    keys: &[&str],
+) -> MethodResult<&'a str> {
+    optional_str_any(object, keys)?.ok_or_else(|| {
+        WorkspaceMethodError::invalid_params(format!("method requires one of {}", keys.join(", ")))
+    })
 }
 
 fn required_str_alias<'a>(

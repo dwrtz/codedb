@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
@@ -27,6 +27,12 @@ pub(crate) struct CacheEntry {
     pub(crate) artifact_hash: String,
     pub(crate) artifact_json: Option<JsonValue>,
     pub(crate) artifact_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum BranchFastForwardOutcome {
+    Updated { old: BranchState, new: BranchState },
+    StaleRoot { current: BranchState },
 }
 
 impl CodeDb {
@@ -56,6 +62,11 @@ impl CodeDb {
     }
 
     pub(crate) fn branch(&self, name: &str) -> Result<BranchState> {
+        self.branch_opt(name)?
+            .ok_or_else(|| anyhow!("branch not initialized: {name}"))
+    }
+
+    pub(crate) fn branch_opt(&self, name: &str) -> Result<Option<BranchState>> {
         self.conn
             .query_row(
                 "SELECT root_hash, history_hash FROM branches WHERE name = ?1",
@@ -67,8 +78,86 @@ impl CodeDb {
                     })
                 },
             )
-            .optional()?
-            .ok_or_else(|| anyhow!("branch not initialized: {name}"))
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn create_branch_pointer(
+        &mut self,
+        name: &str,
+        root_hash: &str,
+        history_hash: Option<&str>,
+    ) -> Result<BranchState> {
+        validate_branch_name(name)?;
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            if self.branch_opt(name)?.is_some() {
+                bail!("branch already exists: {name}");
+            }
+            self.load_root(root_hash)
+                .with_context(|| format!("branch root is not a valid program root: {root_hash}"))?;
+            if let Some(history_hash) = history_hash {
+                self.ensure_history_matches_root(history_hash, root_hash)?;
+            }
+            self.conn.execute(
+                "INSERT INTO branches (name, root_hash, history_hash, updated_at)
+                 VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)",
+                params![name, root_hash, history_hash],
+            )?;
+            Ok(BranchState {
+                root_hash: root_hash.to_string(),
+                history_hash: history_hash.map(str::to_string),
+            })
+        })();
+        finish_immediate_transaction(&mut self.conn, result)
+    }
+
+    pub(crate) fn fast_forward_branch_pointer(
+        &mut self,
+        target: &str,
+        expected_root_hash: &str,
+        source: &BranchState,
+    ) -> Result<BranchFastForwardOutcome> {
+        validate_branch_name(target)?;
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            let old = self.branch(target)?;
+            if old.root_hash != expected_root_hash {
+                return Ok(BranchFastForwardOutcome::StaleRoot { current: old });
+            }
+            self.load_root(&source.root_hash).with_context(|| {
+                format!(
+                    "source root is not a valid program root: {}",
+                    source.root_hash
+                )
+            })?;
+            if let Some(history_hash) = source.history_hash.as_deref() {
+                self.ensure_history_matches_root(history_hash, &source.root_hash)?;
+            }
+            self.conn.execute(
+                "UPDATE branches
+                 SET root_hash = ?2, history_hash = ?3, updated_at = CURRENT_TIMESTAMP
+                 WHERE name = ?1",
+                params![target, source.root_hash, source.history_hash.as_deref()],
+            )?;
+            Ok(BranchFastForwardOutcome::Updated {
+                old,
+                new: source.clone(),
+            })
+        })();
+        finish_immediate_transaction(&mut self.conn, result)
+    }
+
+    pub(crate) fn delete_branch_pointer(&mut self, name: &str) -> Result<BranchState> {
+        validate_branch_name(name)?;
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            let state = self.branch(name)?;
+            self.conn
+                .execute("DELETE FROM branches WHERE name = ?1", params![name])?;
+            Ok(state)
+        })();
+        finish_immediate_transaction(&mut self.conn, result)
     }
 
     pub(crate) fn update_branch(
@@ -86,6 +175,24 @@ impl CodeDb {
                 updated_at = CURRENT_TIMESTAMP",
             params![name, root_hash, history_hash],
         )?;
+        Ok(())
+    }
+
+    fn ensure_history_matches_root(&self, history_hash: &str, root_hash: &str) -> Result<()> {
+        let output_root: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT output_root_hash FROM histories WHERE history_hash = ?1",
+                params![history_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(output_root) = output_root else {
+            bail!("missing history {history_hash}");
+        };
+        if output_root != root_hash {
+            bail!("history {history_hash} outputs root {output_root}, not branch root {root_hash}");
+        }
         Ok(())
     }
 
@@ -577,6 +684,34 @@ pub(crate) fn cache_key_for_input(key_input: &CacheKeyInput) -> Result<String> {
         CACHE_DOMAIN,
         cache_key_json(&key_input)?.as_bytes(),
     ))
+}
+
+fn validate_branch_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("branch name must not be empty");
+    }
+    if name.trim() != name || name.chars().any(char::is_whitespace) {
+        bail!("branch name must not contain whitespace");
+    }
+    if name.chars().any(char::is_control) {
+        bail!("branch name must not contain control characters");
+    }
+    Ok(())
+}
+
+fn finish_immediate_transaction<T>(conn: &mut Connection, result: Result<T>) -> Result<T> {
+    match result {
+        Ok(value) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(value)
+        }
+        Err(err) => {
+            if let Err(rollback_err) = conn.execute_batch("ROLLBACK") {
+                return Err(err).context(format!("rollback failed: {rollback_err}"));
+            }
+            Err(err)
+        }
+    }
 }
 
 pub(crate) fn function_interface_metadata(symbol: &str, signature: &str) -> Result<JsonValue> {

@@ -188,6 +188,138 @@ fn workspace_server_exposes_read_only_workspace_methods() {
 }
 
 #[test]
+fn workspace_server_manages_branch_pointers() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("workspace-branches.sqlite");
+    run(&["init", db.to_str().unwrap()]);
+    run(&["import", db.to_str().unwrap(), "examples/shop.cdb"]);
+    let server = start_server(&db);
+
+    let main_before = workspace_call(&server, "workspace.current", json!({}));
+    let old_main_root = main_before["snapshot"]["root_hash"].as_str().unwrap();
+    let old_main_history = main_before["snapshot"]["history_hash"].clone();
+
+    let created = workspace_call(
+        &server,
+        "workspace.branch.create",
+        json!({"name": "agent/demo", "from_branch": "main"}),
+    );
+    assert_eq!(created["status"], "ok");
+    assert_eq!(
+        created["result"]["schema"],
+        "codedb/branch-operation-result/v1"
+    );
+    assert_eq!(created["result"]["status"], "created");
+    assert_eq!(created["result"]["branch"], "agent/demo");
+    assert_eq!(created["snapshot"]["branch"], "agent/demo");
+    assert_eq!(created["snapshot"]["root_hash"], old_main_root);
+    assert_eq!(created["snapshot"]["history_hash"], old_main_history);
+
+    let duplicate = workspace_call(
+        &server,
+        "workspace.branch.create",
+        json!({"name": "agent/demo", "from_branch": "main"}),
+    );
+    assert_eq!(duplicate["status"], "error");
+    assert_eq!(duplicate["error"]["kind"], "name_conflict");
+
+    let applied = workspace_call(
+        &server,
+        "ops.apply",
+        json!({
+            "schema": "codedb/apply/v1",
+            "branch": "main",
+            "expect_root_hash": old_main_root,
+            "operations": [
+                {
+                    "kind": "rename_symbol",
+                    "name": "tax",
+                    "new_name": "vat"
+                }
+            ]
+        }),
+    );
+    assert_eq!(applied["status"], "ok");
+    let new_main_root = applied["snapshot"]["root_hash"].as_str().unwrap();
+    let new_main_history = applied["snapshot"]["history_hash"].clone();
+    assert_ne!(new_main_root, old_main_root);
+
+    let agent_before = workspace_call(
+        &server,
+        "workspace.current",
+        json!({"branch": "agent/demo"}),
+    );
+    assert_eq!(agent_before["status"], "ok");
+    assert_eq!(agent_before["snapshot"]["root_hash"], old_main_root);
+
+    let fast_forwarded = workspace_call(
+        &server,
+        "workspace.branch.fast_forward",
+        json!({
+            "branch": "agent/demo",
+            "source_branch": "main",
+            "expect_root_hash": old_main_root
+        }),
+    );
+    assert_eq!(fast_forwarded["status"], "ok");
+    assert_eq!(fast_forwarded["result"]["status"], "fast_forwarded");
+    assert_eq!(fast_forwarded["result"]["old_root_hash"], old_main_root);
+    assert_eq!(fast_forwarded["result"]["new_root_hash"], new_main_root);
+    assert_eq!(fast_forwarded["snapshot"]["branch"], "agent/demo");
+    assert_eq!(fast_forwarded["snapshot"]["root_hash"], new_main_root);
+    assert_eq!(fast_forwarded["snapshot"]["history_hash"], new_main_history);
+
+    let stale_fast_forward = workspace_call(
+        &server,
+        "workspace.branch.fast_forward",
+        json!({
+            "branch": "agent/demo",
+            "source_branch": "main",
+            "expect_root_hash": old_main_root
+        }),
+    );
+    assert_eq!(stale_fast_forward["status"], "error");
+    assert_eq!(stale_fast_forward["error"]["kind"], "stale_root");
+    assert_eq!(
+        stale_fast_forward["error"]["expected_root_hash"],
+        old_main_root
+    );
+    assert_eq!(
+        stale_fast_forward["error"]["actual_root_hash"],
+        new_main_root
+    );
+    assert_eq!(stale_fast_forward["snapshot"]["branch"], "agent/demo");
+    assert_eq!(stale_fast_forward["snapshot"]["root_hash"], new_main_root);
+
+    let deleted = workspace_call(
+        &server,
+        "workspace.branch.delete",
+        json!({"branch": "agent/demo"}),
+    );
+    assert_eq!(deleted["status"], "ok");
+    assert_eq!(deleted["result"]["status"], "deleted");
+    assert_eq!(deleted["result"]["branch"], "agent/demo");
+    assert_eq!(deleted["snapshot"]["branch"], "main");
+
+    let branches = workspace_call(&server, "workspace.branches", json!({}));
+    assert!(
+        branches["result"]["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|branch| branch["name"] != "agent/demo")
+    );
+
+    let delete_main = workspace_call(
+        &server,
+        "workspace.branch.delete",
+        json!({"branch": "main"}),
+    );
+    assert_eq!(delete_main["status"], "error");
+    assert_eq!(delete_main["error"]["kind"], "invalid_params");
+}
+
+#[test]
 fn workspace_server_applies_structural_operations_atomically() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("workspace-apply.sqlite");
