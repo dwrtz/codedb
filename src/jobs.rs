@@ -74,6 +74,47 @@ impl CodeDb {
         Ok(())
     }
 
+    pub(crate) fn ensure_artifact_job_for_cache_state(
+        &mut self,
+        cache_key: &str,
+        artifact_kind: ArtifactKind,
+        cache_exists: bool,
+    ) -> Result<()> {
+        if cache_exists {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO artifact_jobs
+                 (cache_key, artifact_kind, status, worker_id, started_at, finished_at)
+                 VALUES (?1, ?2, 'succeeded', 'worker:cache-observed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                params![cache_key, artifact_kind.as_str()],
+            )?;
+            self.conn.execute(
+                "UPDATE artifact_jobs
+                 SET status = 'succeeded',
+                     worker_id = COALESCE(worker_id, 'worker:cache-observed'),
+                     started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+                     finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP),
+                     error_json = NULL
+                 WHERE cache_key = ?1
+                   AND artifact_kind = ?2
+                   AND status NOT IN ('succeeded', 'running')",
+                params![cache_key, artifact_kind.as_str()],
+            )?;
+        } else {
+            self.ensure_artifact_job(cache_key, artifact_kind)?;
+        }
+        let record = self
+            .artifact_job_record(cache_key)?
+            .ok_or_else(|| anyhow!("artifact job {cache_key} was not recorded"))?;
+        if record.artifact_kind != artifact_kind.as_str() {
+            bail!(
+                "artifact job {cache_key} was registered as {}, not {}",
+                record.artifact_kind,
+                artifact_kind.as_str()
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn claim_artifact_job(
         &mut self,
         cache_key: &str,

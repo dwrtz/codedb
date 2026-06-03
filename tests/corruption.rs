@@ -445,14 +445,16 @@ fn verify_rejects_malformed_workspace_transaction_response() {
 fn verify_rejects_succeeded_artifact_job_without_cache_entry() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("artifact-job-missing-cache.sqlite");
+    let plan = temp.path().join("main.link.json");
     setup_shop(&db);
     run(&[
-        "build-plan",
+        "link-native",
         db.to_str().unwrap(),
         "main",
         "--target",
         codedb::LINUX_X86_64_TARGET,
-        "--json",
+        "--out",
+        plan.to_str().unwrap(),
     ]);
 
     let conn = Connection::open(&db).unwrap();

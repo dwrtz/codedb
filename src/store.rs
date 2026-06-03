@@ -207,10 +207,7 @@ impl CodeDb {
                     params![history_hash],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
-            if target_history_hash.is_none()
-                && parent_history_hash.is_none()
-                && input_root_hash == target_root_hash
-            {
+            if parent_history_hash.is_none() && input_root_hash == target_root_hash {
                 return Ok(true);
             }
             cursor = parent_history_hash;

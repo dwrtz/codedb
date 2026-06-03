@@ -2174,7 +2174,9 @@ impl CodeDb {
                         "bad_link_plan: {cache_key} plan does not match link input"
                     ));
                 }
-                if json_string_set(input.get("object_artifact_hashes")) != object_hashes {
+                if input.get("object_artifact_hashes").is_some()
+                    && json_string_set(input.get("object_artifact_hashes")) != object_hashes
+                {
                     errors.push(format!(
                         "bad_link_plan: {cache_key} object list does not match link input"
                     ));

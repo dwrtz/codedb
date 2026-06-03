@@ -700,13 +700,53 @@ fn build_plan_cli_outputs_native_build_plan_json() {
 
     assert_eq!(plan["schema"], "codedb/native-build-plan/v1");
     assert_eq!(plan["target_triple"], codedb::LINUX_X86_64_TARGET);
+    assert_eq!(plan["planned"], true);
+    assert_eq!(plan["executes_artifacts"], false);
+    assert_eq!(plan["link_plan_hash"], JsonValue::Null);
     assert!(
-        plan["link_plan_hash"]
+        plan["link_plan_cache_key"]
             .as_str()
             .unwrap()
             .starts_with("sha256:")
     );
     assert_eq!(plan["objects"].as_array().unwrap().len(), 3);
+    assert_eq!(plan["jobs"].as_array().unwrap().len(), 4);
+    assert_eq!(cache_row_count_by_kind(&db, "object_file"), 0);
+    assert_eq!(cache_row_count_by_kind(&db, "link_plan"), 0);
+
+    let link_path = temp.path().join("main.link.json");
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        link_path.to_str().unwrap(),
+    ]);
+    let materialized_plan = run(&[
+        "build-plan",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--json",
+    ]);
+    let materialized_plan: JsonValue = serde_json::from_str(&materialized_plan).unwrap();
+    assert_eq!(
+        materialized_plan["link_plan_cache_key"],
+        plan["link_plan_cache_key"]
+    );
+    assert_eq!(
+        materialized_plan["link_plan_input_hash"],
+        plan["link_plan_input_hash"]
+    );
+    assert!(
+        materialized_plan["link_plan_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
     assert_eq!(cache_row_count_by_kind(&db, "object_file"), 3);
     assert_eq!(cache_row_count_by_kind(&db, "link_plan"), 1);
 }

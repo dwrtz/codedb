@@ -8,13 +8,17 @@ use serde_json::{Value as JsonValue, json};
 use crate::abi::{export_map, internal_abi_symbol, validate_exported_abi_name};
 use crate::artifact::CacheKeyInput;
 use crate::backend::ArtifactKind;
-use crate::backend::native::NativeObjectArtifact;
+use crate::backend::native::{NativeObjectArtifact, backend_id_for_target};
 use crate::jobs::{ArtifactJobClaim, artifact_job_error, new_worker_id};
 use crate::model::ProgramRootPayload;
-use crate::store::{CodeDb, cache_key_for_input, canonical_json, hash_bytes};
+use crate::store::{
+    CodeDb, cache_key_for_input, canonical_json, function_interface_metadata, hash_bytes,
+    hash_object_canonical,
+};
 use crate::types::type_hash_for;
 use crate::{
     APPLE_ARM64_TARGET, BYTES_DOMAIN, DEFAULT_NATIVE_TARGET, LINUX_X86_64_TARGET, MAIN_BRANCH,
+    SCHEMA_VERSION,
 };
 
 const LINK_PLAN_SCHEMA: &str = "codedb/link-plan/v1";
@@ -32,7 +36,6 @@ pub struct NativeBuild {
 struct PreparedLink {
     root_hash: String,
     input_hash: String,
-    link_plan_cache_key: String,
     plan: JsonValue,
     plan_hash: String,
     objects: Vec<PreparedObject>,
@@ -44,12 +47,53 @@ struct PreparedObject {
     bytes: Vec<u8>,
 }
 
-impl PreparedLink {
+struct PlannedLink {
+    input: JsonValue,
+    input_hash: String,
+    link_plan_cache_key: String,
+    link_plan_key_input: CacheKeyInput,
+    target_triple: String,
+    entry_symbol_hash: String,
+    entry_abi_symbol: String,
+    objects: Vec<PlannedObject>,
+    export_map: Vec<JsonValue>,
+    link_options: JsonValue,
+}
+
+struct PlannedObject {
+    symbol_hash: String,
+    definition_hash: String,
+    signature_hash: String,
+    param_type_hashes: Vec<String>,
+    return_type_hash: String,
+    internal_abi_symbol: String,
+    object_cache_key: String,
+    object_key_input: CacheKeyInput,
+}
+
+impl PlannedLink {
     fn job_cache_keys(&self) -> Vec<String> {
         self.objects
             .iter()
-            .map(|object| object.cache_key.clone())
+            .map(|object| object.object_cache_key.clone())
             .chain(std::iter::once(self.link_plan_cache_key.clone()))
+            .collect()
+    }
+
+    fn object_job_entries(&self) -> Vec<JsonValue> {
+        self.objects
+            .iter()
+            .map(|object| {
+                json!({
+                    "symbol_hash": &object.symbol_hash,
+                    "definition_hash": &object.definition_hash,
+                    "signature_hash": &object.signature_hash,
+                    "param_type_hashes": &object.param_type_hashes,
+                    "return_type_hash": &object.return_type_hash,
+                    "internal_abi_symbol": &object.internal_abi_symbol,
+                    "object_cache_key": &object.object_cache_key,
+                })
+            })
             .collect()
     }
 }
@@ -81,23 +125,29 @@ impl CodeDb {
         entry_name: &str,
         target_triple: &str,
     ) -> Result<String> {
-        let prepared = self.prepare_link_plan_branch(branch_name, entry_name, target_triple)?;
-        let jobs = self.artifact_job_json_for_cache_keys(&prepared.job_cache_keys())?;
+        let planned = self.plan_link_jobs_branch(branch_name, entry_name, target_triple)?;
+        self.ensure_planned_artifact_jobs(&planned)?;
+        let jobs = self.artifact_job_json_for_cache_keys(&planned.job_cache_keys())?;
+        let link_plan_hash = self
+            .lookup_cache(&planned.link_plan_key_input)?
+            .map(|entry| entry.artifact_hash);
         let payload = json!({
             "schema": "codedb/native-build-plan/v1",
             "branch": branch_name,
-            "target_triple": prepared.plan["target_triple"].clone(),
-            "entry_symbol_hash": prepared.plan["entry_symbol_hash"].clone(),
-            "entry_abi_symbol": prepared.plan["entry_abi_symbol"].clone(),
-            "link_plan_input_hash": prepared.input_hash,
-            "link_plan_cache_key": prepared.link_plan_cache_key,
-            "link_plan_hash": prepared.plan_hash,
+            "planned": true,
+            "executes_artifacts": false,
+            "target_triple": &planned.target_triple,
+            "entry_symbol_hash": &planned.entry_symbol_hash,
+            "entry_abi_symbol": &planned.entry_abi_symbol,
+            "link_plan_input_hash": &planned.input_hash,
+            "link_plan_cache_key": &planned.link_plan_cache_key,
+            "link_plan_hash": link_plan_hash,
             "artifact_kinds": ["object_file", "link_plan", "executable"],
             "jobs": jobs,
-            "objects": prepared.plan["objects"].clone(),
-            "export_map": prepared.plan["export_map"].clone(),
-            "external_symbols": prepared.plan["external_symbols"].clone(),
-            "link_options": prepared.plan["link_options"].clone(),
+            "objects": planned.object_job_entries(),
+            "export_map": &planned.export_map,
+            "external_symbols": [],
+            "link_options": &planned.link_options,
         });
         Ok(format!("{}\n", canonical_json(&payload)))
     }
@@ -228,27 +278,41 @@ impl CodeDb {
         entry_symbol: &str,
         target_triple: &str,
     ) -> Result<PreparedLink> {
-        let symbols = self.reachable_symbols(root_hash, entry_symbol)?;
-        let linked_symbols = symbols.iter().cloned().collect::<BTreeSet<_>>();
+        let planned = self.plan_link_jobs(root_hash, root, entry_symbol, target_triple)?;
+        let symbols = planned
+            .objects
+            .iter()
+            .map(|object| object.symbol_hash.clone())
+            .collect::<Vec<_>>();
         let native_objects =
             self.emit_objects_for_symbols_parallel(root_hash, &symbols, target_triple)?;
         let mut objects = Vec::new();
         let mut object_entries = Vec::new();
-        for (symbol, object) in symbols.into_iter().zip(native_objects.into_iter()) {
+        for (planned_object, object) in planned.objects.iter().zip(native_objects.into_iter()) {
             let root_entry = self
-                .root_symbol(root, &symbol)
-                .ok_or_else(|| anyhow!("link plan symbol missing from root {symbol}"))?;
-            let (param_type_hashes, return_type_hash) =
-                self.signature_parts(&root_entry.signature)?;
+                .root_symbol(root, &planned_object.symbol_hash)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "link plan symbol missing from root {}",
+                        planned_object.symbol_hash
+                    )
+                })?;
+            if root_entry.definition != planned_object.definition_hash
+                || root_entry.signature != planned_object.signature_hash
+            {
+                bail!(
+                    "planned link object {} no longer matches the root",
+                    planned_object.symbol_hash
+                );
+            }
             let object_metadata = object.metadata.clone();
-            let internal_abi = internal_abi_symbol(&symbol)?;
             object_entries.push(json!({
-                "symbol_hash": &symbol,
-                "definition_hash": &root_entry.definition,
-                "signature_hash": &root_entry.signature,
-                "param_type_hashes": param_type_hashes,
-                "return_type_hash": return_type_hash,
-                "internal_abi_symbol": &internal_abi,
+                "symbol_hash": &planned_object.symbol_hash,
+                "definition_hash": &planned_object.definition_hash,
+                "signature_hash": &planned_object.signature_hash,
+                "param_type_hashes": &planned_object.param_type_hashes,
+                "return_type_hash": &planned_object.return_type_hash,
+                "internal_abi_symbol": &planned_object.internal_abi_symbol,
                 "defined_symbols": required_metadata_value(&object_metadata, "defined_symbols")?,
                 "object_symbols": object_metadata
                     .get("object_symbols")
@@ -263,59 +327,24 @@ impl CodeDb {
             objects.push(prepared_object(object));
         }
 
-        let exports = export_map(root)?
-            .into_iter()
-            .filter(|export| linked_symbols.contains(&export.symbol))
-            .map(|export| {
-                json!({
-                    "symbol_hash": export.symbol,
-                    "internal_abi_symbol": export.internal_abi_symbol,
-                    "exported_abi_symbol": export.exported_name,
-                })
-            })
-            .collect::<Vec<_>>();
-        let input = json!({
-            "schema": LINK_INPUT_SCHEMA,
-            "target_triple": target_triple,
-            "entry_symbol_hash": entry_symbol,
-            "entry_abi_symbol": internal_abi_symbol(entry_symbol)?,
-            "object_artifact_hashes": objects
-                .iter()
-                .map(|object| object.artifact_hash.clone())
-                .collect::<Vec<_>>(),
-            "object_cache_keys": objects
-                .iter()
-                .map(|object| object.cache_key.clone())
-                .collect::<Vec<_>>(),
-            "export_map": exports,
-            "output_kind": "executable",
-            "link_options": link_options(target_triple)?,
-        });
-        let input_hash = self.put_object("LinkPlanInput", &input)?;
+        let input_hash = self.put_object("LinkPlanInput", &planned.input)?;
+        if input_hash != planned.input_hash {
+            bail!("computed link input hash does not match planned link input hash");
+        }
         let mut plan = json!({
             "schema": LINK_PLAN_SCHEMA,
             "input_hash": &input_hash,
-            "target_triple": target_triple,
-            "entry_symbol_hash": entry_symbol,
-            "entry_abi_symbol": internal_abi_symbol(entry_symbol)?,
+            "target_triple": &planned.target_triple,
+            "entry_symbol_hash": &planned.entry_symbol_hash,
+            "entry_abi_symbol": &planned.entry_abi_symbol,
             "objects": object_entries,
-            "export_map": input["export_map"].clone(),
+            "export_map": planned.export_map.clone(),
             "external_symbols": [],
-            "output_kind": input["output_kind"].clone(),
-            "link_options": input["link_options"].clone(),
+            "output_kind": planned.input["output_kind"].clone(),
+            "link_options": planned.link_options.clone(),
         });
-        let object_cache_keys = objects
-            .iter()
-            .map(|object| object.cache_key.clone())
-            .collect::<Vec<_>>();
-        let key_input = CacheKeyInput::new(
-            ArtifactKind::LinkPlan,
-            &input_hash,
-            LINK_PLAN_BACKEND_ID,
-            target_triple,
-        )
-        .with_dependency_implementation_hashes(object_cache_keys);
-        let plan_cache_key = cache_key_for_input(&key_input)?;
+        let key_input = planned.link_plan_key_input;
+        let plan_cache_key = planned.link_plan_cache_key;
         let plan_hash;
         if let Some(cache_entry) = self.lookup_cache(&key_input)?
             && let Some(artifact_json) = cache_entry.artifact_json
@@ -365,11 +394,147 @@ impl CodeDb {
         Ok(PreparedLink {
             root_hash: root_hash.to_string(),
             input_hash,
-            link_plan_cache_key: plan_cache_key,
             plan,
             plan_hash,
             objects,
         })
+    }
+
+    fn plan_link_jobs_branch(
+        &mut self,
+        branch_name: &str,
+        entry_name: &str,
+        target_triple: &str,
+    ) -> Result<PlannedLink> {
+        self.ensure_initialized()?;
+        let branch = self.branch(branch_name)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let entry_symbol = self
+            .resolve_name(&branch.root_hash, "main", entry_name)
+            .map_err(|err| anyhow!("unknown entry function {entry_name}: {err}"))?;
+        self.plan_link_jobs(&branch.root_hash, &root, &entry_symbol, target_triple)
+    }
+
+    fn plan_link_jobs(
+        &self,
+        root_hash: &str,
+        root: &ProgramRootPayload,
+        entry_symbol: &str,
+        target_triple: &str,
+    ) -> Result<PlannedLink> {
+        let symbols = self.reachable_symbols(root_hash, entry_symbol)?;
+        let linked_symbols = symbols.iter().cloned().collect::<BTreeSet<_>>();
+        let backend_id = backend_id_for_target(target_triple)?;
+        let mut objects = Vec::new();
+        for symbol in symbols {
+            let root_entry = self
+                .root_symbol(root, &symbol)
+                .ok_or_else(|| anyhow!("link plan symbol missing from root {symbol}"))?;
+            let (param_type_hashes, return_type_hash) =
+                self.signature_parts(&root_entry.signature)?;
+            let mut dependency_interface_hashes = self
+                .dependencies_for_definition(root, &root_entry.definition)?
+                .into_iter()
+                .map(|dependency| {
+                    let entry = self
+                        .root_symbol(root, &dependency)
+                        .ok_or_else(|| anyhow!("native object dependency missing {dependency}"))?;
+                    let metadata = function_interface_metadata(&entry.symbol, &entry.signature)?;
+                    Ok(hash_bytes(
+                        BYTES_DOMAIN,
+                        canonical_json(&metadata).as_bytes(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            dependency_interface_hashes.sort();
+            dependency_interface_hashes.dedup();
+            let object_key_input = CacheKeyInput::new(
+                ArtifactKind::ObjectFile,
+                &root_entry.definition,
+                backend_id,
+                target_triple,
+            )
+            .with_dependency_interface_hashes(dependency_interface_hashes);
+            let object_cache_key = cache_key_for_input(&object_key_input)?;
+            objects.push(PlannedObject {
+                symbol_hash: symbol.clone(),
+                definition_hash: root_entry.definition.clone(),
+                signature_hash: root_entry.signature.clone(),
+                param_type_hashes,
+                return_type_hash,
+                internal_abi_symbol: internal_abi_symbol(&symbol)?,
+                object_cache_key,
+                object_key_input,
+            });
+        }
+
+        let export_map = export_map(root)?
+            .into_iter()
+            .filter(|export| linked_symbols.contains(&export.symbol))
+            .map(|export| {
+                json!({
+                    "symbol_hash": export.symbol,
+                    "internal_abi_symbol": export.internal_abi_symbol,
+                    "exported_abi_symbol": export.exported_name,
+                })
+            })
+            .collect::<Vec<_>>();
+        let link_options = link_options(target_triple)?;
+        let object_cache_keys = objects
+            .iter()
+            .map(|object| object.object_cache_key.clone())
+            .collect::<Vec<_>>();
+        let input = json!({
+            "schema": LINK_INPUT_SCHEMA,
+            "target_triple": target_triple,
+            "entry_symbol_hash": entry_symbol,
+            "entry_abi_symbol": internal_abi_symbol(entry_symbol)?,
+            "object_cache_keys": &object_cache_keys,
+            "export_map": &export_map,
+            "output_kind": "executable",
+            "link_options": &link_options,
+        });
+        let input_hash =
+            hash_object_canonical("LinkPlanInput", SCHEMA_VERSION, &canonical_json(&input));
+        let link_plan_key_input = CacheKeyInput::new(
+            ArtifactKind::LinkPlan,
+            &input_hash,
+            LINK_PLAN_BACKEND_ID,
+            target_triple,
+        )
+        .with_dependency_implementation_hashes(object_cache_keys);
+        let link_plan_cache_key = cache_key_for_input(&link_plan_key_input)?;
+
+        Ok(PlannedLink {
+            input,
+            input_hash,
+            link_plan_cache_key,
+            link_plan_key_input,
+            target_triple: target_triple.to_string(),
+            entry_symbol_hash: entry_symbol.to_string(),
+            entry_abi_symbol: internal_abi_symbol(entry_symbol)?,
+            objects,
+            export_map,
+            link_options,
+        })
+    }
+
+    fn ensure_planned_artifact_jobs(&mut self, planned: &PlannedLink) -> Result<()> {
+        for object in &planned.objects {
+            let cache_exists = self.lookup_cache(&object.object_key_input)?.is_some();
+            self.ensure_artifact_job_for_cache_state(
+                &object.object_cache_key,
+                ArtifactKind::ObjectFile,
+                cache_exists,
+            )?;
+        }
+        let cache_exists = self.lookup_cache(&planned.link_plan_key_input)?.is_some();
+        self.ensure_artifact_job_for_cache_state(
+            &planned.link_plan_cache_key,
+            ArtifactKind::LinkPlan,
+            cache_exists,
+        )?;
+        Ok(())
     }
 
     pub(crate) fn reachable_symbols(

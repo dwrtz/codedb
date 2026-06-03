@@ -518,7 +518,7 @@ pub(crate) fn object_metadata_from_cache(artifact_json: &JsonValue) -> Result<Js
     Ok(artifact_json.clone())
 }
 
-fn backend_id_for_target(target_triple: &str) -> Result<&'static str> {
+pub(crate) fn backend_id_for_target(target_triple: &str) -> Result<&'static str> {
     match target_triple {
         LINUX_X86_64_TARGET => Ok(ElfObjectBackend.backend_id()),
         APPLE_ARM64_TARGET => Ok(MachOArm64ObjectBackend.backend_id()),

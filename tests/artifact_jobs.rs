@@ -90,7 +90,7 @@ fn failed_job_error(db: &Path) -> (String, JsonValue) {
 }
 
 #[test]
-fn concurrent_build_plan_workers_share_artifact_jobs_and_cache_rows() {
+fn concurrent_build_plan_workers_share_artifact_jobs_without_materializing_cache_rows() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("concurrent-artifacts.sqlite");
     run(&["init", path(&db)]);
@@ -133,19 +133,24 @@ fn concurrent_build_plan_workers_share_artifact_jobs_and_cache_rows() {
 
     let first_plan = parse_json(&String::from_utf8(first_output.stdout).unwrap());
     let second_plan = parse_json(&String::from_utf8(second_output.stdout).unwrap());
-    assert_eq!(first_plan["link_plan_hash"], second_plan["link_plan_hash"]);
+    assert_eq!(
+        first_plan["link_plan_cache_key"],
+        second_plan["link_plan_cache_key"]
+    );
+    assert_eq!(first_plan["link_plan_hash"], JsonValue::Null);
+    assert_eq!(second_plan["link_plan_hash"], JsonValue::Null);
     assert_eq!(first_plan["jobs"].as_array().unwrap().len(), 4);
     assert_eq!(second_plan["jobs"].as_array().unwrap().len(), 4);
     assert_eq!(job_count_by_kind(&db, "object_file"), 3);
     assert_eq!(job_count_by_kind(&db, "link_plan"), 1);
-    assert_eq!(cache_count_by_kind(&db, "object_file"), 3);
-    assert_eq!(cache_count_by_kind(&db, "link_plan"), 1);
+    assert_eq!(cache_count_by_kind(&db, "object_file"), 0);
+    assert_eq!(cache_count_by_kind(&db, "link_plan"), 0);
     assert!(
         job_statuses(&db, "object_file")
             .iter()
-            .all(|status| status == "succeeded")
+            .all(|status| status == "queued")
     );
-    assert_eq!(job_statuses(&db, "link_plan"), vec!["succeeded"]);
+    assert_eq!(job_statuses(&db, "link_plan"), vec!["queued"]);
 }
 
 #[test]
@@ -163,12 +168,13 @@ fn failed_object_jobs_record_structured_errors_and_retry() {
 
     let first_assert = bin()
         .args([
-            "build-plan",
+            "link-native",
             path(&db),
             "main",
             "--target",
             codedb::LINUX_X86_64_TARGET,
-            "--json",
+            "--out",
+            path(&temp.path().join("too-many-params.link.json")),
         ])
         .assert()
         .failure();
@@ -186,12 +192,13 @@ fn failed_object_jobs_record_structured_errors_and_retry() {
 
     bin()
         .args([
-            "build-plan",
+            "link-native",
             path(&db),
             "main",
             "--target",
             codedb::LINUX_X86_64_TARGET,
-            "--json",
+            "--out",
+            path(&temp.path().join("too-many-params-retry.link.json")),
         ])
         .assert()
         .failure();
@@ -241,8 +248,8 @@ fn rename_reuses_object_jobs_and_body_change_enqueues_changed_object_and_link_wo
     ]);
     assert_eq!(job_count_by_kind(&db, "object_file"), 4);
     assert_eq!(job_count_by_kind(&db, "link_plan"), 2);
-    assert_eq!(cache_count_by_kind(&db, "object_file"), 4);
-    assert_eq!(cache_count_by_kind(&db, "link_plan"), 2);
+    assert_eq!(cache_count_by_kind(&db, "object_file"), 0);
+    assert_eq!(cache_count_by_kind(&db, "link_plan"), 0);
 }
 
 #[test]
@@ -266,11 +273,18 @@ fn workspace_artifact_status_reports_jobs_and_cache_entries() {
     assert_eq!(status["result"]["schema"], "codedb/artifact-status/v1");
     assert_eq!(status["result"]["jobs"].as_array().unwrap().len(), 4);
     assert!(
+        status["result"]["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|job| job["status"] == "queued")
+    );
+    assert!(
         status["result"]["cache_entries"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|entry| entry["artifact_kind"] == "object_file")
+            .all(|entry| entry["artifact_kind"] != "object_file")
     );
 }
 

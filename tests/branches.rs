@@ -42,6 +42,67 @@ fn branch(db: &Path, name: &str) -> JsonValue {
 }
 
 #[test]
+fn branch_created_from_root_can_fast_forward_branch_with_history() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("root-fast-forward.sqlite");
+    let apply_path = temp.path().join("root-branch.apply.json");
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), "examples/shop.cdb"]);
+
+    let main_before = branch(&db, "main");
+    let old_main_root = main_before["root_hash"].as_str().unwrap().to_string();
+    assert!(main_before["history_hash"].is_string());
+
+    let created = parse_json(&run(&[
+        "branch",
+        "create",
+        path(&db),
+        "agent/root-work",
+        "--from-root",
+        &old_main_root,
+        "--json",
+    ]));
+    assert_eq!(created["status"], "created");
+    assert_eq!(created["history_hash"], JsonValue::Null);
+
+    std::fs::write(
+        &apply_path,
+        serde_json::to_string_pretty(&json!({
+            "schema": "codedb/apply/v1",
+            "branch": "agent/root-work",
+            "expect_root_hash": old_main_root,
+            "operations": [
+                {
+                    "kind": "rename_symbol",
+                    "name": "tax",
+                    "new_name": "vat"
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let applied = parse_json(&run(&["apply", path(&db), "--json", path(&apply_path)]));
+    let new_root = applied["new_root_hash"].as_str().unwrap().to_string();
+
+    let fast_forwarded = parse_json(&run(&[
+        "branch",
+        "fast-forward",
+        path(&db),
+        "main",
+        "agent/root-work",
+        "--expect-root",
+        &old_main_root,
+        "--json",
+    ]));
+    assert_eq!(fast_forwarded["status"], "fast_forwarded");
+    assert_eq!(fast_forwarded["old_root_hash"], old_main_root);
+    assert_eq!(fast_forwarded["new_root_hash"], new_root);
+    assert_eq!(branch(&db, "main")["root_hash"], new_root);
+}
+
+#[test]
 fn branch_cli_operations_isolate_writes_and_fast_forward_by_expected_root() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("branches.sqlite");
