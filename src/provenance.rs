@@ -351,76 +351,44 @@ impl CodeDb {
         let mut first_changed = JsonValue::Null;
         let mut previous = JsonValue::Null;
         let mut first_matching = None;
-        let final_idx = states.len().saturating_sub(1);
-        let final_evaluation = eval_at(final_idx)?;
+        let mut last_evaluable = None::<(usize, bool, JsonValue)>;
 
-        if predicate_evaluable(&final_evaluation) {
-            let mut low = 0;
-            let mut high = final_idx;
-            while low < high {
-                let mid = (low + high) / 2;
-                if predicate_evaluable(&eval_at(mid)?) {
-                    high = mid;
-                } else {
-                    low = mid + 1;
-                }
+        for idx in 0..states.len() {
+            let evaluation = eval_at(idx)?;
+            if !predicate_evaluable(&evaluation) {
+                continue;
             }
-            let first_evaluable = low;
-            let first_evaluation = eval_at(first_evaluable)?;
-            let final_matches = predicate_matches(&final_evaluation);
 
-            if final_matches {
-                if predicate_matches(&first_evaluation) {
-                    status = "unchanged";
-                    first_matching = Some(first_evaluable);
-                } else {
-                    status = "changed";
-                    let mut low = first_evaluable + 1;
-                    let mut high = final_idx;
-                    while low < high {
-                        let mid = (low + high) / 2;
-                        if predicate_matches(&eval_at(mid)?) {
-                            high = mid;
-                        } else {
-                            low = mid + 1;
-                        }
-                    }
-                    first_matching = Some(low);
-                    previous = eval_at(low.saturating_sub(1))?;
-                    let state = &states[low];
-                    first_changed = json!({
-                        "sequence": state.sequence,
-                        "root_hash": state.root_hash,
-                        "history_hash": state.history_hash,
-                        "migration": state.migration_from_parent,
-                        "previous_evaluation": previous,
-                        "changed_evaluation": eval_at(low)?,
-                    });
-                }
-            } else if predicate_matches(&first_evaluation) {
+            let matched = predicate_matches(&evaluation);
+            if matched && first_matching.is_none() {
+                first_matching = Some(idx);
+            }
+
+            if let Some((_, previous_matched, previous_evaluation)) = &last_evaluable
+                && matched != *previous_matched
+            {
                 status = "changed";
-                first_matching = Some(first_evaluable);
-                let mut low = first_evaluable + 1;
-                let mut high = final_idx;
-                while low < high {
-                    let mid = (low + high) / 2;
-                    if !predicate_matches(&eval_at(mid)?) {
-                        high = mid;
-                    } else {
-                        low = mid + 1;
-                    }
-                }
-                previous = eval_at(low.saturating_sub(1))?;
-                let state = &states[low];
+                previous = previous_evaluation.clone();
+                let state = &states[idx];
                 first_changed = json!({
                     "sequence": state.sequence,
                     "root_hash": state.root_hash,
                     "history_hash": state.history_hash,
                     "migration": state.migration_from_parent,
                     "previous_evaluation": previous,
-                    "changed_evaluation": eval_at(low)?,
+                    "changed_evaluation": evaluation,
                 });
+                break;
             }
+
+            last_evaluable = Some((idx, matched, evaluation));
+        }
+
+        if status != "changed"
+            && let Some((_, matched, _)) = last_evaluable
+            && matched
+        {
+            status = "unchanged";
         }
 
         let mut evaluations = evaluated.into_values().collect::<Vec<_>>();
@@ -437,7 +405,7 @@ impl CodeDb {
             "root_hash": branch.root_hash,
             "history_hash": branch.history_hash,
             "status": status,
-            "search_strategy": "binary_search_after_first_evaluable",
+            "search_strategy": "linear_transition_scan_after_first_evaluable",
             "predicate": predicate.to_json(),
             "root_count": states.len(),
             "first_matching_sequence": first_matching,
@@ -618,9 +586,6 @@ impl CodeDb {
             }
             Operation::ChangeFunctionSignature {
                 symbol: changed, ..
-            }
-            | Operation::AddParameter {
-                symbol: changed, ..
             } => {
                 if changed == symbol {
                     let changed_reasons = self.classify_root_symbol_change_between(
@@ -634,6 +599,19 @@ impl CodeDb {
                     if changed_reasons.contains("body") {
                         reasons.insert("body");
                     }
+                }
+            }
+            Operation::AddParameter { .. } => {
+                let changed_reasons = self.classify_root_symbol_change_between(
+                    &item.input_root,
+                    &item.output_root,
+                    symbol,
+                )?;
+                if changed_reasons.contains("signature") {
+                    reasons.insert("signature");
+                }
+                if changed_reasons.contains("body") {
+                    reasons.insert("body");
                 }
             }
             Operation::DeleteSymbol {

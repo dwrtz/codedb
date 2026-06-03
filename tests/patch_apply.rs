@@ -418,6 +418,68 @@ fn semantic_patch_apply_covers_initial_operation_surface() {
     assert_eq!(show_unused["signature"], "(scale: i64) -> i64");
     root = added_param["new_root_hash"].as_str().unwrap().to_string();
 
+    let set_export_patch = write_patch(
+        temp.path(),
+        "set-export.patch.json",
+        json!({
+            "schema": "codedb/semantic-patch/v1",
+            "branch": "main",
+            "expected_root": root,
+            "match": {
+                "kind": "symbol",
+                "name": "unused"
+            },
+            "replace": {
+                "kind": "set_export",
+                "exported_name": "unused_api"
+            }
+        }),
+    );
+    let exported = parse_json(&run(&[
+        "patch",
+        "apply",
+        path(&db),
+        "--json",
+        path(&set_export_patch),
+    ]));
+    assert_eq!(exported["status"], "applied");
+    assert_eq!(
+        exported["semantic_summary"]["operation_kinds"],
+        json!(["set_export"])
+    );
+    root = exported["new_root_hash"].as_str().unwrap().to_string();
+
+    let remove_export_patch = write_patch(
+        temp.path(),
+        "remove-export.patch.json",
+        json!({
+            "schema": "codedb/semantic-patch/v1",
+            "branch": "main",
+            "expected_root": root,
+            "match": {
+                "kind": "export",
+                "exported_name": "unused_api"
+            },
+            "replace": {
+                "kind": "remove_export",
+                "exported_name": "unused_api"
+            }
+        }),
+    );
+    let unexported = parse_json(&run(&[
+        "patch",
+        "apply",
+        path(&db),
+        "--json",
+        path(&remove_export_patch),
+    ]));
+    assert_eq!(unexported["status"], "applied");
+    assert_eq!(
+        unexported["semantic_summary"]["operation_kinds"],
+        json!(["remove_export"])
+    );
+    root = unexported["new_root_hash"].as_str().unwrap().to_string();
+
     let remove_patch = write_patch(
         temp.path(),
         "remove-unused.patch.json",

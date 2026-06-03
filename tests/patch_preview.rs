@@ -229,6 +229,16 @@ fn semantic_patch_preview_covers_initial_operation_surface() {
     run(&["import", path(&db), path(&source)]);
 
     let root = current_root(&db);
+    run(&[
+        "set-export",
+        path(&db),
+        "unused",
+        "unused_api",
+        "--expect-root",
+        &root,
+        "--json",
+    ]);
+    let root = current_root(&db);
     let branch_before = branch_state(&db);
     let counts_before = mutation_counts(&db);
     let cases = [
@@ -288,6 +298,40 @@ fn semantic_patch_preview_covers_initial_operation_surface() {
                 }
             }),
             json!(["add_parameter"]),
+        ),
+        (
+            "set-export.patch.json",
+            json!({
+                "schema": "codedb/semantic-patch/v1",
+                "branch": "main",
+                "expected_root": root,
+                "match": {
+                    "kind": "symbol",
+                    "name": "unused"
+                },
+                "replace": {
+                    "kind": "set_export",
+                    "exported_name": "unused_api_extra"
+                }
+            }),
+            json!(["set_export"]),
+        ),
+        (
+            "remove-export.patch.json",
+            json!({
+                "schema": "codedb/semantic-patch/v1",
+                "branch": "main",
+                "expected_root": root,
+                "match": {
+                    "kind": "export",
+                    "exported_name": "unused_api"
+                },
+                "replace": {
+                    "kind": "remove_export",
+                    "exported_name": "unused_api"
+                }
+            }),
+            json!(["remove_export"]),
         ),
         (
             "remove-unused.patch.json",

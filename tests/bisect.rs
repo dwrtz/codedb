@@ -221,3 +221,60 @@ fn semantic_bisect_and_why_explain_behavior_change() {
         change_migration
     );
 }
+
+#[test]
+fn semantic_bisect_reports_first_change_when_behavior_is_restored() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("bisect-restored.sqlite");
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), "examples/shop.cdb"]);
+
+    let root_before_change = current_root(&db);
+    let changed = parse_json(&run(&[
+        "replace-body",
+        path(&db),
+        "tax",
+        "subtotal * 18 / 100",
+        "--expect-root",
+        &root_before_change,
+        "--json",
+    ]));
+    assert_eq!(changed["status"], "applied");
+    let change_migration = changed["migration_hash"].as_str().unwrap().to_string();
+    let root_after_change = changed["new_root_hash"].as_str().unwrap().to_string();
+
+    let restored = parse_json(&run(&[
+        "replace-body",
+        path(&db),
+        "tax",
+        "subtotal * 20 / 100",
+        "--expect-root",
+        &root_after_change,
+        "--json",
+    ]));
+    assert_eq!(restored["status"], "applied");
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "120");
+
+    let bisect = parse_json(&run(&[
+        "bisect-history",
+        path(&db),
+        "main",
+        "--expect-output",
+        "120",
+        "--json",
+    ]));
+    assert_eq!(bisect["status"], "changed");
+    assert_eq!(
+        bisect["first_changed"]["migration"]["migration_hash"],
+        change_migration
+    );
+    assert_eq!(
+        bisect["first_changed"]["previous_evaluation"]["actual"],
+        json!({"kind": "i64", "value": "120"})
+    );
+    assert_eq!(
+        bisect["first_changed"]["changed_evaluation"]["actual"],
+        json!({"kind": "i64", "value": "118"})
+    );
+}

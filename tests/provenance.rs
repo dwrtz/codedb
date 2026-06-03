@@ -449,3 +449,68 @@ fn signature_only_change_does_not_update_body_blame() {
         before["last_body_migration"]["migration_hash"]
     );
 }
+
+#[test]
+fn add_parameter_default_updates_caller_body_blame() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("add-parameter-caller-provenance.sqlite");
+    let source = temp.path().join("add-parameter-caller.cdb");
+    std::fs::write(
+        &source,
+        "fn inc(x: i64) -> i64 = x + 1\n\
+         \n\
+         fn main() -> i64 = inc(2)\n",
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    let root = current_root(&db);
+
+    let patch = write_json(
+        temp.path(),
+        "add-param-caller.json",
+        json!({
+            "schema": "codedb/semantic-patch/v1",
+            "branch": "main",
+            "expected_root": root,
+            "match": {
+                "kind": "symbol",
+                "name": "inc"
+            },
+            "replace": {
+                "kind": "add_parameter",
+                "name": "scale",
+                "type": "i64",
+                "default": {
+                    "kind": "literal_i64",
+                    "value": "1"
+                }
+            }
+        }),
+    );
+    let applied = parse_json(&run(&["patch", "apply", path(&db), "--json", path(&patch)]));
+    assert_eq!(applied["status"], "applied");
+    let migration_hash = applied["apply_result"]["results"][0]["migration_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let show_main = parse_json(&run(&["show", path(&db), "main", "--json"]));
+    assert_eq!(show_main["body_source"], "inc(2, 1)");
+    let blame_main = parse_json(&run(&["blame-symbol", path(&db), "main", "--json"]));
+    assert_eq!(
+        blame_main["last_body_migration"]["operation_kind"],
+        "add_parameter"
+    );
+    assert_eq!(
+        blame_main["last_body_migration"]["migration_hash"],
+        migration_hash
+    );
+    assert!(
+        blame_main["last_body_migration"]["reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("body"))
+    );
+}
