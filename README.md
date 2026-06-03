@@ -129,6 +129,12 @@ selects the branch to mutate and defaults to `main`. See
 Use `--json` on `list`, `show`, `export-map`, and `history` for machine-readable
 inspection output.
 
+`codedb patch preview <db> --json <file>` accepts a higher-level
+`codedb/semantic-patch/v1` document, matches semantic structure such as
+literals and call targets, returns matched hashes and planned structural
+operations, and rolls back the typecheck/build-impact preview. See
+[docs/PATCH.md](docs/PATCH.md).
+
 For operation-by-operation examples, see [docs/MIGRATIONS.md](docs/MIGRATIONS.md).
 
 ## Workspace API
@@ -150,7 +156,8 @@ optional JSON-RPC `id` fields. Responses use the stable
 `workspace.branch.create`, `workspace.branch.fast_forward`,
 `workspace.branch.delete`, `workspace.branch.compare`, `ops.apply` for atomic
 `codedb/apply/v1` structural writes, and `ops.preview` for rollback-only
-previews.
+previews. `patch.preview` exposes the semantic patch preview layer through the
+same response envelope.
 
 `ops.apply` responses include both `operations` and the older `results` field
 for the per-operation records. `trace.run` and `debug.run` return a top-level
@@ -173,6 +180,7 @@ caller wants to pin the exact source root.
 - [docs/MIGRATIONS.md](docs/MIGRATIONS.md): migration cookbook for every
   structural operation and walkthroughs for common edits.
 - [docs/APPLY.md](docs/APPLY.md): stable `codedb/apply/v1` JSON schema.
+- [docs/PATCH.md](docs/PATCH.md): `codedb/semantic-patch/v1` preview schema.
 
 ## Command Reference
 

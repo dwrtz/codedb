@@ -291,6 +291,11 @@ enum Command {
         #[command(subcommand)]
         command: BranchCommand,
     },
+    #[command(about = "Preview higher-level semantic patches")]
+    Patch {
+        #[command(subcommand)]
+        command: PatchCommand,
+    },
     Replay {
         db: PathBuf,
         #[arg(long)]
@@ -349,6 +354,15 @@ enum BranchCommand {
         branch_b: String,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PatchCommand {
+    Preview {
+        db: PathBuf,
+        #[arg(long)]
+        json: PathBuf,
     },
 }
 
@@ -857,6 +871,12 @@ fn main() -> Result<()> {
             } => {
                 let codedb = codedb::CodeDb::open(db)?;
                 print!("{}", codedb.compare_branches(&branch_a, &branch_b, json)?);
+            }
+        },
+        Command::Patch { command } => match command {
+            PatchCommand::Preview { db, json } => {
+                let mut codedb = codedb::CodeDb::open(db)?;
+                print!("{}", codedb.preview_semantic_patch_json_file(&json)?);
             }
         },
         Command::Replay { db, from_genesis } => {

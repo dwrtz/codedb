@@ -462,6 +462,7 @@ fn dispatch_workspace_method(
         "roots.export_projection" => roots_export_projection(db, params),
         "ops.apply" => ops_apply(db, params, idempotency),
         "ops.preview" => ops_preview(db, params),
+        "patch.preview" => patch_preview(db, params),
         "build.plan" => build_plan(db, params),
         "build.execute" => build_execute(db, params),
         "build.artifact_status" => build_artifact_status(db, params),
@@ -937,6 +938,35 @@ fn ops_preview(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMet
     )?;
     let snapshot = workspace_snapshot(db, branch)?;
     Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn patch_preview(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let patch_document = patch_document_param(params)?;
+    let branch = patch_document
+        .as_object()
+        .and_then(|object| object.get("branch"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or(MAIN_BRANCH);
+    let result = parse_json_payload(
+        db.preview_semantic_patch_json_str(&canonical_json(&patch_document))
+            .map_err(|err| WorkspaceMethodError::new("invalid_operation", format!("{err:#}")))?,
+    )?;
+    let snapshot = workspace_snapshot(db, branch)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn patch_document_param(params: &JsonValue) -> MethodResult<JsonValue> {
+    let object = params_object(params)?;
+    if let Some(patch) = object.get("patch") {
+        if !patch.is_object() {
+            return Err(WorkspaceMethodError::invalid_params(
+                "patch.preview field patch must be a JSON object",
+            ));
+        }
+        Ok(patch.clone())
+    } else {
+        Ok(params.clone())
+    }
 }
 
 fn record_idempotent_apply_response(

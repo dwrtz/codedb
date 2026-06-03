@@ -13,6 +13,7 @@ mod link;
 mod lowering;
 mod migrations;
 mod model;
+mod patch;
 pub mod server;
 mod store;
 mod tests;
