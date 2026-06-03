@@ -488,6 +488,7 @@ fn dispatch_workspace_method(
         "build.plan" => build_plan(db, params),
         "build.execute" => build_execute(db, params),
         "build.artifact_status" => build_artifact_status(db, params),
+        "trace.run" => trace_run(db, params),
         "history.list" => history_list(db, params),
         "verify.run" => verify_run(db, params),
         _ => Err(WorkspaceMethodError::new(
@@ -890,6 +891,24 @@ fn build_artifact_status(db: &CodeDb, params: &JsonValue) -> MethodResult<Worksp
     )?;
     let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
     Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn trace_run(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    require_main_branch(params, "trace.run")?;
+    let object = params_object(params)?;
+    let entry_name = required_str_alias(object, "entry_name", "entry")?;
+    let args = optional_string_array(object, "args")?.unwrap_or_default();
+    let result = parse_json_payload(
+        db.trace_main_branch_text_args_json(entry_name, &args)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let diagnostics = trace_workspace_diagnostics(&result);
+    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    Ok(WorkspaceMethodResult {
+        result,
+        diagnostics,
+        snapshot,
+    })
 }
 
 fn history_list(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
@@ -1296,6 +1315,30 @@ fn optional_str_any<'a>(
     Ok(None)
 }
 
+fn optional_string_array(
+    object: &JsonMap<String, JsonValue>,
+    key: &str,
+) -> MethodResult<Option<Vec<String>>> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    let array = value
+        .as_array()
+        .ok_or_else(|| WorkspaceMethodError::invalid_params(format!("{key} must be an array")))?;
+    let mut out = Vec::with_capacity(array.len());
+    for (idx, value) in array.iter().enumerate() {
+        out.push(
+            value
+                .as_str()
+                .ok_or_else(|| {
+                    WorkspaceMethodError::invalid_params(format!("{key}[{idx}] must be a string"))
+                })?
+                .to_string(),
+        );
+    }
+    Ok(Some(out))
+}
+
 fn required_str_any<'a>(
     object: &'a JsonMap<String, JsonValue>,
     keys: &[&str],
@@ -1315,4 +1358,29 @@ fn required_str_alias<'a>(
         .ok_or_else(|| {
             WorkspaceMethodError::invalid_params(format!("method requires {primary} or {alias}"))
         })
+}
+
+fn trace_workspace_diagnostics(result: &JsonValue) -> Vec<WorkspaceDiagnostic> {
+    result
+        .get("diagnostics")
+        .and_then(JsonValue::as_array)
+        .map(|diagnostics| {
+            diagnostics
+                .iter()
+                .map(|diagnostic| WorkspaceDiagnostic {
+                    kind: diagnostic
+                        .get("kind")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("trace_diagnostic")
+                        .to_string(),
+                    message: diagnostic
+                        .get("message")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("trace diagnostic")
+                        .to_string(),
+                    details: Some(diagnostic.clone()),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }

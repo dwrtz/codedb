@@ -51,6 +51,14 @@ enum Command {
         function_name: String,
         args: Vec<String>,
     },
+    #[command(about = "Run the reference evaluator and emit a deterministic semantic trace")]
+    Trace {
+        db: PathBuf,
+        entry_name: String,
+        args: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Emit a deterministic C projection for debugging and inspection")]
     EmitC {
         db: PathBuf,
@@ -324,6 +332,21 @@ fn main() -> Result<()> {
             let codedb = codedb::CodeDb::open(db)?;
             let value = codedb.eval_main_branch_text_args(&function_name, &args)?;
             println!("{value}");
+        }
+        Command::Trace {
+            db,
+            entry_name,
+            args,
+            json,
+        } => {
+            if !json {
+                anyhow::bail!("trace currently requires --json");
+            }
+            let codedb = codedb::CodeDb::open(db)?;
+            print!(
+                "{}",
+                codedb.trace_main_branch_text_args_json(&entry_name, &args)?
+            );
         }
         Command::EmitC {
             db,

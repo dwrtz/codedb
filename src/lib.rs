@@ -14,6 +14,7 @@ mod migrations;
 mod model;
 pub mod server;
 mod store;
+pub mod trace;
 mod types;
 mod verify;
 pub mod workspace;
@@ -51,7 +52,7 @@ pub(crate) const ABI_TAG: &str = "codedb-v0-internal";
 pub(crate) const COMPILER_VERSION: &str = concat!("codedb-", env!("CARGO_PKG_VERSION"));
 pub(crate) const PIPELINE_VERSION: &str = "pipeline:v0";
 
-fn parse_eval_arg(arg: &str, type_name: &str, idx: usize) -> Result<Value> {
+pub(crate) fn parse_eval_arg(arg: &str, type_name: &str, idx: usize) -> Result<Value> {
     match type_name {
         "i64" => arg
             .parse::<i64>()

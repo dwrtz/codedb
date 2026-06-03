@@ -772,7 +772,7 @@ impl CodeDb {
     }
 }
 
-fn eval_binary(op: &str, left: Value, right: Value) -> Result<Value> {
+pub(crate) fn eval_binary(op: &str, left: Value, right: Value) -> Result<Value> {
     match (op, left, right) {
         ("+", Value::I64(a), Value::I64(b)) => Ok(Value::I64(a + b)),
         ("-", Value::I64(a), Value::I64(b)) => Ok(Value::I64(a - b)),
@@ -791,7 +791,7 @@ fn eval_binary(op: &str, left: Value, right: Value) -> Result<Value> {
     }
 }
 
-fn eval_unary(op: &str, value: Value) -> Result<Value> {
+pub(crate) fn eval_unary(op: &str, value: Value) -> Result<Value> {
     match (op, value) {
         ("-", Value::I64(value)) => Ok(Value::I64(-value)),
         ("!", Value::Bool(value)) => Ok(Value::Bool(!value)),
