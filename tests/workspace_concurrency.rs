@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use codedb::CodeDb;
 use codedb::workspace::{WorkspaceRequest, WorkspaceResponse, execute_workspace_request};
@@ -301,4 +303,58 @@ fn workspace_apply_request_id_replays_committed_transaction_response() {
     assert_eq!(reused_token["status"], "error");
     assert_eq!(reused_token["error"]["kind"], "invalid_request");
     assert_eq!(branch_state(&db_path).0, root_after_second);
+}
+
+#[test]
+fn concurrent_duplicate_workspace_apply_request_id_replays_committed_response() {
+    let temp = tempdir().unwrap();
+    let db_path = temp.path().join("workspace-concurrent-idempotency.sqlite");
+    let mut db = init_shop(&db_path);
+    let current = response_json(workspace_call(&mut db, "workspace.current", json!({})));
+    let root = current["snapshot"]["root_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drop(db);
+
+    let transaction = Arc::new(json!({
+        "schema": "codedb/workspace-transaction/v1",
+        "branch": "main",
+        "expected_root": root,
+        "agent": {
+            "agent_id": "agent:a",
+            "request_id": "rename-tax-concurrent"
+        },
+        "operations": [
+            {
+                "kind": "rename_symbol",
+                "name": "tax",
+                "new_name": "vat"
+            }
+        ]
+    }));
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = (0..2)
+        .map(|_| {
+            let db_path = db_path.clone();
+            let transaction = Arc::clone(&transaction);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut db = CodeDb::open(db_path).unwrap();
+                barrier.wait();
+                response_json(workspace_call(&mut db, "ops.apply", (*transaction).clone()))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let responses = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("workspace caller thread"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(responses[0]["status"], "ok");
+    assert_eq!(responses[1]["status"], "ok");
+    assert_eq!(responses[0]["result"], responses[1]["result"]);
+    assert_eq!(responses[0]["snapshot"], responses[1]["snapshot"]);
+    assert_eq!(row_count(&db_path, "workspace_transactions"), 1);
 }

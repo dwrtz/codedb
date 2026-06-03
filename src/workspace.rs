@@ -809,6 +809,9 @@ fn ops_apply(
         .unwrap_or(MAIN_BRANCH);
     let current_snapshot = workspace_snapshot(db, branch)?;
     if current_snapshot.root_hash != expected_root {
+        if let Some(cached_result) = cached_idempotent_apply_result(db, idempotency)? {
+            return Ok(cached_result);
+        }
         return Err(WorkspaceMethodError::stale_root(
             format!(
                 "branch {branch:?} moved before ops.apply; expected root {expected_root}, actual root {}",
@@ -836,10 +839,56 @@ fn ops_apply(
         .unwrap_or(MAIN_BRANCH);
     let snapshot =
         workspace_snapshot(db, branch).or_else(|_| workspace_snapshot(db, MAIN_BRANCH))?;
+    if result.get("committed").and_then(JsonValue::as_bool) != Some(true)
+        && let Some(cached_result) = cached_idempotent_apply_result(db, idempotency)?
+    {
+        return Ok(cached_result);
+    }
     if let Some(err) = apply_result_workspace_error(&result, snapshot.clone()) {
+        if let Some(cached_result) = cached_idempotent_apply_result(db, idempotency)? {
+            return Ok(cached_result);
+        }
         return Err(err);
     }
     Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn cached_idempotent_apply_result(
+    db: &CodeDb,
+    idempotency: Option<&WorkspaceIdempotencyRequest>,
+) -> MethodResult<Option<WorkspaceMethodResult>> {
+    let Some(idempotency) = idempotency else {
+        return Ok(None);
+    };
+    let Some(cached_response) = db
+        .cached_workspace_transaction_response(&idempotency.request_id, &idempotency.request_hash)
+        .map_err(|err| WorkspaceMethodError::new("invalid_request", format!("{err:#}")))?
+    else {
+        return Ok(None);
+    };
+    let response = serde_json::from_str::<WorkspaceResponse>(&cached_response).map_err(|err| {
+        WorkspaceMethodError::new(
+            "method_error",
+            format!("cached workspace response is invalid JSON: {err}"),
+        )
+    })?;
+    let result = response.result.ok_or_else(|| {
+        WorkspaceMethodError::new(
+            "method_error",
+            "cached workspace response is missing result",
+        )
+    })?;
+    let snapshot = response.snapshot.ok_or_else(|| {
+        WorkspaceMethodError::new(
+            "method_error",
+            "cached workspace response is missing snapshot",
+        )
+    })?;
+    Ok(Some(WorkspaceMethodResult {
+        result,
+        diagnostics: response.diagnostics,
+        snapshot,
+    }))
 }
 
 fn ops_preview(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {

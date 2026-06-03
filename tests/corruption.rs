@@ -415,6 +415,90 @@ fn verify_rejects_branch_history_head_that_outputs_a_different_root() {
 }
 
 #[test]
+fn verify_rejects_malformed_workspace_transaction_response() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("bad-workspace-transaction.sqlite");
+    setup_shop(&db);
+
+    let conn = Connection::open(&db).unwrap();
+    let root_hash: String = conn
+        .query_row(
+            "SELECT root_hash FROM branches WHERE name = 'main'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO workspace_transactions
+         (request_id, request_hash, method, branch, expected_root_hash, response_json)
+         VALUES ('bad-request', 'sha256:request', 'ops.apply', 'main', ?1, 'not-json')",
+        [&root_hash],
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_workspace_transaction"));
+    assert!(stderr.contains("response_json is invalid JSON"));
+}
+
+#[test]
+fn verify_rejects_succeeded_artifact_job_without_cache_entry() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("artifact-job-missing-cache.sqlite");
+    setup_shop(&db);
+    run(&[
+        "build-plan",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--json",
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let cache_key: String = conn
+        .query_row(
+            "SELECT cache_key FROM artifact_jobs
+             WHERE status = 'succeeded'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "DELETE FROM compile_cache WHERE cache_key = ?1",
+        [&cache_key],
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_artifact_job"));
+    assert!(stderr.contains("succeeded job is missing cache entry"));
+}
+
+#[test]
+fn verify_rejects_malformed_artifact_job_error() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("bad-artifact-job-error.sqlite");
+    setup_shop(&db);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO artifact_jobs
+         (cache_key, artifact_kind, status, worker_id, started_at, finished_at, error_json)
+         VALUES ('sha256:bad-job', 'object_file', 'failed', 'worker:test', 'started', 'finished', '{}')",
+        [],
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_artifact_job"));
+    assert!(stderr.contains("error_json schema mismatch"));
+    assert!(stderr.contains("error_json missing kind"));
+    assert!(stderr.contains("error_json missing message"));
+}
+
+#[test]
 fn verify_replay_does_not_repair_corrupt_indexes() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("verify-readonly.sqlite");

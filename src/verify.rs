@@ -35,6 +35,8 @@ impl CodeDb {
         self.verify_migrations_and_histories(&mut errors)?;
         self.verify_roots(&mut errors)?;
         self.verify_caches(&mut errors)?;
+        self.verify_workspace_transactions(&mut errors)?;
+        self.verify_artifact_jobs(&mut errors)?;
         self.verify_history_replay_readonly(&mut errors)?;
 
         if errors.is_empty() {
@@ -841,6 +843,319 @@ impl CodeDb {
                 }
             }
         }
+    }
+
+    fn verify_workspace_transactions(&self, errors: &mut Vec<String>) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT request_id, request_hash, method, branch, expected_root_hash, response_json
+             FROM workspace_transactions ORDER BY request_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (request_id, request_hash, method, branch, expected_root, response_json) = row?;
+            if request_id.trim().is_empty() {
+                errors.push("bad_workspace_transaction: request_id must not be empty".to_string());
+            }
+            if request_hash.trim().is_empty() {
+                errors.push(format!(
+                    "bad_workspace_transaction: {request_id} request_hash must not be empty"
+                ));
+            }
+            if method != "ops.apply" {
+                errors.push(format!(
+                    "bad_workspace_transaction: {request_id} method {method:?} is not supported"
+                ));
+            }
+            if branch.trim().is_empty() {
+                errors.push(format!(
+                    "bad_workspace_transaction: {request_id} branch must not be empty"
+                ));
+            }
+            if let Some(expected_root) = expected_root.as_deref() {
+                self.check_existing_object_hash(
+                    errors,
+                    "bad_workspace_transaction",
+                    &request_id,
+                    "expected_root_hash",
+                    expected_root,
+                )?;
+            }
+
+            let response = match serde_json::from_str::<JsonValue>(&response_json) {
+                Ok(response) => {
+                    if canonical_json(&response) != response_json {
+                        errors.push(format!(
+                            "bad_workspace_transaction: {request_id} response_json is not canonical"
+                        ));
+                    }
+                    response
+                }
+                Err(err) => {
+                    errors.push(format!(
+                        "bad_workspace_transaction: {request_id} response_json is invalid JSON: {err}"
+                    ));
+                    continue;
+                }
+            };
+            if response.get("schema").and_then(JsonValue::as_str)
+                != Some(crate::workspace::WORKSPACE_RESPONSE_SCHEMA)
+            {
+                errors.push(format!(
+                    "bad_workspace_transaction: {request_id} response schema mismatch"
+                ));
+            }
+            if response.get("status").and_then(JsonValue::as_str) != Some("ok") {
+                errors.push(format!(
+                    "bad_workspace_transaction: {request_id} cached response is not an ok response"
+                ));
+            }
+            let Some(result) = response.get("result").and_then(JsonValue::as_object) else {
+                errors.push(format!(
+                    "bad_workspace_transaction: {request_id} response missing result"
+                ));
+                continue;
+            };
+            if result.get("schema").and_then(JsonValue::as_str) != Some("codedb/apply-result/v1") {
+                errors.push(format!(
+                    "bad_workspace_transaction: {request_id} result schema mismatch"
+                ));
+            }
+            if result.get("committed").and_then(JsonValue::as_bool) != Some(true) {
+                errors.push(format!(
+                    "bad_workspace_transaction: {request_id} result is not committed"
+                ));
+            }
+            if result.get("branch").and_then(JsonValue::as_str) != Some(branch.as_str()) {
+                errors.push(format!(
+                    "bad_workspace_transaction: {request_id} result branch does not match transaction row"
+                ));
+            }
+            if let Some(expected_root) = expected_root.as_deref()
+                && result.get("old_root_hash").and_then(JsonValue::as_str) != Some(expected_root)
+            {
+                errors.push(format!(
+                    "bad_workspace_transaction: {request_id} expected root does not match result old_root_hash"
+                ));
+            }
+            for field in ["old_root_hash", "new_root_hash"] {
+                if let Some(root_hash) = result.get(field).and_then(JsonValue::as_str) {
+                    self.check_existing_object_hash(
+                        errors,
+                        "bad_workspace_transaction",
+                        &request_id,
+                        field,
+                        root_hash,
+                    )?;
+                }
+            }
+            if let Some(snapshot) = response.get("snapshot").and_then(JsonValue::as_object) {
+                if snapshot.get("branch").and_then(JsonValue::as_str) != Some(branch.as_str()) {
+                    errors.push(format!(
+                        "bad_workspace_transaction: {request_id} snapshot branch does not match transaction row"
+                    ));
+                }
+                if let Some(new_root) = result.get("new_root_hash").and_then(JsonValue::as_str)
+                    && snapshot.get("root_hash").and_then(JsonValue::as_str) != Some(new_root)
+                {
+                    errors.push(format!(
+                        "bad_workspace_transaction: {request_id} snapshot root does not match result new_root_hash"
+                    ));
+                }
+            } else {
+                errors.push(format!(
+                    "bad_workspace_transaction: {request_id} response missing snapshot"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_artifact_jobs(&self, errors: &mut Vec<String>) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cache_key, artifact_kind, status, worker_id, started_at, finished_at, error_json
+             FROM artifact_jobs ORDER BY cache_key",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        for row in rows {
+            let (cache_key, artifact_kind, status, worker_id, started_at, finished_at, error_json) =
+                row?;
+            let Some(parsed_kind) = ArtifactKind::from_str(&artifact_kind) else {
+                errors.push(format!(
+                    "bad_artifact_job: {cache_key} has unknown artifact kind {artifact_kind}"
+                ));
+                continue;
+            };
+            match status.as_str() {
+                "queued" => {
+                    if worker_id.is_some()
+                        || started_at.is_some()
+                        || finished_at.is_some()
+                        || error_json.is_some()
+                    {
+                        errors.push(format!(
+                            "bad_artifact_job: {cache_key} queued job has worker/timestamp/error metadata"
+                        ));
+                    }
+                }
+                "running" => {
+                    if worker_id.is_none() || started_at.is_none() {
+                        errors.push(format!(
+                            "bad_artifact_job: {cache_key} running job is missing worker or started_at"
+                        ));
+                    }
+                    if finished_at.is_some() || error_json.is_some() {
+                        errors.push(format!(
+                            "bad_artifact_job: {cache_key} running job has finished/error metadata"
+                        ));
+                    }
+                }
+                "succeeded" => {
+                    if worker_id.is_none() || started_at.is_none() || finished_at.is_none() {
+                        errors.push(format!(
+                            "bad_artifact_job: {cache_key} succeeded job is missing worker or timestamps"
+                        ));
+                    }
+                    if error_json.is_some() {
+                        errors.push(format!(
+                            "bad_artifact_job: {cache_key} succeeded job has error metadata"
+                        ));
+                    }
+                    let cache_artifact_kind = self
+                        .conn
+                        .query_row(
+                            "SELECT artifact_kind FROM compile_cache WHERE cache_key = ?1",
+                            params![&cache_key],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?;
+                    match cache_artifact_kind {
+                        Some(cache_artifact_kind) if cache_artifact_kind == artifact_kind => {}
+                        Some(cache_artifact_kind) => errors.push(format!(
+                            "bad_artifact_job: {cache_key} succeeded job kind {artifact_kind} does not match cache kind {cache_artifact_kind}"
+                        )),
+                        None => errors.push(format!(
+                            "bad_artifact_job: {cache_key} succeeded job is missing cache entry"
+                        )),
+                    }
+                }
+                "failed" | "abandoned" => {
+                    if worker_id.is_none() || started_at.is_none() || finished_at.is_none() {
+                        errors.push(format!(
+                            "bad_artifact_job: {cache_key} {status} job is missing worker or timestamps"
+                        ));
+                    }
+                    self.verify_artifact_job_error(errors, &cache_key, error_json.as_deref());
+                }
+                other => errors.push(format!(
+                    "bad_artifact_job: {cache_key} has unknown status {other:?}"
+                )),
+            }
+            if parsed_kind.requires_artifact_bytes() && status == "succeeded" {
+                let has_bytes: Option<bool> = self
+                    .conn
+                    .query_row(
+                        "SELECT artifact_bytes IS NOT NULL FROM compile_cache WHERE cache_key = ?1",
+                        params![&cache_key],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if has_bytes == Some(false) {
+                    errors.push(format!(
+                        "bad_artifact_job: {cache_key} succeeded bytes job has cache entry without bytes"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_artifact_job_error(
+        &self,
+        errors: &mut Vec<String>,
+        cache_key: &str,
+        error_json: Option<&str>,
+    ) {
+        let Some(error_json) = error_json else {
+            errors.push(format!(
+                "bad_artifact_job: {cache_key} failed/abandoned job is missing error_json"
+            ));
+            return;
+        };
+        let value = match serde_json::from_str::<JsonValue>(error_json) {
+            Ok(value) => {
+                if canonical_json(&value) != error_json {
+                    errors.push(format!(
+                        "bad_artifact_job: {cache_key} error_json is not canonical"
+                    ));
+                }
+                value
+            }
+            Err(err) => {
+                errors.push(format!(
+                    "bad_artifact_job: {cache_key} error_json is invalid JSON: {err}"
+                ));
+                return;
+            }
+        };
+        if value.get("schema").and_then(JsonValue::as_str) != Some("codedb/artifact-job-error/v1") {
+            errors.push(format!(
+                "bad_artifact_job: {cache_key} error_json schema mismatch"
+            ));
+        }
+        if value.get("kind").and_then(JsonValue::as_str).is_none() {
+            errors.push(format!(
+                "bad_artifact_job: {cache_key} error_json missing kind"
+            ));
+        }
+        if value.get("message").and_then(JsonValue::as_str).is_none() {
+            errors.push(format!(
+                "bad_artifact_job: {cache_key} error_json missing message"
+            ));
+        }
+    }
+
+    fn check_existing_object_hash(
+        &self,
+        errors: &mut Vec<String>,
+        kind: &str,
+        owner: &str,
+        field: &str,
+        hash: &str,
+    ) -> Result<()> {
+        if !hash.starts_with("sha256:") {
+            errors.push(format!("{kind}: {owner} {field} is not a sha256 hash"));
+            return Ok(());
+        }
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM objects WHERE hash = ?1)",
+            params![hash],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            errors.push(format!(
+                "{kind}: {owner} {field} references missing object {hash}"
+            ));
+        }
+        Ok(())
     }
 
     fn verify_caches(&self, errors: &mut Vec<String>) -> Result<()> {
