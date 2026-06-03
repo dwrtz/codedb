@@ -180,6 +180,98 @@ fn branch_cli_operations_isolate_writes_and_fast_forward_by_expected_root() {
     assert_eq!(stale_fast_forward["actual_root_hash"], new_agent_root);
     assert_eq!(branch(&db, "main")["root_hash"], new_agent_root);
 
+    run(&[
+        "branch",
+        "create",
+        path(&db),
+        "agent/sibling-a",
+        "--from",
+        "main",
+    ]);
+    run(&[
+        "branch",
+        "create",
+        path(&db),
+        "agent/sibling-b",
+        "--from",
+        "main",
+    ]);
+    let sibling_base_root = branch(&db, "main")["root_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    std::fs::write(
+        &apply_path,
+        serde_json::to_string_pretty(&json!({
+            "schema": "codedb/apply/v1",
+            "branch": "agent/sibling-a",
+            "expect_root_hash": sibling_base_root,
+            "operations": [
+                {
+                    "kind": "rename_symbol",
+                    "name": "vat",
+                    "new_name": "tax_a"
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let sibling_a = parse_json(&run(&["apply", path(&db), "--json", path(&apply_path)]));
+    let sibling_a_root = sibling_a["new_root_hash"].as_str().unwrap().to_string();
+
+    std::fs::write(
+        &apply_path,
+        serde_json::to_string_pretty(&json!({
+            "schema": "codedb/apply/v1",
+            "branch": "agent/sibling-b",
+            "expect_root_hash": sibling_base_root,
+            "operations": [
+                {
+                    "kind": "rename_symbol",
+                    "name": "vat",
+                    "new_name": "tax_b"
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let sibling_b = parse_json(&run(&["apply", path(&db), "--json", path(&apply_path)]));
+    let sibling_b_root = sibling_b["new_root_hash"].as_str().unwrap().to_string();
+
+    let sibling_a_ff = parse_json(&run(&[
+        "branch",
+        "fast-forward",
+        path(&db),
+        "main",
+        "agent/sibling-a",
+        "--expect-root",
+        &sibling_base_root,
+        "--json",
+    ]));
+    assert_eq!(sibling_a_ff["status"], "fast_forwarded");
+    assert_eq!(branch(&db, "main")["root_hash"], sibling_a_root);
+
+    let non_fast_forward = parse_json(&run(&[
+        "branch",
+        "fast-forward",
+        path(&db),
+        "main",
+        "agent/sibling-b",
+        "--expect-root",
+        &sibling_a_root,
+        "--json",
+    ]));
+    assert_eq!(non_fast_forward["status"], "non_fast_forward");
+    assert_eq!(non_fast_forward["current_root_hash"], sibling_a_root);
+    assert_eq!(
+        non_fast_forward["source"]["root_hash"],
+        JsonValue::String(sibling_b_root)
+    );
+    assert_eq!(branch(&db, "main")["root_hash"], sibling_a_root);
+
     let objects_before_agent_delete = row_count(&db, "objects");
     let deleted = parse_json(&run(&[
         "branch",

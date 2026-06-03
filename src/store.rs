@@ -32,8 +32,17 @@ pub(crate) struct CacheEntry {
 
 #[derive(Debug, Clone)]
 pub(crate) enum BranchFastForwardOutcome {
-    Updated { old: BranchState, new: BranchState },
-    StaleRoot { current: BranchState },
+    Updated {
+        old: BranchState,
+        new: BranchState,
+    },
+    StaleRoot {
+        current: BranchState,
+    },
+    NonFastForward {
+        current: BranchState,
+        source: BranchState,
+    },
 }
 
 impl CodeDb {
@@ -127,6 +136,9 @@ impl CodeDb {
             if old.root_hash != expected_root_hash {
                 return Ok(BranchFastForwardOutcome::StaleRoot { current: old });
             }
+            if let Some(history_hash) = old.history_hash.as_deref() {
+                self.ensure_history_matches_root(history_hash, &old.root_hash)?;
+            }
             self.load_root(&source.root_hash).with_context(|| {
                 format!(
                     "source root is not a valid program root: {}",
@@ -135,6 +147,12 @@ impl CodeDb {
             })?;
             if let Some(history_hash) = source.history_hash.as_deref() {
                 self.ensure_history_matches_root(history_hash, &source.root_hash)?;
+            }
+            if !self.branch_state_descends_from(&old, source)? {
+                return Ok(BranchFastForwardOutcome::NonFastForward {
+                    current: old,
+                    source: source.clone(),
+                });
             }
             self.conn.execute(
                 "UPDATE branches
@@ -148,6 +166,56 @@ impl CodeDb {
             })
         })();
         finish_immediate_transaction(&mut self.conn, result)
+    }
+
+    fn branch_state_descends_from(
+        &self,
+        target: &BranchState,
+        source: &BranchState,
+    ) -> Result<bool> {
+        if target.root_hash == source.root_hash && target.history_hash == source.history_hash {
+            return Ok(true);
+        }
+        self.history_descends_from(
+            source.history_hash.as_deref(),
+            target.history_hash.as_deref(),
+            &target.root_hash,
+        )
+    }
+
+    fn history_descends_from(
+        &self,
+        source_history_hash: Option<&str>,
+        target_history_hash: Option<&str>,
+        target_root_hash: &str,
+    ) -> Result<bool> {
+        let mut cursor = source_history_hash.map(str::to_string);
+        let mut seen = BTreeSet::new();
+        while let Some(history_hash) = cursor {
+            if Some(history_hash.as_str()) == target_history_hash {
+                return Ok(true);
+            }
+            if !seen.insert(history_hash.clone()) {
+                bail!("history chain contains a cycle at {history_hash}");
+            }
+            let (parent_history_hash, input_root_hash): (Option<String>, String) =
+                self.conn.query_row(
+                    "SELECT h.parent_history_hash, m.input_root_hash
+                     FROM histories h
+                     JOIN migrations m ON m.hash = h.migration_hash
+                     WHERE h.history_hash = ?1",
+                    params![history_hash],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+            if target_history_hash.is_none()
+                && parent_history_hash.is_none()
+                && input_root_hash == target_root_hash
+            {
+                return Ok(true);
+            }
+            cursor = parent_history_hash;
+        }
+        Ok(false)
     }
 
     pub(crate) fn delete_branch_pointer(&mut self, name: &str) -> Result<BranchState> {

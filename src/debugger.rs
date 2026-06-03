@@ -156,7 +156,16 @@ impl CodeDb {
         entry_name: &str,
         args: &[String],
     ) -> Result<DebugSession> {
-        let trace = self.trace_main_branch_text_args(entry_name, args)?;
+        self.debug_session_branch_text_args(crate::MAIN_BRANCH, entry_name, args)
+    }
+
+    pub(crate) fn debug_session_branch_text_args(
+        &self,
+        branch_name: &str,
+        entry_name: &str,
+        args: &[String],
+    ) -> Result<DebugSession> {
+        let trace = self.trace_branch_text_args(branch_name, entry_name, args)?;
         DebugSession::from_trace(trace)
     }
 
@@ -166,7 +175,17 @@ impl CodeDb {
         args: &[String],
         commands: &[String],
     ) -> Result<DebugReport> {
-        let mut session = self.debug_session_main_branch_text_args(entry_name, args)?;
+        self.debug_branch_text_args(crate::MAIN_BRANCH, entry_name, args, commands)
+    }
+
+    pub(crate) fn debug_branch_text_args(
+        &self,
+        branch_name: &str,
+        entry_name: &str,
+        args: &[String],
+        commands: &[String],
+    ) -> Result<DebugReport> {
+        let mut session = self.debug_session_branch_text_args(branch_name, entry_name, args)?;
         session.run_commands(self, commands)
     }
 
@@ -176,7 +195,21 @@ impl CodeDb {
         args: &[String],
         commands: &[String],
     ) -> Result<String> {
-        let report = self.debug_main_branch_text_args(entry_name, args, commands)?;
+        let report = self.debug_branch_text_args(crate::MAIN_BRANCH, entry_name, args, commands)?;
+        Ok(format!(
+            "{}\n",
+            canonical_json(&serde_json::to_value(report)?)
+        ))
+    }
+
+    pub(crate) fn debug_branch_text_args_json(
+        &self,
+        branch_name: &str,
+        entry_name: &str,
+        args: &[String],
+        commands: &[String],
+    ) -> Result<String> {
+        let report = self.debug_branch_text_args(branch_name, entry_name, args, commands)?;
         Ok(format!(
             "{}\n",
             canonical_json(&serde_json::to_value(report)?)
@@ -316,7 +349,7 @@ impl DebugSession {
                 if !target.starts_with("sha256:") {
                     bail!("expr breakpoint target must be an expression hash");
                 }
-                let status = if self.events_contain_expr(&target) {
+                let status = if self.expr_exists_in_root(db, &target)? {
                     "active"
                 } else {
                     "obsolete"
@@ -551,11 +584,16 @@ impl DebugSession {
         Ok(db.root_symbol(&root, symbol_hash).is_some())
     }
 
-    fn events_contain_expr(&self, expr_hash: &str) -> bool {
-        self.trace
-            .events
-            .iter()
-            .any(|event| event_expr_hash(event) == Some(expr_hash))
+    fn expr_exists_in_root(&self, db: &CodeDb, expr_hash: &str) -> Result<bool> {
+        let root = db.load_root(&self.trace.root_hash)?;
+        let mut seen = BTreeSet::new();
+        for symbol in &root.symbols {
+            let body_hash = db.function_body_hash(&symbol.definition)?;
+            if expr_reachable_from(db, &body_hash, expr_hash, &mut seen)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn state_at(&self, db: &CodeDb, position: usize) -> Result<DebugState> {
@@ -786,6 +824,80 @@ fn param_bindings(
             })
         })
         .collect()
+}
+
+fn expr_reachable_from(
+    db: &CodeDb,
+    current_hash: &str,
+    target_hash: &str,
+    seen: &mut BTreeSet<String>,
+) -> Result<bool> {
+    if current_hash == target_hash {
+        return Ok(true);
+    }
+    if !seen.insert(current_hash.to_string()) {
+        return Ok(false);
+    }
+    let payload = db.get_payload(current_hash)?;
+    let expr_kind = payload
+        .get("expr_kind")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| anyhow!("expression missing expr_kind {current_hash}"))?;
+    match expr_kind {
+        "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" | "local_ref" => Ok(false),
+        "call" => {
+            for arg in payload
+                .get("args")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| anyhow!("call missing args"))?
+            {
+                let child = arg
+                    .as_str()
+                    .ok_or_else(|| anyhow!("call arg must be hash"))?;
+                if expr_reachable_from(db, child, target_hash, seen)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        "binary" => {
+            if expr_reachable_child_field(db, &payload, "left", target_hash, seen)? {
+                return Ok(true);
+            }
+            expr_reachable_child_field(db, &payload, "right", target_hash, seen)
+        }
+        "unary" => expr_reachable_child_field(db, &payload, "expr", target_hash, seen),
+        "let" => {
+            if expr_reachable_child_field(db, &payload, "value", target_hash, seen)? {
+                return Ok(true);
+            }
+            expr_reachable_child_field(db, &payload, "body", target_hash, seen)
+        }
+        "if" => {
+            if expr_reachable_child_field(db, &payload, "cond", target_hash, seen)? {
+                return Ok(true);
+            }
+            if expr_reachable_child_field(db, &payload, "then", target_hash, seen)? {
+                return Ok(true);
+            }
+            expr_reachable_child_field(db, &payload, "else", target_hash, seen)
+        }
+        other => bail!("unknown expression kind {other}"),
+    }
+}
+
+fn expr_reachable_child_field(
+    db: &CodeDb,
+    payload: &JsonValue,
+    key: &str,
+    target_hash: &str,
+    seen: &mut BTreeSet<String>,
+) -> Result<bool> {
+    let child = payload
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| anyhow!("expression missing {key}"))?;
+    expr_reachable_from(db, child, target_hash, seen)
 }
 
 fn event_view(event_index: usize, event: &TraceEvent) -> DebugEventView {

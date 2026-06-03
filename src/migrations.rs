@@ -675,6 +675,21 @@ impl CodeDb {
         expected_root: &str,
         op: Operation,
     ) -> Result<(MigrationOutcome, bool)> {
+        self.apply_and_record_expected_in_tx_on_branch_with_agent(
+            branch_name,
+            expected_root,
+            op,
+            None,
+        )
+    }
+
+    pub(crate) fn apply_and_record_expected_in_tx_on_branch_with_agent(
+        &mut self,
+        branch_name: &str,
+        expected_root: &str,
+        op: Operation,
+        agent: Option<&JsonValue>,
+    ) -> Result<(MigrationOutcome, bool)> {
         let fallback_summary = self.migration_summary(&op);
         let branch = self.branch(branch_name)?;
         let old_root = branch.root_hash.clone();
@@ -776,12 +791,13 @@ impl CodeDb {
         );
         let history_hash = history_hash(branch.history_hash.as_deref(), &migration_hash, &new_root);
         let summary = self.migration_summary_for_roots(&op, &old_root, &new_root)?;
+        let agent_json = agent.cloned().unwrap_or_else(|| json!({}));
 
         self.conn.execute(
             "INSERT OR IGNORE INTO migrations
              (hash, parent_history_hash, input_root_hash, output_root_hash,
               operation_kind, operation_json, preconditions_json, postconditions_json, agent_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '{}')",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 migration_hash,
                 branch.history_hash,
@@ -791,6 +807,7 @@ impl CodeDb {
                 canonical_json(&operation_json),
                 canonical_json(&preconditions_json),
                 canonical_json(&postconditions_json),
+                canonical_json(&agent_json),
             ],
         )?;
         self.conn.execute(
@@ -1718,8 +1735,12 @@ impl CodeDb {
     }
 
     pub fn history_main_branch_json(&self) -> Result<String> {
-        let branch = self.branch(MAIN_BRANCH)?;
-        let chain = self.history_chain(MAIN_BRANCH)?;
+        self.history_branch_json(MAIN_BRANCH)
+    }
+
+    pub(crate) fn history_branch_json(&self, branch_name: &str) -> Result<String> {
+        let branch = self.branch(branch_name)?;
+        let chain = self.history_chain(branch_name)?;
         let migrations = chain
             .into_iter()
             .map(|item| {
@@ -1736,7 +1757,7 @@ impl CodeDb {
         Ok(format!(
             "{}\n",
             canonical_json(&json!({
-                "branch": MAIN_BRANCH,
+                "branch": branch_name,
                 "root_hash": branch.root_hash,
                 "history_hash": branch.history_hash,
                 "migrations": migrations,

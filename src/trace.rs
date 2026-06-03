@@ -226,7 +226,20 @@ impl CodeDb {
         entry_name: &str,
         args: &[String],
     ) -> Result<String> {
-        let report = self.trace_main_branch_text_args(entry_name, args)?;
+        let report = self.trace_branch_text_args(MAIN_BRANCH, entry_name, args)?;
+        Ok(format!(
+            "{}\n",
+            canonical_json(&serde_json::to_value(report)?)
+        ))
+    }
+
+    pub(crate) fn trace_branch_text_args_json(
+        &self,
+        branch_name: &str,
+        entry_name: &str,
+        args: &[String],
+    ) -> Result<String> {
+        let report = self.trace_branch_text_args(branch_name, entry_name, args)?;
         Ok(format!(
             "{}\n",
             canonical_json(&serde_json::to_value(report)?)
@@ -238,10 +251,19 @@ impl CodeDb {
         entry_name: &str,
         args: &[String],
     ) -> Result<TraceReport> {
-        let branch = self.branch(MAIN_BRANCH)?;
+        self.trace_branch_text_args(MAIN_BRANCH, entry_name, args)
+    }
+
+    pub(crate) fn trace_branch_text_args(
+        &self,
+        branch_name: &str,
+        entry_name: &str,
+        args: &[String],
+    ) -> Result<TraceReport> {
+        let branch = self.branch(branch_name)?;
         let root = self.load_root(&branch.root_hash)?;
         let mut state = TraceState::new(
-            MAIN_BRANCH,
+            branch_name,
             branch.root_hash.clone(),
             branch.history_hash.clone(),
             root,

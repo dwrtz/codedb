@@ -83,6 +83,14 @@ impl CodeDb {
                 "current_history_hash": current.history_hash,
                 "source": source,
             }),
+            BranchFastForwardOutcome::NonFastForward { current, source: _ } => json!({
+                "schema": BRANCH_OPERATION_RESULT_SCHEMA,
+                "status": "non_fast_forward",
+                "branch": target,
+                "current_root_hash": current.root_hash,
+                "current_history_hash": current.history_hash,
+                "source": source,
+            }),
         };
         if json_format {
             Ok(json_line(&payload))

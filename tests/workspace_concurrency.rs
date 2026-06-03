@@ -235,6 +235,20 @@ fn workspace_apply_request_id_replays_committed_transaction_response() {
     let root_after_first = first["snapshot"]["root_hash"].as_str().unwrap();
     assert_ne!(root_after_first, root);
     assert_eq!(row_count(&db_path, "workspace_transactions"), 1);
+    let agent_json: String = Connection::open(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT agent_json FROM migrations
+             WHERE operation_kind = 'rename_symbol'
+             ORDER BY created_at DESC, hash DESC
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let agent: JsonValue = serde_json::from_str(&agent_json).unwrap();
+    assert_eq!(agent["agent_id"], "agent:a");
+    assert_eq!(agent["request_id"], "rename-tax-once");
 
     let second = response_json(workspace_call(
         &mut db,

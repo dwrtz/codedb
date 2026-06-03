@@ -22,6 +22,8 @@ struct ApplyBatch {
     branch: String,
     #[serde(default, alias = "expect_root")]
     expect_root_hash: Option<String>,
+    #[serde(default)]
+    agent: Option<JsonValue>,
     operations: Vec<ApiOperation>,
 }
 
@@ -171,7 +173,20 @@ impl CodeDb {
     pub fn apply_json_str(&mut self, text: &str) -> Result<String> {
         self.ensure_initialized()?;
         let request = parse_apply_json_request(text)?;
-        self.apply_batch(request)
+        self.apply_batch_with_commit_hook(request, |_, _| Ok(()))
+    }
+
+    pub(crate) fn apply_json_str_with_commit_hook<F>(
+        &mut self,
+        text: &str,
+        on_commit: F,
+    ) -> Result<String>
+    where
+        F: FnOnce(&mut Self, &str) -> Result<()>,
+    {
+        self.ensure_initialized()?;
+        let request = parse_apply_json_request(text)?;
+        self.apply_batch_with_commit_hook(request, on_commit)
     }
 
     pub fn preview_apply_json_str(&mut self, text: &str) -> Result<String> {
@@ -180,12 +195,25 @@ impl CodeDb {
         self.preview_apply_batch(request)
     }
 
-    fn apply_batch(&mut self, request: ApplyBatch) -> Result<String> {
+    fn apply_batch_with_commit_hook<F>(
+        &mut self,
+        request: ApplyBatch,
+        on_commit: F,
+    ) -> Result<String>
+    where
+        F: FnOnce(&mut Self, &str) -> Result<()>,
+    {
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = self.apply_batch_in_tx(request);
         match result {
             Ok((json, should_commit)) => {
                 if should_commit {
+                    if let Err(err) = on_commit(self, &json) {
+                        if let Err(rollback_err) = self.conn.execute_batch("ROLLBACK") {
+                            return Err(err).context(format!("rollback failed: {rollback_err}"));
+                        }
+                        return Err(err);
+                    }
                     self.conn.execute_batch("COMMIT")?;
                 } else {
                     self.conn.execute_batch("ROLLBACK")?;
@@ -280,8 +308,12 @@ impl CodeDb {
             };
             let summary = self.migration_summary(&operation);
             let (outcome, operation_changed_root) = match self
-                .apply_and_record_expected_in_tx_on_branch(&branch_name, &expected_root, operation)
-            {
+                .apply_and_record_expected_in_tx_on_branch_with_agent(
+                    &branch_name,
+                    &expected_root,
+                    operation,
+                    request.agent.as_ref(),
+                ) {
                 Ok(result) => result,
                 Err(err) => {
                     self.conn.execute_batch(&format!(
@@ -552,6 +584,7 @@ fn parse_apply_json_request(text: &str) -> Result<ApplyBatch> {
             schema: Some(APPLY_SCHEMA.to_string()),
             branch: MAIN_BRANCH.to_string(),
             expect_root_hash: operation.expect_root_hash().map(str::to_string),
+            agent: None,
             operations: vec![operation],
         }
     };

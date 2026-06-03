@@ -71,10 +71,20 @@ impl CodeDb {
         entry_name: &str,
         target_triple: &str,
     ) -> Result<String> {
-        let prepared = self.prepare_link_plan_main_branch(entry_name, target_triple)?;
+        self.build_plan_branch(MAIN_BRANCH, entry_name, target_triple)
+    }
+
+    pub(crate) fn build_plan_branch(
+        &mut self,
+        branch_name: &str,
+        entry_name: &str,
+        target_triple: &str,
+    ) -> Result<String> {
+        let prepared = self.prepare_link_plan_branch(branch_name, entry_name, target_triple)?;
         let jobs = self.artifact_job_json_for_cache_keys(&prepared.job_cache_keys())?;
         let payload = json!({
             "schema": "codedb/native-build-plan/v1",
+            "branch": branch_name,
             "target_triple": prepared.plan["target_triple"].clone(),
             "entry_symbol_hash": prepared.plan["entry_symbol_hash"].clone(),
             "entry_abi_symbol": prepared.plan["entry_abi_symbol"].clone(),
@@ -96,7 +106,16 @@ impl CodeDb {
         entry_name: &str,
         target_triple: &str,
     ) -> Result<NativeBuild> {
-        let prepared = self.prepare_link_plan_main_branch(entry_name, target_triple)?;
+        self.build_branch(MAIN_BRANCH, entry_name, target_triple)
+    }
+
+    pub(crate) fn build_branch(
+        &mut self,
+        branch_name: &str,
+        entry_name: &str,
+        target_triple: &str,
+    ) -> Result<NativeBuild> {
+        let prepared = self.prepare_link_plan_branch(branch_name, entry_name, target_triple)?;
         self.ensure_executable_entry(&prepared.plan)?;
 
         let linker_identity = host_linker_identity_for_target(target_triple)?;
@@ -183,8 +202,17 @@ impl CodeDb {
         entry_name: &str,
         target_triple: &str,
     ) -> Result<PreparedLink> {
+        self.prepare_link_plan_branch(MAIN_BRANCH, entry_name, target_triple)
+    }
+
+    fn prepare_link_plan_branch(
+        &mut self,
+        branch_name: &str,
+        entry_name: &str,
+        target_triple: &str,
+    ) -> Result<PreparedLink> {
         self.ensure_initialized()?;
-        let branch = self.branch(MAIN_BRANCH)?;
+        let branch = self.branch(branch_name)?;
         let root = self.load_root(&branch.root_hash)?;
         let entry_symbol = self
             .resolve_name(&branch.root_hash, "main", entry_name)

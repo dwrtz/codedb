@@ -245,6 +245,109 @@ fn workspace_server_manages_branch_pointers() {
     let new_agent_history = applied["snapshot"]["history_hash"].clone();
     assert_ne!(new_agent_root, old_main_root);
 
+    let agent_symbols = workspace_call(&server, "symbols.list", json!({"branch": "agent/demo"}));
+    assert_eq!(agent_symbols["status"], "ok");
+    assert_eq!(agent_symbols["snapshot"]["branch"], "agent/demo");
+    assert!(
+        agent_symbols["result"]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["name"] == "vat")
+    );
+    assert!(
+        agent_symbols["result"]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|symbol| symbol["name"] != "tax")
+    );
+
+    let agent_show = workspace_call(
+        &server,
+        "symbols.show",
+        json!({"branch": "agent/demo", "name": "vat"}),
+    );
+    assert_eq!(agent_show["status"], "ok");
+    assert_eq!(agent_show["result"]["branch"], "agent/demo");
+    assert_eq!(agent_show["result"]["name"], "vat");
+
+    let main_tax = workspace_call(&server, "symbols.show", json!({"name": "tax"}));
+    assert_eq!(main_tax["status"], "ok");
+    assert_eq!(main_tax["result"]["name"], "tax");
+    let main_vat = workspace_call(&server, "symbols.show", json!({"name": "vat"}));
+    assert_eq!(main_vat["status"], "error");
+
+    let agent_resolve = workspace_call(
+        &server,
+        "symbols.resolve",
+        json!({"branch": "agent/demo", "name": "vat"}),
+    );
+    assert_eq!(agent_resolve["status"], "ok");
+    assert_eq!(agent_resolve["result"]["branch"], "agent/demo");
+    assert_eq!(
+        agent_resolve["result"]["symbol_hash"],
+        agent_show["result"]["symbol_hash"]
+    );
+
+    let agent_callers = workspace_call(
+        &server,
+        "symbols.callers",
+        json!({"branch": "agent/demo", "name": "vat"}),
+    );
+    assert_eq!(agent_callers["status"], "ok");
+    assert_eq!(agent_callers["result"]["branch"], "agent/demo");
+    assert_eq!(agent_callers["result"]["callers"][0]["name"], "total");
+
+    let agent_build_plan = workspace_call(
+        &server,
+        "build.plan",
+        json!({
+            "branch": "agent/demo",
+            "entry_name": "main",
+            "target": codedb::LINUX_X86_64_TARGET
+        }),
+    );
+    assert_eq!(agent_build_plan["status"], "ok");
+    assert_eq!(agent_build_plan["snapshot"]["branch"], "agent/demo");
+    assert_eq!(agent_build_plan["result"]["branch"], "agent/demo");
+
+    let agent_trace = workspace_call(
+        &server,
+        "trace.run",
+        json!({"branch": "agent/demo", "entry": "main", "args": []}),
+    );
+    assert_eq!(agent_trace["status"], "ok");
+    assert_eq!(agent_trace["result"]["branch"], "agent/demo");
+    assert_eq!(
+        agent_trace["result"]["result"],
+        json!({"kind": "i64", "value": "120"})
+    );
+
+    let agent_debug = workspace_call(
+        &server,
+        "debug.run",
+        json!({
+            "branch": "agent/demo",
+            "entry": "main",
+            "args": [],
+            "commands": ["where"]
+        }),
+    );
+    assert_eq!(agent_debug["status"], "ok");
+    assert_eq!(agent_debug["result"]["branch"], "agent/demo");
+
+    let agent_history = workspace_call(&server, "history.list", json!({"branch": "agent/demo"}));
+    assert_eq!(agent_history["status"], "ok");
+    assert_eq!(agent_history["result"]["branch"], "agent/demo");
+    assert_eq!(
+        agent_history["result"]["migrations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+
     let main_after_agent_write = workspace_call(&server, "workspace.current", json!({}));
     assert_eq!(
         main_after_agent_write["snapshot"]["root_hash"],
@@ -551,7 +654,7 @@ fn workspace_server_returns_stable_error_envelopes() {
     assert_eq!(unknown["error"]["kind"], "unknown_method");
     assert_eq!(unknown["snapshot"]["branch"], "main");
 
-    let invalid_params = workspace_call(&server, "symbols.list", json!({"branch": "agent/demo"}));
+    let invalid_params = workspace_call(&server, "symbols.list", JsonValue::Null);
     assert_eq!(invalid_params["status"], "error");
     assert_eq!(invalid_params["error"]["kind"], "invalid_params");
     assert_eq!(invalid_params["snapshot"]["branch"], "main");

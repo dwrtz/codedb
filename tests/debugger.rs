@@ -4,6 +4,7 @@ use assert_cmd::Command;
 use codedb::CodeDb;
 use codedb::debugger::{DebugCommand, parse_debug_command};
 use codedb::workspace::{WorkspaceRequest, WorkspaceResponse, execute_workspace_request};
+use rusqlite::Connection;
 use serde_json::{Value as JsonValue, json};
 use tempfile::tempdir;
 
@@ -171,6 +172,50 @@ fn debug_expr_breakpoint_triggers_and_reports_obsolete_after_body_replacement() 
         "obsolete_breakpoint"
     );
     assert_eq!(command(&after, "continue")["status"], "completed");
+}
+
+#[test]
+fn debug_expr_breakpoint_is_active_for_reachable_unexecuted_expression() {
+    let temp = tempdir().unwrap();
+    let db_path = temp.path().join("debug-unexecuted-expr.sqlite");
+    let source = temp.path().join("branch.cdb");
+    std::fs::write(
+        &source,
+        "fn main(flag: bool) -> i64 = if flag then 1 else 2\n",
+    )
+    .unwrap();
+    let mut db = CodeDb::open(&db_path).unwrap();
+    db.init().unwrap();
+    db.import_file(&source).unwrap();
+
+    let show = parse_json(&db.show_main_branch_json("main").unwrap());
+    let body_hash = show["body_hash"].as_str().unwrap();
+    let body_payload_json: String = Connection::open(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT payload_json FROM objects WHERE hash = ?1",
+            [body_hash],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let body_payload: JsonValue = serde_json::from_str(&body_payload_json).unwrap();
+    let else_expr = body_payload["else"].as_str().unwrap().to_string();
+
+    let report = parse_json(
+        &db.debug_main_branch_text_args_json(
+            "main",
+            &["true".to_string()],
+            &[format!("break expr {else_expr}"), "continue".to_string()],
+        )
+        .unwrap(),
+    );
+
+    assert_eq!(report["breakpoints"][0]["status"], "active");
+    assert_eq!(
+        command(&report, &format!("break expr {else_expr}"))["status"],
+        "ok"
+    );
+    assert_eq!(command(&report, "continue")["status"], "completed");
 }
 
 #[test]

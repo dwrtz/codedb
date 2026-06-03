@@ -230,15 +230,17 @@ pub fn execute_workspace_request(db: &mut CodeDb, request: WorkspaceRequest) -> 
         }
     }
 
-    let mut response = match dispatch_workspace_method(db, &request.method, &request.params) {
-        Ok(method_result) => WorkspaceResponse::ok(
-            method_result.result,
-            method_result.diagnostics,
-            method_result.snapshot,
-            id.clone(),
-        ),
-        Err(err) => workspace_method_error_response(db, err, id.clone()),
-    };
+    let mut response =
+        match dispatch_workspace_method(db, &request.method, &request.params, idempotency.as_ref())
+        {
+            Ok(method_result) => WorkspaceResponse::ok(
+                method_result.result,
+                method_result.diagnostics,
+                method_result.snapshot,
+                id.clone(),
+            ),
+            Err(err) => workspace_method_error_response(db, err, id.clone()),
+        };
 
     if let Some(idempotency) = idempotency {
         let mut stored_response = response.clone();
@@ -374,6 +376,7 @@ impl WorkspaceMethodError {
 type MethodResult<T> = std::result::Result<T, WorkspaceMethodError>;
 
 struct WorkspaceIdempotencyRequest {
+    method: String,
     request_id: String,
     request_hash: String,
     branch: String,
@@ -395,6 +398,7 @@ fn workspace_idempotency_request(
     }));
     let (branch, expected_root_hash) = workspace_transaction_metadata(&request.params);
     Ok(Some(WorkspaceIdempotencyRequest {
+        method: request.method.clone(),
         request_id,
         request_hash,
         branch,
@@ -469,6 +473,7 @@ fn dispatch_workspace_method(
     db: &mut CodeDb,
     method: &str,
     params: &JsonValue,
+    idempotency: Option<&WorkspaceIdempotencyRequest>,
 ) -> MethodResult<WorkspaceMethodResult> {
     match method {
         "workspace.current" => workspace_current(db, params),
@@ -483,7 +488,7 @@ fn dispatch_workspace_method(
         "symbols.callers" => symbols_callers(db, params),
         "roots.diff" => roots_diff(db, params),
         "roots.export_projection" => roots_export_projection(db, params),
-        "ops.apply" => ops_apply(db, params),
+        "ops.apply" => ops_apply(db, params, idempotency),
         "ops.preview" => ops_preview(db, params),
         "build.plan" => build_plan(db, params),
         "build.execute" => build_execute(db, params),
@@ -607,6 +612,25 @@ fn workspace_branch_fast_forward(
                 current.root_hash,
             ))
         }
+        BranchFastForwardOutcome::NonFastForward {
+            current,
+            source: source_state,
+        } => {
+            let snapshot = WorkspaceSnapshot {
+                branch: target.to_string(),
+                root_hash: current.root_hash.clone(),
+                history_hash: current.history_hash.clone(),
+            };
+            Err(WorkspaceMethodError::new(
+                "dependency_conflict",
+                format!(
+                    "source root {} does not descend from branch {target:?} root {}",
+                    source_state.root_hash, current.root_hash
+                ),
+            )
+            .with_snapshot(snapshot)
+            .with_roots(Some(current.root_hash), Some(source_state.root_hash)))
+        }
     }
 }
 
@@ -658,32 +682,32 @@ fn workspace_branch_compare(
 }
 
 fn symbols_list(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
-    require_main_branch(params, "symbols.list")?;
+    let branch = branch_param(params)?;
     let result = parse_json_payload(
-        db.list_main_branch_json()
+        db.list_branch_json(&branch)
             .map_err(WorkspaceMethodError::method)?,
     )?;
-    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    let snapshot = workspace_snapshot(db, &branch)?;
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 
 fn symbols_show(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
-    require_main_branch(params, "symbols.show")?;
+    let branch = branch_param(params)?;
     let symbol_or_name = symbol_or_name_param(params)?;
     let result = parse_json_payload(
-        db.show_main_branch_json(&symbol_or_name)
+        db.show_branch_json(&branch, &symbol_or_name)
             .map_err(WorkspaceMethodError::method)?,
     )?;
-    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    let snapshot = workspace_snapshot(db, &branch)?;
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 
 fn symbols_resolve(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
-    require_main_branch(params, "symbols.resolve")?;
+    let branch_name = branch_param(params)?;
     let object = params_object(params)?;
     let module = optional_str(object, "module")?.unwrap_or(MAIN_BRANCH);
     let branch = db
-        .branch(MAIN_BRANCH)
+        .branch(&branch_name)
         .map_err(WorkspaceMethodError::method)?;
     let root = db
         .load_root(&branch.root_hash)
@@ -715,7 +739,7 @@ fn symbols_resolve(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMet
     })?;
     let local_param_names = param_names(&root, &symbol);
     let result = json!({
-        "branch": MAIN_BRANCH,
+        "branch": branch_name,
         "root_hash": branch.root_hash,
         "history_hash": branch.history_hash,
         "query": query,
@@ -728,15 +752,15 @@ fn symbols_resolve(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMet
         "signature": db.signature_source(&root_symbol.signature, &local_param_names)
             .map_err(WorkspaceMethodError::method)?,
     });
-    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    let snapshot = workspace_snapshot(db, &branch_name)?;
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 
 fn symbols_callers(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
-    require_main_branch(params, "symbols.callers")?;
+    let branch_name = branch_param(params)?;
     let symbol_or_name = symbol_or_name_param(params)?;
     let branch = db
-        .branch(MAIN_BRANCH)
+        .branch(&branch_name)
         .map_err(WorkspaceMethodError::method)?;
     let root = db
         .load_root(&branch.root_hash)
@@ -757,13 +781,13 @@ fn symbols_callers(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMet
         .collect::<Result<Vec<_>>>()
         .map_err(WorkspaceMethodError::method)?;
     let result = json!({
-        "branch": MAIN_BRANCH,
+        "branch": branch_name,
         "root_hash": branch.root_hash,
         "history_hash": branch.history_hash,
         "symbol_hash": symbol,
         "callers": callers,
     });
-    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    let snapshot = workspace_snapshot(db, &branch_name)?;
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 
@@ -797,7 +821,11 @@ fn roots_export_projection(
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 
-fn ops_apply(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+fn ops_apply(
+    db: &mut CodeDb,
+    params: &JsonValue,
+    idempotency: Option<&WorkspaceIdempotencyRequest>,
+) -> MethodResult<WorkspaceMethodResult> {
     let apply_document = apply_document_param(params, true)?;
     let expected_root = expected_root_hash_from_apply_document(&apply_document)?
         .ok_or_else(|| WorkspaceMethodError::invalid_params("ops.apply requires expected_root"))?
@@ -820,10 +848,16 @@ fn ops_apply(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMetho
         ));
     }
 
-    let result = parse_json_payload(
-        db.apply_json_str(&canonical_json(&apply_document))
-            .map_err(|err| WorkspaceMethodError::new("invalid_operation", format!("{err:#}")))?,
-    )?;
+    let apply_text = canonical_json(&apply_document);
+    let apply_response = if let Some(idempotency) = idempotency {
+        db.apply_json_str_with_commit_hook(&apply_text, |db, apply_json| {
+            record_idempotent_apply_response(db, idempotency, apply_json)
+        })
+    } else {
+        db.apply_json_str(&apply_text)
+    }
+    .map_err(|err| WorkspaceMethodError::new("invalid_operation", format!("{err:#}")))?;
+    let result = parse_json_payload(apply_response)?;
     let branch = result
         .get("branch")
         .and_then(JsonValue::as_str)
@@ -851,30 +885,59 @@ fn ops_preview(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMet
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 
+fn record_idempotent_apply_response(
+    db: &mut CodeDb,
+    idempotency: &WorkspaceIdempotencyRequest,
+    apply_json: &str,
+) -> Result<()> {
+    let result: JsonValue = serde_json::from_str(apply_json.trim_end())?;
+    let branch = result
+        .get("branch")
+        .and_then(JsonValue::as_str)
+        .unwrap_or(MAIN_BRANCH);
+    let state = db.branch(branch)?;
+    let snapshot = WorkspaceSnapshot {
+        branch: branch.to_string(),
+        root_hash: state.root_hash,
+        history_hash: state.history_hash,
+    };
+    let response = WorkspaceResponse::ok(result, Vec::new(), snapshot, None);
+    let response_json = canonical_json(&serde_json::to_value(&response)?);
+    db.record_workspace_transaction_response(
+        &idempotency.request_id,
+        &idempotency.request_hash,
+        &idempotency.method,
+        &idempotency.branch,
+        idempotency.expected_root_hash.as_deref(),
+        &response_json,
+    )
+}
+
 fn build_plan(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
-    require_main_branch(params, "build.plan")?;
+    let branch = branch_param(params)?;
     let object = params_object(params)?;
     let entry_name = required_str_alias(object, "entry_name", "entry")?;
     let target = optional_str(object, "target")?.unwrap_or(DEFAULT_NATIVE_TARGET);
     let result = parse_json_payload(
-        db.build_plan_main_branch(entry_name, target)
+        db.build_plan_branch(&branch, entry_name, target)
             .map_err(WorkspaceMethodError::method)?,
     )?;
-    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    let snapshot = workspace_snapshot(db, &branch)?;
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 
 fn build_execute(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
-    require_main_branch(params, "build.execute")?;
+    let branch = branch_param(params)?;
     let object = params_object(params)?;
     let entry_name = required_str_alias(object, "entry_name", "entry")?;
     let target = optional_str(object, "target")?.unwrap_or(DEFAULT_NATIVE_TARGET);
     let build = db
-        .build_main_branch(entry_name, target)
+        .build_branch(&branch, entry_name, target)
         .map_err(WorkspaceMethodError::method)?;
-    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    let snapshot = workspace_snapshot(db, &branch)?;
     let result = json!({
         "schema": "codedb/build-execute-result/v1",
+        "branch": branch,
         "target_triple": target,
         "entry_name": entry_name,
         "executable_cache_key": build.cache_key,
@@ -895,16 +958,16 @@ fn build_artifact_status(db: &CodeDb, params: &JsonValue) -> MethodResult<Worksp
 }
 
 fn trace_run(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
-    require_main_branch(params, "trace.run")?;
+    let branch = branch_param(params)?;
     let object = params_object(params)?;
     let entry_name = required_str_alias(object, "entry_name", "entry")?;
     let args = optional_string_array(object, "args")?.unwrap_or_default();
     let result = parse_json_payload(
-        db.trace_main_branch_text_args_json(entry_name, &args)
+        db.trace_branch_text_args_json(&branch, entry_name, &args)
             .map_err(WorkspaceMethodError::method)?,
     )?;
     let diagnostics = trace_workspace_diagnostics(&result);
-    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    let snapshot = workspace_snapshot(db, &branch)?;
     Ok(WorkspaceMethodResult {
         result,
         diagnostics,
@@ -913,17 +976,17 @@ fn trace_run(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodRes
 }
 
 fn debug_run(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
-    require_main_branch(params, "debug.run")?;
+    let branch = branch_param(params)?;
     let object = params_object(params)?;
     let entry_name = required_str_alias(object, "entry_name", "entry")?;
     let args = optional_string_array(object, "args")?.unwrap_or_default();
     let commands = optional_string_array(object, "commands")?.unwrap_or_default();
     let result = parse_json_payload(
-        db.debug_main_branch_text_args_json(entry_name, &args, &commands)
+        db.debug_branch_text_args_json(&branch, entry_name, &args, &commands)
             .map_err(WorkspaceMethodError::method)?,
     )?;
     let diagnostics = trace_workspace_diagnostics(&result);
-    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    let snapshot = workspace_snapshot(db, &branch)?;
     Ok(WorkspaceMethodResult {
         result,
         diagnostics,
@@ -932,12 +995,12 @@ fn debug_run(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodRes
 }
 
 fn history_list(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
-    require_main_branch(params, "history.list")?;
+    let branch = branch_param(params)?;
     let result = parse_json_payload(
-        db.history_main_branch_json()
+        db.history_branch_json(&branch)
             .map_err(WorkspaceMethodError::method)?,
     )?;
-    let snapshot = workspace_snapshot(db, MAIN_BRANCH)?;
+    let snapshot = workspace_snapshot(db, &branch)?;
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 
@@ -1087,6 +1150,7 @@ fn apply_document_param(
             "schema": APPLY_SCHEMA,
             "branch": transaction.branch,
             "expect_root_hash": transaction.expected_root_hash,
+            "agent": transaction.agent,
             "operations": transaction.operations,
         })
     } else {
@@ -1280,17 +1344,6 @@ fn string_array_field<'a>(value: &'a JsonValue, key: &str) -> Vec<&'a str> {
         .and_then(JsonValue::as_array)
         .map(|values| values.iter().filter_map(JsonValue::as_str).collect())
         .unwrap_or_default()
-}
-
-fn require_main_branch(params: &JsonValue, method: &str) -> MethodResult<()> {
-    let branch = branch_param(params)?;
-    if branch == MAIN_BRANCH {
-        Ok(())
-    } else {
-        Err(WorkspaceMethodError::invalid_params(format!(
-            "{method} currently supports only branch {MAIN_BRANCH:?}, got {branch:?}"
-        )))
-    }
 }
 
 fn symbol_or_name_param(params: &JsonValue) -> MethodResult<String> {

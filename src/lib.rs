@@ -193,7 +193,11 @@ impl CodeDb {
     }
 
     pub fn list_main_branch_json(&self) -> Result<String> {
-        let branch = self.branch(MAIN_BRANCH)?;
+        self.list_branch_json(MAIN_BRANCH)
+    }
+
+    pub(crate) fn list_branch_json(&self, branch_name: &str) -> Result<String> {
+        let branch = self.branch(branch_name)?;
         let root = self.load_root(&branch.root_hash)?;
         let mut symbols = Vec::new();
         for binding in preferred_names(&root) {
@@ -215,7 +219,7 @@ impl CodeDb {
         Ok(format!(
             "{}\n",
             store::canonical_json(&json!({
-                "branch": MAIN_BRANCH,
+                "branch": branch_name,
                 "root_hash": branch.root_hash,
                 "history_hash": branch.history_hash,
                 "symbols": symbols,
@@ -275,7 +279,15 @@ impl CodeDb {
     }
 
     pub fn show_main_branch_json(&self, symbol_or_name: &str) -> Result<String> {
-        let branch = self.branch(MAIN_BRANCH)?;
+        self.show_branch_json(MAIN_BRANCH, symbol_or_name)
+    }
+
+    pub(crate) fn show_branch_json(
+        &self,
+        branch_name: &str,
+        symbol_or_name: &str,
+    ) -> Result<String> {
+        let branch = self.branch(branch_name)?;
         let symbol = self.resolve_symbol_or_name(&branch.root_hash, symbol_or_name)?;
         let root = self.load_root(&branch.root_hash)?;
         let binding = self
@@ -297,7 +309,7 @@ impl CodeDb {
             .collect::<Result<Vec<_>>>()?;
         let local_param_names = param_names(&root, &symbol);
         let payload = json!({
-            "branch": MAIN_BRANCH,
+            "branch": branch_name,
             "root_hash": branch.root_hash,
             "history_hash": branch.history_hash,
             "symbol_hash": symbol,
