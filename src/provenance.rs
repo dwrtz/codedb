@@ -348,47 +348,111 @@ impl CodeDb {
         };
 
         let mut status = "predicate_never_matched";
+        let mut search_strategy = "linear_transition_scan_after_first_evaluable";
         let mut first_changed = JsonValue::Null;
         let mut previous = JsonValue::Null;
         let mut first_matching = None;
-        let mut last_evaluable = None::<(usize, bool, JsonValue)>;
+        let mut first_evaluable = None::<(usize, bool, JsonValue)>;
 
-        for idx in 0..states.len() {
+        for (idx, _) in states.iter().enumerate() {
             let evaluation = eval_at(idx)?;
-            if !predicate_evaluable(&evaluation) {
-                continue;
-            }
-
-            let matched = predicate_matches(&evaluation);
-            if matched && first_matching.is_none() {
-                first_matching = Some(idx);
-            }
-
-            if let Some((_, previous_matched, previous_evaluation)) = &last_evaluable
-                && matched != *previous_matched
-            {
-                status = "changed";
-                previous = previous_evaluation.clone();
-                let state = &states[idx];
-                first_changed = json!({
-                    "sequence": state.sequence,
-                    "root_hash": state.root_hash,
-                    "history_hash": state.history_hash,
-                    "migration": state.migration_from_parent,
-                    "previous_evaluation": previous,
-                    "changed_evaluation": evaluation,
-                });
+            if predicate_evaluable(&evaluation) {
+                let matched = predicate_matches(&evaluation);
+                first_evaluable = Some((idx, matched, evaluation));
                 break;
             }
-
-            last_evaluable = Some((idx, matched, evaluation));
         }
 
-        if status != "changed"
-            && let Some((_, matched, _)) = last_evaluable
-            && matched
-        {
-            status = "unchanged";
+        let mut scan_end = states.len().saturating_sub(1);
+        if let Some((first_idx, first_matched, first_evaluation)) = &first_evaluable {
+            if *first_matched {
+                first_matching = Some(*first_idx);
+            }
+            let mut last_evaluable = Some((*first_idx, *first_matched, first_evaluation.clone()));
+
+            for (idx, _) in states.iter().enumerate().skip(first_idx + 1).rev() {
+                let evaluation = eval_at(idx)?;
+                if predicate_evaluable(&evaluation) {
+                    last_evaluable = Some((idx, predicate_matches(&evaluation), evaluation));
+                    break;
+                }
+            }
+
+            if let Some((last_idx, last_matched, _)) = &last_evaluable
+                && *last_idx > *first_idx
+                && *last_matched != *first_matched
+            {
+                let mut low = first_idx + 1;
+                let mut high = *last_idx;
+                let mut binary_ok = true;
+                while low < high {
+                    let mid = low + (high - low) / 2;
+                    let evaluation = eval_at(mid)?;
+                    if !predicate_evaluable(&evaluation) {
+                        binary_ok = false;
+                        break;
+                    }
+                    if predicate_matches(&evaluation) == *first_matched {
+                        low = mid + 1;
+                    } else {
+                        high = mid;
+                    }
+                }
+                if binary_ok {
+                    let candidate = eval_at(low)?;
+                    if predicate_evaluable(&candidate)
+                        && predicate_matches(&candidate) != *first_matched
+                    {
+                        scan_end = low;
+                        search_strategy = "binary_transition_search_with_prefix_verification";
+                    }
+                }
+            }
+
+            let mut previous_evaluable =
+                Some((*first_idx, *first_matched, first_evaluation.clone()));
+            for (idx, _) in states
+                .iter()
+                .enumerate()
+                .skip(first_idx + 1)
+                .take(scan_end.saturating_sub(*first_idx))
+            {
+                let evaluation = eval_at(idx)?;
+                if !predicate_evaluable(&evaluation) {
+                    continue;
+                }
+
+                let matched = predicate_matches(&evaluation);
+                if matched && first_matching.is_none() {
+                    first_matching = Some(idx);
+                }
+
+                if let Some((_, previous_matched, previous_evaluation)) = &previous_evaluable
+                    && matched != *previous_matched
+                {
+                    status = "changed";
+                    previous = previous_evaluation.clone();
+                    let state = &states[idx];
+                    first_changed = json!({
+                        "sequence": state.sequence,
+                        "root_hash": state.root_hash,
+                        "history_hash": state.history_hash,
+                        "migration": state.migration_from_parent,
+                        "previous_evaluation": previous,
+                        "changed_evaluation": evaluation,
+                    });
+                    break;
+                }
+
+                previous_evaluable = Some((idx, matched, evaluation));
+            }
+
+            if status != "changed"
+                && let Some((_, matched, _)) = last_evaluable
+                && matched
+            {
+                status = "unchanged";
+            }
         }
 
         let mut evaluations = evaluated.into_values().collect::<Vec<_>>();
@@ -405,7 +469,7 @@ impl CodeDb {
             "root_hash": branch.root_hash,
             "history_hash": branch.history_hash,
             "status": status,
-            "search_strategy": "linear_transition_scan_after_first_evaluable",
+            "search_strategy": search_strategy,
             "predicate": predicate.to_json(),
             "root_count": states.len(),
             "first_matching_sequence": first_matching,
@@ -456,8 +520,9 @@ impl CodeDb {
         self.load_root(to_root)
             .with_context(|| format!("why --to is not a program root: {to_root}"))?;
         let branch = self.branch(branch_name)?;
-        let from_history = self.history_hash_for_root_in_branch(branch_name, from_root)?;
-        let to_history = self.history_hash_for_root_in_branch(branch_name, to_root)?;
+        let migration_span = self.migration_span_between_roots(branch_name, from_root, to_root)?;
+        let from_history = migration_span.from_history_hash.clone();
+        let to_history = migration_span.to_history_hash.clone();
         let before_trace = serde_json::to_value(self.trace_root_text_args_report(
             from_root,
             from_history.clone(),
@@ -473,7 +538,7 @@ impl CodeDb {
         let diff: JsonValue =
             serde_json::from_str(self.diff_roots_json(from_root, to_root)?.trim_end())?;
         let changed_functions = self.changed_functions_between_roots(from_root, to_root)?;
-        let migration_path = self.migration_path_between_roots(branch_name, from_root, to_root)?;
+        let migration_path = migration_span.migrations;
         let direct_migration = if migration_path.len() == 1 {
             migration_path[0].clone()
         } else {
@@ -1007,42 +1072,70 @@ impl CodeDb {
         }
     }
 
-    fn history_hash_for_root_in_branch(
-        &self,
-        branch_name: &str,
-        root_hash: &str,
-    ) -> Result<Option<String>> {
-        for state in self.history_root_states(branch_name)? {
-            if state.root_hash == root_hash {
-                return Ok(state.history_hash);
-            }
-        }
-        Ok(None)
-    }
-
-    fn migration_path_between_roots(
+    fn migration_span_between_roots(
         &self,
         branch_name: &str,
         from_root: &str,
         to_root: &str,
-    ) -> Result<Vec<JsonValue>> {
+    ) -> Result<MigrationRootSpan> {
+        let states = self.history_root_states(branch_name)?;
         if from_root == to_root {
-            return Ok(Vec::new());
+            let history_hash = states
+                .iter()
+                .rev()
+                .find(|state| state.root_hash == from_root)
+                .and_then(|state| state.history_hash.clone());
+            return Ok(MigrationRootSpan {
+                from_history_hash: history_hash.clone(),
+                to_history_hash: history_hash,
+                migrations: Vec::new(),
+            });
         }
-        let mut active = false;
-        let mut path = Vec::new();
-        for item in self.provenance_history_chain(branch_name)? {
-            if !active && item.input_root == from_root {
-                active = true;
+
+        let mut best_pair = None::<(usize, usize)>;
+        for (from_idx, from_state) in states.iter().enumerate() {
+            if from_state.root_hash != from_root {
+                continue;
             }
-            if active {
-                path.push(item.to_json_with_reasons(&["why_path"])?);
-                if item.output_root == to_root {
-                    return Ok(path);
+            for (to_idx, to_state) in states.iter().enumerate().skip(from_idx + 1) {
+                if to_state.root_hash != to_root {
+                    continue;
                 }
+                let candidate_len = to_idx - from_idx;
+                let replace = best_pair.is_none_or(|(best_from, best_to)| {
+                    let best_len = best_to - best_from;
+                    candidate_len < best_len || (candidate_len == best_len && from_idx > best_from)
+                });
+                if replace {
+                    best_pair = Some((from_idx, to_idx));
+                }
+                break;
             }
         }
-        Ok(Vec::new())
+
+        let Some((from_idx, to_idx)) = best_pair else {
+            return Ok(MigrationRootSpan {
+                from_history_hash: states
+                    .iter()
+                    .find(|state| state.root_hash == from_root)
+                    .and_then(|state| state.history_hash.clone()),
+                to_history_hash: states
+                    .iter()
+                    .find(|state| state.root_hash == to_root)
+                    .and_then(|state| state.history_hash.clone()),
+                migrations: Vec::new(),
+            });
+        };
+
+        let migrations = states[from_idx + 1..=to_idx]
+            .iter()
+            .map(|state| state.migration_from_parent.clone())
+            .collect();
+        Ok(MigrationRootSpan {
+            from_history_hash: states[from_idx].history_hash.clone(),
+            to_history_hash: states[to_idx].history_hash.clone(),
+            migrations,
+        })
     }
 
     fn changed_functions_between_roots(
@@ -1386,6 +1479,13 @@ struct HistoryRootState {
 }
 
 #[derive(Debug, Clone)]
+struct MigrationRootSpan {
+    from_history_hash: Option<String>,
+    to_history_hash: Option<String>,
+    migrations: Vec<JsonValue>,
+}
+
+#[derive(Debug, Clone)]
 enum HistoryPredicate {
     EvalOutput {
         entry_name: String,
@@ -1431,6 +1531,24 @@ fn predicate_matches(evaluation: &JsonValue) -> bool {
 }
 
 fn predicate_evaluable(evaluation: &JsonValue) -> bool {
+    if evaluation.get("predicate_kind").and_then(JsonValue::as_str) == Some("semantic_test") {
+        if evaluation
+            .get("test_result")
+            .and_then(|result| result.get("kind"))
+            .and_then(JsonValue::as_str)
+            == Some("test_not_found")
+            && evaluation
+                .get("expected_status")
+                .and_then(JsonValue::as_str)
+                != Some("error")
+        {
+            return false;
+        }
+        return evaluation
+            .get("actual_status")
+            .and_then(JsonValue::as_str)
+            .is_some();
+    }
     evaluation.get("status").and_then(JsonValue::as_str) == Some("ok")
 }
 

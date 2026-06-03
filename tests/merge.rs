@@ -450,10 +450,9 @@ fn conservative_merge_reports_semantic_conflicts() {
         "dependency_conflict"
     );
     assert!(
-        delete_use_conflict["conflicts"][0]["details"]["error"]
+        !delete_use_conflict["conflicts"][0]["details"]["error"]
             .as_str()
             .unwrap()
-            .len()
-            > 0
+            .is_empty()
     );
 }
