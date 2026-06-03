@@ -21,6 +21,7 @@ pub enum DebugCommand {
     Where,
     PrintParams,
     PrintLocals,
+    PrintValue(String),
     ShowExpr(Option<String>),
     ShowFunction,
     Quit,
@@ -418,6 +419,16 @@ impl DebugSession {
                     Some(json!({ "locals": locals })),
                 )
             }
+            DebugCommand::PrintValue(target) => {
+                let value = self.debug_value(db, &target)?;
+                self.record(
+                    db,
+                    command_text,
+                    "ok",
+                    None,
+                    Some(json!({ "value": value })),
+                )
+            }
             DebugCommand::ShowExpr(explicit_hash) => {
                 let state = self.current_state(db)?;
                 let expr_hash = explicit_hash
@@ -739,6 +750,62 @@ impl DebugSession {
             "payload": payload,
         }))
     }
+
+    fn debug_value(&self, db: &CodeDb, target: &str) -> Result<JsonValue> {
+        if target.starts_with("sha256:") {
+            let position = self
+                .position
+                .ok_or_else(|| anyhow!("debug session has no current position"))?;
+            let (event_index, symbol_hash, value) = self
+                .trace
+                .events
+                .iter()
+                .enumerate()
+                .take(position + 1)
+                .rev()
+                .find_map(|(idx, event)| match event {
+                    TraceEvent::Value {
+                        expr_hash,
+                        symbol_hash,
+                        value,
+                        ..
+                    } if expr_hash == target => Some((idx, symbol_hash.clone(), value.clone())),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    anyhow!("value for expression {target} is not available at current position")
+                })?;
+            let view = self.expr_view(db, target, Some(&symbol_hash))?;
+            return Ok(json!({
+                "kind": "expr",
+                "expr_hash": target,
+                "symbol_hash": symbol_hash,
+                "event_index": event_index,
+                "value": value,
+                "expr": view,
+            }));
+        }
+
+        let state = self.current_state(db)?;
+        let frame = state
+            .current_frame
+            .ok_or_else(|| anyhow!("debug session has no current frame"))?;
+        frame
+            .params
+            .iter()
+            .chain(frame.locals.iter())
+            .find(|binding| binding.name == target)
+            .map(|binding| {
+                json!({
+                    "kind": "binding",
+                    "name": binding.name.clone(),
+                    "type_hash": binding.type_hash.clone(),
+                    "type_name": binding.type_name.clone(),
+                    "value": binding.value.clone(),
+                })
+            })
+            .ok_or_else(|| anyhow!("no parameter or local named {target:?} is in scope"))
+    }
 }
 
 struct ContinueOutcome {
@@ -767,6 +834,9 @@ pub fn parse_debug_command(input: &str) -> Result<DebugCommand> {
         }
         "print" if parts.len() == 2 && parts[1] == "params" => Ok(DebugCommand::PrintParams),
         "print" if parts.len() == 2 && parts[1] == "locals" => Ok(DebugCommand::PrintLocals),
+        "print" if parts.len() == 3 && parts[1] == "value" => {
+            Ok(DebugCommand::PrintValue(parts[2].to_string()))
+        }
         "show" if parts.len() == 2 && parts[1] == "expr" => Ok(DebugCommand::ShowExpr(None)),
         "show" if parts.len() == 3 && parts[1] == "expr" => {
             Ok(DebugCommand::ShowExpr(Some(parts[2].to_string())))
@@ -1171,6 +1241,10 @@ mod tests {
         assert_eq!(
             parse_debug_command("show expr sha256:def").unwrap(),
             DebugCommand::ShowExpr(Some("sha256:def".to_string()))
+        );
+        assert_eq!(
+            parse_debug_command("print value sha256:def").unwrap(),
+            DebugCommand::PrintValue("sha256:def".to_string())
         );
         assert!(parse_debug_command("print stack").is_err());
     }

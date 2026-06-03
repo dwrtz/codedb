@@ -247,6 +247,9 @@ fn debug_backtrace_params_and_locals_are_semantic() {
             "continue".to_string(),
             "print params".to_string(),
             "print locals".to_string(),
+            "print value y".to_string(),
+            "step".to_string(),
+            format!("print value {local_ref}"),
             "backtrace".to_string(),
             "show expr".to_string(),
             "show function".to_string(),
@@ -266,6 +269,16 @@ fn debug_backtrace_params_and_locals_are_semantic() {
     assert_eq!(locals[0]["name"], "y");
     assert_eq!(locals[0]["type_name"], "i64");
     assert_eq!(locals[0]["value"], json!({"kind": "i64", "value": "10"}));
+
+    let local_value = &command(&report, "print value y")["result"]["value"];
+    assert_eq!(local_value["kind"], "binding");
+    assert_eq!(local_value["name"], "y");
+    assert_eq!(local_value["value"], json!({"kind": "i64", "value": "10"}));
+
+    let expr_value = &command(&report, &format!("print value {local_ref}"))["result"]["value"];
+    assert_eq!(expr_value["kind"], "expr");
+    assert_eq!(expr_value["expr_hash"], local_ref);
+    assert_eq!(expr_value["value"], json!({"kind": "i64", "value": "10"}));
 
     let frames = &command(&report, "backtrace")["result"]["frames"];
     assert_eq!(frames[0]["function_name"], "main.callee");
@@ -298,6 +311,10 @@ fn debug_command_parser_has_non_interactive_coverage() {
     assert_eq!(
         parse_debug_command("show expr sha256:expr").unwrap(),
         DebugCommand::ShowExpr(Some("sha256:expr".to_string()))
+    );
+    assert_eq!(
+        parse_debug_command("print value sha256:expr").unwrap(),
+        DebugCommand::PrintValue("sha256:expr".to_string())
     );
     assert!(parse_debug_command("break line 10").is_err());
 }

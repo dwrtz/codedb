@@ -267,12 +267,7 @@ impl CodeDb {
             "INSERT INTO workspace_transactions
              (request_id, request_hash, method, branch, expected_root_hash, response_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(request_id) DO UPDATE SET
-                response_json = CASE
-                    WHEN workspace_transactions.request_hash = excluded.request_hash
-                    THEN excluded.response_json
-                    ELSE workspace_transactions.response_json
-                END",
+             ON CONFLICT(request_id) DO NOTHING",
             params![
                 request_id,
                 request_hash,
@@ -282,6 +277,14 @@ impl CodeDb {
                 response_json,
             ],
         )?;
+        let stored_hash: String = self.conn.query_row(
+            "SELECT request_hash FROM workspace_transactions WHERE request_id = ?1",
+            params![request_id],
+            |row| row.get(0),
+        )?;
+        if stored_hash != request_hash {
+            bail!("workspace request_id {request_id:?} was already used for a different request");
+        }
         Ok(())
     }
 
@@ -1155,5 +1158,49 @@ mod tests {
 
         let entry = db.lookup_cache(&key).unwrap().unwrap();
         assert_eq!(entry.artifact_bytes.as_deref(), Some(&b"one"[..]));
+    }
+
+    #[test]
+    fn workspace_transaction_response_is_immutable_for_request_id() {
+        let temp = tempdir().unwrap();
+        let mut db = CodeDb::open(temp.path().join("workspace-idempotency.sqlite")).unwrap();
+        db.init().unwrap();
+
+        db.record_workspace_transaction_response(
+            "request-1",
+            "hash-1",
+            "ops.apply",
+            "main",
+            Some("sha256:root"),
+            r#"{"status":"ok","result":"first"}"#,
+        )
+        .unwrap();
+        db.record_workspace_transaction_response(
+            "request-1",
+            "hash-1",
+            "ops.apply",
+            "main",
+            Some("sha256:root"),
+            r#"{"status":"ok","result":"second"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            db.cached_workspace_transaction_response("request-1", "hash-1")
+                .unwrap()
+                .unwrap(),
+            r#"{"status":"ok","result":"first"}"#
+        );
+
+        let err = db
+            .record_workspace_transaction_response(
+                "request-1",
+                "hash-2",
+                "ops.apply",
+                "main",
+                Some("sha256:root"),
+                r#"{"status":"ok","result":"different"}"#,
+            )
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("already used for a different request"));
     }
 }

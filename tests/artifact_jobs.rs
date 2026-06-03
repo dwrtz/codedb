@@ -273,3 +273,62 @@ fn workspace_artifact_status_reports_jobs_and_cache_entries() {
             .any(|entry| entry["artifact_kind"] == "object_file")
     );
 }
+
+#[test]
+fn workspace_build_execute_validates_entry_signature_on_requested_branch() {
+    let temp = tempdir().unwrap();
+    let db_path = temp.path().join("workspace-branch-build.sqlite");
+    let source = temp.path().join("main.cdb");
+    std::fs::write(&source, "fn main() -> i64 = 1\n").unwrap();
+
+    let mut db = CodeDb::open(&db_path).unwrap();
+    db.init().unwrap();
+    db.import_file(&source).unwrap();
+
+    let current = workspace_call(&mut db, "workspace.current", json!({}));
+    let root = current["snapshot"]["root_hash"].as_str().unwrap();
+    let created = workspace_call(
+        &mut db,
+        "workspace.branch.create",
+        json!({"name": "agent/params", "from_branch": "main"}),
+    );
+    assert_eq!(created["status"], "ok");
+
+    let changed = workspace_call(
+        &mut db,
+        "ops.apply",
+        json!({
+            "schema": "codedb/apply/v1",
+            "branch": "agent/params",
+            "expect_root_hash": root,
+            "operations": [
+                {
+                    "kind": "change_function_signature",
+                    "name": "main",
+                    "params": [{"name": "x", "type": "i64"}],
+                    "return_type": "i64"
+                }
+            ]
+        }),
+    );
+    assert_eq!(changed["status"], "ok");
+
+    let build = workspace_call(
+        &mut db,
+        "build.execute",
+        json!({
+            "branch": "agent/params",
+            "entry": "main",
+            "target": codedb::DEFAULT_NATIVE_TARGET
+        }),
+    );
+    assert_eq!(build["status"], "error");
+    assert_eq!(build["error"]["kind"], "method_error");
+    assert!(
+        build["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("native executable entry must not take parameters")
+    );
+    assert_eq!(build["snapshot"]["branch"], "agent/params");
+}

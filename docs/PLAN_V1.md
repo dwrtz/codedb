@@ -1,6 +1,6 @@
 # PLAN_V1.md — CodeDB Semantic Workspace Roadmap
 
-Status: Draft 1.0  
+Status: Draft 1.0
 Scope: implementation roadmap for the v1 semantic workspace track
 
 ## Direction
@@ -417,6 +417,7 @@ continue
 backtrace
 print params
 print locals
+print value
 show current expression
 show current function
 REPL-style CLI debugger
@@ -442,6 +443,7 @@ expr breakpoint triggers on matching expression hash
 removed expr breakpoint reports obsolete after body replacement
 backtrace contains semantic frames
 print params shows typed values
+print value shows in-scope bindings and evaluated expressions
 interactive command parser has non-interactive tests
 ```
 

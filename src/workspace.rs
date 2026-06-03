@@ -230,48 +230,15 @@ pub fn execute_workspace_request(db: &mut CodeDb, request: WorkspaceRequest) -> 
         }
     }
 
-    let mut response =
-        match dispatch_workspace_method(db, &request.method, &request.params, idempotency.as_ref())
-        {
-            Ok(method_result) => WorkspaceResponse::ok(
-                method_result.result,
-                method_result.diagnostics,
-                method_result.snapshot,
-                id.clone(),
-            ),
-            Err(err) => workspace_method_error_response(db, err, id.clone()),
-        };
-
-    if let Some(idempotency) = idempotency {
-        let mut stored_response = response.clone();
-        stored_response.id = None;
-        match serde_json::to_value(&stored_response) {
-            Ok(value) => {
-                let response_json = canonical_json(&value);
-                if let Err(err) = db.record_workspace_transaction_response(
-                    &idempotency.request_id,
-                    &idempotency.request_hash,
-                    &request.method,
-                    &idempotency.branch,
-                    idempotency.expected_root_hash.as_deref(),
-                    &response_json,
-                ) {
-                    response.diagnostics.push(WorkspaceDiagnostic {
-                        kind: "idempotency_cache_error".to_string(),
-                        message: format!("{err:#}"),
-                        details: None,
-                    });
-                }
-            }
-            Err(err) => response.diagnostics.push(WorkspaceDiagnostic {
-                kind: "serialization_error".to_string(),
-                message: format!("failed to serialize workspace response for idempotency: {err}"),
-                details: None,
-            }),
-        }
+    match dispatch_workspace_method(db, &request.method, &request.params, idempotency.as_ref()) {
+        Ok(method_result) => WorkspaceResponse::ok(
+            method_result.result,
+            method_result.diagnostics,
+            method_result.snapshot,
+            id.clone(),
+        ),
+        Err(err) => workspace_method_error_response(db, err, id.clone()),
     }
-
-    response
 }
 
 fn workspace_method_error_response(
@@ -279,6 +246,8 @@ fn workspace_method_error_response(
     err: WorkspaceMethodError,
     id: Option<JsonValue>,
 ) -> WorkspaceResponse {
+    let WorkspaceMethodError(err) = err;
+    let err = *err;
     WorkspaceResponse::error_with_diagnostics_and_details(
         err.kind,
         err.message,
@@ -307,7 +276,10 @@ impl WorkspaceMethodResult {
 }
 
 #[derive(Debug)]
-struct WorkspaceMethodError {
+struct WorkspaceMethodError(Box<WorkspaceMethodErrorData>);
+
+#[derive(Debug)]
+struct WorkspaceMethodErrorData {
     kind: &'static str,
     message: String,
     diagnostics: Vec<WorkspaceDiagnostic>,
@@ -318,14 +290,14 @@ struct WorkspaceMethodError {
 
 impl WorkspaceMethodError {
     fn new(kind: &'static str, message: impl Into<String>) -> Self {
-        Self {
+        Self(Box::new(WorkspaceMethodErrorData {
             kind,
             message: message.into(),
             diagnostics: Vec::new(),
             snapshot: None,
             expected_root_hash: None,
             actual_root_hash: None,
-        }
+        }))
     }
 
     fn method(err: anyhow::Error) -> Self {
@@ -342,23 +314,23 @@ impl WorkspaceMethodError {
         expected_root_hash: impl Into<String>,
         actual_root_hash: impl Into<String>,
     ) -> Self {
-        Self {
+        Self(Box::new(WorkspaceMethodErrorData {
             kind: "stale_root",
             message: message.into(),
             diagnostics: Vec::new(),
             snapshot: Some(snapshot),
             expected_root_hash: Some(expected_root_hash.into()),
             actual_root_hash: Some(actual_root_hash.into()),
-        }
+        }))
     }
 
     fn with_diagnostics(mut self, diagnostics: Vec<WorkspaceDiagnostic>) -> Self {
-        self.diagnostics = diagnostics;
+        self.0.diagnostics = diagnostics;
         self
     }
 
     fn with_snapshot(mut self, snapshot: WorkspaceSnapshot) -> Self {
-        self.snapshot = Some(snapshot);
+        self.0.snapshot = Some(snapshot);
         self
     }
 
@@ -367,8 +339,8 @@ impl WorkspaceMethodError {
         expected_root_hash: Option<String>,
         actual_root_hash: Option<String>,
     ) -> Self {
-        self.expected_root_hash = expected_root_hash;
-        self.actual_root_hash = actual_root_hash;
+        self.0.expected_root_hash = expected_root_hash;
+        self.0.actual_root_hash = actual_root_hash;
         self
     }
 }
@@ -931,9 +903,16 @@ fn build_execute(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceM
     let object = params_object(params)?;
     let entry_name = required_str_alias(object, "entry_name", "entry")?;
     let target = optional_str(object, "target")?.unwrap_or(DEFAULT_NATIVE_TARGET);
-    let build = db
-        .build_branch(&branch, entry_name, target)
-        .map_err(WorkspaceMethodError::method)?;
+    let build = match db.build_branch(&branch, entry_name, target) {
+        Ok(build) => build,
+        Err(err) => {
+            let mut method_error = WorkspaceMethodError::method(err);
+            if let Ok(snapshot) = workspace_snapshot(db, &branch) {
+                method_error = method_error.with_snapshot(snapshot);
+            }
+            return Err(method_error);
+        }
+    };
     let snapshot = workspace_snapshot(db, &branch)?;
     let result = json!({
         "schema": "codedb/build-execute-result/v1",

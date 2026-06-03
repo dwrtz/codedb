@@ -30,6 +30,7 @@ pub struct NativeBuild {
 }
 
 struct PreparedLink {
+    root_hash: String,
     input_hash: String,
     link_plan_cache_key: String,
     plan: JsonValue,
@@ -116,7 +117,7 @@ impl CodeDb {
         target_triple: &str,
     ) -> Result<NativeBuild> {
         let prepared = self.prepare_link_plan_branch(branch_name, entry_name, target_triple)?;
-        self.ensure_executable_entry(&prepared.plan)?;
+        self.ensure_executable_entry(&prepared)?;
 
         let linker_identity = host_linker_identity_for_target(target_triple)?;
         let linker_identity_hash = hash_bytes(BYTES_DOMAIN, linker_identity.as_bytes());
@@ -362,6 +363,7 @@ impl CodeDb {
         }
 
         Ok(PreparedLink {
+            root_hash: root_hash.to_string(),
             input_hash,
             link_plan_cache_key: plan_cache_key,
             plan,
@@ -398,13 +400,13 @@ impl CodeDb {
         Ok(())
     }
 
-    fn ensure_executable_entry(&self, plan: &JsonValue) -> Result<()> {
-        let entry = plan
+    fn ensure_executable_entry(&self, prepared: &PreparedLink) -> Result<()> {
+        let entry = prepared
+            .plan
             .get("entry_symbol_hash")
             .and_then(JsonValue::as_str)
             .ok_or_else(|| anyhow!("link plan missing entry symbol"))?;
-        let root_hash = self.branch(MAIN_BRANCH)?.root_hash;
-        let root = self.load_root(&root_hash)?;
+        let root = self.load_root(&prepared.root_hash)?;
         let root_entry = self
             .root_symbol(&root, entry)
             .ok_or_else(|| anyhow!("entry symbol missing from root {entry}"))?;

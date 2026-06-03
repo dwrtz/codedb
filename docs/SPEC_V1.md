@@ -1,6 +1,6 @@
 # SPEC_V1.md — CodeDB Semantic Workspace
 
-Status: Draft 1.0  
+Status: Draft 1.0
 Scope: v1 design track built on the v0 CodeDB proof of concept
 
 ## 1. Thesis

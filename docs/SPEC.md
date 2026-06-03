@@ -2,7 +2,7 @@
 
 Status: Draft 0.4
 Scope: v0 Rust proof of concept plus the implemented native-artifact architecture.
-The v1 semantic workspace design track lives in [SPEC_V1.md](SPEC_V1.md).  
+The v1 semantic workspace design track lives in [SPEC_V1.md](SPEC_V1.md).
 Working name: `codedb`
 
 ## 1. Thesis
