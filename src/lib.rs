@@ -14,6 +14,7 @@ mod lowering;
 mod migrations;
 mod model;
 mod patch;
+mod provenance;
 pub mod server;
 mod store;
 mod tests;

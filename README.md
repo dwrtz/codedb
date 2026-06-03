@@ -151,8 +151,8 @@ optional JSON-RPC `id` fields. Responses use the stable
 `workspace.current`, `workspace.branches`, `symbols.list`, `symbols.show`,
 `symbols.resolve`, `symbols.callers`, `roots.diff`, `roots.export_projection`,
 `build.plan`, `build.execute`, `build.artifact_status`, `trace.run`,
-`debug.run`, `tests.list`, `tests.run`, `tests.impact`, `history.list`, and
-`verify.run`. It also exposes
+`debug.run`, `tests.list`, `tests.run`, `tests.impact`, `history.list`,
+`provenance.blame_symbol`, `provenance.blame_expr`, and `verify.run`. It also exposes
 `workspace.branch.create`, `workspace.branch.fast_forward`,
 `workspace.branch.delete`, `workspace.branch.compare`, `ops.apply` for atomic
 `codedb/apply/v1` structural writes, and `ops.preview` for rollback-only
@@ -206,6 +206,8 @@ cargo run -- show <db> <symbol-or-name> [--json]
 cargo run -- callers <db> <symbol-or-name>
 cargo run -- diff <db> <root-a> <root-b> [--json]
 cargo run -- history <db> [--json]
+cargo run -- blame-symbol <db> <symbol-or-name> [--branch main] [--json]
+cargo run -- blame-expr <db> <expr-hash> [--branch main] [--json]
 cargo run -- branches <db> [--json]
 cargo run -- branch list <db> [--json]
 cargo run -- branch create <db> <name> --from main [--json]

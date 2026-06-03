@@ -458,6 +458,8 @@ fn dispatch_workspace_method(
         "symbols.show" => symbols_show(db, params),
         "symbols.resolve" => symbols_resolve(db, params),
         "symbols.callers" => symbols_callers(db, params),
+        "provenance.blame_symbol" | "blame.symbol" => provenance_blame_symbol(db, params),
+        "provenance.blame_expr" | "blame.expr" => provenance_blame_expr(db, params),
         "roots.diff" => roots_diff(db, params),
         "roots.export_projection" => roots_export_projection(db, params),
         "ops.apply" => ops_apply(db, params, idempotency),
@@ -795,6 +797,29 @@ fn symbols_callers(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMet
         "callers": callers,
     });
     let snapshot = workspace_snapshot(db, &branch_name)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn provenance_blame_symbol(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let branch = branch_param(params)?;
+    let symbol_or_name = symbol_or_name_param(params)?;
+    let result = parse_json_payload(
+        db.blame_symbol_branch_json(&branch, &symbol_or_name)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, &branch)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn provenance_blame_expr(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let branch = branch_param(params)?;
+    let object = params_object(params)?;
+    let expr_hash = required_str_any(object, &["expr_hash", "expr"])?;
+    let result = parse_json_payload(
+        db.blame_expr_branch_json(&branch, expr_hash)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, &branch)?;
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 

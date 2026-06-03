@@ -191,6 +191,24 @@ enum Command {
         db: PathBuf,
         symbol_or_name: String,
     },
+    #[command(about = "Explain which migrations affected a semantic symbol")]
+    BlameSymbol {
+        db: PathBuf,
+        symbol_or_name: String,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Explain which migration introduced a reachable expression")]
+    BlameExpr {
+        db: PathBuf,
+        expr_hash: String,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        #[arg(long)]
+        json: bool,
+    },
     Rename {
         db: PathBuf,
         old_name: String,
@@ -632,6 +650,35 @@ fn main() -> Result<()> {
         Command::Callers { db, symbol_or_name } => {
             let codedb = codedb::CodeDb::open(db)?;
             print!("{}", codedb.callers_main_branch(&symbol_or_name)?);
+        }
+        Command::BlameSymbol {
+            db,
+            symbol_or_name,
+            branch,
+            json,
+        } => {
+            let codedb = codedb::CodeDb::open(db)?;
+            if json {
+                print!(
+                    "{}",
+                    codedb.blame_symbol_branch_json(&branch, &symbol_or_name)?
+                );
+            } else {
+                print!("{}", codedb.blame_symbol_branch(&branch, &symbol_or_name)?);
+            }
+        }
+        Command::BlameExpr {
+            db,
+            expr_hash,
+            branch,
+            json,
+        } => {
+            let codedb = codedb::CodeDb::open(db)?;
+            if json {
+                print!("{}", codedb.blame_expr_branch_json(&branch, &expr_hash)?);
+            } else {
+                print!("{}", codedb.blame_expr_branch(&branch, &expr_hash)?);
+            }
         }
         Command::Rename {
             db,
