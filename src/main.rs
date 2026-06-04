@@ -136,6 +136,15 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    #[command(about = "Emit and cache a deterministic native type layout artifact")]
+    EmitTypeLayout {
+        db: PathBuf,
+        type_source: String,
+        #[arg(long, default_value = codedb::DEFAULT_NATIVE_TARGET)]
+        target: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
     #[command(about = "Emit a native relocatable object artifact for one lowered function")]
     EmitObject {
         db: PathBuf,
@@ -687,6 +696,17 @@ fn main() -> Result<()> {
             let ir = codedb.emit_ir_main_branch(&function_name)?;
             std::fs::write(&out, ir)?;
             println!("emitted lowered IR {}", out.display());
+        }
+        Command::EmitTypeLayout {
+            db,
+            type_source,
+            target,
+            out,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            let layout = codedb.emit_type_layout_main_branch(&type_source, &target)?;
+            std::fs::write(&out, layout)?;
+            println!("emitted type layout {}", out.display());
         }
         Command::EmitObject {
             db,

@@ -10,6 +10,7 @@ pub mod debugger;
 mod diff;
 mod expr;
 mod jobs;
+mod layout;
 mod link;
 mod lowering;
 mod merge;

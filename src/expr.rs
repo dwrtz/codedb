@@ -1778,6 +1778,15 @@ impl CodeDb {
             TypeSpec::Named { type_symbol, .. } => {
                 deps.insert(type_symbol);
             }
+            TypeSpec::Reference { referent, .. } => {
+                self.collect_type_deps(&referent, deps)?;
+            }
+            TypeSpec::RawPointer { pointee, .. } => {
+                self.collect_type_deps(&pointee, deps)?;
+            }
+            TypeSpec::FixedArray { element, .. } => {
+                self.collect_type_deps(&element, deps)?;
+            }
             TypeSpec::Record(fields) | TypeSpec::Enum(fields) => {
                 for field in fields {
                     self.collect_type_deps(&field.type_hash, deps)?;
@@ -2361,6 +2370,17 @@ impl Parser {
 
     fn parse_type_source(&mut self) -> Result<String> {
         match self.next() {
+            Token::Symbol(symbol) if symbol == "&" => {
+                self.expect_symbol("'")?;
+                let region = self.expect_ident()?;
+                let mutable = self.consume_ident_value("mut");
+                let referent = self.parse_type_source()?;
+                if mutable {
+                    Ok(format!("&'{region} mut {referent}"))
+                } else {
+                    Ok(format!("&'{region} {referent}"))
+                }
+            }
             Token::Ident(name) => self.parse_type_source_after_ident(name),
             Token::Symbol(symbol) if symbol == "(" => {
                 self.expect_symbol(")")?;
@@ -2382,6 +2402,20 @@ impl Parser {
             "enum" => {
                 let variants = self.parse_type_fields()?;
                 Ok(format!("enum {{{}}}", variants.join(", ")))
+            }
+            "raw_ptr" | "raw_mut_ptr" => {
+                self.expect_symbol("<")?;
+                let pointee = self.parse_type_source()?;
+                self.expect_symbol(">")?;
+                Ok(format!("{name}<{pointee}>"))
+            }
+            "array" => {
+                self.expect_symbol("<")?;
+                let element = self.parse_type_source()?;
+                self.expect_symbol(",")?;
+                let len = self.expect_number()?;
+                self.expect_symbol(">")?;
+                Ok(format!("array<{element}, {len}>"))
             }
             _ => {
                 let path = self.finish_name_path(name)?;
@@ -2446,6 +2480,13 @@ impl Parser {
         match self.next() {
             Token::Ident(value) => Ok(value),
             other => bail!("expected identifier, got {other:?}"),
+        }
+    }
+
+    fn expect_number(&mut self) -> Result<String> {
+        match self.next() {
+            Token::Number(value) => Ok(value),
+            other => bail!("expected number, got {other:?}"),
         }
     }
 

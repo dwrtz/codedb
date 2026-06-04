@@ -21,6 +21,7 @@ pub(crate) enum ArtifactKind {
     FunctionDependencySet,
     InterfaceHash,
     ImplementationHash,
+    TypeLayout,
     LoweredIr,
     ObjectFile,
     LinkPlan,
@@ -36,6 +37,7 @@ impl ArtifactKind {
             ArtifactKind::FunctionDependencySet => "function_dependency_set",
             ArtifactKind::InterfaceHash => "interface_hash",
             ArtifactKind::ImplementationHash => "implementation_hash",
+            ArtifactKind::TypeLayout => "type_layout",
             ArtifactKind::LoweredIr => "lowered_ir",
             ArtifactKind::ObjectFile => "object_file",
             ArtifactKind::LinkPlan => "link_plan",
@@ -51,6 +53,7 @@ impl ArtifactKind {
             "function_dependency_set" => Some(ArtifactKind::FunctionDependencySet),
             "interface_hash" => Some(ArtifactKind::InterfaceHash),
             "implementation_hash" => Some(ArtifactKind::ImplementationHash),
+            "type_layout" => Some(ArtifactKind::TypeLayout),
             "lowered_ir" => Some(ArtifactKind::LoweredIr),
             "object_file" => Some(ArtifactKind::ObjectFile),
             "link_plan" => Some(ArtifactKind::LinkPlan),
@@ -63,6 +66,7 @@ impl ArtifactKind {
         matches!(
             self,
             ArtifactKind::LoweredIr
+                | ArtifactKind::TypeLayout
                 | ArtifactKind::ObjectFile
                 | ArtifactKind::LinkPlan
                 | ArtifactKind::Executable

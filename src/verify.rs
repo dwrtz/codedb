@@ -14,6 +14,7 @@ use crate::backend::native::{
 use crate::backend::{ArtifactKind, ObjectBackend, ObjectBackendInput};
 use crate::backend_c::ensure_no_forbidden_runtime_calls;
 use crate::diff::dependency_pairs;
+use crate::layout::{TYPE_LAYOUT_BACKEND_ID, TYPE_LAYOUT_SCHEMA, type_layout_cache_key_input};
 use crate::lowering::{
     LoweredFunctionIr, LoweredOp, lowered_op_id_for_value, lowered_value_debug_ops,
 };
@@ -612,6 +613,16 @@ impl CodeDb {
                     }
                 }
             }
+            Some("Reference") => {
+                self.check_hash_ref(parent_hash, "region", payload.get("region"), errors)?;
+                self.check_hash_ref(parent_hash, "referent", payload.get("referent"), errors)?;
+            }
+            Some("RawPointer") => {
+                self.check_hash_ref(parent_hash, "pointee", payload.get("pointee"), errors)?;
+            }
+            Some("FixedArray") => {
+                self.check_hash_ref(parent_hash, "element", payload.get("element"), errors)?;
+            }
             Some("Record") => {
                 for (idx, field) in payload
                     .get("fields")
@@ -726,6 +737,22 @@ impl CodeDb {
                         ));
                     }
                 }
+            }
+            Ok(crate::types::TypeSpec::Reference {
+                region, referent, ..
+            }) => {
+                if !allowed_regions.contains(&region) {
+                    errors.push(format!(
+                        "bad_type_def: {parent_hash}: invalid region reference {region}"
+                    ));
+                }
+                self.verify_type_region_args(parent_hash, &referent, allowed_regions, errors)?;
+            }
+            Ok(crate::types::TypeSpec::RawPointer { pointee, .. }) => {
+                self.verify_type_region_args(parent_hash, &pointee, allowed_regions, errors)?;
+            }
+            Ok(crate::types::TypeSpec::FixedArray { element, .. }) => {
+                self.verify_type_region_args(parent_hash, &element, allowed_regions, errors)?;
             }
             Ok(crate::types::TypeSpec::Record(fields))
             | Ok(crate::types::TypeSpec::Enum(fields)) => {
@@ -1938,6 +1965,9 @@ impl CodeDb {
                             errors, &cache_key, key_input, value,
                         )?;
                     }
+                    ArtifactKind::TypeLayout => {
+                        self.verify_type_layout_artifact(errors, &cache_key, key_input, value)?;
+                    }
                     ArtifactKind::ObjectFile => {
                         self.verify_object_artifact(
                             errors,
@@ -2210,6 +2240,105 @@ impl CodeDb {
             ));
         }
         Ok(())
+    }
+
+    fn verify_type_layout_artifact(
+        &self,
+        errors: &mut Vec<String>,
+        cache_key: &str,
+        key_input: &CacheKeyInput,
+        artifact_json: &JsonValue,
+    ) -> Result<()> {
+        let Some(metadata) = artifact_inner_metadata(artifact_json) else {
+            errors.push(format!(
+                "bad_type_layout: {cache_key} missing layout metadata"
+            ));
+            return Ok(());
+        };
+        if key_input.backend_id != TYPE_LAYOUT_BACKEND_ID {
+            errors.push(format!(
+                "bad_type_layout: {cache_key} cache key backend must be {TYPE_LAYOUT_BACKEND_ID}"
+            ));
+        }
+        if !key_input.dependency_interface_hashes.is_empty() {
+            errors.push(format!(
+                "bad_type_layout: {cache_key} cache key should not record interface dependencies"
+            ));
+        }
+        if metadata.get("schema").and_then(JsonValue::as_str) != Some(TYPE_LAYOUT_SCHEMA) {
+            errors.push(format!("bad_type_layout: {cache_key} schema mismatch"));
+        }
+        if metadata.get("type_hash").and_then(JsonValue::as_str)
+            != Some(key_input.input_hash.as_str())
+        {
+            errors.push(format!("bad_type_layout: {cache_key} type hash mismatch"));
+        }
+        if metadata.get("target_triple").and_then(JsonValue::as_str)
+            != Some(key_input.target_triple.as_str())
+        {
+            errors.push(format!("bad_type_layout: {cache_key} target mismatch"));
+        }
+        let Some(metadata_dependencies) = json_string_vec(metadata.get("type_dependency_hashes"))
+        else {
+            errors.push(format!(
+                "bad_type_layout: {cache_key} type_dependency_hashes must be a string array"
+            ));
+            return Ok(());
+        };
+        if metadata_dependencies != key_input.dependency_implementation_hashes {
+            errors.push(format!(
+                "bad_type_layout: {cache_key} dependency metadata does not match cache key"
+            ));
+        }
+
+        let candidates = self.indexed_program_roots()?;
+        if candidates.is_empty() {
+            errors.push(format!(
+                "bad_type_layout: {cache_key} cannot be recomputed: no indexed roots"
+            ));
+            return Ok(());
+        }
+        let mut last_error = None;
+        for root_hash in candidates {
+            let root = self.load_root(&root_hash)?;
+            match self.compute_type_layout(&root, &key_input.input_hash, &key_input.target_triple) {
+                Ok(expected) => {
+                    let expected_key = type_layout_cache_key_input(
+                        &key_input.input_hash,
+                        &key_input.target_triple,
+                        expected.dependency_type_def_hashes.clone(),
+                    );
+                    let expected_cache_key = cache_key_for_input(&expected_key)?;
+                    if &expected.metadata == metadata
+                        && expected.dependency_type_def_hashes
+                            == key_input.dependency_implementation_hashes
+                        && expected_cache_key == cache_key
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(err) => last_error = Some(err),
+            }
+        }
+        if let Some(err) = last_error {
+            errors.push(format!(
+                "bad_type_layout: {cache_key} cannot be recomputed from any indexed root: {err:#}"
+            ));
+        } else {
+            errors.push(format!(
+                "bad_type_layout: {cache_key} layout metadata does not match any indexed root"
+            ));
+        }
+        Ok(())
+    }
+
+    fn indexed_program_roots(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT hash FROM objects WHERE kind = 'ProgramRoot' ORDER BY hash")?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     fn dependency_symbols_for_indexed_roots(

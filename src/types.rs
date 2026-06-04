@@ -154,6 +154,19 @@ pub(crate) enum TypeSpec {
         type_symbol: String,
         region_args: Vec<String>,
     },
+    Reference {
+        region: String,
+        mutable: bool,
+        referent: String,
+    },
+    RawPointer {
+        mutable: bool,
+        pointee: String,
+    },
+    FixedArray {
+        element: String,
+        len: u64,
+    },
     Record(Vec<TypeFieldSpec>),
     Enum(Vec<TypeFieldSpec>),
 }
@@ -523,6 +536,49 @@ impl CodeDb {
                 }
                 Ok(source)
             }
+            TypeSpec::Reference {
+                region,
+                mutable,
+                referent,
+            } => {
+                let region_name = region_names
+                    .get(&region)
+                    .map(String::as_str)
+                    .unwrap_or(region.as_str());
+                let referent = self.type_name_in_root_with_regions(
+                    root,
+                    current_module,
+                    &referent,
+                    region_names,
+                )?;
+                if mutable {
+                    Ok(format!("&'{region_name} mut {referent}"))
+                } else {
+                    Ok(format!("&'{region_name} {referent}"))
+                }
+            }
+            TypeSpec::RawPointer { mutable, pointee } => {
+                let pointee = self.type_name_in_root_with_regions(
+                    root,
+                    current_module,
+                    &pointee,
+                    region_names,
+                )?;
+                if mutable {
+                    Ok(format!("raw_mut_ptr<{pointee}>"))
+                } else {
+                    Ok(format!("raw_ptr<{pointee}>"))
+                }
+            }
+            TypeSpec::FixedArray { element, len } => {
+                let element = self.type_name_in_root_with_regions(
+                    root,
+                    current_module,
+                    &element,
+                    region_names,
+                )?;
+                Ok(format!("array<{element}, {len}>"))
+            }
             TypeSpec::Record(fields) => {
                 let rendered = fields
                     .iter()
@@ -659,6 +715,26 @@ impl CodeDb {
             ParsedTypeSpec::Named { name, .. } => {
                 bail!("named type {name} requires root-aware resolution")
             }
+            ParsedTypeSpec::Reference {
+                region,
+                mutable,
+                referent,
+            } => {
+                bail!(
+                    "reference region '{region} requires root-aware resolution before resolving {referent:?} as mutable={mutable}"
+                )
+            }
+            ParsedTypeSpec::RawPointer { mutable, pointee } => {
+                let pointee = self.put_type_spec(pointee)?;
+                self.put_structural_type(TypeSpec::RawPointer {
+                    mutable: *mutable,
+                    pointee,
+                })
+            }
+            ParsedTypeSpec::FixedArray { element, len } => {
+                let element = self.put_type_spec(element)?;
+                self.put_structural_type(TypeSpec::FixedArray { element, len: *len })
+            }
             ParsedTypeSpec::Record(fields) => {
                 let fields = fields
                     .iter()
@@ -714,6 +790,33 @@ impl CodeDb {
                     type_symbol,
                     region_args,
                 })
+            }
+            ParsedTypeSpec::Reference {
+                region,
+                mutable,
+                referent,
+            } => {
+                let referent =
+                    self.put_type_spec_in_root(current_module, root, referent, region_scope)?;
+                let region = resolve_region_arg(region, region_scope)?;
+                self.put_structural_type(TypeSpec::Reference {
+                    region,
+                    mutable: *mutable,
+                    referent,
+                })
+            }
+            ParsedTypeSpec::RawPointer { mutable, pointee } => {
+                let pointee =
+                    self.put_type_spec_in_root(current_module, root, pointee, region_scope)?;
+                self.put_structural_type(TypeSpec::RawPointer {
+                    mutable: *mutable,
+                    pointee,
+                })
+            }
+            ParsedTypeSpec::FixedArray { element, len } => {
+                let element =
+                    self.put_type_spec_in_root(current_module, root, element, region_scope)?;
+                self.put_structural_type(TypeSpec::FixedArray { element, len: *len })
             }
             ParsedTypeSpec::Record(fields) => {
                 let fields = fields
@@ -779,6 +882,36 @@ impl CodeDb {
                     type_symbol,
                     region_args: resolve_region_args(region_args, region_scope)?,
                 })
+            }
+            ParsedTypeSpec::Reference {
+                region,
+                mutable,
+                referent,
+            } => {
+                let referent = self.type_hash_for_parsed_in_root(
+                    current_module,
+                    root,
+                    referent,
+                    region_scope,
+                )?;
+                hash_for_type_spec(&TypeSpec::Reference {
+                    region: resolve_region_arg(region, region_scope)?,
+                    mutable: *mutable,
+                    referent,
+                })
+            }
+            ParsedTypeSpec::RawPointer { mutable, pointee } => {
+                let pointee =
+                    self.type_hash_for_parsed_in_root(current_module, root, pointee, region_scope)?;
+                hash_for_type_spec(&TypeSpec::RawPointer {
+                    mutable: *mutable,
+                    pointee,
+                })
+            }
+            ParsedTypeSpec::FixedArray { element, len } => {
+                let element =
+                    self.type_hash_for_parsed_in_root(current_module, root, element, region_scope)?;
+                hash_for_type_spec(&TypeSpec::FixedArray { element, len: *len })
             }
             ParsedTypeSpec::Record(fields) => {
                 let fields = fields
@@ -1872,6 +2005,20 @@ impl CodeDb {
                 }
                 Ok(())
             }
+            TypeSpec::Reference {
+                region, referent, ..
+            } => {
+                if !allowed_regions.contains(&region) {
+                    bail!("invalid region reference {region}");
+                }
+                self.validate_type_hash_in_root(root, &referent, allowed_regions)
+            }
+            TypeSpec::RawPointer { pointee, .. } => {
+                self.validate_type_hash_in_root(root, &pointee, allowed_regions)
+            }
+            TypeSpec::FixedArray { element, .. } => {
+                self.validate_type_hash_in_root(root, &element, allowed_regions)
+            }
             TypeSpec::Record(fields) | TypeSpec::Enum(fields) => {
                 for field in fields {
                     self.validate_type_hash_in_root(root, &field.type_hash, allowed_regions)?;
@@ -2383,6 +2530,29 @@ impl TypeSpec {
                     Ok(format!("type<{type_symbol}<{}>>", region_args.join(", ")))
                 }
             }
+            TypeSpec::Reference {
+                region,
+                mutable,
+                referent,
+            } => {
+                let referent = db.type_name(referent)?;
+                if *mutable {
+                    Ok(format!("&'{region} mut {referent}"))
+                } else {
+                    Ok(format!("&'{region} {referent}"))
+                }
+            }
+            TypeSpec::RawPointer { mutable, pointee } => {
+                let pointee = db.type_name(pointee)?;
+                if *mutable {
+                    Ok(format!("raw_mut_ptr<{pointee}>"))
+                } else {
+                    Ok(format!("raw_ptr<{pointee}>"))
+                }
+            }
+            TypeSpec::FixedArray { element, len } => {
+                Ok(format!("array<{}, {len}>", db.type_name(element)?))
+            }
             TypeSpec::Record(fields) => {
                 let rendered = fields
                     .iter()
@@ -2426,6 +2596,19 @@ enum ParsedTypeSpec {
         name: String,
         region_args: Vec<String>,
     },
+    Reference {
+        region: String,
+        mutable: bool,
+        referent: Box<ParsedTypeSpec>,
+    },
+    RawPointer {
+        mutable: bool,
+        pointee: Box<ParsedTypeSpec>,
+    },
+    FixedArray {
+        element: Box<ParsedTypeSpec>,
+        len: u64,
+    },
     Record(Vec<ParsedTypeField>),
     Enum(Vec<ParsedTypeField>),
 }
@@ -2437,6 +2620,17 @@ impl ParsedTypeSpec {
             ParsedTypeSpec::Named { name, .. } => {
                 bail!("named type {name} requires root-aware resolution")
             }
+            ParsedTypeSpec::Reference { region, .. } => {
+                bail!("reference region '{region} requires root-aware resolution")
+            }
+            ParsedTypeSpec::RawPointer { mutable, pointee } => Ok(TypeSpec::RawPointer {
+                mutable: *mutable,
+                pointee: type_hash_for_spec(pointee)?,
+            }),
+            ParsedTypeSpec::FixedArray { element, len } => Ok(TypeSpec::FixedArray {
+                element: type_hash_for_spec(element)?,
+                len: *len,
+            }),
             ParsedTypeSpec::Record(fields) => Ok(TypeSpec::Record(
                 fields
                     .iter()
@@ -2476,7 +2670,13 @@ fn type_hash_for_spec(spec: &ParsedTypeSpec) -> Result<String> {
         ParsedTypeSpec::Named { name, .. } => {
             bail!("named type {name} requires root-aware resolution")
         }
-        ParsedTypeSpec::Record(_) | ParsedTypeSpec::Enum(_) => {
+        ParsedTypeSpec::Reference { region, .. } => {
+            bail!("reference region '{region} requires root-aware resolution")
+        }
+        ParsedTypeSpec::RawPointer { .. }
+        | ParsedTypeSpec::FixedArray { .. }
+        | ParsedTypeSpec::Record(_)
+        | ParsedTypeSpec::Enum(_) => {
             let payload = type_payload_for_spec(&spec.to_payload_spec()?)?;
             Ok(hash_object_canonical(
                 "Type",
@@ -2499,6 +2699,36 @@ pub(crate) fn type_payload_for_spec(spec: &TypeSpec) -> Result<JsonValue> {
                 "type_kind": "Named",
                 "type_symbol": type_symbol,
                 "region_args": region_args,
+            })
+        }
+        TypeSpec::Reference {
+            region,
+            mutable,
+            referent,
+        } => {
+            validate_region_arg(region)?;
+            validate_type_hash("reference referent", referent)?;
+            json!({
+                "type_kind": "Reference",
+                "region": region,
+                "mutable": mutable,
+                "referent": referent,
+            })
+        }
+        TypeSpec::RawPointer { mutable, pointee } => {
+            validate_type_hash("raw pointer pointee", pointee)?;
+            json!({
+                "type_kind": "RawPointer",
+                "mutable": mutable,
+                "pointee": pointee,
+            })
+        }
+        TypeSpec::FixedArray { element, len } => {
+            validate_type_hash("fixed array element", element)?;
+            json!({
+                "type_kind": "FixedArray",
+                "element": element,
+                "len": len,
             })
         }
         TypeSpec::Record(fields) => {
@@ -2557,6 +2787,55 @@ pub(crate) fn type_spec_from_payload(payload: &JsonValue) -> Result<TypeSpec> {
                 type_symbol,
                 region_args,
             })
+        }
+        "Reference" => {
+            let region = payload
+                .get("region")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("Reference Type object missing region"))?
+                .to_string();
+            validate_region_arg(&region)?;
+            let mutable = payload
+                .get("mutable")
+                .and_then(JsonValue::as_bool)
+                .ok_or_else(|| anyhow!("Reference Type object missing mutable"))?;
+            let referent = payload
+                .get("referent")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("Reference Type object missing referent"))?
+                .to_string();
+            validate_type_hash("reference referent", &referent)?;
+            Ok(TypeSpec::Reference {
+                region,
+                mutable,
+                referent,
+            })
+        }
+        "RawPointer" => {
+            let mutable = payload
+                .get("mutable")
+                .and_then(JsonValue::as_bool)
+                .ok_or_else(|| anyhow!("RawPointer Type object missing mutable"))?;
+            let pointee = payload
+                .get("pointee")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("RawPointer Type object missing pointee"))?
+                .to_string();
+            validate_type_hash("raw pointer pointee", &pointee)?;
+            Ok(TypeSpec::RawPointer { mutable, pointee })
+        }
+        "FixedArray" => {
+            let element = payload
+                .get("element")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("FixedArray Type object missing element"))?
+                .to_string();
+            validate_type_hash("fixed array element", &element)?;
+            let len = payload
+                .get("len")
+                .and_then(JsonValue::as_u64)
+                .ok_or_else(|| anyhow!("FixedArray Type object missing len"))?;
+            Ok(TypeSpec::FixedArray { element, len })
         }
         "Record" => Ok(TypeSpec::Record(type_fields_from_payload(
             "record field",
@@ -2654,9 +2933,21 @@ pub(crate) fn validate_member_defs(label: &str, members: &[TypeMemberDef]) -> Re
 
 pub(crate) fn validate_region_args(args: &[String]) -> Result<()> {
     for arg in args {
-        if !arg.starts_with("sha256:") {
-            bail!("region argument must be a region hash");
-        }
+        validate_region_arg(arg)?;
+    }
+    Ok(())
+}
+
+fn validate_region_arg(arg: &str) -> Result<()> {
+    if !arg.starts_with("sha256:") {
+        bail!("region argument must be a region hash");
+    }
+    Ok(())
+}
+
+fn validate_type_hash(label: &str, hash: &str) -> Result<()> {
+    if !hash.starts_with("sha256:") {
+        bail!("{label} type must be a hash");
     }
     Ok(())
 }
@@ -2727,13 +3018,15 @@ fn resolve_region_args(
     region_scope: &BTreeMap<String, String>,
 ) -> Result<Vec<String>> {
     args.iter()
-        .map(|arg| {
-            region_scope
-                .get(arg)
-                .cloned()
-                .ok_or_else(|| anyhow!("unknown region parameter '{arg}"))
-        })
+        .map(|arg| resolve_region_arg(arg, region_scope))
         .collect()
+}
+
+fn resolve_region_arg(arg: &str, region_scope: &BTreeMap<String, String>) -> Result<String> {
+    region_scope
+        .get(arg)
+        .cloned()
+        .ok_or_else(|| anyhow!("unknown region parameter '{arg}"))
 }
 
 fn hash_for_type_spec(spec: &TypeSpec) -> Result<String> {
@@ -2748,6 +3041,7 @@ fn hash_for_type_spec(spec: &TypeSpec) -> Result<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TypeToken {
     Ident(String),
+    Number(String),
     Symbol(String),
     Eof,
 }
@@ -2767,6 +3061,7 @@ impl TypeParser {
 
     fn parse_type(&mut self) -> Result<ParsedTypeSpec> {
         match self.next() {
+            TypeToken::Symbol(value) if value == "&" => self.parse_reference_type(),
             TypeToken::Ident(value) if value == "i64" || value == "I64" => {
                 Ok(ParsedTypeSpec::Builtin("I64".to_string()))
             }
@@ -2782,6 +3077,15 @@ impl TypeParser {
             TypeToken::Ident(value) if value == "enum" => {
                 Ok(ParsedTypeSpec::Enum(self.parse_fields("enum variant")?))
             }
+            TypeToken::Ident(value) if value == "raw_ptr" => Ok(ParsedTypeSpec::RawPointer {
+                mutable: false,
+                pointee: Box::new(self.parse_single_type_arg()?),
+            }),
+            TypeToken::Ident(value) if value == "raw_mut_ptr" => Ok(ParsedTypeSpec::RawPointer {
+                mutable: true,
+                pointee: Box::new(self.parse_single_type_arg()?),
+            }),
+            TypeToken::Ident(value) if value == "array" => self.parse_fixed_array_type(),
             TypeToken::Ident(value) => {
                 let name = self.finish_name_path(value)?;
                 let region_args = self.parse_optional_region_args()?;
@@ -2793,6 +3097,38 @@ impl TypeParser {
             }
             other => bail!("expected type, got {other:?}"),
         }
+    }
+
+    fn parse_reference_type(&mut self) -> Result<ParsedTypeSpec> {
+        self.expect_symbol("'")?;
+        let region = self.expect_ident()?;
+        validate_projection_identifier("reference region", &region)?;
+        let mutable = self.consume_ident_value("mut");
+        let referent = self.parse_type()?;
+        Ok(ParsedTypeSpec::Reference {
+            region,
+            mutable,
+            referent: Box::new(referent),
+        })
+    }
+
+    fn parse_single_type_arg(&mut self) -> Result<ParsedTypeSpec> {
+        self.expect_symbol("<")?;
+        let ty = self.parse_type()?;
+        self.expect_symbol(">")?;
+        Ok(ty)
+    }
+
+    fn parse_fixed_array_type(&mut self) -> Result<ParsedTypeSpec> {
+        self.expect_symbol("<")?;
+        let element = self.parse_type()?;
+        self.expect_symbol(",")?;
+        let len = self.expect_number()?;
+        self.expect_symbol(">")?;
+        Ok(ParsedTypeSpec::FixedArray {
+            element: Box::new(element),
+            len,
+        })
     }
 
     fn parse_fields(&mut self, label: &str) -> Result<Vec<ParsedTypeField>> {
@@ -2859,6 +3195,15 @@ impl TypeParser {
         }
     }
 
+    fn expect_number(&mut self) -> Result<u64> {
+        match self.next() {
+            TypeToken::Number(value) => value
+                .parse::<u64>()
+                .with_context(|| format!("invalid array length {value}")),
+            other => bail!("expected number, got {other:?}"),
+        }
+    }
+
     fn expect_symbol(&mut self, expected: &str) -> Result<()> {
         match self.next() {
             TypeToken::Symbol(value) if value == expected => Ok(()),
@@ -2869,6 +3214,16 @@ impl TypeParser {
     fn consume_symbol(&mut self, expected: &str) -> bool {
         match self.peek() {
             TypeToken::Symbol(value) if value == expected => {
+                self.pos += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn consume_ident_value(&mut self, expected: &str) -> bool {
+        match self.peek() {
+            TypeToken::Ident(value) if value == expected => {
                 self.pos += 1;
                 true
             }
@@ -2918,6 +3273,13 @@ fn lex_type(source: &str) -> Result<Vec<TypeToken>> {
                 i += 1;
             }
             tokens.push(TypeToken::Ident(chars[start..i].iter().collect()));
+        } else if ch.is_ascii_digit() {
+            let start = i;
+            i += 1;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            tokens.push(TypeToken::Number(chars[start..i].iter().collect()));
         } else {
             tokens.push(TypeToken::Symbol(ch.to_string()));
             i += 1;
