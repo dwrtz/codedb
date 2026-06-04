@@ -114,6 +114,79 @@ are rejected.
 { "kind": "delete_test", "name": "main_returns_120" }
 ```
 
+```json
+{
+  "kind": "create_type",
+  "name": "Line",
+  "birth_seed": "stable-type-seed",
+  "definition": {
+    "kind": "record",
+    "fields": [
+      { "name": "price_cents", "type": "i64" },
+      { "name": "qty", "type": "i64" }
+    ]
+  }
+}
+```
+
+```json
+{
+  "kind": "create_type",
+  "name": "LineView",
+  "region_params": ["a"],
+  "definition": {
+    "kind": "record",
+    "fields": [{ "name": "line", "type": "Line" }]
+  }
+}
+```
+
+```json
+{
+  "kind": "create_type",
+  "name": "Discount",
+  "definition": {
+    "kind": "enum",
+    "variants": [
+      { "name": "none", "type": "unit" },
+      { "name": "percent", "type": "i64" }
+    ]
+  }
+}
+```
+
+```json
+{ "kind": "rename_type", "name": "Line", "new_name": "InvoiceLine" }
+```
+
+```json
+{ "kind": "move_type", "name": "Line", "new_module": "billing" }
+```
+
+```json
+{ "kind": "add_field", "type": "Line", "field": { "name": "discount", "type": "i64" } }
+```
+
+```json
+{ "kind": "rename_field", "type": "Line", "field": "price_cents", "new_name": "amount_cents" }
+```
+
+```json
+{ "kind": "remove_field", "type": "Line", "field": "discount" }
+```
+
+```json
+{ "kind": "add_variant", "type": "Discount", "variant": { "name": "fixed", "type": "i64" } }
+```
+
+```json
+{ "kind": "rename_variant", "type": "Discount", "variant": "percent", "new_name": "pct" }
+```
+
+```json
+{ "kind": "remove_variant", "type": "Discount", "variant": "fixed" }
+```
+
 For non-create operations, `module` defaults to `main`. `symbol` may be supplied
 to bind directly to stable identity; otherwise CodeDB resolves `name` in the
 expected root. `move_symbol` changes the module metadata for the symbol's names
@@ -133,6 +206,11 @@ native agreement. Set `native_required: true` for v2 gates; unsupported native
 execution is then reported as a failed test with native status `unsupported`
 instead of a skipped native comparison.
 
+Type operations use a separate type namespace. `type_symbol`, `field_symbol`,
+and `variant_symbol` may be supplied to bind directly to stable identities;
+otherwise CodeDB resolves names in the expected root. Type, field, and variant
+renames preserve their stable symbols.
+
 ## Types
 
 Function signatures, parameters, let bindings, enum constructors, and structural
@@ -144,11 +222,35 @@ bool
 unit
 record {amount: i64, tax: i64}
 enum {none: unit, some: i64}
+Money
+views.LineView<'a>
 ```
 
 Record fields and enum variants are projection-safe identifiers. Record and enum
 type objects are structural and content-addressed; they do not imply heap
 allocation or a managed runtime.
+
+Named record and enum definitions are root-registered v2 type definitions:
+
+```text
+record Money {
+  cents: i64
+}
+
+record LineView<'a> {
+  line: Money
+}
+
+enum Discount {
+  none: unit
+  percent: i64
+}
+```
+
+Region parameters are declared on named type definitions and are represented by
+stable region identities. Reference types are reserved for the later v2
+reference phases; phase 3 validates region parameters and named type region
+arguments without introducing reference semantics.
 
 ## Effects
 

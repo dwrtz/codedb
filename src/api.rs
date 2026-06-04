@@ -9,7 +9,7 @@ use crate::expr::RawExpr;
 use crate::migrations::{MigrationStatus, Operation};
 use crate::model::{TestCategory, TestMode, TestValue};
 use crate::store::{CodeDb, canonical_json};
-use crate::types::{Effect, ParamSpec};
+use crate::types::{Effect, ParamSpec, TypeDefinitionKind, TypeMemberSpec};
 
 const APPLY_SCHEMA: &str = "codedb/apply/v1";
 const APPLY_RESULT_SCHEMA: &str = "codedb/apply-result/v1";
@@ -59,6 +59,128 @@ enum ApiOperation {
         link_name: String,
         #[serde(default)]
         library: Option<String>,
+        #[serde(default, alias = "expect_root")]
+        expect_root_hash: Option<String>,
+    },
+    CreateType {
+        #[serde(default = "default_module")]
+        module: String,
+        name: String,
+        #[serde(default)]
+        birth_seed: Option<String>,
+        #[serde(default)]
+        region_params: Vec<String>,
+        definition: TypeDefinitionKind,
+        #[serde(default, alias = "expect_root")]
+        expect_root_hash: Option<String>,
+    },
+    RenameType {
+        #[serde(default = "default_module")]
+        module: String,
+        #[serde(default)]
+        type_symbol: Option<String>,
+        #[serde(alias = "old_name")]
+        name: String,
+        new_name: String,
+        #[serde(default, alias = "expect_root")]
+        expect_root_hash: Option<String>,
+    },
+    MoveType {
+        #[serde(
+            default = "default_module",
+            alias = "from_module",
+            alias = "old_module"
+        )]
+        module: String,
+        #[serde(default)]
+        type_symbol: Option<String>,
+        name: String,
+        #[serde(alias = "to_module", alias = "target_module")]
+        new_module: String,
+        #[serde(default, alias = "expect_root")]
+        expect_root_hash: Option<String>,
+    },
+    AddField {
+        #[serde(default = "default_module")]
+        module: String,
+        #[serde(default)]
+        type_symbol: Option<String>,
+        #[serde(alias = "type", alias = "name")]
+        type_name: String,
+        field: TypeMemberSpec,
+        #[serde(default)]
+        field_birth_seed: Option<String>,
+        #[serde(default, alias = "expect_root")]
+        expect_root_hash: Option<String>,
+    },
+    RenameField {
+        #[serde(default = "default_module")]
+        module: String,
+        #[serde(default)]
+        type_symbol: Option<String>,
+        #[serde(alias = "type")]
+        type_name: String,
+        #[serde(default)]
+        field_symbol: Option<String>,
+        #[serde(alias = "field")]
+        old_name: String,
+        new_name: String,
+        #[serde(default, alias = "expect_root")]
+        expect_root_hash: Option<String>,
+    },
+    RemoveField {
+        #[serde(default = "default_module")]
+        module: String,
+        #[serde(default)]
+        type_symbol: Option<String>,
+        #[serde(alias = "type")]
+        type_name: String,
+        #[serde(default)]
+        field_symbol: Option<String>,
+        #[serde(alias = "field")]
+        name: String,
+        #[serde(default, alias = "expect_root")]
+        expect_root_hash: Option<String>,
+    },
+    AddVariant {
+        #[serde(default = "default_module")]
+        module: String,
+        #[serde(default)]
+        type_symbol: Option<String>,
+        #[serde(alias = "type", alias = "name")]
+        type_name: String,
+        variant: TypeMemberSpec,
+        #[serde(default)]
+        variant_birth_seed: Option<String>,
+        #[serde(default, alias = "expect_root")]
+        expect_root_hash: Option<String>,
+    },
+    RenameVariant {
+        #[serde(default = "default_module")]
+        module: String,
+        #[serde(default)]
+        type_symbol: Option<String>,
+        #[serde(alias = "type")]
+        type_name: String,
+        #[serde(default)]
+        variant_symbol: Option<String>,
+        #[serde(alias = "variant")]
+        old_name: String,
+        new_name: String,
+        #[serde(default, alias = "expect_root")]
+        expect_root_hash: Option<String>,
+    },
+    RemoveVariant {
+        #[serde(default = "default_module")]
+        module: String,
+        #[serde(default)]
+        type_symbol: Option<String>,
+        #[serde(alias = "type")]
+        type_name: String,
+        #[serde(default)]
+        variant_symbol: Option<String>,
+        #[serde(alias = "variant")]
+        name: String,
         #[serde(default, alias = "expect_root")]
         expect_root_hash: Option<String>,
     },
@@ -213,6 +335,33 @@ impl ApiOperation {
                 expect_root_hash, ..
             }
             | ApiOperation::CreateExternalFunction {
+                expect_root_hash, ..
+            }
+            | ApiOperation::CreateType {
+                expect_root_hash, ..
+            }
+            | ApiOperation::RenameType {
+                expect_root_hash, ..
+            }
+            | ApiOperation::MoveType {
+                expect_root_hash, ..
+            }
+            | ApiOperation::AddField {
+                expect_root_hash, ..
+            }
+            | ApiOperation::RenameField {
+                expect_root_hash, ..
+            }
+            | ApiOperation::RemoveField {
+                expect_root_hash, ..
+            }
+            | ApiOperation::AddVariant {
+                expect_root_hash, ..
+            }
+            | ApiOperation::RenameVariant {
+                expect_root_hash, ..
+            }
+            | ApiOperation::RemoveVariant {
                 expect_root_hash, ..
             }
             | ApiOperation::RenameSymbol {
@@ -562,6 +711,198 @@ impl CodeDb {
                 link_name: link_name.clone(),
                 library: library.clone(),
             }),
+            ApiOperation::CreateType {
+                module,
+                name,
+                birth_seed,
+                region_params,
+                definition,
+                ..
+            } => Ok(Operation::CreateType {
+                module: module.clone(),
+                name: name.clone(),
+                birth_seed: birth_seed
+                    .clone()
+                    .unwrap_or_else(|| format!("json:type:{module}:{name}")),
+                region_params: region_params.clone(),
+                definition: definition.clone(),
+            }),
+            ApiOperation::RenameType {
+                module,
+                type_symbol,
+                name,
+                new_name,
+                ..
+            } => {
+                let type_symbol = match type_symbol {
+                    Some(type_symbol) => type_symbol.clone(),
+                    None => match self.resolve_type_name(expected_root, module, name) {
+                        Ok(type_symbol) => type_symbol,
+                        Err(err) => self
+                            .resolve_type_name(expected_root, module, new_name)
+                            .map_err(|_| err)?,
+                    },
+                };
+                Ok(Operation::RenameType {
+                    module: module.clone(),
+                    type_symbol,
+                    old_name: name.clone(),
+                    new_name: new_name.clone(),
+                })
+            }
+            ApiOperation::MoveType {
+                module,
+                type_symbol,
+                name,
+                new_module,
+                ..
+            } => Ok(Operation::MoveType {
+                module: module.clone(),
+                type_symbol: self.type_symbol_or_resolve(
+                    expected_root,
+                    module,
+                    name,
+                    type_symbol,
+                )?,
+                name: name.clone(),
+                new_module: new_module.clone(),
+            }),
+            ApiOperation::AddField {
+                module,
+                type_symbol,
+                type_name,
+                field,
+                field_birth_seed,
+                ..
+            } => {
+                let resolved_type =
+                    self.type_symbol_or_resolve(expected_root, module, type_name, type_symbol)?;
+                Ok(Operation::AddField {
+                    module: module.clone(),
+                    type_symbol: resolved_type,
+                    type_name: type_name.clone(),
+                    field: field.clone(),
+                    field_birth_seed: field_birth_seed.clone().unwrap_or_else(|| {
+                        format!("json:type-field:{module}:{type_name}:{}", field.name)
+                    }),
+                })
+            }
+            ApiOperation::RenameField {
+                module,
+                type_symbol,
+                type_name,
+                field_symbol,
+                old_name,
+                new_name,
+                ..
+            } => {
+                let resolved_type =
+                    self.type_symbol_or_resolve(expected_root, module, type_name, type_symbol)?;
+                Ok(Operation::RenameField {
+                    module: module.clone(),
+                    field_symbol: self.field_symbol_or_resolve(
+                        expected_root,
+                        &resolved_type,
+                        old_name,
+                        field_symbol,
+                    )?,
+                    type_symbol: resolved_type,
+                    type_name: type_name.clone(),
+                    old_name: old_name.clone(),
+                    new_name: new_name.clone(),
+                })
+            }
+            ApiOperation::RemoveField {
+                module,
+                type_symbol,
+                type_name,
+                field_symbol,
+                name,
+                ..
+            } => {
+                let resolved_type =
+                    self.type_symbol_or_resolve(expected_root, module, type_name, type_symbol)?;
+                Ok(Operation::RemoveField {
+                    module: module.clone(),
+                    field_symbol: self.field_symbol_or_resolve(
+                        expected_root,
+                        &resolved_type,
+                        name,
+                        field_symbol,
+                    )?,
+                    type_symbol: resolved_type,
+                    type_name: type_name.clone(),
+                    name: name.clone(),
+                })
+            }
+            ApiOperation::AddVariant {
+                module,
+                type_symbol,
+                type_name,
+                variant,
+                variant_birth_seed,
+                ..
+            } => {
+                let resolved_type =
+                    self.type_symbol_or_resolve(expected_root, module, type_name, type_symbol)?;
+                Ok(Operation::AddVariant {
+                    module: module.clone(),
+                    type_symbol: resolved_type,
+                    type_name: type_name.clone(),
+                    variant: variant.clone(),
+                    variant_birth_seed: variant_birth_seed.clone().unwrap_or_else(|| {
+                        format!("json:type-variant:{module}:{type_name}:{}", variant.name)
+                    }),
+                })
+            }
+            ApiOperation::RenameVariant {
+                module,
+                type_symbol,
+                type_name,
+                variant_symbol,
+                old_name,
+                new_name,
+                ..
+            } => {
+                let resolved_type =
+                    self.type_symbol_or_resolve(expected_root, module, type_name, type_symbol)?;
+                Ok(Operation::RenameVariant {
+                    module: module.clone(),
+                    variant_symbol: self.variant_symbol_or_resolve(
+                        expected_root,
+                        &resolved_type,
+                        old_name,
+                        variant_symbol,
+                    )?,
+                    type_symbol: resolved_type,
+                    type_name: type_name.clone(),
+                    old_name: old_name.clone(),
+                    new_name: new_name.clone(),
+                })
+            }
+            ApiOperation::RemoveVariant {
+                module,
+                type_symbol,
+                type_name,
+                variant_symbol,
+                name,
+                ..
+            } => {
+                let resolved_type =
+                    self.type_symbol_or_resolve(expected_root, module, type_name, type_symbol)?;
+                Ok(Operation::RemoveVariant {
+                    module: module.clone(),
+                    variant_symbol: self.variant_symbol_or_resolve(
+                        expected_root,
+                        &resolved_type,
+                        name,
+                        variant_symbol,
+                    )?,
+                    type_symbol: resolved_type,
+                    type_name: type_name.clone(),
+                    name: name.clone(),
+                })
+            }
             ApiOperation::RenameSymbol {
                 module,
                 symbol,
@@ -746,6 +1087,50 @@ impl CodeDb {
             .map(Ok)
             .unwrap_or_else(|| self.resolve_name(root_hash, module, name))
             .with_context(|| anyhow!("failed to resolve {module}.{name}"))
+    }
+
+    fn type_symbol_or_resolve(
+        &self,
+        root_hash: &str,
+        module: &str,
+        name: &str,
+        type_symbol: &Option<String>,
+    ) -> Result<String> {
+        type_symbol
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| self.resolve_type_name(root_hash, module, name))
+            .with_context(|| anyhow!("failed to resolve type {module}.{name}"))
+    }
+
+    fn field_symbol_or_resolve(
+        &self,
+        root_hash: &str,
+        type_symbol: &str,
+        name: &str,
+        field_symbol: &Option<String>,
+    ) -> Result<String> {
+        if let Some(field_symbol) = field_symbol {
+            return Ok(field_symbol.clone());
+        }
+        let root = self.load_root(root_hash)?;
+        self.field_symbol_by_name(&root, type_symbol, name)
+            .with_context(|| anyhow!("failed to resolve field {name}"))
+    }
+
+    fn variant_symbol_or_resolve(
+        &self,
+        root_hash: &str,
+        type_symbol: &str,
+        name: &str,
+        variant_symbol: &Option<String>,
+    ) -> Result<String> {
+        if let Some(variant_symbol) = variant_symbol {
+            return Ok(variant_symbol.clone());
+        }
+        let root = self.load_root(root_hash)?;
+        self.variant_symbol_by_name(&root, type_symbol, name)
+            .with_context(|| anyhow!("failed to resolve variant {name}"))
     }
 }
 

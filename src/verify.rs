@@ -27,8 +27,9 @@ use crate::store::{
     hash_bytes, hash_object_canonical,
 };
 use crate::types::{
-    effect_names, type_payload_for_spec, type_spec_from_payload, validate_external_abi_tag,
-    validate_external_library_name, validate_external_link_name,
+    effect_names, member_defs_from_payload, region_params_from_payload, type_payload_for_spec,
+    type_spec_from_payload, validate_external_abi_tag, validate_external_library_name,
+    validate_external_link_name, validate_member_defs, validate_region_params,
 };
 use crate::{BYTES_DOMAIN, SCHEMA_VERSION};
 
@@ -123,6 +124,70 @@ impl CodeDb {
                 self.verify_type_object_references(parent_hash, payload, errors)?;
             }
             "SymbolBirth" => {}
+            "TypeDef" => {
+                self.check_hash_ref(
+                    parent_hash,
+                    "type_symbol",
+                    payload.get("type_symbol"),
+                    errors,
+                )?;
+                self.check_hash_ref(parent_hash, "definition", payload.get("definition"), errors)?;
+                match (
+                    payload.get("type_kind").and_then(JsonValue::as_str),
+                    payload.get("definition").and_then(JsonValue::as_str),
+                ) {
+                    (Some("record"), Some(definition)) => {
+                        if self.get_kind(definition).ok().as_deref() != Some("RecordDef") {
+                            errors.push(format!(
+                                "bad_type_def: {parent_hash} record definition is not RecordDef"
+                            ));
+                        }
+                    }
+                    (Some("enum"), Some(definition)) => {
+                        if self.get_kind(definition).ok().as_deref() != Some("EnumDef") {
+                            errors.push(format!(
+                                "bad_type_def: {parent_hash} enum definition is not EnumDef"
+                            ));
+                        }
+                    }
+                    (Some(other), _) => {
+                        errors.push(format!("bad_type_def: {parent_hash} unknown kind {other}"))
+                    }
+                    (None, _) => errors.push(format!("bad_type_def: {parent_hash} missing kind")),
+                }
+            }
+            "RecordDef" => {
+                self.check_hash_ref(
+                    parent_hash,
+                    "type_symbol",
+                    payload.get("type_symbol"),
+                    errors,
+                )?;
+                self.verify_type_definition_payload(
+                    parent_hash,
+                    "record field",
+                    "fields",
+                    "field_symbol",
+                    payload,
+                    errors,
+                )?;
+            }
+            "EnumDef" => {
+                self.check_hash_ref(
+                    parent_hash,
+                    "type_symbol",
+                    payload.get("type_symbol"),
+                    errors,
+                )?;
+                self.verify_type_definition_payload(
+                    parent_hash,
+                    "enum variant",
+                    "variants",
+                    "variant_symbol",
+                    payload,
+                    errors,
+                )?;
+            }
             "FunctionSignature" => {
                 self.check_hash_array_refs(parent_hash, "params", payload.get("params"), errors)?;
                 self.check_hash_ref(parent_hash, "return", payload.get("return"), errors)?;
@@ -337,6 +402,40 @@ impl CodeDb {
                     )?;
                 }
                 for (idx, entry) in payload
+                    .get("types")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("types[{idx}].type_symbol"),
+                        entry.get("type_symbol"),
+                        errors,
+                    )?;
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("types[{idx}].type_def"),
+                        entry.get("type_def"),
+                        errors,
+                    )?;
+                }
+                for (idx, entry) in payload
+                    .get("type_names")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("type_names[{idx}].type_symbol"),
+                        entry.get("type_symbol"),
+                        errors,
+                    )?;
+                }
+                for (idx, entry) in payload
                     .get("param_names")
                     .and_then(JsonValue::as_array)
                     .into_iter()
@@ -495,6 +594,24 @@ impl CodeDb {
     ) -> Result<()> {
         match payload.get("type_kind").and_then(JsonValue::as_str) {
             Some("I64" | "Bool" | "Unit") => {}
+            Some("Named") => {
+                self.check_hash_ref(
+                    parent_hash,
+                    "type_symbol",
+                    payload.get("type_symbol"),
+                    errors,
+                )?;
+                if let Some(args) = payload.get("region_args").and_then(JsonValue::as_array) {
+                    for (idx, arg) in args.iter().enumerate() {
+                        self.check_hash_ref(
+                            parent_hash,
+                            &format!("region_args[{idx}]"),
+                            Some(arg),
+                            errors,
+                        )?;
+                    }
+                }
+            }
             Some("Record") => {
                 for (idx, field) in payload
                     .get("fields")
@@ -528,6 +645,101 @@ impl CodeDb {
                 }
             }
             Some(_) | None => {}
+        }
+        Ok(())
+    }
+
+    fn verify_type_definition_payload(
+        &self,
+        parent_hash: &str,
+        label: &str,
+        members_key: &str,
+        member_symbol_key: &str,
+        payload: &JsonValue,
+        errors: &mut Vec<String>,
+    ) -> Result<()> {
+        let mut allowed_regions = BTreeSet::new();
+        match region_params_from_payload(payload.get("region_params")) {
+            Ok(params) => {
+                if let Err(err) = validate_region_params(&params) {
+                    errors.push(format!("bad_type_def: {parent_hash}: {err:#}"));
+                }
+                for (idx, param) in params.iter().enumerate() {
+                    allowed_regions.insert(param.region.clone());
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("region_params[{idx}].region"),
+                        Some(&JsonValue::String(param.region.clone())),
+                        errors,
+                    )?;
+                }
+            }
+            Err(err) => errors.push(format!("bad_type_def: {parent_hash}: {err:#}")),
+        }
+        match member_defs_from_payload(label, member_symbol_key, payload.get(members_key)) {
+            Ok(members) => {
+                if let Err(err) = validate_member_defs(label, &members) {
+                    errors.push(format!("bad_type_def: {parent_hash}: {err:#}"));
+                }
+                for (idx, member) in members.iter().enumerate() {
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("{members_key}[{idx}].{member_symbol_key}"),
+                        Some(&JsonValue::String(member.member_symbol.clone())),
+                        errors,
+                    )?;
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("{members_key}[{idx}].type"),
+                        Some(&JsonValue::String(member.type_hash.clone())),
+                        errors,
+                    )?;
+                    self.verify_type_region_args(
+                        parent_hash,
+                        &member.type_hash,
+                        &allowed_regions,
+                        errors,
+                    )?;
+                }
+            }
+            Err(err) => errors.push(format!("bad_type_def: {parent_hash}: {err:#}")),
+        }
+        Ok(())
+    }
+
+    fn verify_type_region_args(
+        &self,
+        parent_hash: &str,
+        type_hash: &str,
+        allowed_regions: &BTreeSet<String>,
+        errors: &mut Vec<String>,
+    ) -> Result<()> {
+        let Ok(payload) = self.get_payload(type_hash) else {
+            return Ok(());
+        };
+        match type_spec_from_payload(&payload) {
+            Ok(crate::types::TypeSpec::Named { region_args, .. }) => {
+                for region in region_args {
+                    if !allowed_regions.contains(&region) {
+                        errors.push(format!(
+                            "bad_type_def: {parent_hash}: invalid region reference {region}"
+                        ));
+                    }
+                }
+            }
+            Ok(crate::types::TypeSpec::Record(fields))
+            | Ok(crate::types::TypeSpec::Enum(fields)) => {
+                for field in fields {
+                    self.verify_type_region_args(
+                        parent_hash,
+                        &field.type_hash,
+                        allowed_regions,
+                        errors,
+                    )?;
+                }
+            }
+            Ok(crate::types::TypeSpec::Builtin(_)) => {}
+            Err(err) => errors.push(format!("bad_type_def: {parent_hash}: {err:#}")),
         }
         Ok(())
     }
@@ -918,6 +1130,25 @@ impl CodeDb {
             errors.push(format!("bad_index: root_symbols mismatch for {root_hash}"));
         }
 
+        let expected_types = root
+            .types
+            .iter()
+            .map(|entry| (entry.type_symbol.clone(), entry.type_def.clone()))
+            .collect::<BTreeSet<_>>();
+        let actual_types = {
+            let mut stmt = self.conn.prepare(
+                "SELECT type_symbol_hash, type_def_hash FROM root_types
+                 WHERE root_hash = ?1 ORDER BY type_symbol_hash",
+            )?;
+            stmt.query_map(params![root_hash], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?
+        };
+        if expected_types != actual_types {
+            errors.push(format!("bad_index: root_types mismatch for {root_hash}"));
+        }
+
         let expected_names = root
             .names
             .iter()
@@ -947,6 +1178,39 @@ impl CodeDb {
         };
         if expected_names != actual_names {
             errors.push(format!("bad_index: root_names mismatch for {root_hash}"));
+        }
+
+        let expected_type_names = root
+            .type_names
+            .iter()
+            .map(|binding| {
+                (
+                    binding.module.clone(),
+                    binding.display_name.clone(),
+                    binding.type_symbol.clone(),
+                    binding.is_preferred,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let actual_type_names = {
+            let mut stmt = self.conn.prepare(
+                "SELECT module_name, display_name, type_symbol_hash, is_preferred FROM root_type_names
+                 WHERE root_hash = ?1 ORDER BY module_name, display_name",
+            )?;
+            stmt.query_map(params![root_hash], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                ))
+            })?
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?
+        };
+        if expected_type_names != actual_type_names {
+            errors.push(format!(
+                "bad_index: root_type_names mismatch for {root_hash}"
+            ));
         }
         self.verify_projection_names(root_hash, root, errors);
         self.verify_module_metadata(root_hash, root, errors);
@@ -1068,6 +1332,20 @@ impl CodeDb {
                 errors.push(format!(
                     "bad_index: invalid display name for {} in {root_hash}: {err:#}",
                     binding.symbol
+                ));
+            }
+        }
+        for binding in &root.type_names {
+            if let Err(err) = validate_module_path("module", &binding.module) {
+                errors.push(format!(
+                    "bad_index: invalid module for type {} in {root_hash}: {err:#}",
+                    binding.type_symbol
+                ));
+            }
+            if let Err(err) = validate_projection_identifier("type name", &binding.display_name) {
+                errors.push(format!(
+                    "bad_index: invalid type name for {} in {root_hash}: {err:#}",
+                    binding.type_symbol
                 ));
             }
         }

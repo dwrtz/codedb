@@ -206,6 +206,12 @@ existing non-native-required tests remain compatible
 
 Goal: add stable named type identities and region parameters before adding memory-heavy features.
 
+Status: implemented. The root model now has `TypeDef`, `RecordDef`, and
+`EnumDef` objects, stable type/member/region identities, type-name indexes,
+record/enum projection syntax, root-aware named type resolution, structural
+type/member migrations, and verification for duplicate members and invalid
+region references.
+
 Deliverables:
 
 ```text

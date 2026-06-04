@@ -224,7 +224,9 @@ impl CodeDb {
 
         let genesis_root = self.put_program_root(&ProgramRootPayload {
             symbols: vec![],
+            types: vec![],
             names: vec![],
+            type_names: vec![],
             param_names: vec![],
             exports: vec![],
             tests: vec![],

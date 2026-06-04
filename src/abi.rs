@@ -194,7 +194,9 @@ mod tests {
         let second = symbol_hash("2222222222222222");
         let root = ProgramRootPayload {
             symbols: vec![root_symbol(&first), root_symbol(&second)],
+            types: vec![],
             names: vec![],
+            type_names: vec![],
             param_names: vec![],
             exports: vec![ExportBinding {
                 symbol: first,

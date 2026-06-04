@@ -456,7 +456,7 @@ impl CodeDb {
             );
         }
         for (idx, (arg, ty)) in args.iter().zip(param_types.iter()).enumerate() {
-            if !self.value_has_type(arg, ty)? {
+            if !self.value_has_type(&state.root, arg, ty)? {
                 bail!(
                     "argument {idx} has wrong type for {}: expected {}, got {arg}",
                     self.qualified_symbol_display(&state.root, symbol)?,

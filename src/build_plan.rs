@@ -217,6 +217,11 @@ impl CodeDb {
                 changed_symbols.insert(symbol);
             }
         }
+        if old_root.types != new_root.types {
+            raise_kind(&mut kind, BuildImpactKind::FullRebuild);
+            relink = true;
+            reasons.insert(BuildImpactReason::UnclassifiedRootChange);
+        }
 
         for symbol in all_symbols {
             match (old_symbols.get(&symbol), new_symbols.get(&symbol)) {
@@ -390,6 +395,7 @@ fn raise_kind(current: &mut BuildImpactKind, candidate: BuildImpactKind) {
 
 fn root_metadata_changed(old_root: &ProgramRootPayload, new_root: &ProgramRootPayload) -> bool {
     old_root.names != new_root.names
+        || old_root.type_names != new_root.type_names
         || old_root.param_names != new_root.param_names
         || old_root.tests != new_root.tests
         || old_root.metadata != new_root.metadata
@@ -573,11 +579,13 @@ mod tests {
                         signature: sig_i64.clone(),
                     },
                 ],
+                types: vec![],
                 names: vec![
                     name("leaf", &leaf_symbol),
                     name("mid", &mid_symbol),
                     name("root", &root_symbol),
                 ],
+                type_names: vec![],
                 param_names: vec![],
                 exports: vec![],
                 tests: vec![],
@@ -603,11 +611,13 @@ mod tests {
                         signature: sig_i64,
                     },
                 ],
+                types: vec![],
                 names: vec![
                     name("leaf", &leaf_symbol),
                     name("mid", &mid_symbol),
                     name("root", &root_symbol),
                 ],
+                type_names: vec![],
                 param_names: vec![],
                 exports: vec![],
                 tests: vec![],
@@ -742,11 +752,13 @@ mod tests {
                         signature: sig_no_args.clone(),
                     },
                 ],
+                types: vec![],
                 names: vec![
                     name("leaf", &leaf_symbol),
                     name("mid", &mid_symbol),
                     name("root", &root_symbol),
                 ],
+                type_names: vec![],
                 param_names: vec![],
                 exports: vec![],
                 tests: vec![],
@@ -772,11 +784,13 @@ mod tests {
                         signature: sig_no_args,
                     },
                 ],
+                types: vec![],
                 names: vec![
                     name("leaf", &leaf_symbol),
                     name("mid", &mid_symbol),
                     name("root", &root_symbol),
                 ],
+                type_names: vec![],
                 param_names: vec![],
                 exports: vec![],
                 tests: vec![],

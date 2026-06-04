@@ -7,7 +7,11 @@ use serde_json::Value as JsonValue;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProgramRootPayload {
     pub(crate) symbols: Vec<RootSymbolPayload>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) types: Vec<RootTypePayload>,
     pub(crate) names: Vec<NameBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) type_names: Vec<TypeNameBinding>,
     pub(crate) param_names: Vec<ParamNames>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) exports: Vec<ExportBinding>,
@@ -26,10 +30,24 @@ pub(crate) struct RootSymbolPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RootTypePayload {
+    pub(crate) type_symbol: String,
+    pub(crate) type_def: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct NameBinding {
     pub(crate) module: String,
     pub(crate) display_name: String,
     pub(crate) symbol: String,
+    pub(crate) is_preferred: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TypeNameBinding {
+    pub(crate) module: String,
+    pub(crate) display_name: String,
+    pub(crate) type_symbol: String,
     pub(crate) is_preferred: bool,
 }
 
@@ -152,11 +170,20 @@ pub(crate) struct TypeCheckResult {
 
 pub(crate) fn normalize_root(mut root: ProgramRootPayload) -> ProgramRootPayload {
     root.symbols.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    root.types.sort_by(|a, b| a.type_symbol.cmp(&b.type_symbol));
     root.names.sort_by(|a, b| {
         (&a.module, &a.display_name, &a.symbol, a.is_preferred).cmp(&(
             &b.module,
             &b.display_name,
             &b.symbol,
+            b.is_preferred,
+        ))
+    });
+    root.type_names.sort_by(|a, b| {
+        (&a.module, &a.display_name, &a.type_symbol, a.is_preferred).cmp(&(
+            &b.module,
+            &b.display_name,
+            &b.type_symbol,
             b.is_preferred,
         ))
     });
@@ -179,6 +206,7 @@ pub(crate) fn root_module_names(root: &ProgramRootPayload) -> BTreeSet<String> {
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
     modules.extend(root.names.iter().map(|binding| binding.module.clone()));
+    modules.extend(root.type_names.iter().map(|binding| binding.module.clone()));
     if modules.is_empty() {
         modules.insert("main".to_string());
     }
@@ -190,6 +218,7 @@ pub(crate) fn synchronize_module_metadata(root: &mut ProgramRootPayload) {
         .names
         .iter()
         .map(|binding| binding.module.clone())
+        .chain(root.type_names.iter().map(|binding| binding.module.clone()))
         .collect::<BTreeSet<_>>();
     if modules.is_empty() {
         root.metadata.remove(ROOT_MODULES_METADATA_KEY);
@@ -215,6 +244,13 @@ pub(crate) fn root_symbol_index(root: &ProgramRootPayload, symbol: &str) -> Resu
         .iter()
         .position(|entry| entry.symbol == symbol)
         .ok_or_else(|| anyhow!("symbol missing from root {symbol}"))
+}
+
+pub(crate) fn root_type_index(root: &ProgramRootPayload, type_symbol: &str) -> Result<usize> {
+    root.types
+        .iter()
+        .position(|entry| entry.type_symbol == type_symbol)
+        .ok_or_else(|| anyhow!("type missing from root {type_symbol}"))
 }
 
 pub(crate) fn upsert_param_names(root: &mut ProgramRootPayload, symbol: &str, names: Vec<String>) {
@@ -253,6 +289,23 @@ pub(crate) fn preferred_names(root: &ProgramRootPayload) -> Vec<NameBinding> {
     names
 }
 
+pub(crate) fn preferred_type_names(root: &ProgramRootPayload) -> Vec<TypeNameBinding> {
+    let mut names = root
+        .type_names
+        .iter()
+        .filter(|binding| binding.is_preferred)
+        .cloned()
+        .collect::<Vec<_>>();
+    names.sort_by(|a, b| {
+        (&a.module, &a.display_name, &a.type_symbol).cmp(&(
+            &b.module,
+            &b.display_name,
+            &b.type_symbol,
+        ))
+    });
+    names
+}
+
 pub(crate) fn preferred_binding<'a>(
     root: &'a ProgramRootPayload,
     symbol: &str,
@@ -261,6 +314,20 @@ pub(crate) fn preferred_binding<'a>(
         .iter()
         .find(|binding| binding.symbol == symbol && binding.is_preferred)
         .or_else(|| root.names.iter().find(|binding| binding.symbol == symbol))
+}
+
+pub(crate) fn preferred_type_binding<'a>(
+    root: &'a ProgramRootPayload,
+    type_symbol: &str,
+) -> Option<&'a TypeNameBinding> {
+    root.type_names
+        .iter()
+        .find(|binding| binding.type_symbol == type_symbol && binding.is_preferred)
+        .or_else(|| {
+            root.type_names
+                .iter()
+                .find(|binding| binding.type_symbol == type_symbol)
+        })
 }
 
 pub(crate) fn aliases_for(root: &ProgramRootPayload, symbol: &str) -> BTreeSet<String> {
@@ -297,6 +364,17 @@ pub(crate) fn resolve_name_in_root(
         .map(|binding| binding.symbol.clone())
 }
 
+pub(crate) fn resolve_type_name_in_root(
+    root: &ProgramRootPayload,
+    module: &str,
+    name: &str,
+) -> Option<String> {
+    root.type_names
+        .iter()
+        .find(|binding| binding.module == module && binding.display_name == name)
+        .map(|binding| binding.type_symbol.clone())
+}
+
 pub(crate) fn split_qualified_name(name: &str) -> Option<(&str, &str)> {
     let (module, local_name) = name.rsplit_once('.')?;
     if module.is_empty() || local_name.is_empty() {
@@ -316,6 +394,17 @@ pub(crate) fn resolve_function_name_in_root(
     resolve_name_in_root(root, current_module, name)
 }
 
+pub(crate) fn resolve_named_type_in_root(
+    root: &ProgramRootPayload,
+    current_module: &str,
+    name: &str,
+) -> Option<String> {
+    if let Some((module, local_name)) = split_qualified_name(name) {
+        return resolve_type_name_in_root(root, module, local_name);
+    }
+    resolve_type_name_in_root(root, current_module, name)
+}
+
 pub(crate) fn symbol_display_in_module(
     root: &ProgramRootPayload,
     current_module: &str,
@@ -332,6 +421,19 @@ pub(crate) fn symbol_display_in_module(
 pub(crate) fn qualified_symbol_display(root: &ProgramRootPayload, symbol: &str) -> Option<String> {
     let binding = preferred_binding(root, symbol)?;
     Some(format!("{}.{}", binding.module, binding.display_name))
+}
+
+pub(crate) fn type_symbol_display_in_module(
+    root: &ProgramRootPayload,
+    current_module: &str,
+    type_symbol: &str,
+) -> Option<String> {
+    let binding = preferred_type_binding(root, type_symbol)?;
+    if binding.module == current_module {
+        Some(binding.display_name.clone())
+    } else {
+        Some(format!("{}.{}", binding.module, binding.display_name))
+    }
 }
 
 pub(crate) fn validate_projection_identifier(label: &str, name: &str) -> Result<()> {

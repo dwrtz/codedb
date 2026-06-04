@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -7,7 +7,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::backend::ArtifactKind;
 use crate::expr::RawExpr;
 use crate::model::{
-    ProgramRootPayload, TypeCheckResult, resolve_function_name_in_root,
+    ProgramRootPayload, TypeCheckResult, resolve_function_name_in_root, resolve_named_type_in_root,
     validate_projection_identifier,
 };
 use crate::store::{CodeDb, canonical_json, hash_object_canonical};
@@ -19,6 +19,81 @@ pub struct ParamSpec {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypeMemberSpec {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TypeDefinitionKind {
+    Record { fields: Vec<TypeMemberSpec> },
+    Enum { variants: Vec<TypeMemberSpec> },
+}
+
+impl TypeDefinitionKind {
+    pub(crate) fn kind_name(&self) -> &'static str {
+        match self {
+            TypeDefinitionKind::Record { .. } => "record",
+            TypeDefinitionKind::Enum { .. } => "enum",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RegionParamDef {
+    pub(crate) region: String,
+    pub(crate) name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TypeMemberDef {
+    pub(crate) member_symbol: String,
+    pub(crate) name: String,
+    pub(crate) type_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TypeDefinition {
+    Record {
+        type_symbol: String,
+        region_params: Vec<RegionParamDef>,
+        fields: Vec<TypeMemberDef>,
+    },
+    Enum {
+        type_symbol: String,
+        region_params: Vec<RegionParamDef>,
+        variants: Vec<TypeMemberDef>,
+    },
+}
+
+impl TypeDefinition {
+    pub(crate) fn kind_name(&self) -> &'static str {
+        match self {
+            TypeDefinition::Record { .. } => "record",
+            TypeDefinition::Enum { .. } => "enum",
+        }
+    }
+
+    pub(crate) fn type_symbol(&self) -> &str {
+        match self {
+            TypeDefinition::Record { type_symbol, .. }
+            | TypeDefinition::Enum { type_symbol, .. } => type_symbol,
+        }
+    }
+
+    pub(crate) fn region_params(&self) -> &[RegionParamDef] {
+        match self {
+            TypeDefinition::Record { region_params, .. }
+            | TypeDefinition::Enum { region_params, .. } => region_params,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -75,6 +150,10 @@ pub(crate) struct TypeFieldSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TypeSpec {
     Builtin(String),
+    Named {
+        type_symbol: String,
+        region_args: Vec<String>,
+    },
     Record(Vec<TypeFieldSpec>),
     Enum(Vec<TypeFieldSpec>),
 }
@@ -96,14 +175,294 @@ impl CodeDb {
         Ok(())
     }
 
+    pub(crate) fn put_type_symbol_birth(
+        &mut self,
+        parent_history_hash: Option<&str>,
+        birth_seed: &str,
+    ) -> Result<String> {
+        self.put_symbol_birth_with_kind(parent_history_hash, birth_seed, "type")
+    }
+
+    pub(crate) fn put_region_param_birth(
+        &mut self,
+        parent_history_hash: Option<&str>,
+        owner_type_symbol: &str,
+        birth_seed: &str,
+    ) -> Result<String> {
+        self.put_owned_symbol_birth(
+            parent_history_hash,
+            birth_seed,
+            "region_param",
+            owner_type_symbol,
+        )
+    }
+
+    pub(crate) fn put_record_field_birth(
+        &mut self,
+        parent_history_hash: Option<&str>,
+        owner_type_symbol: &str,
+        birth_seed: &str,
+    ) -> Result<String> {
+        self.put_owned_symbol_birth(
+            parent_history_hash,
+            birth_seed,
+            "record_field",
+            owner_type_symbol,
+        )
+    }
+
+    pub(crate) fn put_enum_variant_birth(
+        &mut self,
+        parent_history_hash: Option<&str>,
+        owner_type_symbol: &str,
+        birth_seed: &str,
+    ) -> Result<String> {
+        self.put_owned_symbol_birth(
+            parent_history_hash,
+            birth_seed,
+            "enum_variant",
+            owner_type_symbol,
+        )
+    }
+
+    fn put_owned_symbol_birth(
+        &mut self,
+        parent_history_hash: Option<&str>,
+        birth_seed: &str,
+        symbol_kind: &str,
+        owner_type_symbol: &str,
+    ) -> Result<String> {
+        self.put_object(
+            "SymbolBirth",
+            &json!({
+                "symbol_kind": symbol_kind,
+                "owner_type_symbol": owner_type_symbol,
+                "birth_history_hash": parent_history_hash.unwrap_or("genesis"),
+                "local_nonce": birth_seed,
+            }),
+        )
+    }
+
+    pub(crate) fn put_type_def(
+        &mut self,
+        type_symbol: &str,
+        definition: &TypeDefinition,
+    ) -> Result<String> {
+        if definition.type_symbol() != type_symbol {
+            bail!("type definition symbol does not match TypeDef symbol");
+        }
+        let (type_kind, definition_hash) = match definition {
+            TypeDefinition::Record { .. } => ("record", self.put_record_def(definition)?),
+            TypeDefinition::Enum { .. } => ("enum", self.put_enum_def(definition)?),
+        };
+        self.put_object(
+            "TypeDef",
+            &json!({
+                "type_symbol": type_symbol,
+                "type_kind": type_kind,
+                "definition": definition_hash,
+            }),
+        )
+    }
+
+    pub(crate) fn put_record_def(&mut self, definition: &TypeDefinition) -> Result<String> {
+        let TypeDefinition::Record {
+            type_symbol,
+            region_params,
+            fields,
+        } = definition
+        else {
+            bail!("put_record_def requires record definition");
+        };
+        validate_region_params(region_params)?;
+        validate_member_defs("record field", fields)?;
+        self.put_object(
+            "RecordDef",
+            &json!({
+                "type_symbol": type_symbol,
+                "region_params": region_params
+                    .iter()
+                    .map(|param| json!({ "region": param.region, "name": param.name }))
+                    .collect::<Vec<_>>(),
+                "fields": fields
+                    .iter()
+                    .map(|field| {
+                        json!({
+                            "field_symbol": field.member_symbol,
+                            "name": field.name,
+                            "type": field.type_hash,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            }),
+        )
+    }
+
+    pub(crate) fn put_enum_def(&mut self, definition: &TypeDefinition) -> Result<String> {
+        let TypeDefinition::Enum {
+            type_symbol,
+            region_params,
+            variants,
+        } = definition
+        else {
+            bail!("put_enum_def requires enum definition");
+        };
+        validate_region_params(region_params)?;
+        validate_member_defs("enum variant", variants)?;
+        self.put_object(
+            "EnumDef",
+            &json!({
+                "type_symbol": type_symbol,
+                "region_params": region_params
+                    .iter()
+                    .map(|param| json!({ "region": param.region, "name": param.name }))
+                    .collect::<Vec<_>>(),
+                "variants": variants
+                    .iter()
+                    .map(|variant| {
+                        json!({
+                            "variant_symbol": variant.member_symbol,
+                            "name": variant.name,
+                            "type": variant.type_hash,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            }),
+        )
+    }
+
+    pub(crate) fn type_definition(&self, type_def_hash: &str) -> Result<TypeDefinition> {
+        if self.get_kind(type_def_hash)? != "TypeDef" {
+            bail!("type definition hash points to non-TypeDef object {type_def_hash}");
+        }
+        let type_def = self.get_payload(type_def_hash)?;
+        let type_symbol = type_def
+            .get("type_symbol")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("TypeDef missing type_symbol"))?
+            .to_string();
+        let type_kind = type_def
+            .get("type_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("TypeDef missing type_kind"))?;
+        let definition_hash = type_def
+            .get("definition")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("TypeDef missing definition"))?;
+        match type_kind {
+            "record" => self.record_definition(&type_symbol, definition_hash),
+            "enum" => self.enum_definition(&type_symbol, definition_hash),
+            other => bail!("unknown TypeDef type_kind {other}"),
+        }
+    }
+
+    pub(crate) fn record_definition(
+        &self,
+        expected_type_symbol: &str,
+        record_def_hash: &str,
+    ) -> Result<TypeDefinition> {
+        if self.get_kind(record_def_hash)? != "RecordDef" {
+            bail!("record definition hash points to non-RecordDef object {record_def_hash}");
+        }
+        let payload = self.get_payload(record_def_hash)?;
+        let type_symbol = payload
+            .get("type_symbol")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("RecordDef missing type_symbol"))?
+            .to_string();
+        if type_symbol != expected_type_symbol {
+            bail!("RecordDef type_symbol does not match TypeDef");
+        }
+        let region_params = region_params_from_payload(payload.get("region_params"))?;
+        let fields =
+            member_defs_from_payload("record field", "field_symbol", payload.get("fields"))?;
+        validate_region_params(&region_params)?;
+        validate_member_defs("record field", &fields)?;
+        Ok(TypeDefinition::Record {
+            type_symbol,
+            region_params,
+            fields,
+        })
+    }
+
+    pub(crate) fn enum_definition(
+        &self,
+        expected_type_symbol: &str,
+        enum_def_hash: &str,
+    ) -> Result<TypeDefinition> {
+        if self.get_kind(enum_def_hash)? != "EnumDef" {
+            bail!("enum definition hash points to non-EnumDef object {enum_def_hash}");
+        }
+        let payload = self.get_payload(enum_def_hash)?;
+        let type_symbol = payload
+            .get("type_symbol")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("EnumDef missing type_symbol"))?
+            .to_string();
+        if type_symbol != expected_type_symbol {
+            bail!("EnumDef type_symbol does not match TypeDef");
+        }
+        let region_params = region_params_from_payload(payload.get("region_params"))?;
+        let variants =
+            member_defs_from_payload("enum variant", "variant_symbol", payload.get("variants"))?;
+        validate_region_params(&region_params)?;
+        validate_member_defs("enum variant", &variants)?;
+        Ok(TypeDefinition::Enum {
+            type_symbol,
+            region_params,
+            variants,
+        })
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn resolve_type(&mut self, ty: &str) -> Result<String> {
         let parsed = parse_type_source(ty)?;
         self.put_type_spec(&parsed)
     }
 
+    pub(crate) fn resolve_type_in_root(
+        &mut self,
+        current_module: &str,
+        root: &ProgramRootPayload,
+        ty: &str,
+    ) -> Result<String> {
+        self.resolve_type_in_root_with_regions(current_module, root, ty, &BTreeMap::new())
+    }
+
+    pub(crate) fn resolve_type_in_root_with_regions(
+        &mut self,
+        current_module: &str,
+        root: &ProgramRootPayload,
+        ty: &str,
+        region_scope: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        let parsed = parse_type_source(ty)?;
+        self.put_type_spec_in_root(current_module, root, &parsed, region_scope)
+    }
+
     pub(crate) fn type_hash_for_source(&self, ty: &str) -> Result<String> {
         let parsed = parse_type_source(ty)?;
-        Ok(type_hash_for_spec(&parsed))
+        type_hash_for_spec(&parsed)
+    }
+
+    pub(crate) fn type_hash_for_source_in_root(
+        &self,
+        current_module: &str,
+        root: &ProgramRootPayload,
+        ty: &str,
+    ) -> Result<String> {
+        self.type_hash_for_source_in_root_with_regions(current_module, root, ty, &BTreeMap::new())
+    }
+
+    pub(crate) fn type_hash_for_source_in_root_with_regions(
+        &self,
+        current_module: &str,
+        root: &ProgramRootPayload,
+        ty: &str,
+        region_scope: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        let parsed = parse_type_source(ty)?;
+        self.type_hash_for_parsed_in_root(current_module, root, &parsed, region_scope)
     }
 
     pub(crate) fn type_name(&self, hash: &str) -> Result<String> {
@@ -115,6 +474,92 @@ impl CodeDb {
             Ok("unit".to_string())
         } else {
             self.type_spec(hash)?.to_source(self)
+        }
+    }
+
+    pub(crate) fn type_name_in_root(
+        &self,
+        root: &ProgramRootPayload,
+        current_module: &str,
+        hash: &str,
+    ) -> Result<String> {
+        self.type_name_in_root_with_regions(root, current_module, hash, &BTreeMap::new())
+    }
+
+    pub(crate) fn type_name_in_root_with_regions(
+        &self,
+        root: &ProgramRootPayload,
+        current_module: &str,
+        hash: &str,
+        region_names: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        if hash == type_hash_for("I64") {
+            return Ok("i64".to_string());
+        }
+        if hash == type_hash_for("Bool") {
+            return Ok("bool".to_string());
+        }
+        if hash == type_hash_for("Unit") {
+            return Ok("unit".to_string());
+        }
+        match self.type_spec(hash)? {
+            TypeSpec::Named {
+                type_symbol,
+                region_args,
+            } => {
+                let mut source =
+                    self.type_symbol_display_for_module(root, current_module, &type_symbol)?;
+                if !region_args.is_empty() {
+                    let args = region_args
+                        .iter()
+                        .map(|region| {
+                            region_names
+                                .get(region)
+                                .map(|name| format!("'{name}"))
+                                .unwrap_or_else(|| region.clone())
+                        })
+                        .collect::<Vec<_>>();
+                    source.push_str(&format!("<{}>", args.join(", ")));
+                }
+                Ok(source)
+            }
+            TypeSpec::Record(fields) => {
+                let rendered = fields
+                    .iter()
+                    .map(|field| {
+                        Ok(format!(
+                            "{}: {}",
+                            field.name,
+                            self.type_name_in_root_with_regions(
+                                root,
+                                current_module,
+                                &field.type_hash,
+                                region_names,
+                            )?
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(format!("record {{{}}}", rendered.join(", ")))
+            }
+            TypeSpec::Enum(variants) => {
+                let rendered = variants
+                    .iter()
+                    .map(|variant| {
+                        Ok(format!(
+                            "{}: {}",
+                            variant.name,
+                            self.type_name_in_root_with_regions(
+                                root,
+                                current_module,
+                                &variant.type_hash,
+                                region_names,
+                            )?
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(format!("enum {{{}}}", rendered.join(", ")))
+            }
+            TypeSpec::Builtin(_) => self.type_name(hash),
         }
     }
 
@@ -134,8 +579,48 @@ impl CodeDb {
         type_spec_from_payload(&self.get_payload(hash)?)
     }
 
-    pub(crate) fn record_field_type(&self, type_hash: &str, field: &str) -> Result<String> {
+    pub(crate) fn type_spec_in_root(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+    ) -> Result<TypeSpec> {
         match self.type_spec(type_hash)? {
+            TypeSpec::Named { type_symbol, .. } => {
+                let entry = self
+                    .root_type(root, &type_symbol)
+                    .ok_or_else(|| anyhow!("named type missing from root {type_symbol}"))?;
+                match self.type_definition(&entry.type_def)? {
+                    TypeDefinition::Record { fields, .. } => Ok(TypeSpec::Record(
+                        fields
+                            .into_iter()
+                            .map(|field| TypeFieldSpec {
+                                name: field.name,
+                                type_hash: field.type_hash,
+                            })
+                            .collect(),
+                    )),
+                    TypeDefinition::Enum { variants, .. } => Ok(TypeSpec::Enum(
+                        variants
+                            .into_iter()
+                            .map(|variant| TypeFieldSpec {
+                                name: variant.name,
+                                type_hash: variant.type_hash,
+                            })
+                            .collect(),
+                    )),
+                }
+            }
+            other => Ok(other),
+        }
+    }
+
+    pub(crate) fn record_field_type_in_root(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+        field: &str,
+    ) -> Result<String> {
+        match self.type_spec_in_root(root, type_hash)? {
             TypeSpec::Record(fields) => fields
                 .into_iter()
                 .find(|candidate| candidate.name == field)
@@ -148,8 +633,13 @@ impl CodeDb {
         }
     }
 
-    pub(crate) fn enum_variant_type(&self, type_hash: &str, variant: &str) -> Result<String> {
-        match self.type_spec(type_hash)? {
+    pub(crate) fn enum_variant_type_in_root(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+        variant: &str,
+    ) -> Result<String> {
+        match self.type_spec_in_root(root, type_hash)? {
             TypeSpec::Enum(variants) => variants
                 .into_iter()
                 .find(|candidate| candidate.name == variant)
@@ -162,9 +652,13 @@ impl CodeDb {
         }
     }
 
+    #[allow(dead_code)]
     fn put_type_spec(&mut self, spec: &ParsedTypeSpec) -> Result<String> {
         match spec {
             ParsedTypeSpec::Builtin(kind) => Ok(type_hash_for(kind)),
+            ParsedTypeSpec::Named { name, .. } => {
+                bail!("named type {name} requires root-aware resolution")
+            }
             ParsedTypeSpec::Record(fields) => {
                 let fields = fields
                     .iter()
@@ -188,6 +682,137 @@ impl CodeDb {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 self.put_structural_type(TypeSpec::Enum(variants))
+            }
+        }
+    }
+
+    fn put_type_spec_in_root(
+        &mut self,
+        current_module: &str,
+        root: &ProgramRootPayload,
+        spec: &ParsedTypeSpec,
+        region_scope: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        match spec {
+            ParsedTypeSpec::Builtin(kind) => Ok(type_hash_for(kind)),
+            ParsedTypeSpec::Named { name, region_args } => {
+                let type_symbol = resolve_named_type_in_root(root, current_module, name)
+                    .ok_or_else(|| anyhow!("unknown type {name}"))?;
+                let entry = self
+                    .root_type(root, &type_symbol)
+                    .ok_or_else(|| anyhow!("type {name} missing root definition"))?;
+                let definition = self.type_definition(&entry.type_def)?;
+                if definition.region_params().len() != region_args.len() {
+                    bail!(
+                        "type {name} expects {} region args, got {}",
+                        definition.region_params().len(),
+                        region_args.len()
+                    );
+                }
+                let region_args = resolve_region_args(region_args, region_scope)?;
+                self.put_structural_type(TypeSpec::Named {
+                    type_symbol,
+                    region_args,
+                })
+            }
+            ParsedTypeSpec::Record(fields) => {
+                let fields = fields
+                    .iter()
+                    .map(|field| {
+                        Ok(TypeFieldSpec {
+                            name: field.name.clone(),
+                            type_hash: self.put_type_spec_in_root(
+                                current_module,
+                                root,
+                                &field.ty,
+                                region_scope,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.put_structural_type(TypeSpec::Record(fields))
+            }
+            ParsedTypeSpec::Enum(variants) => {
+                let variants = variants
+                    .iter()
+                    .map(|variant| {
+                        Ok(TypeFieldSpec {
+                            name: variant.name.clone(),
+                            type_hash: self.put_type_spec_in_root(
+                                current_module,
+                                root,
+                                &variant.ty,
+                                region_scope,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.put_structural_type(TypeSpec::Enum(variants))
+            }
+        }
+    }
+
+    fn type_hash_for_parsed_in_root(
+        &self,
+        current_module: &str,
+        root: &ProgramRootPayload,
+        spec: &ParsedTypeSpec,
+        region_scope: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        match spec {
+            ParsedTypeSpec::Builtin(kind) => Ok(type_hash_for(kind)),
+            ParsedTypeSpec::Named { name, region_args } => {
+                let type_symbol = resolve_named_type_in_root(root, current_module, name)
+                    .ok_or_else(|| anyhow!("unknown type {name}"))?;
+                let entry = self
+                    .root_type(root, &type_symbol)
+                    .ok_or_else(|| anyhow!("type {name} missing root definition"))?;
+                let definition = self.type_definition(&entry.type_def)?;
+                if definition.region_params().len() != region_args.len() {
+                    bail!(
+                        "type {name} expects {} region args, got {}",
+                        definition.region_params().len(),
+                        region_args.len()
+                    );
+                }
+                hash_for_type_spec(&TypeSpec::Named {
+                    type_symbol,
+                    region_args: resolve_region_args(region_args, region_scope)?,
+                })
+            }
+            ParsedTypeSpec::Record(fields) => {
+                let fields = fields
+                    .iter()
+                    .map(|field| {
+                        Ok(TypeFieldSpec {
+                            name: field.name.clone(),
+                            type_hash: self.type_hash_for_parsed_in_root(
+                                current_module,
+                                root,
+                                &field.ty,
+                                region_scope,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                hash_for_type_spec(&TypeSpec::Record(fields))
+            }
+            ParsedTypeSpec::Enum(variants) => {
+                let variants = variants
+                    .iter()
+                    .map(|variant| {
+                        Ok(TypeFieldSpec {
+                            name: variant.name.clone(),
+                            type_hash: self.type_hash_for_parsed_in_root(
+                                current_module,
+                                root,
+                                &variant.ty,
+                                region_scope,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                hash_for_type_spec(&TypeSpec::Enum(variants))
             }
         }
     }
@@ -277,10 +902,19 @@ impl CodeDb {
         parent_history_hash: Option<&str>,
         birth_seed: &str,
     ) -> Result<String> {
+        self.put_symbol_birth_with_kind(parent_history_hash, birth_seed, "function")
+    }
+
+    pub(crate) fn put_symbol_birth_with_kind(
+        &mut self,
+        parent_history_hash: Option<&str>,
+        birth_seed: &str,
+        symbol_kind: &str,
+    ) -> Result<String> {
         self.put_object(
             "SymbolBirth",
             &json!({
-                "symbol_kind": "function",
+                "symbol_kind": symbol_kind,
                 "birth_history_hash": parent_history_hash.unwrap_or("genesis"),
                 "local_nonce": birth_seed,
             }),
@@ -568,7 +1202,7 @@ impl CodeDb {
                         locals,
                     )?;
                     for field in fields.split('.') {
-                        typed = self.type_field_access(&typed, field)?;
+                        typed = self.type_field_access(root, &typed, field)?;
                     }
                     return Ok(typed);
                 }
@@ -772,7 +1406,7 @@ impl CodeDb {
                 body,
             } => {
                 validate_projection_identifier("let binding", name)?;
-                let binding_type = self.resolve_type(ty)?;
+                let binding_type = self.resolve_type_in_root(current_module, root, ty)?;
                 let value = self.type_expr_with_locals(
                     current_module,
                     value,
@@ -949,7 +1583,7 @@ impl CodeDb {
                     param_types,
                     locals,
                 )?;
-                self.type_field_access(&target, field)
+                self.type_field_access(root, &target, field)
             }
             RawExpr::EnumConstruct {
                 enum_type,
@@ -957,8 +1591,9 @@ impl CodeDb {
                 value,
             } => {
                 validate_projection_identifier("enum variant", variant)?;
-                let enum_type_hash = self.resolve_type(enum_type)?;
-                let variant_type = self.enum_variant_type(&enum_type_hash, variant)?;
+                let enum_type_hash = self.resolve_type_in_root(current_module, root, enum_type)?;
+                let variant_type =
+                    self.enum_variant_type_in_root(root, &enum_type_hash, variant)?;
                 let typed_value = self.type_expr_with_locals(
                     current_module,
                     value,
@@ -1004,7 +1639,9 @@ impl CodeDb {
                     param_types,
                     locals,
                 )?;
-                let TypeSpec::Enum(variants) = self.type_spec(&scrutinee.type_hash)? else {
+                let TypeSpec::Enum(variants) =
+                    self.type_spec_in_root(root, &scrutinee.type_hash)?
+                else {
                     bail!(
                         "case expression requires enum type, got {}",
                         self.type_name(&scrutinee.type_hash)?
@@ -1100,10 +1737,11 @@ impl CodeDb {
 
     fn type_field_access(
         &mut self,
+        root: &ProgramRootPayload,
         target: &TypeCheckResult,
         field: &str,
     ) -> Result<TypeCheckResult> {
-        let field_type = self.record_field_type(&target.type_hash, field)?;
+        let field_type = self.record_field_type_in_root(root, &target.type_hash, field)?;
         let expr_hash = self.put_object(
             "Expression",
             &json!({
@@ -1128,9 +1766,14 @@ impl CodeDb {
 
     pub(crate) fn type_check_root(&self, root_hash: &str) -> Result<()> {
         let root = self.load_root(root_hash)?;
+        self.validate_root_type_definitions(&root)?;
         for entry in &root.symbols {
             let (param_types, return_type) = self.signature_parts(&entry.signature)?;
             self.signature_effects(&entry.signature)?;
+            for param_type in &param_types {
+                self.validate_type_hash_in_root(&root, param_type, &BTreeSet::new())?;
+            }
+            self.validate_type_hash_in_root(&root, &return_type, &BTreeSet::new())?;
             let definition_signature = self.function_signature_hash(&entry.definition)?;
             if definition_signature != entry.signature {
                 bail!(
@@ -1165,6 +1808,77 @@ impl CodeDb {
         }
         self.validate_tests_for_root(root_hash, &root)?;
         Ok(())
+    }
+
+    fn validate_root_type_definitions(&self, root: &ProgramRootPayload) -> Result<()> {
+        for entry in &root.types {
+            let definition = self.type_definition(&entry.type_def)?;
+            if definition.type_symbol() != entry.type_symbol {
+                bail!("bad_type_def: root type symbol does not match TypeDef");
+            }
+            let allowed_regions = definition
+                .region_params()
+                .iter()
+                .map(|param| param.region.clone())
+                .collect::<BTreeSet<_>>();
+            match definition {
+                TypeDefinition::Record { fields, .. } => {
+                    for field in fields {
+                        self.validate_type_hash_in_root(root, &field.type_hash, &allowed_regions)?;
+                    }
+                }
+                TypeDefinition::Enum { variants, .. } => {
+                    for variant in variants {
+                        self.validate_type_hash_in_root(
+                            root,
+                            &variant.type_hash,
+                            &allowed_regions,
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_type_hash_in_root(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+        allowed_regions: &BTreeSet<String>,
+    ) -> Result<()> {
+        match self.type_spec(type_hash)? {
+            TypeSpec::Builtin(_) => Ok(()),
+            TypeSpec::Named {
+                type_symbol,
+                region_args,
+            } => {
+                let entry = self
+                    .root_type(root, &type_symbol)
+                    .ok_or_else(|| anyhow!("named type missing from root {type_symbol}"))?;
+                let definition = self.type_definition(&entry.type_def)?;
+                if definition.region_params().len() != region_args.len() {
+                    bail!(
+                        "named type {} expects {} region args, got {}",
+                        type_symbol,
+                        definition.region_params().len(),
+                        region_args.len()
+                    );
+                }
+                for region in region_args {
+                    if !allowed_regions.contains(&region) {
+                        bail!("invalid region reference {region}");
+                    }
+                }
+                Ok(())
+            }
+            TypeSpec::Record(fields) | TypeSpec::Enum(fields) => {
+                for field in fields {
+                    self.validate_type_hash_in_root(root, &field.type_hash, allowed_regions)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn verify_function_effects(
@@ -1450,7 +2164,7 @@ impl CodeDb {
                 validate_projection_identifier("record field", field)?;
                 let target_type =
                     self.verify_expr_type_with_locals(target_hash, root, param_types, locals)?;
-                self.record_field_type(&target_type, field)?
+                self.record_field_type_in_root(root, &target_type, field)?
             }
             "enum_construct" => {
                 let enum_type = payload
@@ -1465,7 +2179,7 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("enum_construct missing variant"))?;
                 validate_projection_identifier("enum variant", variant)?;
-                let variant_type = self.enum_variant_type(enum_type, variant)?;
+                let variant_type = self.enum_variant_type_in_root(root, enum_type, variant)?;
                 let value_hash = payload
                     .get("value")
                     .and_then(JsonValue::as_str)
@@ -1484,7 +2198,8 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("case missing expr"))?;
                 let scrutinee_type =
                     self.verify_expr_type_with_locals(scrutinee_hash, root, param_types, locals)?;
-                let TypeSpec::Enum(variants) = self.type_spec(&scrutinee_type)? else {
+                let TypeSpec::Enum(variants) = self.type_spec_in_root(root, &scrutinee_type)?
+                else {
                     bail!("case scrutinee must be enum");
                 };
                 let arms = payload
@@ -1658,6 +2373,16 @@ impl TypeSpec {
                 "Unit" => Ok("unit".to_string()),
                 other => bail!("unknown builtin type kind {other}"),
             },
+            TypeSpec::Named {
+                type_symbol,
+                region_args,
+            } => {
+                if region_args.is_empty() {
+                    Ok(format!("type<{type_symbol}>"))
+                } else {
+                    Ok(format!("type<{type_symbol}<{}>>", region_args.join(", ")))
+                }
+            }
             TypeSpec::Record(fields) => {
                 let rendered = fields
                     .iter()
@@ -1697,32 +2422,43 @@ struct ParsedTypeField {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ParsedTypeSpec {
     Builtin(String),
+    Named {
+        name: String,
+        region_args: Vec<String>,
+    },
     Record(Vec<ParsedTypeField>),
     Enum(Vec<ParsedTypeField>),
 }
 
 impl ParsedTypeSpec {
-    fn to_payload_spec(&self) -> TypeSpec {
+    fn to_payload_spec(&self) -> Result<TypeSpec> {
         match self {
-            ParsedTypeSpec::Builtin(kind) => TypeSpec::Builtin(kind.clone()),
-            ParsedTypeSpec::Record(fields) => TypeSpec::Record(
+            ParsedTypeSpec::Builtin(kind) => Ok(TypeSpec::Builtin(kind.clone())),
+            ParsedTypeSpec::Named { name, .. } => {
+                bail!("named type {name} requires root-aware resolution")
+            }
+            ParsedTypeSpec::Record(fields) => Ok(TypeSpec::Record(
                 fields
                     .iter()
-                    .map(|field| TypeFieldSpec {
-                        name: field.name.clone(),
-                        type_hash: type_hash_for_spec(&field.ty),
+                    .map(|field| {
+                        Ok(TypeFieldSpec {
+                            name: field.name.clone(),
+                            type_hash: type_hash_for_spec(&field.ty)?,
+                        })
                     })
-                    .collect(),
-            ),
-            ParsedTypeSpec::Enum(variants) => TypeSpec::Enum(
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+            ParsedTypeSpec::Enum(variants) => Ok(TypeSpec::Enum(
                 variants
                     .iter()
-                    .map(|variant| TypeFieldSpec {
-                        name: variant.name.clone(),
-                        type_hash: type_hash_for_spec(&variant.ty),
+                    .map(|variant| {
+                        Ok(TypeFieldSpec {
+                            name: variant.name.clone(),
+                            type_hash: type_hash_for_spec(&variant.ty)?,
+                        })
                     })
-                    .collect(),
-            ),
+                    .collect::<Result<Vec<_>>>()?,
+            )),
         }
     }
 }
@@ -1734,13 +2470,19 @@ fn parse_type_source(source: &str) -> Result<ParsedTypeSpec> {
     Ok(spec)
 }
 
-fn type_hash_for_spec(spec: &ParsedTypeSpec) -> String {
+fn type_hash_for_spec(spec: &ParsedTypeSpec) -> Result<String> {
     match spec {
-        ParsedTypeSpec::Builtin(kind) => type_hash_for(kind),
+        ParsedTypeSpec::Builtin(kind) => Ok(type_hash_for(kind)),
+        ParsedTypeSpec::Named { name, .. } => {
+            bail!("named type {name} requires root-aware resolution")
+        }
         ParsedTypeSpec::Record(_) | ParsedTypeSpec::Enum(_) => {
-            let payload = type_payload_for_spec(&spec.to_payload_spec())
-                .expect("parsed type spec is already validated");
-            hash_object_canonical("Type", SCHEMA_VERSION, &canonical_json(&payload))
+            let payload = type_payload_for_spec(&spec.to_payload_spec()?)?;
+            Ok(hash_object_canonical(
+                "Type",
+                SCHEMA_VERSION,
+                &canonical_json(&payload),
+            ))
         }
     }
 }
@@ -1748,6 +2490,17 @@ fn type_hash_for_spec(spec: &ParsedTypeSpec) -> String {
 pub(crate) fn type_payload_for_spec(spec: &TypeSpec) -> Result<JsonValue> {
     Ok(match spec {
         TypeSpec::Builtin(kind) => json!({ "type_kind": kind }),
+        TypeSpec::Named {
+            type_symbol,
+            region_args,
+        } => {
+            validate_region_args(region_args)?;
+            json!({
+                "type_kind": "Named",
+                "type_symbol": type_symbol,
+                "region_args": region_args,
+            })
+        }
         TypeSpec::Record(fields) => {
             let fields = canonical_type_fields("record field", fields)?;
             json!({
@@ -1780,6 +2533,31 @@ pub(crate) fn type_spec_from_payload(payload: &JsonValue) -> Result<TypeSpec> {
         "I64" => Ok(TypeSpec::Builtin("I64".to_string())),
         "Bool" => Ok(TypeSpec::Builtin("Bool".to_string())),
         "Unit" => Ok(TypeSpec::Builtin("Unit".to_string())),
+        "Named" => {
+            let type_symbol = payload
+                .get("type_symbol")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("Named Type object missing type_symbol"))?
+                .to_string();
+            let region_args = match payload.get("region_args") {
+                Some(JsonValue::Array(values)) => values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| anyhow!("Named Type region arg must be string"))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                Some(_) => bail!("Named Type region_args must be an array"),
+                None => Vec::new(),
+            };
+            validate_region_args(&region_args)?;
+            Ok(TypeSpec::Named {
+                type_symbol,
+                region_args,
+            })
+        }
         "Record" => Ok(TypeSpec::Record(type_fields_from_payload(
             "record field",
             payload.get("fields"),
@@ -1832,6 +2610,132 @@ fn canonical_type_fields(label: &str, fields: &[TypeFieldSpec]) -> Result<Vec<Ty
     Ok(out)
 }
 
+pub(crate) fn validate_region_params(params: &[RegionParamDef]) -> Result<()> {
+    let mut names = BTreeSet::new();
+    let mut symbols = BTreeSet::new();
+    for param in params {
+        validate_projection_identifier("region parameter", &param.name)?;
+        if !names.insert(param.name.clone()) {
+            bail!("duplicate region parameter {}", param.name);
+        }
+        if !param.region.starts_with("sha256:") {
+            bail!("region parameter symbol must be a hash");
+        }
+        if !symbols.insert(param.region.clone()) {
+            bail!("duplicate region parameter symbol {}", param.region);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_member_defs(label: &str, members: &[TypeMemberDef]) -> Result<()> {
+    if members.is_empty() {
+        bail!("{label}s must not be empty");
+    }
+    let mut names = BTreeSet::new();
+    let mut symbols = BTreeSet::new();
+    for member in members {
+        validate_projection_identifier(label, &member.name)?;
+        if !names.insert(member.name.clone()) {
+            bail!("duplicate {label} {}", member.name);
+        }
+        if !member.member_symbol.starts_with("sha256:") {
+            bail!("{label} symbol must be a hash");
+        }
+        if !symbols.insert(member.member_symbol.clone()) {
+            bail!("duplicate {label} symbol {}", member.member_symbol);
+        }
+        if !member.type_hash.starts_with("sha256:") {
+            bail!("{label} type must be a hash");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_region_args(args: &[String]) -> Result<()> {
+    for arg in args {
+        if !arg.starts_with("sha256:") {
+            bail!("region argument must be a region hash");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn region_params_from_payload(value: Option<&JsonValue>) -> Result<Vec<RegionParamDef>> {
+    let params = match value {
+        Some(JsonValue::Array(values)) => values
+            .iter()
+            .map(|entry| {
+                let region = entry
+                    .get("region")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("region parameter missing region"))?
+                    .to_string();
+                let name = entry
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("region parameter missing name"))?
+                    .to_string();
+                Ok(RegionParamDef { region, name })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        Some(_) => bail!("region_params must be an array"),
+        None => Vec::new(),
+    };
+    validate_region_params(&params)?;
+    Ok(params)
+}
+
+pub(crate) fn member_defs_from_payload(
+    label: &str,
+    symbol_field: &str,
+    value: Option<&JsonValue>,
+) -> Result<Vec<TypeMemberDef>> {
+    let members = value
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| anyhow!("{label}s must be an array"))?
+        .iter()
+        .map(|entry| {
+            let member_symbol = entry
+                .get(symbol_field)
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("{label} missing symbol"))?
+                .to_string();
+            let name = entry
+                .get("name")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("{label} missing name"))?
+                .to_string();
+            let type_hash = entry
+                .get("type")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("{label} missing type"))?
+                .to_string();
+            Ok(TypeMemberDef {
+                member_symbol,
+                name,
+                type_hash,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validate_member_defs(label, &members)?;
+    Ok(members)
+}
+
+fn resolve_region_args(
+    args: &[String],
+    region_scope: &BTreeMap<String, String>,
+) -> Result<Vec<String>> {
+    args.iter()
+        .map(|arg| {
+            region_scope
+                .get(arg)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown region parameter '{arg}"))
+        })
+        .collect()
+}
+
 fn hash_for_type_spec(spec: &TypeSpec) -> Result<String> {
     let payload = type_payload_for_spec(spec)?;
     Ok(hash_object_canonical(
@@ -1878,6 +2782,11 @@ impl TypeParser {
             TypeToken::Ident(value) if value == "enum" => {
                 Ok(ParsedTypeSpec::Enum(self.parse_fields("enum variant")?))
             }
+            TypeToken::Ident(value) => {
+                let name = self.finish_name_path(value)?;
+                let region_args = self.parse_optional_region_args()?;
+                Ok(ParsedTypeSpec::Named { name, region_args })
+            }
             TypeToken::Symbol(value) if value == "(" => {
                 self.expect_symbol(")")?;
                 Ok(ParsedTypeSpec::Builtin("Unit".to_string()))
@@ -1904,6 +2813,35 @@ impl TypeParser {
             self.expect_symbol(",")?;
         }
         validate_parsed_type_fields(label, fields)
+    }
+
+    fn parse_optional_region_args(&mut self) -> Result<Vec<String>> {
+        if !self.consume_symbol("<") {
+            return Ok(Vec::new());
+        }
+        let mut args = Vec::new();
+        if self.consume_symbol(">") {
+            bail!("region argument list must not be empty");
+        }
+        loop {
+            self.expect_symbol("'")?;
+            let name = self.expect_ident()?;
+            validate_projection_identifier("region argument", &name)?;
+            args.push(name);
+            if self.consume_symbol(">") {
+                break;
+            }
+            self.expect_symbol(",")?;
+        }
+        Ok(args)
+    }
+
+    fn finish_name_path(&mut self, first: String) -> Result<String> {
+        let mut parts = vec![first];
+        while self.consume_symbol(".") {
+            parts.push(self.expect_ident()?);
+        }
+        Ok(parts.join("."))
     }
 
     fn expect_eof(&self) -> Result<()> {

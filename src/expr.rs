@@ -8,10 +8,13 @@ use serde_json::Value as JsonValue;
 use crate::MAIN_BRANCH;
 use crate::model::{
     NameBinding, ProgramRootPayload, RootSymbolPayload, param_names, preferred_names,
-    root_module_names,
+    preferred_type_names, root_module_names,
 };
 use crate::store::CodeDb;
-use crate::types::{Effect, ParamSpec, TypeSpec, normalize_effects, visible_effects};
+use crate::types::{
+    Effect, ParamSpec, TypeDefinition, TypeDefinitionKind, TypeMemberSpec, TypeSpec,
+    normalize_effects, visible_effects,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -116,8 +119,17 @@ pub struct ExternalFunctionSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgramItem {
+    TypeDefinition(TypeDefinitionSource),
     Function(FunctionSource),
     ExternalFunction(ExternalFunctionSource),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeDefinitionSource {
+    pub module: String,
+    pub name: String,
+    pub region_params: Vec<String>,
+    pub definition: TypeDefinitionKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,7 +196,7 @@ impl CodeDb {
             );
         }
         for (idx, (arg, ty)) in args.iter().zip(param_types.iter()).enumerate() {
-            if !self.value_has_type(arg, ty)? {
+            if !self.value_has_type(&root, arg, ty)? {
                 bail!(
                     "argument {idx} has wrong type for {}: expected {}, got {arg}",
                     self.symbol_display(&root, symbol)?,
@@ -211,8 +223,13 @@ impl CodeDb {
         self.eval_expr_with_locals(root_hash, expr_hash, args, &mut Vec::new())
     }
 
-    pub(crate) fn value_has_type(&self, value: &Value, type_hash: &str) -> Result<bool> {
-        match (value, self.type_spec(type_hash)?) {
+    pub(crate) fn value_has_type(
+        &self,
+        root: &ProgramRootPayload,
+        value: &Value,
+        type_hash: &str,
+    ) -> Result<bool> {
+        match (value, self.type_spec_in_root(root, type_hash)?) {
             (Value::I64(_), TypeSpec::Builtin(kind)) => Ok(kind == "I64"),
             (Value::Bool(_), TypeSpec::Builtin(kind)) => Ok(kind == "Bool"),
             (Value::Unit, TypeSpec::Builtin(kind)) => Ok(kind == "Unit"),
@@ -224,7 +241,7 @@ impl CodeDb {
                     let Some(value) = values.get(&field.name) else {
                         return Ok(false);
                     };
-                    if !self.value_has_type(value, &field.type_hash)? {
+                    if !self.value_has_type(root, value, &field.type_hash)? {
                         return Ok(false);
                     }
                 }
@@ -235,7 +252,7 @@ impl CodeDb {
                 else {
                     return Ok(false);
                 };
-                self.value_has_type(value, &variant.type_hash)
+                self.value_has_type(root, value, &variant.type_hash)
             }
             _ => Ok(false),
         }
@@ -476,6 +493,20 @@ impl CodeDb {
         let has_non_main_modules = root_module_names(&root)
             .iter()
             .any(|name| name != MAIN_BRANCH);
+        for binding in self.type_projection_order(&root)? {
+            let type_entry = self.root_type(&root, &binding.type_symbol).ok_or_else(|| {
+                anyhow!(
+                    "root type name points to missing type {}",
+                    binding.type_symbol
+                )
+            })?;
+            let source = self.render_type_source(&root, &binding, type_entry)?;
+            if has_non_main_modules && binding.module != MAIN_BRANCH {
+                chunks.push(format!("module {} {{\n{}\n}}", binding.module, source));
+            } else {
+                chunks.push(source);
+            }
+        }
         for binding in self.source_projection_order(&root)? {
             let symbol = binding.symbol.clone();
             let root_symbol = self
@@ -502,7 +533,9 @@ impl CodeDb {
             let mut source = format!(
                 "extern fn {}{} link_name \"{}\"",
                 binding.display_name,
-                self.external_signature_source(
+                self.external_signature_source_in_root(
+                    root,
+                    &binding.module,
                     &root_symbol.signature,
                     &param_names(root, &binding.symbol),
                     &external.abi,
@@ -518,7 +551,12 @@ impl CodeDb {
         Ok(format!(
             "fn {}{} = {}",
             binding.display_name,
-            self.signature_source(&root_symbol.signature, &param_names(root, &binding.symbol),)?,
+            self.signature_source_in_root(
+                root,
+                &binding.module,
+                &root_symbol.signature,
+                &param_names(root, &binding.symbol),
+            )?,
             self.expr_to_source_in_module(
                 &body,
                 root,
@@ -527,6 +565,81 @@ impl CodeDb {
                 0,
             )?
         ))
+    }
+
+    pub(crate) fn render_type_source(
+        &self,
+        root: &ProgramRootPayload,
+        binding: &crate::model::TypeNameBinding,
+        root_type: &crate::model::RootTypePayload,
+    ) -> Result<String> {
+        let definition = self.type_definition(&root_type.type_def)?;
+        let region_names = definition
+            .region_params()
+            .iter()
+            .map(|param| (param.region.clone(), param.name.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let region_suffix = if definition.region_params().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<{}>",
+                definition
+                    .region_params()
+                    .iter()
+                    .map(|param| format!("'{}", param.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        match definition {
+            TypeDefinition::Record { fields, .. } => {
+                let rendered_fields = fields
+                    .iter()
+                    .map(|field| {
+                        Ok(format!(
+                            "  {}: {}",
+                            field.name,
+                            self.type_name_in_root_with_regions(
+                                root,
+                                &binding.module,
+                                &field.type_hash,
+                                &region_names,
+                            )?
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(format!(
+                    "record {}{} {{\n{}\n}}",
+                    binding.display_name,
+                    region_suffix,
+                    rendered_fields.join("\n")
+                ))
+            }
+            TypeDefinition::Enum { variants, .. } => {
+                let rendered_variants = variants
+                    .iter()
+                    .map(|variant| {
+                        Ok(format!(
+                            "  {}: {}",
+                            variant.name,
+                            self.type_name_in_root_with_regions(
+                                root,
+                                &binding.module,
+                                &variant.type_hash,
+                                &region_names,
+                            )?
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(format!(
+                    "enum {}{} {{\n{}\n}}",
+                    binding.display_name,
+                    region_suffix,
+                    rendered_variants.join("\n")
+                ))
+            }
+        }
     }
 
     fn source_projection_order(
@@ -554,6 +667,72 @@ impl CodeDb {
         }
 
         Ok(ordered)
+    }
+
+    fn type_projection_order(
+        &self,
+        root: &ProgramRootPayload,
+    ) -> Result<Vec<crate::model::TypeNameBinding>> {
+        let bindings = preferred_type_names(root);
+        let binding_by_type = bindings
+            .iter()
+            .map(|binding| (binding.type_symbol.clone(), binding.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut visiting = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        let mut ordered = Vec::new();
+
+        for binding in bindings {
+            self.visit_projection_type(
+                root,
+                &binding_by_type,
+                &binding.type_symbol,
+                &mut visiting,
+                &mut visited,
+                &mut ordered,
+            )?;
+        }
+        Ok(ordered)
+    }
+
+    fn visit_projection_type(
+        &self,
+        root: &ProgramRootPayload,
+        binding_by_type: &BTreeMap<String, crate::model::TypeNameBinding>,
+        type_symbol: &str,
+        visiting: &mut BTreeSet<String>,
+        visited: &mut BTreeSet<String>,
+        ordered: &mut Vec<crate::model::TypeNameBinding>,
+    ) -> Result<()> {
+        if visited.contains(type_symbol) {
+            return Ok(());
+        }
+        if !visiting.insert(type_symbol.to_string()) {
+            return Ok(());
+        }
+
+        if let Some(entry) = self.root_type(root, type_symbol) {
+            for dependency in self.dependencies_for_type_definition(root, &entry.type_def)? {
+                if binding_by_type.contains_key(&dependency) {
+                    self.visit_projection_type(
+                        root,
+                        binding_by_type,
+                        &dependency,
+                        visiting,
+                        visited,
+                        ordered,
+                    )?;
+                }
+            }
+        }
+
+        visiting.remove(type_symbol);
+        if visited.insert(type_symbol.to_string())
+            && let Some(binding) = binding_by_type.get(type_symbol)
+        {
+            ordered.push(binding.clone());
+        }
+        Ok(())
     }
 
     fn visit_projection_symbol(
@@ -630,6 +809,7 @@ impl CodeDb {
         Ok(source)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn external_signature_source(
         &self,
         signature_hash: &str,
@@ -662,6 +842,60 @@ impl CodeDb {
                 .join(", ");
             source.push_str(&format!(" effects[{rendered_effects}]"));
         }
+        Ok(source)
+    }
+
+    pub(crate) fn signature_source_in_root(
+        &self,
+        root: &ProgramRootPayload,
+        current_module: &str,
+        signature_hash: &str,
+        param_names: &[String],
+    ) -> Result<String> {
+        let (params, return_type) = self.signature_parts(signature_hash)?;
+        let effects = self.signature_effects(signature_hash)?;
+        let rendered_params = params
+            .iter()
+            .enumerate()
+            .map(|(idx, ty)| {
+                let name = param_names
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| format!("p{idx}"));
+                Ok(format!(
+                    "{name}: {}",
+                    self.type_name_in_root(root, current_module, ty)?
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut source = format!(
+            "({}) -> {}",
+            rendered_params.join(", "),
+            self.type_name_in_root(root, current_module, &return_type)?
+        );
+        if !effects.is_empty() {
+            let rendered_effects = visible_effects(&effects)
+                .into_iter()
+                .map(|effect| effect.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            source.push_str(&format!(" effects[{rendered_effects}]"));
+        }
+        Ok(source)
+    }
+
+    pub(crate) fn external_signature_source_in_root(
+        &self,
+        root: &ProgramRootPayload,
+        current_module: &str,
+        signature_hash: &str,
+        param_names: &[String],
+        abi: &str,
+    ) -> Result<String> {
+        let mut source =
+            self.signature_source_in_root(root, current_module, signature_hash, param_names)?;
+        let insert_at = source.find(" effects[").unwrap_or(source.len());
+        source.insert_str(insert_at, &format!(" abi[{abi}]"));
         Ok(source)
     }
 
@@ -875,7 +1109,7 @@ impl CodeDb {
                 local_names.pop();
                 let expr = format!(
                     "let {name}: {} = {value} in {}",
-                    self.type_name(binding_type)?,
+                    self.type_name_in_root(root, current_module, binding_type)?,
                     body?
                 );
                 if parent_prec > 0 {
@@ -1007,11 +1241,14 @@ impl CodeDb {
                         .and_then(JsonValue::as_str)
                         == Some("literal_unit")
                 {
-                    format!("{}::{variant}", self.type_name(enum_type)?)
+                    format!(
+                        "{}::{variant}",
+                        self.type_name_in_root(root, current_module, enum_type)?
+                    )
                 } else {
                     format!(
                         "{}::{variant}({})",
-                        self.type_name(enum_type)?,
+                        self.type_name_in_root(root, current_module, enum_type)?,
                         self.expr_to_source_with_locals(
                             value,
                             root,
@@ -1258,7 +1495,9 @@ impl CodeDb {
                 local_names.pop();
                 Ok(RawExpr::Let {
                     name,
-                    ty: self.type_name(binding_type)?.to_string(),
+                    ty: self
+                        .type_name_in_root(root, current_module, binding_type)?
+                        .to_string(),
                     value: Box::new(value),
                     body: Box::new(body?),
                 })
@@ -1342,7 +1581,9 @@ impl CodeDb {
                     .to_string(),
             }),
             "enum_construct" => Ok(RawExpr::EnumConstruct {
-                enum_type: self.type_name(
+                enum_type: self.type_name_in_root(
+                    root,
+                    current_module,
                     payload
                         .get("enum_type")
                         .and_then(JsonValue::as_str)
@@ -1507,6 +1748,43 @@ impl CodeDb {
         let mut deps = BTreeSet::new();
         self.collect_expr_deps(root, &body, &mut deps)?;
         Ok(deps)
+    }
+
+    pub(crate) fn dependencies_for_type_definition(
+        &self,
+        _root: &ProgramRootPayload,
+        type_def_hash: &str,
+    ) -> Result<BTreeSet<String>> {
+        let definition = self.type_definition(type_def_hash)?;
+        let mut deps = BTreeSet::new();
+        match definition {
+            TypeDefinition::Record { fields, .. } => {
+                for field in fields {
+                    self.collect_type_deps(&field.type_hash, &mut deps)?;
+                }
+            }
+            TypeDefinition::Enum { variants, .. } => {
+                for variant in variants {
+                    self.collect_type_deps(&variant.type_hash, &mut deps)?;
+                }
+            }
+        }
+        Ok(deps)
+    }
+
+    fn collect_type_deps(&self, type_hash: &str, deps: &mut BTreeSet<String>) -> Result<()> {
+        match self.type_spec(type_hash)? {
+            TypeSpec::Builtin(_) => {}
+            TypeSpec::Named { type_symbol, .. } => {
+                deps.insert(type_symbol);
+            }
+            TypeSpec::Record(fields) | TypeSpec::Enum(fields) => {
+                for field in fields {
+                    self.collect_type_deps(&field.type_hash, deps)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn collect_expr_deps(
@@ -1708,11 +1986,57 @@ impl Parser {
             Ok(ProgramItem::ExternalFunction(
                 self.parse_external_function_in_module(module)?,
             ))
+        } else if self.consume_ident_value("record") {
+            Ok(ProgramItem::TypeDefinition(
+                self.parse_type_definition_in_module(module, "record")?,
+            ))
+        } else if self.consume_ident_value("enum") {
+            Ok(ProgramItem::TypeDefinition(
+                self.parse_type_definition_in_module(module, "enum")?,
+            ))
         } else {
             Ok(ProgramItem::Function(
                 self.parse_function_in_module(module)?,
             ))
         }
+    }
+
+    fn parse_type_definition_in_module(
+        &mut self,
+        module: String,
+        kind: &str,
+    ) -> Result<TypeDefinitionSource> {
+        let name = self.expect_ident()?;
+        let region_params = self.parse_optional_region_params()?;
+        self.expect_symbol("{")?;
+        let mut members = Vec::new();
+        if self.consume_symbol("}") {
+            bail!("{kind} definition must have at least one member");
+        }
+        loop {
+            let member_name = self.expect_ident()?;
+            self.expect_symbol(":")?;
+            let ty = self.parse_type_source()?;
+            members.push(TypeMemberSpec {
+                name: member_name,
+                ty,
+            });
+            if self.consume_symbol("}") {
+                break;
+            }
+            let _ = self.consume_symbol(",");
+        }
+        let definition = match kind {
+            "record" => TypeDefinitionKind::Record { fields: members },
+            "enum" => TypeDefinitionKind::Enum { variants: members },
+            other => bail!("unknown type definition kind {other}"),
+        };
+        Ok(TypeDefinitionSource {
+            module,
+            name,
+            region_params,
+            definition,
+        })
     }
 
     fn parse_function_in_module(&mut self, module: String) -> Result<FunctionSource> {
@@ -1790,6 +2114,26 @@ impl Parser {
         self.expect_symbol("->")?;
         let return_type = self.parse_type_source()?;
         Ok((params, return_type))
+    }
+
+    fn parse_optional_region_params(&mut self) -> Result<Vec<String>> {
+        if !self.consume_symbol("<") {
+            return Ok(Vec::new());
+        }
+        let mut params = Vec::new();
+        if self.consume_symbol(">") {
+            bail!("region parameter list must not be empty");
+        }
+        loop {
+            self.expect_symbol("'")?;
+            let name = self.expect_ident()?;
+            params.push(name);
+            if self.consume_symbol(">") {
+                break;
+            }
+            self.expect_symbol(",")?;
+        }
+        Ok(params)
     }
 
     fn parse_effect_list(&mut self) -> Result<Vec<Effect>> {
@@ -1954,7 +2298,21 @@ impl Parser {
                     });
                 }
                 let path = self.finish_name_path(name)?;
-                if self.consume_symbol("(") {
+                if self.consume_symbol("::") {
+                    let variant = self.expect_ident()?;
+                    let value = if self.consume_symbol("(") {
+                        let value = self.parse_expr()?;
+                        self.expect_symbol(")")?;
+                        value
+                    } else {
+                        RawExpr::Unit
+                    };
+                    Ok(RawExpr::EnumConstruct {
+                        enum_type: path,
+                        variant,
+                        value: Box::new(value),
+                    })
+                } else if self.consume_symbol("(") {
                     let mut args = Vec::new();
                     if !self.consume_symbol(")") {
                         loop {
@@ -2025,8 +2383,43 @@ impl Parser {
                 let variants = self.parse_type_fields()?;
                 Ok(format!("enum {{{}}}", variants.join(", ")))
             }
-            other => bail!("unknown type {other}"),
+            _ => {
+                let path = self.finish_name_path(name)?;
+                let region_args = self.parse_optional_type_region_args()?;
+                if region_args.is_empty() {
+                    Ok(path)
+                } else {
+                    Ok(format!(
+                        "{}<{}>",
+                        path,
+                        region_args
+                            .into_iter()
+                            .map(|name| format!("'{name}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                }
+            }
         }
+    }
+
+    fn parse_optional_type_region_args(&mut self) -> Result<Vec<String>> {
+        if !self.consume_symbol("<") {
+            return Ok(Vec::new());
+        }
+        let mut args = Vec::new();
+        if self.consume_symbol(">") {
+            bail!("region argument list must not be empty");
+        }
+        loop {
+            self.expect_symbol("'")?;
+            args.push(self.expect_ident()?);
+            if self.consume_symbol(">") {
+                break;
+            }
+            self.expect_symbol(",")?;
+        }
+        Ok(args)
     }
 
     fn parse_type_fields(&mut self) -> Result<Vec<String>> {

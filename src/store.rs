@@ -11,9 +11,11 @@ use crate::abi::{internal_abi_symbol, validate_export_map};
 use crate::artifact::{ARTIFACT_METADATA_SCHEMA, CacheKeyInput};
 use crate::backend::ArtifactKind;
 use crate::model::{
-    BranchState, NameBinding, ProgramRootPayload, RootSymbolPayload, normalize_root,
-    preferred_binding as preferred_binding_in_root, preferred_names, qualified_symbol_display,
-    resolve_name_in_root, split_qualified_name, symbol_display_in_module,
+    BranchState, NameBinding, ProgramRootPayload, RootSymbolPayload, RootTypePayload,
+    normalize_root, preferred_binding as preferred_binding_in_root, preferred_names,
+    preferred_type_binding, qualified_symbol_display, resolve_name_in_root,
+    resolve_named_type_in_root, split_qualified_name, symbol_display_in_module,
+    type_symbol_display_in_module,
 };
 use crate::{BYTES_DOMAIN, CACHE_DOMAIN, MAIN_BRANCH, OBJECT_DOMAIN, SCHEMA_SQL, SCHEMA_VERSION};
 
@@ -66,7 +68,9 @@ impl CodeDb {
         self.insert_builtin_types()?;
         let root_hash = self.put_program_root(&ProgramRootPayload {
             symbols: vec![],
+            types: vec![],
             names: vec![],
+            type_names: vec![],
             param_names: vec![],
             exports: vec![],
             tests: vec![],
@@ -433,7 +437,15 @@ impl CodeDb {
             params![root_hash],
         )?;
         self.conn.execute(
+            "DELETE FROM root_types WHERE root_hash = ?1",
+            params![root_hash],
+        )?;
+        self.conn.execute(
             "DELETE FROM root_names WHERE root_hash = ?1",
+            params![root_hash],
+        )?;
+        self.conn.execute(
+            "DELETE FROM root_type_names WHERE root_hash = ?1",
             params![root_hash],
         )?;
         self.conn.execute(
@@ -514,6 +526,15 @@ impl CodeDb {
             }
         }
 
+        for entry in &root.types {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO root_types
+                 (root_hash, type_symbol_hash, type_def_hash)
+                 VALUES (?1, ?2, ?3)",
+                params![root_hash, entry.type_symbol, entry.type_def],
+            )?;
+        }
+
         for binding in &root.names {
             self.conn.execute(
                 "INSERT OR REPLACE INTO root_names
@@ -524,6 +545,21 @@ impl CodeDb {
                     binding.module,
                     binding.display_name,
                     binding.symbol,
+                    if binding.is_preferred { 1 } else { 0 }
+                ],
+            )?;
+        }
+
+        for binding in &root.type_names {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO root_type_names
+                 (root_hash, module_name, display_name, type_symbol_hash, is_preferred)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    root_hash,
+                    binding.module,
+                    binding.display_name,
+                    binding.type_symbol,
                     if binding.is_preferred { 1 } else { 0 }
                 ],
             )?;
@@ -689,12 +725,31 @@ impl CodeDb {
         root.symbols.iter().find(|entry| entry.symbol == symbol)
     }
 
+    pub(crate) fn root_type<'a>(
+        &self,
+        root: &'a ProgramRootPayload,
+        type_symbol: &str,
+    ) -> Option<&'a RootTypePayload> {
+        root.types
+            .iter()
+            .find(|entry| entry.type_symbol == type_symbol)
+    }
+
     pub(crate) fn preferred_binding<'a>(
         &self,
         root: &'a ProgramRootPayload,
         symbol: &str,
     ) -> Option<&'a NameBinding> {
         preferred_binding_in_root(root, symbol)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn preferred_type_binding<'a>(
+        &self,
+        root: &'a ProgramRootPayload,
+        type_symbol: &str,
+    ) -> Option<&'a crate::model::TypeNameBinding> {
+        preferred_type_binding(root, type_symbol)
     }
 
     pub(crate) fn symbol_display(&self, root: &ProgramRootPayload, symbol: &str) -> Result<String> {
@@ -711,6 +766,27 @@ impl CodeDb {
     ) -> Result<String> {
         symbol_display_in_module(root, current_module, symbol)
             .ok_or_else(|| anyhow!("symbol has no display name {symbol}"))
+    }
+
+    pub(crate) fn type_symbol_display_for_module(
+        &self,
+        root: &ProgramRootPayload,
+        current_module: &str,
+        type_symbol: &str,
+    ) -> Result<String> {
+        type_symbol_display_in_module(root, current_module, type_symbol)
+            .ok_or_else(|| anyhow!("type symbol has no display name {type_symbol}"))
+    }
+
+    pub(crate) fn resolve_type_name(
+        &self,
+        root_hash: &str,
+        current_module: &str,
+        name: &str,
+    ) -> Result<String> {
+        let root = self.load_root(root_hash)?;
+        resolve_named_type_in_root(&root, current_module, name)
+            .ok_or_else(|| anyhow!("unknown type {name}"))
     }
 
     pub(crate) fn qualified_symbol_display(

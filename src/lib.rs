@@ -31,14 +31,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::params;
 use serde_json::json;
 
-pub use expr::{ExternalFunctionSource, FunctionSource, ProgramItem, RawExpr, Value};
+pub use expr::{
+    ExternalFunctionSource, FunctionSource, ProgramItem, RawExpr, TypeDefinitionSource, Value,
+};
 pub use store::CodeDb;
-pub use types::{Effect, ParamSpec};
+pub use types::{Effect, ParamSpec, TypeDefinitionKind, TypeMemberSpec};
 
 use backend::ArtifactKind;
 use expr::{parse_expr_source, parse_program, parse_signature_source_with_effects};
 use migrations::Operation;
-use model::{param_names, preferred_names, root_module_names};
+use model::{param_names, preferred_names, preferred_type_names, root_module_names};
 
 pub(crate) const SCHEMA_SQL: &str = include_str!("../schema.sql");
 pub(crate) const OBJECT_DOMAIN: &[u8] = b"codedb/object/v1\0";
@@ -92,6 +94,19 @@ impl CodeDb {
         for (idx, item) in items.into_iter().enumerate() {
             let branch = self.branch(MAIN_BRANCH)?;
             let op = match item {
+                ProgramItem::TypeDefinition(definition) => {
+                    let birth_seed = format!(
+                        "import:type:{}:{}:{}",
+                        definition.module, definition.name, idx
+                    );
+                    Operation::CreateType {
+                        module: definition.module,
+                        name: definition.name,
+                        birth_seed,
+                        region_params: definition.region_params,
+                        definition: definition.definition,
+                    }
+                }
                 ProgramItem::Function(function) => {
                     let birth_seed =
                         format!("import:{}:{}:{}", function.module, function.name, idx);
@@ -206,6 +221,26 @@ impl CodeDb {
         let branch = self.branch(MAIN_BRANCH)?;
         let root = self.load_root(&branch.root_hash)?;
         let mut out = String::new();
+        for binding in preferred_type_names(&root) {
+            let root_type = root
+                .types
+                .iter()
+                .find(|entry| entry.type_symbol == binding.type_symbol)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "root type name points to missing type {}",
+                        binding.type_symbol
+                    )
+                })?;
+            let definition = self.type_definition(&root_type.type_def)?;
+            out.push_str(&format!(
+                "{}.{} {} type {}\n",
+                binding.module,
+                binding.display_name,
+                binding.type_symbol,
+                definition.kind_name()
+            ));
+        }
         for binding in preferred_names(&root) {
             let symbol = binding.symbol;
             let root_symbol = root
@@ -213,8 +248,12 @@ impl CodeDb {
                 .iter()
                 .find(|entry| entry.symbol == symbol)
                 .ok_or_else(|| anyhow!("root name points to missing symbol {symbol}"))?;
-            let signature =
-                self.signature_source(&root_symbol.signature, &param_names(&root, &symbol))?;
+            let signature = self.signature_source_in_root(
+                &root,
+                &binding.module,
+                &root_symbol.signature,
+                &param_names(&root, &symbol),
+            )?;
             let prefix = if self.definition_is_external(&root_symbol.definition)? {
                 "extern fn"
             } else {
@@ -235,6 +274,79 @@ impl CodeDb {
     pub(crate) fn list_branch_json(&self, branch_name: &str) -> Result<String> {
         let branch = self.branch(branch_name)?;
         let root = self.load_root(&branch.root_hash)?;
+        let mut types = Vec::new();
+        for binding in preferred_type_names(&root) {
+            let root_type = root
+                .types
+                .iter()
+                .find(|entry| entry.type_symbol == binding.type_symbol)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "root type name points to missing type {}",
+                        binding.type_symbol
+                    )
+                })?;
+            let definition = self.type_definition(&root_type.type_def)?;
+            let kind = definition.kind_name();
+            let (region_params, members_key, members) = match definition {
+                types::TypeDefinition::Record {
+                    region_params,
+                    fields,
+                    ..
+                } => (
+                    region_params,
+                    "fields",
+                    fields
+                        .into_iter()
+                        .map(|field| {
+                            json!({
+                                "name": field.name,
+                                "symbol_hash": field.member_symbol,
+                                "type_hash": field.type_hash,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                types::TypeDefinition::Enum {
+                    region_params,
+                    variants,
+                    ..
+                } => (
+                    region_params,
+                    "variants",
+                    variants
+                        .into_iter()
+                        .map(|variant| {
+                            json!({
+                                "name": variant.name,
+                                "symbol_hash": variant.member_symbol,
+                                "type_hash": variant.type_hash,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            };
+            let mut object = serde_json::Map::new();
+            object.insert("module".to_string(), json!(binding.module));
+            object.insert("name".to_string(), json!(binding.display_name));
+            object.insert("type_symbol_hash".to_string(), json!(binding.type_symbol));
+            object.insert("type_def_hash".to_string(), json!(root_type.type_def));
+            object.insert("kind".to_string(), json!(kind));
+            object.insert(
+                "region_params".to_string(),
+                json!(
+                    region_params
+                        .into_iter()
+                        .map(|param| json!({
+                            "name": param.name,
+                            "region_hash": param.region,
+                        }))
+                        .collect::<Vec<_>>()
+                ),
+            );
+            object.insert(members_key.to_string(), json!(members));
+            types.push(serde_json::Value::Object(object));
+        }
         let mut symbols = Vec::new();
         for binding in preferred_names(&root) {
             let symbol = binding.symbol;
@@ -262,7 +374,7 @@ impl CodeDb {
                 "definition_kind": if external.is_null() { "function" } else { "external_function" },
                 "external": external,
                 "effects": self.signature_effect_names(&root_symbol.signature)?,
-                "signature": self.signature_source(&root_symbol.signature, &param_names(&root, &symbol))?,
+                "signature": self.signature_source_in_root(&root, &binding.module, &root_symbol.signature, &param_names(&root, &symbol))?,
             }));
         }
         Ok(format!(
@@ -271,6 +383,7 @@ impl CodeDb {
                 "branch": branch_name,
                 "root_hash": branch.root_hash,
                 "history_hash": branch.history_hash,
+                "types": types,
                 "symbols": symbols,
             }))
         ))
@@ -320,7 +433,12 @@ impl CodeDb {
             out.push_str(&format!(
                 "source fn {}{}\n",
                 binding.display_name,
-                self.signature_source(&root_symbol.signature, &param_names(&root, &symbol))?
+                self.signature_source_in_root(
+                    &root,
+                    &binding.module,
+                    &root_symbol.signature,
+                    &param_names(&root, &symbol),
+                )?
             ));
             out.push_str(&format!(
                 "body_source {}\n",
@@ -426,7 +544,7 @@ impl CodeDb {
             "effects": self.signature_effect_names(&root_symbol.signature)?,
             "internal_abi_symbol": abi::internal_abi_symbol(&symbol)?,
             "exported_abi_symbols": abi::exported_abi_names(&root, &symbol),
-            "signature": self.signature_source(&root_symbol.signature, &local_param_names)?,
+            "signature": self.signature_source_in_root(&root, &binding.module, &root_symbol.signature, &local_param_names)?,
             "source": self.render_function_source(&root, binding, root_symbol)?,
             "body_source": body_source,
             "dependencies": dependencies,

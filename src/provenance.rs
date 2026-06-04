@@ -644,6 +644,15 @@ impl CodeDb {
                     reasons.insert("name");
                 }
             }
+            Operation::CreateType { .. }
+            | Operation::RenameType { .. }
+            | Operation::MoveType { .. }
+            | Operation::AddField { .. }
+            | Operation::RenameField { .. }
+            | Operation::RemoveField { .. }
+            | Operation::AddVariant { .. }
+            | Operation::RenameVariant { .. }
+            | Operation::RemoveVariant { .. } => {}
             Operation::RenameSymbol {
                 symbol: changed, ..
             } => {

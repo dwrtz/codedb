@@ -11,13 +11,16 @@ use crate::build_plan::{BuildImpact, BuildImpactKind, BuildImpactReason, project
 use crate::expr::RawExpr;
 use crate::model::{
     BranchState, ExportBinding, NameBinding, ParamNames, ProgramRootPayload, RootSymbolPayload,
-    RootTestBinding, TestCasePayload, TestCategory, TestMode, TestValue, param_names,
-    root_symbol_index, synchronize_module_metadata, test_binding_for, upsert_param_names,
-    validate_module_path, validate_projection_identifier,
+    RootTestBinding, RootTypePayload, TestCasePayload, TestCategory, TestMode, TestValue,
+    TypeNameBinding, param_names, root_symbol_index, root_type_index, synchronize_module_metadata,
+    test_binding_for, upsert_param_names, validate_module_path, validate_projection_identifier,
 };
 use crate::store::{CodeDb, canonical_json, hash_bytes};
 use crate::tests::{test_points_to_entry_symbol, validate_test_value_type};
-use crate::types::{Effect, ParamSpec};
+use crate::types::{
+    Effect, ParamSpec, RegionParamDef, TypeDefinition, TypeDefinitionKind, TypeMemberDef,
+    TypeMemberSpec,
+};
 use crate::{HISTORY_DOMAIN, MAIN_BRANCH, MIGRATION_DOMAIN};
 
 const HISTORY_EXPORT_SCHEMA: &str = "codedb/history-export/v1";
@@ -48,6 +51,70 @@ pub(crate) enum Operation {
         link_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         library: Option<String>,
+    },
+    CreateType {
+        module: String,
+        name: String,
+        birth_seed: String,
+        #[serde(default)]
+        region_params: Vec<String>,
+        definition: TypeDefinitionKind,
+    },
+    RenameType {
+        module: String,
+        type_symbol: String,
+        old_name: String,
+        new_name: String,
+    },
+    MoveType {
+        module: String,
+        type_symbol: String,
+        name: String,
+        new_module: String,
+    },
+    AddField {
+        module: String,
+        type_symbol: String,
+        type_name: String,
+        field: TypeMemberSpec,
+        field_birth_seed: String,
+    },
+    RenameField {
+        module: String,
+        type_symbol: String,
+        type_name: String,
+        field_symbol: String,
+        old_name: String,
+        new_name: String,
+    },
+    RemoveField {
+        module: String,
+        type_symbol: String,
+        type_name: String,
+        field_symbol: String,
+        name: String,
+    },
+    AddVariant {
+        module: String,
+        type_symbol: String,
+        type_name: String,
+        variant: TypeMemberSpec,
+        variant_birth_seed: String,
+    },
+    RenameVariant {
+        module: String,
+        type_symbol: String,
+        type_name: String,
+        variant_symbol: String,
+        old_name: String,
+        new_name: String,
+    },
+    RemoveVariant {
+        module: String,
+        type_symbol: String,
+        type_name: String,
+        variant_symbol: String,
+        name: String,
     },
     RenameSymbol {
         module: String,
@@ -151,6 +218,15 @@ impl Operation {
         match self {
             Operation::CreateFunction { .. } => "create_function",
             Operation::CreateExternalFunction { .. } => "create_external_function",
+            Operation::CreateType { .. } => "create_type",
+            Operation::RenameType { .. } => "rename_type",
+            Operation::MoveType { .. } => "move_type",
+            Operation::AddField { .. } => "add_field",
+            Operation::RenameField { .. } => "rename_field",
+            Operation::RemoveField { .. } => "remove_field",
+            Operation::AddVariant { .. } => "add_variant",
+            Operation::RenameVariant { .. } => "rename_variant",
+            Operation::RemoveVariant { .. } => "remove_variant",
             Operation::RenameSymbol { .. } => "rename_symbol",
             Operation::MoveSymbol { .. } => "move_symbol",
             Operation::ReplaceFunctionBody { .. } => "replace_function_body",
@@ -380,6 +456,10 @@ impl MigrationSummary {
 pub(crate) enum SemanticImpact {
     FunctionCreated,
     ExternalFunctionCreated,
+    TypeCreated,
+    TypeRenamed,
+    TypeMoved,
+    TypeDefinitionChanged,
     SymbolRenamed,
     SymbolMoved,
     ImplementationChanged,
@@ -399,6 +479,10 @@ impl SemanticImpact {
         match self {
             SemanticImpact::FunctionCreated => "function_created",
             SemanticImpact::ExternalFunctionCreated => "external_function_created",
+            SemanticImpact::TypeCreated => "type_created",
+            SemanticImpact::TypeRenamed => "type_renamed",
+            SemanticImpact::TypeMoved => "type_moved",
+            SemanticImpact::TypeDefinitionChanged => "type_definition_changed",
             SemanticImpact::SymbolRenamed => "symbol_renamed",
             SemanticImpact::SymbolMoved => "symbol_moved",
             SemanticImpact::ImplementationChanged => "implementation_changed",
@@ -444,10 +528,42 @@ pub(crate) enum Precondition {
         module: String,
         name: String,
     },
+    TypeNameIsAvailable {
+        module: String,
+        name: String,
+    },
     NamePointsToSymbol {
         module: String,
         name: String,
         symbol: String,
+    },
+    TypeNamePointsToType {
+        module: String,
+        name: String,
+        type_symbol: String,
+    },
+    PreferredTypeNamePointsToType {
+        module: String,
+        name: String,
+        type_symbol: String,
+    },
+    FieldPointsToSymbol {
+        type_symbol: String,
+        name: String,
+        field_symbol: String,
+    },
+    FieldNameIsAvailable {
+        type_symbol: String,
+        name: String,
+    },
+    VariantPointsToSymbol {
+        type_symbol: String,
+        name: String,
+        variant_symbol: String,
+    },
+    VariantNameIsAvailable {
+        type_symbol: String,
+        name: String,
     },
     PreferredNamePointsToSymbol {
         module: String,
@@ -480,7 +596,16 @@ impl Precondition {
         match self {
             Precondition::RootIsCurrent { .. } => "root_is_current",
             Precondition::NameIsAvailable { .. } => "name_is_available",
+            Precondition::TypeNameIsAvailable { .. } => "type_name_is_available",
             Precondition::NamePointsToSymbol { .. } => "name_points_to_symbol",
+            Precondition::TypeNamePointsToType { .. } => "type_name_points_to_type",
+            Precondition::PreferredTypeNamePointsToType { .. } => {
+                "preferred_type_name_points_to_type"
+            }
+            Precondition::FieldPointsToSymbol { .. } => "field_points_to_symbol",
+            Precondition::FieldNameIsAvailable { .. } => "field_name_is_available",
+            Precondition::VariantPointsToSymbol { .. } => "variant_points_to_symbol",
+            Precondition::VariantNameIsAvailable { .. } => "variant_name_is_available",
             Precondition::PreferredNamePointsToSymbol { .. } => "preferred_name_points_to_symbol",
             Precondition::AliasPointsToSymbol { .. } => "alias_points_to_symbol",
             Precondition::ExportNameIsAvailable { .. } => "export_name_is_available",
@@ -515,14 +640,49 @@ pub(crate) enum Postcondition {
         link_name: String,
         library: Option<String>,
     },
+    TypeSourceMatches {
+        module: String,
+        name: String,
+        region_params: Vec<String>,
+        definition: TypeDefinitionKind,
+    },
     NamePointsToSymbol {
         module: String,
         name: String,
         symbol: String,
     },
+    TypeNamePointsToType {
+        module: String,
+        name: String,
+        type_symbol: String,
+    },
     NameAbsent {
         module: String,
         name: String,
+    },
+    TypeNameAbsent {
+        module: String,
+        name: String,
+    },
+    FieldPointsToSymbol {
+        type_symbol: String,
+        name: String,
+        field_symbol: String,
+    },
+    FieldAbsent {
+        type_symbol: String,
+        name: String,
+        field_symbol: String,
+    },
+    VariantPointsToSymbol {
+        type_symbol: String,
+        name: String,
+        variant_symbol: String,
+    },
+    VariantAbsent {
+        type_symbol: String,
+        name: String,
+        variant_symbol: String,
     },
     BodySourceMatches {
         module: String,
@@ -566,8 +726,15 @@ impl Postcondition {
             Postcondition::ExternalFunctionSourceMatches { .. } => {
                 "external_function_source_matches"
             }
+            Postcondition::TypeSourceMatches { .. } => "type_source_matches",
             Postcondition::NamePointsToSymbol { .. } => "name_points_to_symbol",
+            Postcondition::TypeNamePointsToType { .. } => "type_name_points_to_type",
             Postcondition::NameAbsent { .. } => "name_absent",
+            Postcondition::TypeNameAbsent { .. } => "type_name_absent",
+            Postcondition::FieldPointsToSymbol { .. } => "field_points_to_symbol",
+            Postcondition::FieldAbsent { .. } => "field_absent",
+            Postcondition::VariantPointsToSymbol { .. } => "variant_points_to_symbol",
+            Postcondition::VariantAbsent { .. } => "variant_absent",
             Postcondition::BodySourceMatches { .. } => "body_source_matches",
             Postcondition::SignatureSourceMatches { .. } => "signature_source_matches",
             Postcondition::SymbolAbsent { .. } => "symbol_absent",
@@ -705,6 +872,98 @@ fn operation_summary_parts(op: &Operation) -> (String, SemanticImpact, Typecheck
             SemanticImpact::ExternalFunctionCreated,
             TypecheckImpact::Checked,
         ),
+        Operation::CreateType {
+            module,
+            name,
+            definition,
+            ..
+        } => (
+            format!("{} {module}.{name}", definition.kind_name()),
+            SemanticImpact::TypeCreated,
+            TypecheckImpact::Checked,
+        ),
+        Operation::RenameType {
+            module,
+            old_name,
+            new_name,
+            ..
+        } => (
+            format!("{module}.{old_name} -> {module}.{new_name}"),
+            SemanticImpact::TypeRenamed,
+            TypecheckImpact::Unchanged,
+        ),
+        Operation::MoveType {
+            module,
+            name,
+            new_module,
+            ..
+        } => (
+            format!("{module}.{name} -> {new_module}.{name}"),
+            SemanticImpact::TypeMoved,
+            TypecheckImpact::Unchanged,
+        ),
+        Operation::AddField {
+            module,
+            type_name,
+            field,
+            ..
+        } => (
+            format!("{module}.{type_name}.{}", field.name),
+            SemanticImpact::TypeDefinitionChanged,
+            TypecheckImpact::RootRechecked,
+        ),
+        Operation::RenameField {
+            module,
+            type_name,
+            old_name,
+            new_name,
+            ..
+        } => (
+            format!("{module}.{type_name}.{old_name} -> {new_name}"),
+            SemanticImpact::TypeDefinitionChanged,
+            TypecheckImpact::RootRechecked,
+        ),
+        Operation::RemoveField {
+            module,
+            type_name,
+            name,
+            ..
+        } => (
+            format!("{module}.{type_name}.{name}"),
+            SemanticImpact::TypeDefinitionChanged,
+            TypecheckImpact::RootRechecked,
+        ),
+        Operation::AddVariant {
+            module,
+            type_name,
+            variant,
+            ..
+        } => (
+            format!("{module}.{type_name}.{}", variant.name),
+            SemanticImpact::TypeDefinitionChanged,
+            TypecheckImpact::RootRechecked,
+        ),
+        Operation::RenameVariant {
+            module,
+            type_name,
+            old_name,
+            new_name,
+            ..
+        } => (
+            format!("{module}.{type_name}.{old_name} -> {new_name}"),
+            SemanticImpact::TypeDefinitionChanged,
+            TypecheckImpact::RootRechecked,
+        ),
+        Operation::RemoveVariant {
+            module,
+            type_name,
+            name,
+            ..
+        } => (
+            format!("{module}.{type_name}.{name}"),
+            SemanticImpact::TypeDefinitionChanged,
+            TypecheckImpact::RootRechecked,
+        ),
         Operation::RenameSymbol {
             module,
             old_name,
@@ -821,6 +1080,26 @@ fn fallback_build_impact(op: &Operation) -> BuildImpact {
             true,
             vec![],
             vec![BuildImpactReason::SymbolAdded],
+        ),
+        Operation::CreateType { .. }
+        | Operation::AddField { .. }
+        | Operation::RemoveField { .. }
+        | Operation::AddVariant { .. }
+        | Operation::RemoveVariant { .. }
+        | Operation::RenameField { .. }
+        | Operation::RenameVariant { .. } => (
+            BuildImpactKind::FullRebuild,
+            vec![],
+            true,
+            vec![],
+            vec![BuildImpactReason::UnclassifiedRootChange],
+        ),
+        Operation::RenameType { .. } | Operation::MoveType { .. } => (
+            BuildImpactKind::MetadataOnly,
+            vec![],
+            false,
+            vec![],
+            vec![BuildImpactReason::MetadataChanged],
         ),
         Operation::RenameSymbol { .. }
         | Operation::MoveSymbol { .. }
@@ -1157,6 +1436,210 @@ impl CodeDb {
                     name: name.clone(),
                 },
             ],
+            Operation::CreateType { module, name, .. } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::TypeNameIsAvailable {
+                    module: module.clone(),
+                    name: name.clone(),
+                },
+            ],
+            Operation::RenameType {
+                module,
+                type_symbol,
+                old_name,
+                new_name,
+            } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::PreferredTypeNamePointsToType {
+                    module: module.clone(),
+                    name: old_name.clone(),
+                    type_symbol: type_symbol.clone(),
+                },
+                Precondition::TypeNameIsAvailable {
+                    module: module.clone(),
+                    name: new_name.clone(),
+                },
+            ],
+            Operation::MoveType {
+                module,
+                type_symbol,
+                name,
+                new_module,
+            } => {
+                let mut preconditions = vec![
+                    Precondition::RootIsCurrent {
+                        root: input_root.to_string(),
+                    },
+                    Precondition::PreferredTypeNamePointsToType {
+                        module: module.clone(),
+                        name: name.clone(),
+                        type_symbol: type_symbol.clone(),
+                    },
+                ];
+                if module == new_module {
+                    return preconditions;
+                }
+                if let Ok(root) = self.load_root(input_root) {
+                    for moved_name in root
+                        .type_names
+                        .iter()
+                        .filter(|binding| {
+                            binding.module == *module && binding.type_symbol == *type_symbol
+                        })
+                        .map(|binding| binding.display_name.clone())
+                        .collect::<BTreeSet<_>>()
+                    {
+                        preconditions.push(Precondition::TypeNameIsAvailable {
+                            module: new_module.clone(),
+                            name: moved_name,
+                        });
+                    }
+                } else {
+                    preconditions.push(Precondition::TypeNameIsAvailable {
+                        module: new_module.clone(),
+                        name: name.clone(),
+                    });
+                }
+                preconditions
+            }
+            Operation::AddField {
+                module,
+                type_symbol,
+                type_name,
+                field,
+                ..
+            } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::TypeNamePointsToType {
+                    module: module.clone(),
+                    name: type_name.clone(),
+                    type_symbol: type_symbol.clone(),
+                },
+                Precondition::FieldNameIsAvailable {
+                    type_symbol: type_symbol.clone(),
+                    name: field.name.clone(),
+                },
+            ],
+            Operation::RenameField {
+                module,
+                type_symbol,
+                type_name,
+                field_symbol,
+                old_name,
+                new_name,
+            } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::TypeNamePointsToType {
+                    module: module.clone(),
+                    name: type_name.clone(),
+                    type_symbol: type_symbol.clone(),
+                },
+                Precondition::FieldPointsToSymbol {
+                    type_symbol: type_symbol.clone(),
+                    name: old_name.clone(),
+                    field_symbol: field_symbol.clone(),
+                },
+                Precondition::FieldNameIsAvailable {
+                    type_symbol: type_symbol.clone(),
+                    name: new_name.clone(),
+                },
+            ],
+            Operation::RemoveField {
+                module,
+                type_symbol,
+                type_name,
+                field_symbol,
+                name,
+            } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::TypeNamePointsToType {
+                    module: module.clone(),
+                    name: type_name.clone(),
+                    type_symbol: type_symbol.clone(),
+                },
+                Precondition::FieldPointsToSymbol {
+                    type_symbol: type_symbol.clone(),
+                    name: name.clone(),
+                    field_symbol: field_symbol.clone(),
+                },
+            ],
+            Operation::AddVariant {
+                module,
+                type_symbol,
+                type_name,
+                variant,
+                ..
+            } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::TypeNamePointsToType {
+                    module: module.clone(),
+                    name: type_name.clone(),
+                    type_symbol: type_symbol.clone(),
+                },
+                Precondition::VariantNameIsAvailable {
+                    type_symbol: type_symbol.clone(),
+                    name: variant.name.clone(),
+                },
+            ],
+            Operation::RenameVariant {
+                module,
+                type_symbol,
+                type_name,
+                variant_symbol,
+                old_name,
+                new_name,
+            } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::TypeNamePointsToType {
+                    module: module.clone(),
+                    name: type_name.clone(),
+                    type_symbol: type_symbol.clone(),
+                },
+                Precondition::VariantPointsToSymbol {
+                    type_symbol: type_symbol.clone(),
+                    name: old_name.clone(),
+                    variant_symbol: variant_symbol.clone(),
+                },
+                Precondition::VariantNameIsAvailable {
+                    type_symbol: type_symbol.clone(),
+                    name: new_name.clone(),
+                },
+            ],
+            Operation::RemoveVariant {
+                module,
+                type_symbol,
+                type_name,
+                variant_symbol,
+                name,
+            } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::TypeNamePointsToType {
+                    module: module.clone(),
+                    name: type_name.clone(),
+                    type_symbol: type_symbol.clone(),
+                },
+                Precondition::VariantPointsToSymbol {
+                    type_symbol: type_symbol.clone(),
+                    name: name.clone(),
+                    variant_symbol: variant_symbol.clone(),
+                },
+            ],
             Operation::RenameSymbol {
                 module,
                 symbol,
@@ -1410,6 +1893,179 @@ impl CodeDb {
                     library: library.clone(),
                 },
             ],
+            Operation::CreateType {
+                module,
+                name,
+                region_params,
+                definition,
+                ..
+            } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::TypeSourceMatches {
+                    module: module.clone(),
+                    name: name.clone(),
+                    region_params: region_params.clone(),
+                    definition: definition.clone(),
+                },
+            ],
+            Operation::RenameType {
+                module,
+                type_symbol,
+                old_name,
+                new_name,
+            } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::TypeNamePointsToType {
+                    module: module.clone(),
+                    name: new_name.clone(),
+                    type_symbol: type_symbol.clone(),
+                },
+                Postcondition::TypeNameAbsent {
+                    module: module.clone(),
+                    name: old_name.clone(),
+                },
+            ],
+            Operation::MoveType {
+                module,
+                type_symbol,
+                name,
+                new_module,
+            } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::TypeNamePointsToType {
+                    module: new_module.clone(),
+                    name: name.clone(),
+                    type_symbol: type_symbol.clone(),
+                },
+                Postcondition::TypeNameAbsent {
+                    module: module.clone(),
+                    name: name.clone(),
+                },
+            ],
+            Operation::AddField {
+                type_symbol, field, ..
+            } => {
+                let field_symbol = self
+                    .load_root(output_root)
+                    .ok()
+                    .and_then(|root| {
+                        self.field_symbol_by_name(&root, type_symbol, &field.name)
+                            .ok()
+                    })
+                    .unwrap_or_default();
+                vec![
+                    Postcondition::RootExists {
+                        root: output_root.to_string(),
+                    },
+                    Postcondition::FieldPointsToSymbol {
+                        type_symbol: type_symbol.clone(),
+                        name: field.name.clone(),
+                        field_symbol,
+                    },
+                ]
+            }
+            Operation::RenameField {
+                type_symbol,
+                field_symbol,
+                old_name,
+                new_name,
+                ..
+            } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::FieldPointsToSymbol {
+                    type_symbol: type_symbol.clone(),
+                    name: new_name.clone(),
+                    field_symbol: field_symbol.clone(),
+                },
+                Postcondition::FieldAbsent {
+                    type_symbol: type_symbol.clone(),
+                    name: old_name.clone(),
+                    field_symbol: field_symbol.clone(),
+                },
+            ],
+            Operation::RemoveField {
+                type_symbol,
+                field_symbol,
+                name,
+                ..
+            } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::FieldAbsent {
+                    type_symbol: type_symbol.clone(),
+                    name: name.clone(),
+                    field_symbol: field_symbol.clone(),
+                },
+            ],
+            Operation::AddVariant {
+                type_symbol,
+                variant,
+                ..
+            } => {
+                let variant_symbol = self
+                    .load_root(output_root)
+                    .ok()
+                    .and_then(|root| {
+                        self.variant_symbol_by_name(&root, type_symbol, &variant.name)
+                            .ok()
+                    })
+                    .unwrap_or_default();
+                vec![
+                    Postcondition::RootExists {
+                        root: output_root.to_string(),
+                    },
+                    Postcondition::VariantPointsToSymbol {
+                        type_symbol: type_symbol.clone(),
+                        name: variant.name.clone(),
+                        variant_symbol,
+                    },
+                ]
+            }
+            Operation::RenameVariant {
+                type_symbol,
+                variant_symbol,
+                old_name,
+                new_name,
+                ..
+            } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::VariantPointsToSymbol {
+                    type_symbol: type_symbol.clone(),
+                    name: new_name.clone(),
+                    variant_symbol: variant_symbol.clone(),
+                },
+                Postcondition::VariantAbsent {
+                    type_symbol: type_symbol.clone(),
+                    name: old_name.clone(),
+                    variant_symbol: variant_symbol.clone(),
+                },
+            ],
+            Operation::RemoveVariant {
+                type_symbol,
+                variant_symbol,
+                name,
+                ..
+            } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::VariantAbsent {
+                    type_symbol: type_symbol.clone(),
+                    name: name.clone(),
+                    variant_symbol: variant_symbol.clone(),
+                },
+            ],
             Operation::RenameSymbol {
                 module,
                 symbol,
@@ -1629,11 +2285,45 @@ impl CodeDb {
                     .names
                     .iter()
                     .any(|binding| binding.module == *module && binding.display_name == *name),
+                Precondition::TypeNameIsAvailable { module, name } => !root
+                    .type_names
+                    .iter()
+                    .any(|binding| binding.module == *module && binding.display_name == *name),
                 Precondition::NamePointsToSymbol {
                     module,
                     name,
                     symbol,
                 } => name_points_to_symbol(&root, module, name, symbol),
+                Precondition::TypeNamePointsToType {
+                    module,
+                    name,
+                    type_symbol,
+                } => type_name_points_to_type(&root, module, name, type_symbol),
+                Precondition::PreferredTypeNamePointsToType {
+                    module,
+                    name,
+                    type_symbol,
+                } => preferred_type_name_points_to_type(&root, module, name, type_symbol),
+                Precondition::FieldPointsToSymbol {
+                    type_symbol,
+                    name,
+                    field_symbol,
+                } => self
+                    .field_points_to_symbol(&root, type_symbol, name, field_symbol)
+                    .unwrap_or(false),
+                Precondition::FieldNameIsAvailable { type_symbol, name } => self
+                    .field_name_is_available(&root, type_symbol, name)
+                    .unwrap_or(false),
+                Precondition::VariantPointsToSymbol {
+                    type_symbol,
+                    name,
+                    variant_symbol,
+                } => self
+                    .variant_points_to_symbol(&root, type_symbol, name, variant_symbol)
+                    .unwrap_or(false),
+                Precondition::VariantNameIsAvailable { type_symbol, name } => self
+                    .variant_name_is_available(&root, type_symbol, name)
+                    .unwrap_or(false),
                 Precondition::PreferredNamePointsToSymbol {
                     module,
                     name,
@@ -1715,6 +2405,7 @@ impl CodeDb {
                     .collect::<Vec<_>>();
                 Ok(self.function_signature_source_matches(
                     root,
+                    module,
                     &symbol,
                     params,
                     return_type,
@@ -1742,6 +2433,7 @@ impl CodeDb {
                 };
                 self.external_function_source_matches(
                     root,
+                    module,
                     &symbol,
                     params,
                     return_type,
@@ -1751,15 +2443,50 @@ impl CodeDb {
                     library.as_deref(),
                 )
             }
+            Postcondition::TypeSourceMatches {
+                module,
+                name,
+                region_params,
+                definition,
+            } => self.type_source_matches(root, module, name, region_params, definition),
             Postcondition::NamePointsToSymbol {
                 module,
                 name,
                 symbol,
             } => Ok(name_points_to_symbol(root, module, name, symbol)),
+            Postcondition::TypeNamePointsToType {
+                module,
+                name,
+                type_symbol,
+            } => Ok(type_name_points_to_type(root, module, name, type_symbol)),
             Postcondition::NameAbsent { module, name } => Ok(!root
                 .names
                 .iter()
                 .any(|binding| binding.module == *module && binding.display_name == *name)),
+            Postcondition::TypeNameAbsent { module, name } => Ok(!root
+                .type_names
+                .iter()
+                .any(|binding| binding.module == *module && binding.display_name == *name)),
+            Postcondition::FieldPointsToSymbol {
+                type_symbol,
+                name,
+                field_symbol,
+            } => self.field_points_to_symbol(root, type_symbol, name, field_symbol),
+            Postcondition::FieldAbsent {
+                type_symbol,
+                name,
+                field_symbol,
+            } => Ok(!self.field_points_to_symbol(root, type_symbol, name, field_symbol)?),
+            Postcondition::VariantPointsToSymbol {
+                type_symbol,
+                name,
+                variant_symbol,
+            } => self.variant_points_to_symbol(root, type_symbol, name, variant_symbol),
+            Postcondition::VariantAbsent {
+                type_symbol,
+                name,
+                variant_symbol,
+            } => Ok(!self.variant_points_to_symbol(root, type_symbol, name, variant_symbol)?),
             Postcondition::BodySourceMatches {
                 module,
                 name,
@@ -1788,7 +2515,14 @@ impl CodeDb {
                 if !name_points_to_symbol(root, module, name, symbol) {
                     return Ok(false);
                 }
-                self.function_signature_source_matches(root, symbol, params, return_type, effects)
+                self.function_signature_source_matches(
+                    root,
+                    module,
+                    symbol,
+                    params,
+                    return_type,
+                    effects,
+                )
             }
             Postcondition::SymbolAbsent { symbol } => {
                 let test_refs_symbol = root
@@ -1821,6 +2555,7 @@ impl CodeDb {
     fn function_signature_source_matches(
         &self,
         root: &ProgramRootPayload,
+        module: &str,
         symbol: &str,
         params: &[ParamSpec],
         return_type: &str,
@@ -1832,9 +2567,9 @@ impl CodeDb {
         let (actual_params, actual_return_type) = self.signature_parts(&entry.signature)?;
         let expected_params = params
             .iter()
-            .map(|param| self.type_hash_for_source(&param.ty))
+            .map(|param| self.type_hash_for_source_in_root(module, root, &param.ty))
             .collect::<Result<Vec<_>>>()?;
-        let expected_return_type = self.type_hash_for_source(return_type)?;
+        let expected_return_type = self.type_hash_for_source_in_root(module, root, return_type)?;
         let expected_effects = crate::types::normalize_effects(effects)?;
         let actual_effects = self.signature_effects(&entry.signature)?;
         let expected_names = params
@@ -1851,6 +2586,7 @@ impl CodeDb {
     fn external_function_source_matches(
         &self,
         root: &ProgramRootPayload,
+        module: &str,
         symbol: &str,
         params: &[ParamSpec],
         return_type: &str,
@@ -1862,7 +2598,14 @@ impl CodeDb {
         let Some(entry) = self.root_symbol(root, symbol) else {
             return Ok(false);
         };
-        if !self.function_signature_source_matches(root, symbol, params, return_type, effects)? {
+        if !self.function_signature_source_matches(
+            root,
+            module,
+            symbol,
+            params,
+            return_type,
+            effects,
+        )? {
             return Ok(false);
         }
         if !self.definition_is_external(&entry.definition)? {
@@ -1939,6 +2682,123 @@ impl CodeDb {
                 abi,
                 link_name,
                 library.as_deref(),
+            ),
+            Operation::CreateType {
+                module,
+                name,
+                birth_seed,
+                region_params,
+                definition,
+            } => self.apply_create_type(
+                input_root,
+                parent_history_hash,
+                module,
+                name,
+                birth_seed,
+                region_params,
+                definition,
+            ),
+            Operation::RenameType {
+                module,
+                type_symbol,
+                old_name,
+                new_name,
+            } => self.apply_rename_type(input_root, module, type_symbol, old_name, new_name),
+            Operation::MoveType {
+                module,
+                type_symbol,
+                name,
+                new_module,
+            } => self.apply_move_type(input_root, module, type_symbol, name, new_module),
+            Operation::AddField {
+                module,
+                type_symbol,
+                type_name,
+                field,
+                field_birth_seed,
+            } => self.apply_add_field(
+                input_root,
+                parent_history_hash,
+                module,
+                type_symbol,
+                type_name,
+                field,
+                field_birth_seed,
+            ),
+            Operation::RenameField {
+                module,
+                type_symbol,
+                type_name,
+                field_symbol,
+                old_name,
+                new_name,
+            } => self.apply_rename_field(
+                input_root,
+                module,
+                type_symbol,
+                type_name,
+                field_symbol,
+                old_name,
+                new_name,
+            ),
+            Operation::RemoveField {
+                module,
+                type_symbol,
+                type_name,
+                field_symbol,
+                name,
+            } => self.apply_remove_field(
+                input_root,
+                module,
+                type_symbol,
+                type_name,
+                field_symbol,
+                name,
+            ),
+            Operation::AddVariant {
+                module,
+                type_symbol,
+                type_name,
+                variant,
+                variant_birth_seed,
+            } => self.apply_add_variant(
+                input_root,
+                parent_history_hash,
+                module,
+                type_symbol,
+                type_name,
+                variant,
+                variant_birth_seed,
+            ),
+            Operation::RenameVariant {
+                module,
+                type_symbol,
+                type_name,
+                variant_symbol,
+                old_name,
+                new_name,
+            } => self.apply_rename_variant(
+                input_root,
+                module,
+                type_symbol,
+                type_name,
+                variant_symbol,
+                old_name,
+                new_name,
+            ),
+            Operation::RemoveVariant {
+                module,
+                type_symbol,
+                type_name,
+                variant_symbol,
+                name,
+            } => self.apply_remove_variant(
+                input_root,
+                module,
+                type_symbol,
+                type_name,
+                variant_symbol,
+                name,
             ),
             Operation::RenameSymbol {
                 module,
@@ -2077,9 +2937,9 @@ impl CodeDb {
         let symbol = self.put_symbol_birth(parent_history_hash, birth_seed)?;
         let param_types = params
             .iter()
-            .map(|param| self.resolve_type(&param.ty))
+            .map(|param| self.resolve_type_in_root(module, &root, &param.ty))
             .collect::<Result<Vec<_>>>()?;
-        let return_type_hash = self.resolve_type(return_type)?;
+        let return_type_hash = self.resolve_type_in_root(module, &root, return_type)?;
         let signature =
             self.put_signature_with_effects(&param_types, &return_type_hash, effects)?;
         let param_name_list = params
@@ -2155,9 +3015,9 @@ impl CodeDb {
         let symbol = self.put_symbol_birth(parent_history_hash, birth_seed)?;
         let param_types = params
             .iter()
-            .map(|param| self.resolve_type(&param.ty))
+            .map(|param| self.resolve_type_in_root(module, &root, &param.ty))
             .collect::<Result<Vec<_>>>()?;
-        let return_type_hash = self.resolve_type(return_type)?;
+        let return_type_hash = self.resolve_type_in_root(module, &root, return_type)?;
         let signature =
             self.put_signature_with_effects(&param_types, &return_type_hash, effects)?;
         let definition =
@@ -2189,6 +3049,459 @@ impl CodeDb {
         {
             synchronize_module_metadata(&mut root);
         }
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_create_type(
+        &mut self,
+        input_root: &str,
+        parent_history_hash: Option<&str>,
+        module: &str,
+        name: &str,
+        birth_seed: &str,
+        region_param_names: &[String],
+        definition: &TypeDefinitionKind,
+    ) -> Result<String> {
+        validate_module_path("module", module)?;
+        validate_projection_identifier("type name", name)?;
+        validate_region_param_names(region_param_names)?;
+        validate_type_member_specs(definition)?;
+        let mut root = self.load_root(input_root)?;
+        if root
+            .type_names
+            .iter()
+            .any(|binding| binding.module == module && binding.display_name == name)
+        {
+            bail!("type name already exists: {module}.{name}");
+        }
+
+        let type_symbol = self.put_type_symbol_birth(parent_history_hash, birth_seed)?;
+        let (region_params, region_scope) = self.create_region_params(
+            parent_history_hash,
+            &type_symbol,
+            birth_seed,
+            region_param_names,
+        )?;
+        let semantic_definition = self.type_definition_from_source(
+            &root,
+            module,
+            parent_history_hash,
+            birth_seed,
+            &type_symbol,
+            region_params,
+            &region_scope,
+            definition,
+        )?;
+        let type_def = self.put_type_def(&type_symbol, &semantic_definition)?;
+        root.types.push(RootTypePayload {
+            type_symbol: type_symbol.clone(),
+            type_def,
+        });
+        root.type_names.push(TypeNameBinding {
+            module: module.to_string(),
+            display_name: name.to_string(),
+            type_symbol,
+            is_preferred: true,
+        });
+        if module != MAIN_BRANCH
+            || root
+                .metadata
+                .contains_key(crate::model::ROOT_MODULES_METADATA_KEY)
+        {
+            synchronize_module_metadata(&mut root);
+        }
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    pub(crate) fn apply_rename_type(
+        &mut self,
+        input_root: &str,
+        module: &str,
+        type_symbol: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<String> {
+        validate_module_path("module", module)?;
+        validate_projection_identifier("type name", new_name)?;
+        let mut root = self.load_root(input_root)?;
+        if root
+            .type_names
+            .iter()
+            .any(|binding| binding.module == module && binding.display_name == new_name)
+        {
+            bail!("type name already exists: {module}.{new_name}");
+        }
+        let mut changed = false;
+        for binding in &mut root.type_names {
+            if binding.module == module
+                && binding.display_name == old_name
+                && binding.type_symbol == type_symbol
+                && binding.is_preferred
+            {
+                binding.display_name = new_name.to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            bail!("precondition failed: {module}.{old_name} does not point to {type_symbol}");
+        }
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    pub(crate) fn apply_move_type(
+        &mut self,
+        input_root: &str,
+        module: &str,
+        type_symbol: &str,
+        name: &str,
+        new_module: &str,
+    ) -> Result<String> {
+        validate_module_path("module", module)?;
+        validate_module_path("new module", new_module)?;
+        let mut root = self.load_root(input_root)?;
+        if module == new_module {
+            self.assert_type_name_points(&root, module, name, type_symbol)?;
+            return Ok(input_root.to_string());
+        }
+        if !root.type_names.iter().any(|binding| {
+            binding.module == module
+                && binding.display_name == name
+                && binding.type_symbol == type_symbol
+                && binding.is_preferred
+        }) {
+            bail!("precondition failed: {module}.{name} does not point to {type_symbol}");
+        }
+
+        let moved_names = root
+            .type_names
+            .iter()
+            .filter(|binding| binding.module == module && binding.type_symbol == type_symbol)
+            .map(|binding| binding.display_name.clone())
+            .collect::<BTreeSet<_>>();
+        for moved_name in &moved_names {
+            if root.type_names.iter().any(|binding| {
+                binding.module == new_module
+                    && binding.display_name == *moved_name
+                    && binding.type_symbol != type_symbol
+            }) {
+                bail!("type name already exists: {new_module}.{moved_name}");
+            }
+        }
+
+        let mut changed = false;
+        for binding in &mut root.type_names {
+            if binding.module == module && binding.type_symbol == type_symbol {
+                binding.module = new_module.to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            bail!("precondition failed: {module}.{name} does not point to {type_symbol}");
+        }
+        synchronize_module_metadata(&mut root);
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_add_field(
+        &mut self,
+        input_root: &str,
+        parent_history_hash: Option<&str>,
+        module: &str,
+        type_symbol: &str,
+        type_name: &str,
+        field: &TypeMemberSpec,
+        field_birth_seed: &str,
+    ) -> Result<String> {
+        validate_projection_identifier("record field", &field.name)?;
+        let mut root = self.load_root(input_root)?;
+        self.assert_type_name_points(&root, module, type_name, type_symbol)?;
+        let definition = self.type_definition_for_symbol(&root, type_symbol)?;
+        let TypeDefinition::Record {
+            region_params,
+            mut fields,
+            ..
+        } = definition
+        else {
+            bail!("add_field requires record type {module}.{type_name}");
+        };
+        if fields.iter().any(|candidate| candidate.name == field.name) {
+            bail!(
+                "record field already exists: {field_name}",
+                field_name = field.name
+            );
+        }
+        let field_symbol =
+            self.put_record_field_birth(parent_history_hash, type_symbol, field_birth_seed)?;
+        let region_scope = region_scope_from_params(&region_params);
+        let type_hash =
+            self.resolve_type_in_root_with_regions(module, &root, &field.ty, &region_scope)?;
+        fields.push(TypeMemberDef {
+            member_symbol: field_symbol,
+            name: field.name.clone(),
+            type_hash,
+        });
+        self.update_type_definition(
+            &mut root,
+            type_symbol,
+            TypeDefinition::Record {
+                type_symbol: type_symbol.to_string(),
+                region_params,
+                fields,
+            },
+        )?;
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_rename_field(
+        &mut self,
+        input_root: &str,
+        module: &str,
+        type_symbol: &str,
+        type_name: &str,
+        field_symbol: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<String> {
+        validate_projection_identifier("record field", new_name)?;
+        let mut root = self.load_root(input_root)?;
+        self.assert_type_name_points(&root, module, type_name, type_symbol)?;
+        let definition = self.type_definition_for_symbol(&root, type_symbol)?;
+        let TypeDefinition::Record {
+            region_params,
+            mut fields,
+            ..
+        } = definition
+        else {
+            bail!("rename_field requires record type {module}.{type_name}");
+        };
+        if fields.iter().any(|field| field.name == new_name) {
+            bail!("record field already exists: {new_name}");
+        }
+        let mut changed = false;
+        for field in &mut fields {
+            if field.member_symbol == field_symbol && field.name == old_name {
+                field.name = new_name.to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            bail!("record field {old_name} does not point to {field_symbol}");
+        }
+        self.update_type_definition(
+            &mut root,
+            type_symbol,
+            TypeDefinition::Record {
+                type_symbol: type_symbol.to_string(),
+                region_params,
+                fields,
+            },
+        )?;
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    pub(crate) fn apply_remove_field(
+        &mut self,
+        input_root: &str,
+        module: &str,
+        type_symbol: &str,
+        type_name: &str,
+        field_symbol: &str,
+        name: &str,
+    ) -> Result<String> {
+        let mut root = self.load_root(input_root)?;
+        self.assert_type_name_points(&root, module, type_name, type_symbol)?;
+        let definition = self.type_definition_for_symbol(&root, type_symbol)?;
+        let TypeDefinition::Record {
+            region_params,
+            mut fields,
+            ..
+        } = definition
+        else {
+            bail!("remove_field requires record type {module}.{type_name}");
+        };
+        let original_len = fields.len();
+        fields.retain(|field| !(field.member_symbol == field_symbol && field.name == name));
+        if fields.len() == original_len {
+            bail!("record field {name} does not point to {field_symbol}");
+        }
+        self.update_type_definition(
+            &mut root,
+            type_symbol,
+            TypeDefinition::Record {
+                type_symbol: type_symbol.to_string(),
+                region_params,
+                fields,
+            },
+        )?;
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_add_variant(
+        &mut self,
+        input_root: &str,
+        parent_history_hash: Option<&str>,
+        module: &str,
+        type_symbol: &str,
+        type_name: &str,
+        variant: &TypeMemberSpec,
+        variant_birth_seed: &str,
+    ) -> Result<String> {
+        validate_projection_identifier("enum variant", &variant.name)?;
+        let mut root = self.load_root(input_root)?;
+        self.assert_type_name_points(&root, module, type_name, type_symbol)?;
+        let definition = self.type_definition_for_symbol(&root, type_symbol)?;
+        let TypeDefinition::Enum {
+            region_params,
+            mut variants,
+            ..
+        } = definition
+        else {
+            bail!("add_variant requires enum type {module}.{type_name}");
+        };
+        if variants
+            .iter()
+            .any(|candidate| candidate.name == variant.name)
+        {
+            bail!(
+                "enum variant already exists: {variant_name}",
+                variant_name = variant.name
+            );
+        }
+        let variant_symbol =
+            self.put_enum_variant_birth(parent_history_hash, type_symbol, variant_birth_seed)?;
+        let region_scope = region_scope_from_params(&region_params);
+        let type_hash =
+            self.resolve_type_in_root_with_regions(module, &root, &variant.ty, &region_scope)?;
+        variants.push(TypeMemberDef {
+            member_symbol: variant_symbol,
+            name: variant.name.clone(),
+            type_hash,
+        });
+        self.update_type_definition(
+            &mut root,
+            type_symbol,
+            TypeDefinition::Enum {
+                type_symbol: type_symbol.to_string(),
+                region_params,
+                variants,
+            },
+        )?;
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_rename_variant(
+        &mut self,
+        input_root: &str,
+        module: &str,
+        type_symbol: &str,
+        type_name: &str,
+        variant_symbol: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<String> {
+        validate_projection_identifier("enum variant", new_name)?;
+        let mut root = self.load_root(input_root)?;
+        self.assert_type_name_points(&root, module, type_name, type_symbol)?;
+        let definition = self.type_definition_for_symbol(&root, type_symbol)?;
+        let TypeDefinition::Enum {
+            region_params,
+            mut variants,
+            ..
+        } = definition
+        else {
+            bail!("rename_variant requires enum type {module}.{type_name}");
+        };
+        if variants.iter().any(|variant| variant.name == new_name) {
+            bail!("enum variant already exists: {new_name}");
+        }
+        let mut changed = false;
+        for variant in &mut variants {
+            if variant.member_symbol == variant_symbol && variant.name == old_name {
+                variant.name = new_name.to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            bail!("enum variant {old_name} does not point to {variant_symbol}");
+        }
+        self.update_type_definition(
+            &mut root,
+            type_symbol,
+            TypeDefinition::Enum {
+                type_symbol: type_symbol.to_string(),
+                region_params,
+                variants,
+            },
+        )?;
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    pub(crate) fn apply_remove_variant(
+        &mut self,
+        input_root: &str,
+        module: &str,
+        type_symbol: &str,
+        type_name: &str,
+        variant_symbol: &str,
+        name: &str,
+    ) -> Result<String> {
+        let mut root = self.load_root(input_root)?;
+        self.assert_type_name_points(&root, module, type_name, type_symbol)?;
+        let definition = self.type_definition_for_symbol(&root, type_symbol)?;
+        let TypeDefinition::Enum {
+            region_params,
+            mut variants,
+            ..
+        } = definition
+        else {
+            bail!("remove_variant requires enum type {module}.{type_name}");
+        };
+        let original_len = variants.len();
+        variants
+            .retain(|variant| !(variant.member_symbol == variant_symbol && variant.name == name));
+        if variants.len() == original_len {
+            bail!("enum variant {name} does not point to {variant_symbol}");
+        }
+        self.update_type_definition(
+            &mut root,
+            type_symbol,
+            TypeDefinition::Enum {
+                type_symbol: type_symbol.to_string(),
+                region_params,
+                variants,
+            },
+        )?;
         let new_root = self.put_program_root(&root)?;
         self.index_root(&new_root)?;
         self.type_check_root(&new_root)?;
@@ -2343,9 +3656,9 @@ impl CodeDb {
         let old_definition = root.symbols[idx].definition.clone();
         let param_types = params
             .iter()
-            .map(|param| self.resolve_type(&param.ty))
+            .map(|param| self.resolve_type_in_root(module, &root, &param.ty))
             .collect::<Result<Vec<_>>>()?;
-        let return_type_hash = self.resolve_type(return_type)?;
+        let return_type_hash = self.resolve_type_in_root(module, &root, return_type)?;
         let signature =
             self.put_signature_with_effects(&param_types, &return_type_hash, effects)?;
         let param_name_list = params
@@ -2426,7 +3739,7 @@ impl CodeDb {
         let (mut param_types, return_type) = self.signature_parts(&old_signature)?;
         let effects = self.signature_effects(&old_signature)?;
         let mut param_name_list = param_names(&root, symbol);
-        param_types.push(self.resolve_type(&param.ty)?);
+        param_types.push(self.resolve_type_in_root(module, &root, &param.ty)?);
         param_name_list.push(param.name.clone());
         let params = param_types
             .iter()
@@ -2812,6 +4125,294 @@ impl CodeDb {
         } else {
             bail!("precondition failed: {module}.{name} does not point to {symbol}")
         }
+    }
+
+    pub(crate) fn assert_type_name_points(
+        &self,
+        root: &ProgramRootPayload,
+        module: &str,
+        name: &str,
+        type_symbol: &str,
+    ) -> Result<()> {
+        if type_name_points_to_type(root, module, name, type_symbol) {
+            Ok(())
+        } else {
+            bail!("precondition failed: {module}.{name} does not point to {type_symbol}")
+        }
+    }
+
+    fn create_region_params(
+        &mut self,
+        parent_history_hash: Option<&str>,
+        type_symbol: &str,
+        birth_seed: &str,
+        region_param_names: &[String],
+    ) -> Result<(Vec<RegionParamDef>, BTreeMap<String, String>)> {
+        validate_region_param_names(region_param_names)?;
+        let mut params = Vec::with_capacity(region_param_names.len());
+        let mut scope = BTreeMap::new();
+        for (idx, name) in region_param_names.iter().enumerate() {
+            let region = self.put_region_param_birth(
+                parent_history_hash,
+                type_symbol,
+                &format!("{birth_seed}:region:{idx}:{name}"),
+            )?;
+            params.push(RegionParamDef {
+                region: region.clone(),
+                name: name.clone(),
+            });
+            scope.insert(name.clone(), region);
+        }
+        Ok((params, scope))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn type_definition_from_source(
+        &mut self,
+        root: &ProgramRootPayload,
+        module: &str,
+        parent_history_hash: Option<&str>,
+        birth_seed: &str,
+        type_symbol: &str,
+        region_params: Vec<RegionParamDef>,
+        region_scope: &BTreeMap<String, String>,
+        definition: &TypeDefinitionKind,
+    ) -> Result<TypeDefinition> {
+        match definition {
+            TypeDefinitionKind::Record { fields } => {
+                let fields = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, field)| {
+                        validate_projection_identifier("record field", &field.name)?;
+                        Ok(TypeMemberDef {
+                            member_symbol: self.put_record_field_birth(
+                                parent_history_hash,
+                                type_symbol,
+                                &format!("{birth_seed}:field:{idx}:{}", field.name),
+                            )?,
+                            name: field.name.clone(),
+                            type_hash: self.resolve_type_in_root_with_regions(
+                                module,
+                                root,
+                                &field.ty,
+                                region_scope,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(TypeDefinition::Record {
+                    type_symbol: type_symbol.to_string(),
+                    region_params,
+                    fields,
+                })
+            }
+            TypeDefinitionKind::Enum { variants } => {
+                let variants = variants
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, variant)| {
+                        validate_projection_identifier("enum variant", &variant.name)?;
+                        Ok(TypeMemberDef {
+                            member_symbol: self.put_enum_variant_birth(
+                                parent_history_hash,
+                                type_symbol,
+                                &format!("{birth_seed}:variant:{idx}:{}", variant.name),
+                            )?,
+                            name: variant.name.clone(),
+                            type_hash: self.resolve_type_in_root_with_regions(
+                                module,
+                                root,
+                                &variant.ty,
+                                region_scope,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(TypeDefinition::Enum {
+                    type_symbol: type_symbol.to_string(),
+                    region_params,
+                    variants,
+                })
+            }
+        }
+    }
+
+    fn update_type_definition(
+        &mut self,
+        root: &mut ProgramRootPayload,
+        type_symbol: &str,
+        definition: TypeDefinition,
+    ) -> Result<()> {
+        let idx = root_type_index(root, type_symbol)?;
+        let type_def = self.put_type_def(type_symbol, &definition)?;
+        root.types[idx].type_def = type_def;
+        Ok(())
+    }
+
+    fn type_definition_for_symbol(
+        &self,
+        root: &ProgramRootPayload,
+        type_symbol: &str,
+    ) -> Result<TypeDefinition> {
+        let entry = self
+            .root_type(root, type_symbol)
+            .ok_or_else(|| anyhow!("type missing from root {type_symbol}"))?;
+        self.type_definition(&entry.type_def)
+    }
+
+    fn type_source_matches(
+        &self,
+        root: &ProgramRootPayload,
+        module: &str,
+        name: &str,
+        region_param_names: &[String],
+        expected: &TypeDefinitionKind,
+    ) -> Result<bool> {
+        let Some(type_symbol) = type_symbol_for_name(root, module, name) else {
+            return Ok(false);
+        };
+        let definition = self.type_definition_for_symbol(root, &type_symbol)?;
+        let actual_region_names = definition
+            .region_params()
+            .iter()
+            .map(|param| param.name.clone())
+            .collect::<Vec<_>>();
+        if actual_region_names != region_param_names {
+            return Ok(false);
+        }
+        let region_scope = region_scope_from_params(definition.region_params());
+        match (definition, expected) {
+            (
+                TypeDefinition::Record { fields, .. },
+                TypeDefinitionKind::Record { fields: expected },
+            ) => self.member_specs_match(root, module, &region_scope, &fields, expected),
+            (
+                TypeDefinition::Enum { variants, .. },
+                TypeDefinitionKind::Enum { variants: expected },
+            ) => self.member_specs_match(root, module, &region_scope, &variants, expected),
+            _ => Ok(false),
+        }
+    }
+
+    fn member_specs_match(
+        &self,
+        root: &ProgramRootPayload,
+        module: &str,
+        region_scope: &BTreeMap<String, String>,
+        actual: &[TypeMemberDef],
+        expected: &[TypeMemberSpec],
+    ) -> Result<bool> {
+        if actual.len() != expected.len() {
+            return Ok(false);
+        }
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            if actual.name != expected.name {
+                return Ok(false);
+            }
+            let expected_hash = self.type_hash_for_source_in_root_with_regions(
+                module,
+                root,
+                &expected.ty,
+                region_scope,
+            )?;
+            if actual.type_hash != expected_hash {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn field_points_to_symbol(
+        &self,
+        root: &ProgramRootPayload,
+        type_symbol: &str,
+        name: &str,
+        field_symbol: &str,
+    ) -> Result<bool> {
+        let definition = self.type_definition_for_symbol(root, type_symbol)?;
+        let TypeDefinition::Record { fields, .. } = definition else {
+            return Ok(false);
+        };
+        Ok(fields
+            .iter()
+            .any(|field| field.name == name && field.member_symbol == field_symbol))
+    }
+
+    fn field_name_is_available(
+        &self,
+        root: &ProgramRootPayload,
+        type_symbol: &str,
+        name: &str,
+    ) -> Result<bool> {
+        let definition = self.type_definition_for_symbol(root, type_symbol)?;
+        let TypeDefinition::Record { fields, .. } = definition else {
+            return Ok(false);
+        };
+        Ok(!fields.iter().any(|field| field.name == name))
+    }
+
+    pub(crate) fn field_symbol_by_name(
+        &self,
+        root: &ProgramRootPayload,
+        type_symbol: &str,
+        name: &str,
+    ) -> Result<String> {
+        let definition = self.type_definition_for_symbol(root, type_symbol)?;
+        let TypeDefinition::Record { fields, .. } = definition else {
+            bail!("type is not a record {type_symbol}");
+        };
+        fields
+            .into_iter()
+            .find(|field| field.name == name)
+            .map(|field| field.member_symbol)
+            .ok_or_else(|| anyhow!("record has no field {name}"))
+    }
+
+    fn variant_points_to_symbol(
+        &self,
+        root: &ProgramRootPayload,
+        type_symbol: &str,
+        name: &str,
+        variant_symbol: &str,
+    ) -> Result<bool> {
+        let definition = self.type_definition_for_symbol(root, type_symbol)?;
+        let TypeDefinition::Enum { variants, .. } = definition else {
+            return Ok(false);
+        };
+        Ok(variants
+            .iter()
+            .any(|variant| variant.name == name && variant.member_symbol == variant_symbol))
+    }
+
+    fn variant_name_is_available(
+        &self,
+        root: &ProgramRootPayload,
+        type_symbol: &str,
+        name: &str,
+    ) -> Result<bool> {
+        let definition = self.type_definition_for_symbol(root, type_symbol)?;
+        let TypeDefinition::Enum { variants, .. } = definition else {
+            return Ok(false);
+        };
+        Ok(!variants.iter().any(|variant| variant.name == name))
+    }
+
+    pub(crate) fn variant_symbol_by_name(
+        &self,
+        root: &ProgramRootPayload,
+        type_symbol: &str,
+        name: &str,
+    ) -> Result<String> {
+        let definition = self.type_definition_for_symbol(root, type_symbol)?;
+        let TypeDefinition::Enum { variants, .. } = definition else {
+            bail!("type is not an enum {type_symbol}");
+        };
+        variants
+            .into_iter()
+            .find(|variant| variant.name == name)
+            .map(|variant| variant.member_symbol)
+            .ok_or_else(|| anyhow!("enum has no variant {name}"))
     }
 
     pub fn history_main_branch(&self) -> Result<String> {
@@ -3252,7 +4853,9 @@ impl CodeDb {
         let chain = self.history_chain(MAIN_BRANCH)?;
         let mut current_root = self.put_program_root(&ProgramRootPayload {
             symbols: vec![],
+            types: vec![],
             names: vec![],
+            type_names: vec![],
             param_names: vec![],
             exports: vec![],
             tests: vec![],
@@ -3479,6 +5082,19 @@ fn name_points_to_symbol(
     })
 }
 
+fn type_name_points_to_type(
+    root: &ProgramRootPayload,
+    module: &str,
+    name: &str,
+    type_symbol: &str,
+) -> bool {
+    root.type_names.iter().any(|binding| {
+        binding.module == module
+            && binding.display_name == name
+            && binding.type_symbol == type_symbol
+    })
+}
+
 fn preferred_name_points_to_symbol(
     root: &ProgramRootPayload,
     module: &str,
@@ -3489,6 +5105,20 @@ fn preferred_name_points_to_symbol(
         binding.module == module
             && binding.display_name == name
             && binding.symbol == symbol
+            && binding.is_preferred
+    })
+}
+
+fn preferred_type_name_points_to_type(
+    root: &ProgramRootPayload,
+    module: &str,
+    name: &str,
+    type_symbol: &str,
+) -> bool {
+    root.type_names.iter().any(|binding| {
+        binding.module == module
+            && binding.display_name == name
+            && binding.type_symbol == type_symbol
             && binding.is_preferred
     })
 }
@@ -3514,6 +5144,13 @@ fn symbol_for_name(root: &ProgramRootPayload, module: &str, name: &str) -> Optio
         .map(|binding| binding.symbol.clone())
 }
 
+fn type_symbol_for_name(root: &ProgramRootPayload, module: &str, name: &str) -> Option<String> {
+    root.type_names
+        .iter()
+        .find(|binding| binding.module == module && binding.display_name == name)
+        .map(|binding| binding.type_symbol.clone())
+}
+
 fn export_points_to_symbol(root: &ProgramRootPayload, name: &str, symbol: &str) -> bool {
     root.exports
         .iter()
@@ -3535,6 +5172,52 @@ fn validate_param_names(params: &[ParamSpec]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_region_param_names(params: &[String]) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for name in params {
+        validate_projection_identifier("region parameter", name)?;
+        if !seen.insert(name.clone()) {
+            bail!("duplicate region parameter {name}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_type_member_specs(definition: &TypeDefinitionKind) -> Result<()> {
+    match definition {
+        TypeDefinitionKind::Record { fields } => {
+            if fields.is_empty() {
+                bail!("record fields must not be empty");
+            }
+            validate_member_specs("record field", fields)
+        }
+        TypeDefinitionKind::Enum { variants } => {
+            if variants.is_empty() {
+                bail!("enum variants must not be empty");
+            }
+            validate_member_specs("enum variant", variants)
+        }
+    }
+}
+
+fn validate_member_specs(label: &str, members: &[TypeMemberSpec]) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for member in members {
+        validate_projection_identifier(label, &member.name)?;
+        if !seen.insert(member.name.clone()) {
+            bail!("duplicate {label} {}", member.name);
+        }
+    }
+    Ok(())
+}
+
+fn region_scope_from_params(params: &[RegionParamDef]) -> BTreeMap<String, String> {
+    params
+        .iter()
+        .map(|param| (param.name.clone(), param.region.clone()))
+        .collect()
 }
 
 fn normalize_param_refs(expr: &RawExpr, local_params: &[String]) -> RawExpr {

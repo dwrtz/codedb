@@ -71,6 +71,16 @@ CREATE TABLE IF NOT EXISTS root_symbols (
     FOREIGN KEY (signature_hash) REFERENCES objects(hash)
 );
 
+CREATE TABLE IF NOT EXISTS root_types (
+    root_hash TEXT NOT NULL,
+    type_symbol_hash TEXT NOT NULL,
+    type_def_hash TEXT NOT NULL,
+    PRIMARY KEY (root_hash, type_symbol_hash),
+    FOREIGN KEY (root_hash) REFERENCES objects(hash) ON DELETE CASCADE,
+    FOREIGN KEY (type_symbol_hash) REFERENCES objects(hash),
+    FOREIGN KEY (type_def_hash) REFERENCES objects(hash)
+);
+
 CREATE TABLE IF NOT EXISTS root_names (
     root_hash TEXT NOT NULL,
     module_name TEXT NOT NULL,
@@ -80,6 +90,17 @@ CREATE TABLE IF NOT EXISTS root_names (
     PRIMARY KEY (root_hash, module_name, display_name),
     FOREIGN KEY (root_hash) REFERENCES objects(hash) ON DELETE CASCADE,
     FOREIGN KEY (symbol_hash) REFERENCES objects(hash)
+);
+
+CREATE TABLE IF NOT EXISTS root_type_names (
+    root_hash TEXT NOT NULL,
+    module_name TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    type_symbol_hash TEXT NOT NULL,
+    is_preferred INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (root_hash, module_name, display_name),
+    FOREIGN KEY (root_hash) REFERENCES objects(hash) ON DELETE CASCADE,
+    FOREIGN KEY (type_symbol_hash) REFERENCES objects(hash)
 );
 
 CREATE TABLE IF NOT EXISTS root_exports (
