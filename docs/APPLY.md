@@ -104,7 +104,9 @@ are rejected.
   "name": "main_returns_120",
   "entry": "main",
   "expected": { "kind": "i64", "value": "120" },
-  "category": "behavior"
+  "category": "behavior",
+  "mode": "reference_and_native",
+  "native_required": true
 }
 ```
 
@@ -125,6 +127,11 @@ migration. If live call sites exist, `default` is required.
 `create_test` categories are `behavior` (default), `projection`, and `export`.
 Incremental test impact uses the category to decide whether rename/export-only
 changes should select a test.
+
+`create_test` mode defaults to `reference`. Use `reference_and_native` to request
+native agreement. Set `native_required: true` for v2 gates; unsupported native
+execution is then reported as a failed test with native status `unsupported`
+instead of a skipped native comparison.
 
 ## Types
 

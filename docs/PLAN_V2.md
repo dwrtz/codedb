@@ -156,6 +156,11 @@ no command behavior changes required in this phase
 
 Goal: make it impossible to accidentally count evaluator-only behavior as v2 done.
 
+Status: implemented. The harness supports v2 test cases with
+`mode: "reference_and_native"` and `native_required: true`, reports structured
+native results, and fails native-required tests when native execution is
+unsupported.
+
 Deliverables:
 
 ```text

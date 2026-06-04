@@ -9,8 +9,9 @@ use serde_json::{Value as JsonValue, json};
 use crate::expr::Value;
 use crate::migrations::Operation;
 use crate::model::{
-    ProgramRootPayload, RootTestBinding, TEST_CASE_SCHEMA, TestCasePayload, TestCategory,
-    TestValue, exports_for, test_binding_for, validate_projection_identifier,
+    ProgramRootPayload, RootTestBinding, TEST_CASE_SCHEMA_V1, TEST_CASE_SCHEMA_V2, TestCasePayload,
+    TestCategory, TestMode, TestValue, exports_for, test_binding_for,
+    validate_projection_identifier,
 };
 use crate::store::{CodeDb, canonical_json};
 use crate::{APPLE_ARM64_TARGET, DEFAULT_NATIVE_TARGET, LINUX_X86_64_TARGET, MAIN_BRANCH};
@@ -18,6 +19,7 @@ use crate::{APPLE_ARM64_TARGET, DEFAULT_NATIVE_TARGET, LINUX_X86_64_TARGET, MAIN
 const TEST_LIST_SCHEMA: &str = "codedb/tests-list/v1";
 const TEST_RUN_SCHEMA: &str = "codedb/test-run/v1";
 const TEST_IMPACT_SCHEMA: &str = "codedb/test-impact/v1";
+const NATIVE_TEST_RESULT_SCHEMA: &str = "codedb/native-test-result/v1";
 
 impl CodeDb {
     #[allow(clippy::too_many_arguments)]
@@ -31,6 +33,7 @@ impl CodeDb {
         expected_unit: bool,
         category: Option<&str>,
         native_agreement: bool,
+        native_required: bool,
         expected_root: Option<&str>,
         json: bool,
     ) -> Result<String> {
@@ -49,6 +52,7 @@ impl CodeDb {
             expected,
             parse_test_category(category)?,
             native_agreement,
+            native_required,
         )?;
         let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
         Ok(if json {
@@ -108,6 +112,7 @@ impl CodeDb {
         expected: TestValue,
         category: TestCategory,
         native_agreement: bool,
+        native_required: bool,
     ) -> Result<Operation> {
         let root = self.load_root(root_hash)?;
         let entry_symbol = self.resolve_name(root_hash, entry_module, entry_name)?;
@@ -131,15 +136,23 @@ impl CodeDb {
                 parse_test_value_arg(arg, &type_name, idx)
             })
             .collect::<Result<Vec<_>>>()?;
+        let native_agreement = native_agreement || native_required;
+        let mode = if native_agreement || native_required {
+            TestMode::ReferenceAndNative
+        } else {
+            TestMode::Reference
+        };
         Ok(Operation::CreateTest {
             name: name.to_string(),
             entry_module: entry_module.to_string(),
             entry_name: entry_name.to_string(),
             entry_symbol,
             category,
+            mode,
             args,
             expected,
             native_agreement,
+            native_required,
         })
     }
 
@@ -154,11 +167,19 @@ impl CodeDb {
         args: Vec<TestValue>,
         expected: TestValue,
         category: TestCategory,
+        mode: TestMode,
         native_agreement: bool,
+        native_required: bool,
     ) -> Result<Operation> {
         let symbol = match entry_symbol {
             Some(symbol) => symbol.to_string(),
             None => self.resolve_name(root_hash, entry_module, entry_name)?,
+        };
+        let native_agreement = native_agreement || native_required;
+        let mode = if native_agreement || native_required {
+            TestMode::ReferenceAndNative
+        } else {
+            mode
         };
         Ok(Operation::CreateTest {
             name: name.to_string(),
@@ -166,9 +187,11 @@ impl CodeDb {
             entry_name: entry_name.to_string(),
             entry_symbol: symbol,
             category,
+            mode,
             args,
             expected,
             native_agreement,
+            native_required,
         })
     }
 
@@ -180,11 +203,17 @@ impl CodeDb {
     }
 
     pub(crate) fn put_test_case(&mut self, case: &TestCasePayload) -> Result<String> {
-        if case.schema != TEST_CASE_SCHEMA {
+        if !test_case_schema_supported(&case.schema) {
             bail!(
-                "unsupported test case schema {:?}; expected {TEST_CASE_SCHEMA}",
+                "unsupported test case schema {:?}; expected {TEST_CASE_SCHEMA_V1} or {TEST_CASE_SCHEMA_V2}",
                 case.schema
             );
+        }
+        if case.native_required && case.schema != TEST_CASE_SCHEMA_V2 {
+            bail!("native_required test cases require schema {TEST_CASE_SCHEMA_V2}");
+        }
+        if case.native_required && !case.native_requested() {
+            bail!("native_required test cases require mode reference_and_native");
         }
         self.put_object("TestCase", &serde_json::to_value(case)?)
     }
@@ -194,12 +223,18 @@ impl CodeDb {
         if kind != "TestCase" {
             bail!("object {test_hash} is {kind}, not TestCase");
         }
-        let case: TestCasePayload = serde_json::from_value(self.get_payload(test_hash)?)?;
-        if case.schema != TEST_CASE_SCHEMA {
+        let mut case: TestCasePayload = serde_json::from_value(self.get_payload(test_hash)?)?;
+        if !test_case_schema_supported(&case.schema) {
             bail!(
-                "unsupported test case schema {:?}; expected {TEST_CASE_SCHEMA}",
+                "unsupported test case schema {:?}; expected {TEST_CASE_SCHEMA_V1} or {TEST_CASE_SCHEMA_V2}",
                 case.schema
             );
+        }
+        if case.native_required && case.schema != TEST_CASE_SCHEMA_V2 {
+            bail!("native_required test cases require schema {TEST_CASE_SCHEMA_V2}");
+        }
+        if case.native_agreement || case.native_required {
+            case.mode = TestMode::ReferenceAndNative;
         }
         Ok(case)
     }
@@ -271,12 +306,14 @@ impl CodeDb {
         for binding in &root.tests {
             let case = self.load_test_case(&binding.test)?;
             out.push_str(&format!(
-                "{} category {} entry {} expected {} native_agreement {}\n",
+                "{} category {} entry {} expected {} mode {} native_agreement {} native_required {}\n",
                 binding.name,
                 case.category.as_str(),
                 self.symbol_display_for_module(&root, MAIN_BRANCH, &case.entry_symbol)?,
                 display_test_value(&case.expected),
-                case.native_agreement
+                case.mode.as_str(),
+                case.native_requested(),
+                case.native_required
             ));
         }
         if out.is_empty() {
@@ -321,9 +358,12 @@ impl CodeDb {
             "entry_symbol": case.entry_symbol,
             "entry_effects": self.signature_effect_names(&entry.signature)?,
             "category": case.category.as_str(),
+            "mode": case.mode.as_str(),
             "args": case.args,
             "expected": case.expected,
-            "native_agreement": case.native_agreement,
+            "native_agreement": case.native_requested(),
+            "native_required": case.native_required,
+            "labels": case.labels(),
         }))
     }
 
@@ -346,7 +386,7 @@ impl CodeDb {
             .flatten()
         {
             out.push_str(&format!(
-                "{} {} reference {}\n",
+                "{} {} reference {} native {}\n",
                 test.get("status")
                     .and_then(JsonValue::as_str)
                     .unwrap_or("error"),
@@ -356,11 +396,15 @@ impl CodeDb {
                 test.get("reference")
                     .and_then(|reference| reference.get("status"))
                     .and_then(JsonValue::as_str)
+                    .unwrap_or("error"),
+                test.get("native")
+                    .and_then(|native| native.get("status"))
+                    .and_then(JsonValue::as_str)
                     .unwrap_or("error")
             ));
         }
         out.push_str(&format!(
-            "summary status {} passed {} failed {} errors {} native_skipped {}\n",
+            "summary status {} passed {} failed {} errors {} unsupported {} native_mismatches {} native_skipped {}\n",
             payload
                 .get("status")
                 .and_then(JsonValue::as_str)
@@ -375,6 +419,14 @@ impl CodeDb {
                 .unwrap_or(0),
             payload
                 .get("errors")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0),
+            payload
+                .get("unsupported")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0),
+            payload
+                .get("native_mismatches")
                 .and_then(JsonValue::as_u64)
                 .unwrap_or(0),
             payload
@@ -393,6 +445,8 @@ impl CodeDb {
         let mut passed = 0usize;
         let mut failed = 0usize;
         let mut errors = 0usize;
+        let mut unsupported = 0usize;
+        let mut native_mismatches = 0usize;
         let mut native_skipped = 0usize;
 
         for binding in &test_bindings {
@@ -400,10 +454,18 @@ impl CodeDb {
             match result.get("status").and_then(JsonValue::as_str) {
                 Some("passed") => passed += 1,
                 Some("failed") => failed += 1,
+                Some("unsupported") => {
+                    failed += 1;
+                    unsupported += 1;
+                }
+                Some("native_mismatch") => {
+                    failed += 1;
+                    native_mismatches += 1;
+                }
                 _ => errors += 1,
             }
             if result
-                .get("native_agreement")
+                .get("native")
                 .and_then(|native| native.get("status"))
                 .and_then(JsonValue::as_str)
                 == Some("skipped")
@@ -431,6 +493,8 @@ impl CodeDb {
                 "passed": passed,
                 "failed": failed,
                 "errors": errors,
+                "unsupported": unsupported,
+                "native_mismatches": native_mismatches,
                 "native_skipped": native_skipped,
                 "tests": tests,
             }))
@@ -481,8 +545,19 @@ impl CodeDb {
             .to_string();
         let native_result =
             self.native_agreement_result(branch_name, &entry_name, &case, &expected);
-        if native_result.get("status").and_then(JsonValue::as_str) == Some("failed") {
-            status = "failed".to_string();
+        match native_result.get("status").and_then(JsonValue::as_str) {
+            Some("failed")
+                if status != "error" && (case.native_required || case.native_requested()) =>
+            {
+                status = "failed".to_string();
+            }
+            Some("unsupported") if status != "error" && case.native_required => {
+                status = "unsupported".to_string();
+            }
+            Some("native_mismatch") if status != "error" => {
+                status = "native_mismatch".to_string();
+            }
+            _ => {}
         }
         Ok(json!({
             "name": binding.name,
@@ -491,10 +566,14 @@ impl CodeDb {
             "entry_symbol": case.entry_symbol,
             "entry_effects": self.signature_effect_names(&entry.signature)?,
             "category": case.category.as_str(),
+            "mode": case.mode.as_str(),
             "args": case.args,
             "expected": case.expected,
+            "native_required": case.native_required,
+            "labels": case.labels(),
             "status": status,
             "reference": reference_result,
+            "native": native_result,
             "native_agreement": native_result,
         }))
     }
@@ -833,45 +912,45 @@ impl CodeDb {
         case: &TestCasePayload,
         expected: &Value,
     ) -> JsonValue {
-        if !case.native_agreement {
-            return json!({ "status": "not_requested" });
+        if !case.native_requested() {
+            return native_result_base(case, "not_requested", None, None, Vec::new());
         }
         if !case.args.is_empty() {
-            return json!({
-                "status": "skipped",
-                "reason": "native executable tests require an entry with no arguments",
-                "target_triple": DEFAULT_NATIVE_TARGET,
-            });
+            return native_unavailable_result(
+                case,
+                "unsupported_feature",
+                "native executable tests require an entry with no arguments",
+            );
         }
         let Some(expected_exit) = expected_native_exit_code(expected) else {
-            return json!({
-                "status": "skipped",
-                "reason": "expected value cannot be represented as a native process exit status",
-                "target_triple": DEFAULT_NATIVE_TARGET,
-            });
+            return native_unavailable_result(
+                case,
+                "unsupported_feature",
+                "expected value cannot be represented as a native process exit status",
+            );
         };
         if !native_target_is_host_linkable(DEFAULT_NATIVE_TARGET) {
-            return json!({
-                "status": "skipped",
-                "reason": "default native target is not linkable on this host",
-                "target_triple": DEFAULT_NATIVE_TARGET,
-            });
+            return native_unavailable_result(
+                case,
+                "backend_unavailable",
+                "default native target is not linkable on this host",
+            );
         }
         if !host_has_cc() {
-            return json!({
-                "status": "skipped",
-                "reason": "cc linker is not available",
-                "target_triple": DEFAULT_NATIVE_TARGET,
-            });
+            return native_unavailable_result(
+                case,
+                "backend_unavailable",
+                "cc linker is not available",
+            );
         }
         let build = match self.build_branch(branch_name, entry_name, DEFAULT_NATIVE_TARGET) {
             Ok(build) => build,
             Err(err) => {
-                return json!({
-                    "status": "skipped",
-                    "reason": format!("native build unavailable: {err:#}"),
-                    "target_triple": DEFAULT_NATIVE_TARGET,
-                });
+                return native_unavailable_result(
+                    case,
+                    "unsupported_feature",
+                    &format!("native build unavailable: {err:#}"),
+                );
             }
         };
         let exe = native_test_executable_path(&build.artifact_hash);
@@ -879,11 +958,16 @@ impl CodeDb {
             std::fs::write(&exe, &build.executable).and_then(|_| make_executable(&exe))
         {
             let _ = std::fs::remove_file(&exe);
-            return json!({
-                "status": "failed",
-                "target_triple": DEFAULT_NATIVE_TARGET,
-                "error": format!("failed to materialize native executable: {err}"),
-            });
+            return native_result_base(
+                case,
+                "failed",
+                Some("native_execution_failed"),
+                Some(format!("failed to materialize native executable: {err}")),
+                vec![native_diagnostic(
+                    "native_execution_failed",
+                    &format!("failed to materialize native executable: {err}"),
+                )],
+            );
         }
         let output = ProcessCommand::new(&exe).status();
         let _ = std::fs::remove_file(&exe);
@@ -891,20 +975,47 @@ impl CodeDb {
             Ok(status) => {
                 let actual = status.code();
                 let passed = actual == Some(expected_exit);
+                let actual_value =
+                    actual.and_then(|code| native_test_value_from_exit_code(expected, code));
                 json!({
-                    "status": if passed { "passed" } else { "failed" },
+                    "schema": NATIVE_TEST_RESULT_SCHEMA,
+                    "status": if passed { "passed" } else { "native_mismatch" },
+                    "mode": case.mode.as_str(),
+                    "native_required": case.native_required,
                     "target_triple": DEFAULT_NATIVE_TARGET,
+                    "reason_code": if passed { JsonValue::Null } else { JsonValue::String("native_mismatch".to_string()) },
+                    "reason": if passed { JsonValue::Null } else { JsonValue::String("native result did not match expected value".to_string()) },
                     "expected_exit_code": expected_exit,
                     "actual_exit_code": actual,
+                    "comparison": {
+                        "kind": "process_exit_scalar",
+                        "expected": &case.expected,
+                        "actual": actual_value,
+                        "expected_exit_code": expected_exit,
+                        "actual_exit_code": actual,
+                    },
                     "executable_cache_key": build.cache_key,
                     "executable_artifact_hash": build.artifact_hash,
+                    "diagnostics": if passed {
+                        Vec::<JsonValue>::new()
+                    } else {
+                        vec![native_diagnostic(
+                            "native_mismatch",
+                            "native result did not match expected value",
+                        )]
+                    },
                 })
             }
-            Err(err) => json!({
-                "status": "failed",
-                "target_triple": DEFAULT_NATIVE_TARGET,
-                "error": format!("failed to run native executable: {err}"),
-            }),
+            Err(err) => native_result_base(
+                case,
+                "failed",
+                Some("native_execution_failed"),
+                Some(format!("failed to run native executable: {err}")),
+                vec![native_diagnostic(
+                    "native_execution_failed",
+                    &format!("failed to run native executable: {err}"),
+                )],
+            ),
         }
     }
 }
@@ -1177,6 +1288,58 @@ fn signature_effects_for_changed_symbol(
         .unwrap_or_default()
 }
 
+fn test_case_schema_supported(schema: &str) -> bool {
+    schema == TEST_CASE_SCHEMA_V1 || schema == TEST_CASE_SCHEMA_V2
+}
+
+fn native_unavailable_result(
+    case: &TestCasePayload,
+    reason_code: &'static str,
+    reason: &str,
+) -> JsonValue {
+    let status = if case.native_required {
+        "unsupported"
+    } else {
+        "skipped"
+    };
+    native_result_base(
+        case,
+        status,
+        Some(reason_code),
+        Some(reason.to_string()),
+        vec![native_diagnostic(reason_code, reason)],
+    )
+}
+
+fn native_result_base(
+    case: &TestCasePayload,
+    status: &str,
+    reason_code: Option<&str>,
+    reason: Option<String>,
+    diagnostics: Vec<JsonValue>,
+) -> JsonValue {
+    json!({
+        "schema": NATIVE_TEST_RESULT_SCHEMA,
+        "status": status,
+        "mode": case.mode.as_str(),
+        "native_required": case.native_required,
+        "target_triple": DEFAULT_NATIVE_TARGET,
+        "reason_code": reason_code,
+        "reason": reason,
+        "diagnostics": diagnostics,
+    })
+}
+
+fn native_diagnostic(kind: &str, message: &str) -> JsonValue {
+    json!({
+        "kind": kind,
+        "message": message,
+        "details": {
+            "target_triple": DEFAULT_NATIVE_TARGET,
+        },
+    })
+}
+
 pub(crate) fn value_from_test_value(value: &TestValue) -> Result<Value> {
     match value {
         TestValue::I64 { value } => value
@@ -1300,6 +1463,20 @@ fn expected_native_exit_code(value: &Value) -> Option<i32> {
         Value::Bool(value) => Some(i32::from(*value)),
         Value::Unit => None,
         Value::Record(_) | Value::Enum { .. } => None,
+    }
+}
+
+fn native_test_value_from_exit_code(expected: &Value, code: i32) -> Option<TestValue> {
+    match expected {
+        Value::I64(_) => Some(TestValue::I64 {
+            value: code.to_string(),
+        }),
+        Value::Bool(_) => match code {
+            0 => Some(TestValue::Bool { value: false }),
+            1 => Some(TestValue::Bool { value: true }),
+            _ => None,
+        },
+        Value::Unit | Value::Record(_) | Value::Enum { .. } => None,
     }
 }
 

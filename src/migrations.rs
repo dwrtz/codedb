@@ -11,9 +11,9 @@ use crate::build_plan::{BuildImpact, BuildImpactKind, BuildImpactReason, project
 use crate::expr::RawExpr;
 use crate::model::{
     BranchState, ExportBinding, NameBinding, ParamNames, ProgramRootPayload, RootSymbolPayload,
-    RootTestBinding, TestCasePayload, TestCategory, TestValue, param_names, root_symbol_index,
-    synchronize_module_metadata, test_binding_for, upsert_param_names, validate_module_path,
-    validate_projection_identifier,
+    RootTestBinding, TestCasePayload, TestCategory, TestMode, TestValue, param_names,
+    root_symbol_index, synchronize_module_metadata, test_binding_for, upsert_param_names,
+    validate_module_path, validate_projection_identifier,
 };
 use crate::store::{CodeDb, canonical_json, hash_bytes};
 use crate::tests::{test_points_to_entry_symbol, validate_test_value_type};
@@ -120,11 +120,15 @@ pub(crate) enum Operation {
         entry_symbol: String,
         #[serde(default, skip_serializing_if = "TestCategory::is_behavior")]
         category: TestCategory,
+        #[serde(default, skip_serializing_if = "TestMode::is_reference")]
+        mode: TestMode,
         #[serde(default)]
         args: Vec<TestValue>,
         expected: TestValue,
         #[serde(default)]
         native_agreement: bool,
+        #[serde(default)]
+        native_required: bool,
     },
     DeleteTest {
         name: String,
@@ -2015,9 +2019,11 @@ impl CodeDb {
                 entry_name,
                 entry_symbol,
                 category,
+                mode,
                 args,
                 expected,
                 native_agreement,
+                native_required,
             } => self.apply_create_test(
                 input_root,
                 name,
@@ -2025,9 +2031,11 @@ impl CodeDb {
                 entry_name,
                 entry_symbol,
                 *category,
+                *mode,
                 args,
                 expected,
                 *native_agreement,
+                *native_required,
             ),
             Operation::DeleteTest { name, test } => self.apply_delete_test(input_root, name, test),
             Operation::MergeBranch {
@@ -2674,9 +2682,11 @@ impl CodeDb {
         entry_name: &str,
         entry_symbol: &str,
         category: TestCategory,
+        mode: TestMode,
         args: &[TestValue],
         expected: &TestValue,
         native_agreement: bool,
+        native_required: bool,
     ) -> Result<String> {
         validate_projection_identifier("test name", name)?;
         let mut root = self.load_root(input_root)?;
@@ -2701,13 +2711,26 @@ impl CodeDb {
         }
         let return_type_name = self.type_name(&return_type)?;
         validate_test_value_type(expected, &return_type_name, "expected value")?;
+        let native_agreement = native_agreement || native_required;
+        let mode = if native_agreement || native_required {
+            TestMode::ReferenceAndNative
+        } else {
+            mode
+        };
+        let schema = if mode == TestMode::ReferenceAndNative || native_required {
+            crate::model::TEST_CASE_SCHEMA_V2
+        } else {
+            crate::model::TEST_CASE_SCHEMA_V1
+        };
         let case = TestCasePayload {
-            schema: crate::model::TEST_CASE_SCHEMA.to_string(),
+            schema: schema.to_string(),
             category,
+            mode,
             entry_symbol: entry_symbol.to_string(),
             args: args.to_vec(),
             expected: expected.clone(),
             native_agreement,
+            native_required,
         };
         self.validate_test_case_for_root(input_root, &root, &case)?;
         let test = self.put_test_case(&case)?;

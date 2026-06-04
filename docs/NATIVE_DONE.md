@@ -48,11 +48,9 @@ The following do not satisfy a v2 feature gate:
 
 ## Native-Required Test Policy
 
-V2 acceptance tests must be marked native-required once the test-case schema
-supports that flag. Until Phase 2 adds the executable test-harness field, v2
-plans and fixtures should label these gates as native-required in documentation.
+V2 acceptance tests must be marked native-required.
 
-The intended test-case shape is:
+The executable test-harness fields use the v2 test-case schema:
 
 ```json
 {
@@ -66,6 +64,12 @@ In native-required mode, unsupported native backend behavior is a failure, not a
 skip. The reference evaluator may compare behavior as an oracle, but it is not
 the acceptance backend.
 
+Native run JSON includes a structured native result object with schema
+`codedb/native-test-result/v1`. Native result statuses distinguish
+`not_requested`, `skipped`, `unsupported`, `failed`, `native_mismatch`, and
+`passed`; native-required unsupported results count as failed tests and are
+reported with the `v2_native_required` label.
+
 ## Phase 1 Feature Gates
 
 Phase 1 opens only the version-boundary documentation gate. It is accepted when:
@@ -78,3 +82,19 @@ Phase 1 opens only the version-boundary documentation gate. It is accepted when:
 - this checklist marks future v2 feature gates as native-required;
 - existing tests still pass;
 - no command behavior changes are required.
+
+## Phase 2 Feature Gates
+
+Phase 2 opens the native-required test harness gate. It is accepted when:
+
+- test cases can use `schema: "codedb/test-case/v2"`,
+  `mode: "reference_and_native"`, and `native_required: true`;
+- CLI `create-test --native-required` and apply JSON `native_required: true`
+  both preserve the flag through migrations and history replay;
+- native-required scalar tests pass for currently native-supported functions;
+- unsupported native backend or harness features report native status
+  `unsupported` with an `unsupported_feature` diagnostic and fail the test;
+- JSON test results separately count ordinary failures, unsupported native
+  requirements, skipped native comparisons, and native mismatches;
+- existing non-native-required tests remain valid and v1 test cases remain
+  readable.

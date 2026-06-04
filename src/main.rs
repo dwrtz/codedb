@@ -81,6 +81,8 @@ enum Command {
         #[arg(long)]
         native_agreement: bool,
         #[arg(long)]
+        native_required: bool,
+        #[arg(long)]
         expect_root: Option<String>,
         #[arg(long)]
         json: bool,
@@ -572,6 +574,7 @@ fn main() -> Result<()> {
             expect_unit,
             category,
             native_agreement,
+            native_required,
             expect_root,
             json,
         } => {
@@ -587,6 +590,7 @@ fn main() -> Result<()> {
                     expect_unit,
                     category.as_deref(),
                     native_agreement,
+                    native_required,
                     expect_root.as_deref(),
                     json,
                 )?

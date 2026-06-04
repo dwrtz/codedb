@@ -45,7 +45,9 @@ pub(crate) struct ExportBinding {
     pub(crate) exported_name: String,
 }
 
-pub(crate) const TEST_CASE_SCHEMA: &str = "codedb/test-case/v1";
+pub(crate) const TEST_CASE_SCHEMA_V1: &str = "codedb/test-case/v1";
+pub(crate) const TEST_CASE_SCHEMA_V2: &str = "codedb/test-case/v2";
+pub(crate) const TEST_CASE_SCHEMA: &str = TEST_CASE_SCHEMA_V2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RootTestBinding {
@@ -59,11 +61,29 @@ pub(crate) struct TestCasePayload {
     pub(crate) schema: String,
     #[serde(default, skip_serializing_if = "TestCategory::is_behavior")]
     pub(crate) category: TestCategory,
+    #[serde(default, skip_serializing_if = "TestMode::is_reference")]
+    pub(crate) mode: TestMode,
     pub(crate) entry_symbol: String,
     pub(crate) args: Vec<TestValue>,
     pub(crate) expected: TestValue,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) native_agreement: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) native_required: bool,
+}
+
+impl TestCasePayload {
+    pub(crate) fn native_requested(&self) -> bool {
+        self.native_agreement || matches!(self.mode, TestMode::ReferenceAndNative)
+    }
+
+    pub(crate) fn labels(&self) -> Vec<&'static str> {
+        let mut labels = Vec::new();
+        if self.native_required {
+            labels.push("v2_native_required");
+        }
+        labels
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -73,6 +93,27 @@ pub(crate) enum TestCategory {
     Behavior,
     Projection,
     Export,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TestMode {
+    #[default]
+    Reference,
+    ReferenceAndNative,
+}
+
+impl TestMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            TestMode::Reference => "reference",
+            TestMode::ReferenceAndNative => "reference_and_native",
+        }
+    }
+
+    pub(crate) fn is_reference(&self) -> bool {
+        matches!(self, TestMode::Reference)
+    }
 }
 
 impl TestCategory {

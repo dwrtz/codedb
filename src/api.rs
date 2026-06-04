@@ -7,7 +7,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::MAIN_BRANCH;
 use crate::expr::RawExpr;
 use crate::migrations::{MigrationStatus, Operation};
-use crate::model::{TestCategory, TestValue};
+use crate::model::{TestCategory, TestMode, TestValue};
 use crate::store::{CodeDb, canonical_json};
 use crate::types::{Effect, ParamSpec};
 
@@ -189,7 +189,11 @@ enum ApiOperation {
         #[serde(default)]
         category: TestCategory,
         #[serde(default)]
+        mode: TestMode,
+        #[serde(default)]
         native_agreement: bool,
+        #[serde(default)]
+        native_required: bool,
         #[serde(default, alias = "expect_root")]
         expect_root_hash: Option<String>,
     },
@@ -703,7 +707,9 @@ impl CodeDb {
                 args,
                 expected,
                 category,
+                mode,
                 native_agreement,
+                native_required,
                 ..
             } => self.create_test_operation_from_values(
                 expected_root,
@@ -714,7 +720,9 @@ impl CodeDb {
                 args.clone(),
                 expected.clone(),
                 *category,
+                *mode,
                 *native_agreement,
+                *native_required,
             ),
             ApiOperation::DeleteTest { name, test, .. } => Ok(Operation::DeleteTest {
                 name: name.clone(),
