@@ -387,55 +387,90 @@ impl CodeDb {
         let expected_root_hash = patch.expected_root_hash.clone().ok_or_else(|| {
             anyhow!("semantic patch apply requires expected_root or expected_root_hash")
         })?;
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = self.apply_semantic_patch_in_tx(patch, &expected_root_hash);
+        match result {
+            Ok((payload, should_commit)) => {
+                if should_commit {
+                    self.conn.execute_batch("COMMIT")?;
+                } else {
+                    self.conn.execute_batch("ROLLBACK")?;
+                }
+                Ok(payload)
+            }
+            Err(err) => {
+                if let Err(rollback_err) = self.conn.execute_batch("ROLLBACK") {
+                    return Err(err).context(format!("rollback failed: {rollback_err}"));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn apply_semantic_patch_in_tx(
+        &mut self,
+        patch: SemanticPatch,
+        expected_root_hash: &str,
+    ) -> Result<(String, bool)> {
         let branch_before = self.branch(&patch.branch)?;
-        let root = self.load_root(&expected_root_hash)?;
+        let root = self.load_root(expected_root_hash)?;
         let mut matches = self.match_semantic_patch(&root, &patch)?;
         matches.sort_dedup();
         let planned_operations =
-            self.plan_semantic_patch_operations(&expected_root_hash, &root, &patch, &matches)?;
+            self.plan_semantic_patch_operations(expected_root_hash, &root, &patch, &matches)?;
         let planned_operations_json = planned_operations
             .iter()
             .map(serde_json::to_value)
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let apply_result = if planned_operations.is_empty() {
+        let (apply_result, should_commit) = if planned_operations.is_empty() {
             if branch_before.root_hash == expected_root_hash {
-                None
+                (None, false)
             } else {
-                Some(stale_root_patch_apply_result(
-                    &patch.branch,
-                    &expected_root_hash,
-                    &branch_before.root_hash,
-                    branch_before.history_hash.as_deref(),
-                ))
+                (
+                    Some(stale_root_patch_apply_result(
+                        &patch.branch,
+                        expected_root_hash,
+                        &branch_before.root_hash,
+                        branch_before.history_hash.as_deref(),
+                    )),
+                    false,
+                )
             }
         } else if branch_before.root_hash != expected_root_hash
             && self.recorded_operation_sequence_outputs_root(
-                &expected_root_hash,
+                expected_root_hash,
                 &branch_before.root_hash,
                 &planned_operations,
             )?
         {
-            Some(self.already_applied_patch_apply_result(
-                &patch.branch,
-                &branch_before.root_hash,
-                branch_before.history_hash.as_deref(),
-                &planned_operations,
-            )?)
+            (
+                Some(self.already_applied_patch_apply_result(
+                    &patch.branch,
+                    &branch_before.root_hash,
+                    branch_before.history_hash.as_deref(),
+                    &planned_operations,
+                )?),
+                false,
+            )
         } else {
             let apply_document = json!({
                 "schema": "codedb/apply/v1",
                 "branch": &patch.branch,
-                "expect_root_hash": &expected_root_hash,
+                "expect_root_hash": expected_root_hash,
                 "agent": semantic_patch_agent_metadata(
                     &patch,
-                    &expected_root_hash,
+                    expected_root_hash,
                     &matches,
                     &planned_operations_json,
                 )?,
                 "operations": planned_operations_json,
             });
-            let applied = self.apply_json_str(&canonical_json(&apply_document))?;
-            Some(serde_json::from_str::<JsonValue>(applied.trim_end())?)
+            let (applied, should_commit) =
+                self.apply_json_str_in_current_transaction(&canonical_json(&apply_document))?;
+            (
+                Some(serde_json::from_str::<JsonValue>(applied.trim_end())?),
+                should_commit,
+            )
         };
         let branch_after = self.branch(&patch.branch)?;
         let status =
@@ -458,7 +493,7 @@ impl CodeDb {
             "schema": SEMANTIC_PATCH_APPLY_RESULT_SCHEMA,
             "status": status,
             "branch": &patch.branch,
-            "expected_root_hash": &expected_root_hash,
+            "expected_root_hash": expected_root_hash,
             "old_root_hash": apply_result
                 .as_ref()
                 .and_then(|result| result.get("old_root_hash"))
@@ -505,7 +540,7 @@ impl CodeDb {
             "diagnostics": diagnostics,
             "apply_result": apply_result,
         });
-        Ok(format!("{}\n", canonical_json(&payload)))
+        Ok((format!("{}\n", canonical_json(&payload)), should_commit))
     }
 
     fn match_semantic_patch(

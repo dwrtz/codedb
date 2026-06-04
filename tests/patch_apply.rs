@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::{Arc, Barrier};
 
 use assert_cmd::Command;
 use codedb::CodeDb;
@@ -291,6 +292,80 @@ fn semantic_patch_apply_retries_multi_operation_patch_without_duplicate_history(
     assert_eq!(retry["apply_result"]["processed_operation_count"], 2);
     assert_eq!(row_count(&db, "migrations"), migration_count);
     assert_eq!(row_count(&db, "histories"), history_count);
+}
+
+#[test]
+fn concurrent_duplicate_multi_operation_patch_apply_is_retry_safe() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("extract-concurrent-retry.sqlite");
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), "examples/shop.cdb"]);
+
+    let root = current_root(&db);
+    let migration_count = row_count(&db, "migrations");
+    let history_count = row_count(&db, "histories");
+    let patch_text = Arc::new(
+        serde_json::to_string(&json!({
+            "schema": "codedb/semantic-patch/v1",
+            "branch": "main",
+            "expected_root": root,
+            "match": {
+                "kind": "literal_i64",
+                "value": "20",
+                "within_name": "tax"
+            },
+            "replace": {
+                "kind": "extract_function",
+                "name": "rate"
+            }
+        }))
+        .unwrap(),
+    );
+    let barrier = Arc::new(Barrier::new(4));
+    let handles = (0..4)
+        .map(|_| {
+            let db = db.clone();
+            let patch_text = Arc::clone(&patch_text);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let mut codedb = CodeDb::open(&db).unwrap();
+                barrier.wait();
+                let result = codedb.apply_semantic_patch_json_str(&patch_text).unwrap();
+                serde_json::from_str::<JsonValue>(result.trim_end()).unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    let statuses = results
+        .iter()
+        .map(|result| result["status"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == "applied")
+            .count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == "already_applied")
+            .count(),
+        3
+    );
+    assert!(
+        results
+            .iter()
+            .all(|result| result["committed"].as_bool() == Some(result["status"] == "applied"))
+    );
+    assert_eq!(row_count(&db, "migrations"), migration_count + 2);
+    assert_eq!(row_count(&db, "histories"), history_count + 2);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "120");
 }
 
 #[test]

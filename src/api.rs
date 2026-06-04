@@ -237,6 +237,14 @@ impl CodeDb {
         self.apply_batch_with_commit_hook(request, on_commit)
     }
 
+    pub(crate) fn apply_json_str_in_current_transaction(
+        &mut self,
+        text: &str,
+    ) -> Result<(String, bool)> {
+        let request = parse_apply_json_request(text)?;
+        self.apply_batch_in_tx(request)
+    }
+
     pub fn preview_apply_json_str(&mut self, text: &str) -> Result<String> {
         self.ensure_initialized()?;
         let request = parse_apply_json_request(text)?;
