@@ -51,6 +51,23 @@ fn cache_row_count_by_kind(db: &Path, artifact_kind: &str) -> i64 {
     .unwrap()
 }
 
+fn cache_kinds_in_bundle(bundle: &Path) -> Vec<String> {
+    let bundle_json = parse_json(&std::fs::read_to_string(bundle).unwrap());
+    let mut kinds = bundle_json["artifact_cache"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|artifact| {
+            artifact["cache_key_input"]["artifact_kind"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    kinds.sort();
+    kinds
+}
+
 #[test]
 fn bundle_export_import_reconstructs_object_closure_and_verifies() {
     let temp = tempdir().unwrap();
@@ -120,6 +137,17 @@ fn bundle_artifact_cache_is_optional_and_can_be_regenerated() {
         path(&source_object),
     ]);
     assert_eq!(cache_row_count_by_kind(&source_db, "object_file"), 1);
+    run(&[
+        "link-native",
+        path(&source_db),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        path(&temp.path().join("link-plan.json")),
+    ]);
+    assert_eq!(cache_row_count_by_kind(&source_db, "link_plan"), 1);
+    assert!(cache_row_count_by_kind(&source_db, "interface_hash") > 0);
     let source_branch = branch_state(&source_db);
 
     run(&[
@@ -135,6 +163,9 @@ fn bundle_artifact_cache_is_optional_and_can_be_regenerated() {
     let bundle_json = parse_json(&std::fs::read_to_string(&bundle).unwrap());
     assert_eq!(bundle_json["manifest"]["artifact_cache_included"], true);
     assert!(!bundle_json["artifact_cache"].as_array().unwrap().is_empty());
+    let bundle_cache_kinds = cache_kinds_in_bundle(&bundle);
+    assert!(bundle_cache_kinds.contains(&"interface_hash".to_string()));
+    assert!(bundle_cache_kinds.contains(&"link_plan".to_string()));
 
     run(&["init", path(&imported_db)]);
     assert_eq!(cache_row_count_by_kind(&imported_db, "object_file"), 0);
@@ -154,6 +185,27 @@ fn bundle_artifact_cache_is_optional_and_can_be_regenerated() {
     let bytes = std::fs::read(&imported_object).unwrap();
     assert_eq!(&bytes[..4], b"\x7fELF");
     assert_eq!(cache_row_count_by_kind(&imported_db, "object_file"), 1);
+
+    let imported_with_artifacts = temp.path().join("imported-with-artifacts.sqlite");
+    run(&["init", path(&imported_with_artifacts)]);
+    run(&[
+        "bundle",
+        "import",
+        path(&imported_with_artifacts),
+        path(&bundle),
+        "--import-artifacts",
+    ]);
+    assert_eq!(branch_state(&imported_with_artifacts), source_branch);
+    assert_eq!(
+        cache_row_count_by_kind(&imported_with_artifacts, "link_plan"),
+        1
+    );
+    assert!(cache_row_count_by_kind(&imported_with_artifacts, "interface_hash") > 0);
+    bin()
+        .args(["verify", path(&imported_with_artifacts)])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
 }
 
 #[test]
@@ -188,6 +240,41 @@ fn bundle_import_rejects_tampered_bundle() {
     run(&["init", path(&tampered_db)]);
     let stderr = run_failure(&["bundle", "import", path(&tampered_db), path(&tampered)]);
     assert!(stderr.contains("bad_bundle"));
+}
+
+#[test]
+fn bundle_import_rejects_tampered_migration_agent_metadata() {
+    let temp = tempdir().unwrap();
+    let source_db = temp.path().join("source-agent-tamper.sqlite");
+    let tampered_db = temp.path().join("tampered-agent.sqlite");
+    let bundle = temp.path().join("shop.codedb.bundle");
+    let tampered = temp.path().join("shop-agent-tampered.codedb.bundle");
+
+    run(&["init", path(&source_db)]);
+    run(&["import", path(&source_db), "examples/shop.cdb"]);
+    let source_branch = branch_state(&source_db);
+    run(&[
+        "bundle",
+        "export",
+        path(&source_db),
+        "--root",
+        &source_branch.0,
+        "--out",
+        path(&bundle),
+    ]);
+
+    let mut bundle_json = parse_json(&std::fs::read_to_string(&bundle).unwrap());
+    bundle_json["migrations"][0]["agent"] = json!({ "agent_id": "tampered" });
+    std::fs::write(
+        &tampered,
+        format!("{}\n", serde_json::to_string(&bundle_json).unwrap()),
+    )
+    .unwrap();
+
+    run(&["init", path(&tampered_db)]);
+    let stderr = run_failure(&["bundle", "import", path(&tampered_db), path(&tampered)]);
+    assert!(stderr.contains("bad_bundle_history"), "{stderr}");
+    assert!(stderr.contains("audit hash"), "{stderr}");
 }
 
 #[test]

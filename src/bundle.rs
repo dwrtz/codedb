@@ -19,6 +19,7 @@ const BUNDLE_SCHEMA: &str = "codedb/bundle/v1";
 const BUNDLE_MANIFEST_SCHEMA: &str = "codedb/bundle-manifest/v1";
 const BUNDLE_OBJECT_SCHEMA: &str = "codedb/bundle-object/v1";
 const BUNDLE_MIGRATION_SCHEMA: &str = "codedb/bundle-migration/v1";
+const BUNDLE_MIGRATION_AUDIT_SCHEMA: &str = "codedb/bundle-migration-audit/v1";
 const BUNDLE_ARTIFACT_SCHEMA: &str = "codedb/bundle-artifact/v1";
 const BUNDLE_API_SCHEMA: &str = "codedb/bundle-api/v1";
 const PACKAGE_IDENTITY_SCHEMA: &str = "codedb/package-identity/v1";
@@ -85,6 +86,7 @@ struct BundleMigration {
     preconditions: JsonValue,
     postconditions: JsonValue,
     agent: JsonValue,
+    audit_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,16 +119,27 @@ impl CodeDb {
             closure_roots.insert(migration.input_root_hash.clone());
             closure_roots.insert(migration.output_root_hash.clone());
         }
-        let objects = self.bundle_object_closure(&closure_roots)?;
-        let object_hashes = objects
+        let root_objects = self.bundle_object_closure(&closure_roots)?;
+        let root_object_hashes = root_objects
             .iter()
             .map(|object| object.hash.clone())
             .collect::<BTreeSet<_>>();
+        let mut objects_by_hash = root_objects
+            .into_iter()
+            .map(|object| (object.hash.clone(), object))
+            .collect::<BTreeMap<_, _>>();
+        if include_artifacts {
+            for object in self.bundle_artifact_input_objects(&root_object_hashes)? {
+                objects_by_hash.entry(object.hash.clone()).or_insert(object);
+            }
+        }
+        let object_hashes = objects_by_hash.keys().cloned().collect::<BTreeSet<_>>();
         let artifact_cache = if include_artifacts {
             self.bundle_artifact_cache(&object_hashes)?
         } else {
             Vec::new()
         };
+        let objects = objects_by_hash.into_values().collect::<Vec<_>>();
 
         let api_hash = bundle_api_hash();
         let package_hash = package_hash(root_hash, history_hash.as_deref(), &api_hash);
@@ -378,12 +391,14 @@ impl CodeDb {
                 preconditions: serde_json::from_str(&preconditions_json)?,
                 postconditions: serde_json::from_str(&postconditions_json)?,
                 agent: serde_json::from_str(&agent_json)?,
+                audit_hash: String::new(),
             });
             cursor = parent_history_hash;
         }
         rows.reverse();
         for (sequence, row) in rows.iter_mut().enumerate() {
             row.sequence = sequence;
+            row.audit_hash = bundle_migration_audit_hash(row)?;
         }
         Ok(rows)
     }
@@ -484,6 +499,68 @@ impl CodeDb {
         Ok(artifacts)
     }
 
+    fn bundle_artifact_input_objects(
+        &self,
+        root_object_hashes: &BTreeSet<String>,
+    ) -> Result<Vec<BundleObject>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT hash, kind, schema_version, payload_json
+             FROM objects
+             WHERE kind IN ('FunctionInterface', 'LinkPlanInput')
+             ORDER BY hash",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut objects = Vec::new();
+        for row in rows {
+            let (hash, kind, schema_version, payload_json) = row?;
+            if root_object_hashes.contains(&hash) {
+                continue;
+            }
+            let payload: JsonValue = serde_json::from_str(&payload_json)
+                .with_context(|| format!("artifact input object {hash} has invalid JSON"))?;
+            let canonical_payload = canonical_json(&payload);
+            if canonical_payload != payload_json {
+                bail!("corrupt_object: payload is not canonical {hash}");
+            }
+            let object = BundleObject {
+                schema: BUNDLE_OBJECT_SCHEMA.to_string(),
+                hash,
+                kind,
+                schema_version,
+                payload,
+            };
+            if self.bundle_artifact_input_object_belongs_to_root(&object, root_object_hashes)? {
+                objects.push(object);
+            }
+        }
+        Ok(objects)
+    }
+
+    fn bundle_artifact_input_object_belongs_to_root(
+        &self,
+        object: &BundleObject,
+        root_object_hashes: &BTreeSet<String>,
+    ) -> Result<bool> {
+        if !artifact_input_object_kind_is_supported(object) {
+            return Ok(false);
+        }
+        let mut refs = Vec::new();
+        collect_bundle_object_refs(&object.kind, &object.payload, &mut refs);
+        for child_hash in refs {
+            if self.object_exists(&child_hash)? && !root_object_hashes.contains(&child_hash) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn object_row(&self, hash: &str) -> Result<Option<(String, i64, String)>> {
         self.conn
             .query_row(
@@ -544,10 +621,21 @@ impl CodeDb {
         current_root: &mut String,
         current_history: &mut Option<String>,
     ) -> Result<()> {
+        if row.schema != BUNDLE_MIGRATION_SCHEMA {
+            bail!("bad_bundle_history: unsupported migration schema");
+        }
         if row.sequence != expected_sequence {
             bail!(
                 "bad_bundle_history: expected migration sequence {expected_sequence}, got {}",
                 row.sequence
+            );
+        }
+        let recomputed_audit = bundle_migration_audit_hash(row)?;
+        if recomputed_audit != row.audit_hash {
+            bail!(
+                "bad_bundle_history: migration {} audit hash recomputes to {}",
+                row.migration_hash,
+                recomputed_audit
             );
         }
         if row.parent_history_hash != *current_history {
@@ -1091,7 +1179,8 @@ fn validate_bundle_object_closure(
         roots.insert(migration.input_root_hash.clone());
         roots.insert(migration.output_root_hash.clone());
     }
-    let expected = bundle_object_closure_from_map(&roots, objects_by_hash)?;
+    let root_closure = bundle_object_closure_from_map(&roots, objects_by_hash)?;
+    let expected = expected_bundle_object_set(document, objects_by_hash, &root_closure)?;
     let actual = objects_by_hash.keys().cloned().collect::<BTreeSet<_>>();
     if expected != actual {
         let missing = expected
@@ -1111,6 +1200,80 @@ fn validate_bundle_object_closure(
         );
     }
     Ok(())
+}
+
+fn expected_bundle_object_set(
+    document: &BundleDocument,
+    objects_by_hash: &BTreeMap<String, BundleObject>,
+    root_closure: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let mut expected = root_closure.clone();
+    if document.manifest.artifact_cache_included {
+        for artifact in &document.artifact_cache {
+            let key_input: CacheKeyInput = serde_json::from_value(artifact.cache_key_input.clone())
+                .with_context(|| {
+                    format!(
+                        "bad_bundle_artifact: invalid cache key {}",
+                        artifact.cache_key
+                    )
+                })?;
+            if root_closure.contains(&key_input.input_hash) {
+                continue;
+            }
+            let object = objects_by_hash.get(&key_input.input_hash).ok_or_else(|| {
+                anyhow!(
+                    "bad_bundle_closure: missing artifact input object {}",
+                    key_input.input_hash
+                )
+            })?;
+            validate_artifact_input_object(object, root_closure, objects_by_hash)?;
+            expected.insert(key_input.input_hash);
+        }
+    }
+    let expected_closure = bundle_object_closure_from_map(&expected, objects_by_hash)?;
+    for hash in expected_closure.difference(root_closure) {
+        let object = objects_by_hash
+            .get(hash)
+            .ok_or_else(|| anyhow!("bad_bundle_closure: missing artifact input object {hash}"))?;
+        validate_artifact_input_object(object, root_closure, objects_by_hash)?;
+    }
+    Ok(expected_closure)
+}
+
+fn validate_artifact_input_object(
+    object: &BundleObject,
+    root_closure: &BTreeSet<String>,
+    objects_by_hash: &BTreeMap<String, BundleObject>,
+) -> Result<()> {
+    if !artifact_input_object_kind_is_supported(object) {
+        bail!(
+            "bad_bundle_closure: artifact input object {} has unsupported kind {}",
+            object.hash,
+            object.kind
+        );
+    }
+    let mut refs = Vec::new();
+    collect_bundle_object_refs(&object.kind, &object.payload, &mut refs);
+    for child_hash in refs {
+        if objects_by_hash.contains_key(&child_hash) && !root_closure.contains(&child_hash) {
+            bail!(
+                "bad_bundle_closure: artifact input object {} references non-root object {}",
+                object.hash,
+                child_hash
+            );
+        }
+    }
+    Ok(())
+}
+
+fn artifact_input_object_kind_is_supported(object: &BundleObject) -> bool {
+    match object.kind.as_str() {
+        "FunctionInterface" => true,
+        "LinkPlanInput" => {
+            object.payload.get("schema").and_then(JsonValue::as_str) == Some("codedb/link-input/v1")
+        }
+        _ => false,
+    }
 }
 
 fn bundle_object_closure_from_map(
@@ -1280,6 +1443,29 @@ fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<St
             }
         }
         "TestCase" => push_hash_ref(payload.get("entry_symbol"), refs),
+        "LinkPlanInput" => {
+            push_hash_ref(payload.get("entry_symbol_hash"), refs);
+            for entry in payload
+                .get("export_map")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_hash_ref(entry.get("symbol_hash"), refs);
+            }
+            for entry in payload
+                .get("external_symbols")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_hash_ref(entry.get("symbol_hash"), refs);
+                push_hash_ref(entry.get("definition_hash"), refs);
+                push_hash_ref(entry.get("signature_hash"), refs);
+                push_hash_array_refs(entry.get("param_type_hashes"), refs);
+                push_hash_ref(entry.get("return_type_hash"), refs);
+            }
+        }
         _ => extract_hash_strings(payload, refs),
     }
 }
@@ -1296,6 +1482,27 @@ fn push_hash_array_refs(value: Option<&JsonValue>, refs: &mut Vec<String>) {
     }
 }
 
+fn bundle_migration_audit_hash(row: &BundleMigration) -> Result<String> {
+    Ok(hash_bytes(
+        BYTES_DOMAIN,
+        canonical_json(&json!({
+            "schema": BUNDLE_MIGRATION_AUDIT_SCHEMA,
+            "sequence": row.sequence,
+            "migration_hash": &row.migration_hash,
+            "history_hash": &row.history_hash,
+            "parent_history_hash": &row.parent_history_hash,
+            "input_root_hash": &row.input_root_hash,
+            "output_root_hash": &row.output_root_hash,
+            "operation_kind": &row.operation_kind,
+            "operation": &row.operation,
+            "preconditions": &row.preconditions,
+            "postconditions": &row.postconditions,
+            "agent": &row.agent,
+        }))
+        .as_bytes(),
+    ))
+}
+
 fn bundle_api_hash() -> String {
     hash_bytes(
         BYTES_DOMAIN,
@@ -1305,6 +1512,7 @@ fn bundle_api_hash() -> String {
             "manifest_schema": BUNDLE_MANIFEST_SCHEMA,
             "object_schema": BUNDLE_OBJECT_SCHEMA,
             "migration_schema": BUNDLE_MIGRATION_SCHEMA,
+            "migration_audit_schema": BUNDLE_MIGRATION_AUDIT_SCHEMA,
             "artifact_schema": BUNDLE_ARTIFACT_SCHEMA,
         }))
         .as_bytes(),
