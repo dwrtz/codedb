@@ -161,7 +161,7 @@ impl CodeDb {
     ) -> Result<Value> {
         let branch = self.branch(MAIN_BRANCH)?;
         let root = self.load_root(&branch.root_hash)?;
-        let symbol = self.resolve_name(&branch.root_hash, "main", function_name)?;
+        let symbol = self.resolve_symbol_or_name(&branch.root_hash, function_name)?;
         let root_symbol = self
             .root_symbol(&root, &symbol)
             .ok_or_else(|| anyhow!("missing symbol {symbol}"))?;
@@ -183,13 +183,13 @@ impl CodeDb {
                 parse_eval_arg(arg, &type_name, idx)
             })
             .collect::<Result<Vec<_>>>()?;
-        self.eval_name(&branch.root_hash, function_name, parsed_args)
+        self.eval_symbol(&branch.root_hash, &symbol, parsed_args)
     }
 
     pub fn emit_c_main_branch(&mut self, function_name: &str) -> Result<String> {
         self.ensure_initialized()?;
         let branch = self.branch(MAIN_BRANCH)?;
-        self.resolve_name(&branch.root_hash, "main", function_name)
+        self.resolve_symbol_or_name(&branch.root_hash, function_name)
             .with_context(|| format!("unknown entry function {function_name}"))?;
         let source = self.render_c(&branch.root_hash)?;
         self.write_cache_text(

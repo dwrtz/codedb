@@ -134,7 +134,7 @@ fn bundle_artifact_cache_is_optional_and_can_be_regenerated() {
     ]);
     let bundle_json = parse_json(&std::fs::read_to_string(&bundle).unwrap());
     assert_eq!(bundle_json["manifest"]["artifact_cache_included"], true);
-    assert!(bundle_json["artifact_cache"].as_array().unwrap().len() >= 1);
+    assert!(!bundle_json["artifact_cache"].as_array().unwrap().is_empty());
 
     run(&["init", path(&imported_db)]);
     assert_eq!(cache_row_count_by_kind(&imported_db, "object_file"), 0);

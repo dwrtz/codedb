@@ -38,11 +38,13 @@ impl CodeDb {
         let branch = self.branch(MAIN_BRANCH)?;
         let operation_root = expected_root.unwrap_or(&branch.root_hash).to_string();
         let expected = cli_expected_value(expected_i64, expected_bool, expected_unit)?;
+        let (entry_module, entry_local_name) =
+            self.preferred_entry_name_for_root(&operation_root, entry_name)?;
         let op = self.create_test_operation_from_text_args(
             &operation_root,
             name,
-            "main",
-            entry_name,
+            &entry_module,
+            &entry_local_name,
             arg_texts,
             expected,
             parse_test_category(category)?,
@@ -54,6 +56,19 @@ impl CodeDb {
         } else {
             outcome.format_cli()
         })
+    }
+
+    fn preferred_entry_name_for_root(
+        &self,
+        root_hash: &str,
+        symbol_or_name: &str,
+    ) -> Result<(String, String)> {
+        let root = self.load_root(root_hash)?;
+        let symbol = self.resolve_symbol_or_name(root_hash, symbol_or_name)?;
+        let binding = self
+            .preferred_binding(&root, &symbol)
+            .ok_or_else(|| anyhow!("symbol has no preferred name {symbol}"))?;
+        Ok((binding.module.clone(), binding.display_name.clone()))
     }
 
     pub fn delete_test_main_branch_expected_format(
@@ -202,7 +217,7 @@ impl CodeDb {
         if param_types.len() != case.args.len() {
             bail!(
                 "test for {} expects {} args, got {}",
-                self.symbol_display(root, &case.entry_symbol)?,
+                self.symbol_display_for_module(root, MAIN_BRANCH, &case.entry_symbol)?,
                 param_types.len(),
                 case.args.len()
             );
@@ -259,7 +274,7 @@ impl CodeDb {
                 "{} category {} entry {} expected {} native_agreement {}\n",
                 binding.name,
                 case.category.as_str(),
-                self.symbol_display(&root, &case.entry_symbol)?,
+                self.symbol_display_for_module(&root, MAIN_BRANCH, &case.entry_symbol)?,
                 display_test_value(&case.expected),
                 case.native_agreement
             ));
@@ -302,7 +317,7 @@ impl CodeDb {
         Ok(json!({
             "name": binding.name,
             "test_hash": binding.test,
-            "entry_name": self.symbol_display(root, &case.entry_symbol)?,
+            "entry_name": self.symbol_display_for_module(root, MAIN_BRANCH, &case.entry_symbol)?,
             "entry_symbol": case.entry_symbol,
             "entry_effects": self.signature_effect_names(&entry.signature)?,
             "category": case.category.as_str(),
@@ -430,7 +445,7 @@ impl CodeDb {
         binding: &RootTestBinding,
     ) -> Result<JsonValue> {
         let case = self.load_test_case(&binding.test)?;
-        let entry_name = self.symbol_display(root, &case.entry_symbol)?;
+        let entry_name = self.symbol_display_for_module(root, MAIN_BRANCH, &case.entry_symbol)?;
         let entry = self
             .root_symbol(root, &case.entry_symbol)
             .ok_or_else(|| anyhow!("test entry symbol missing from root: {}", case.entry_symbol))?;
@@ -553,7 +568,8 @@ impl CodeDb {
         let mut skipped = 0usize;
         for binding in &new_root.tests {
             let case = self.load_test_case(&binding.test)?;
-            let entry_name = self.symbol_display(&new_root, &case.entry_symbol)?;
+            let entry_name =
+                self.symbol_display_for_module(&new_root, MAIN_BRANCH, &case.entry_symbol)?;
             let entry = self
                 .root_symbol(&new_root, &case.entry_symbol)
                 .ok_or_else(|| {

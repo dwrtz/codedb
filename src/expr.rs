@@ -160,7 +160,7 @@ impl CodeDb {
         function_name: &str,
         args: Vec<Value>,
     ) -> Result<Value> {
-        let symbol = self.resolve_name(root_hash, "main", function_name)?;
+        let symbol = self.resolve_symbol_or_name(root_hash, function_name)?;
         self.eval_symbol(root_hash, &symbol, args)
     }
 

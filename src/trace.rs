@@ -319,8 +319,8 @@ impl CodeDb {
         entry_name: &str,
         args: &[String],
     ) -> Result<TraceReport> {
-        let entry_label = format!("{MAIN_BRANCH}.{entry_name}");
-        let entry_symbol = match self.resolve_name(&state.root_hash, MAIN_BRANCH, entry_name) {
+        let entry_label = entry_name.to_string();
+        let entry_symbol = match self.resolve_symbol_or_name(&state.root_hash, entry_name) {
             Ok(symbol) => symbol,
             Err(err) => {
                 return Ok(trace_report(

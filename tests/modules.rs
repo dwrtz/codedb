@@ -259,3 +259,93 @@ fn workspace_module_methods_list_show_and_move_symbols() {
     assert_eq!(result["module"], "billing");
     assert_eq!(result["symbols"][0]["name"], "tax");
 }
+
+#[test]
+fn qualified_module_entries_work_across_core_entry_commands() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("module-entry.sqlite");
+    let source = temp.path().join("source.cdb");
+    std::fs::write(
+        &source,
+        r#"
+module billing {
+fn main() -> i64 = 7
+}
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+
+    let shown = parse_json(&run(&["show", path(&db), "billing.main", "--json"]));
+    assert_eq!(shown["module"], "billing");
+    assert_eq!(run(&["eval", path(&db), "billing.main"]).trim(), "7");
+
+    let trace = parse_json(&run(&["trace", path(&db), "billing.main", "--json"]));
+    assert_eq!(trace["status"], "ok");
+    assert_eq!(trace["entry_name"], "billing.main");
+    assert_eq!(trace["result"]["value"], "7");
+
+    let plan = parse_json(&run(&[
+        "build-plan",
+        path(&db),
+        "billing.main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--json",
+    ]));
+    assert_eq!(plan["entry_symbol_hash"], shown["symbol_hash"]);
+
+    run(&[
+        "create-test",
+        path(&db),
+        "billing_main_returns_7",
+        "--entry",
+        "billing.main",
+        "--expect-i64",
+        "7",
+    ]);
+    let tests = parse_json(&run(&["test", path(&db), "--json"]));
+    assert_eq!(tests["tests"][0]["status"], "passed");
+    assert_eq!(tests["tests"][0]["entry_name"], "billing.main");
+}
+
+#[test]
+fn moving_symbol_with_alias_conflict_returns_structured_conflict() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("module-alias-conflict.sqlite");
+    let source = temp.path().join("source.cdb");
+    std::fs::write(
+        &source,
+        r#"
+fn tax(x: i64) -> i64 = x
+fn main() -> i64 = tax(1)
+module billing {
+fn alt(x: i64) -> i64 = x + 1
+}
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&["create-alias", path(&db), "tax", "alt"]);
+
+    let root = current_root(&db);
+    let moved = parse_json(&run(&[
+        "module",
+        "move-symbol",
+        path(&db),
+        "tax",
+        "billing",
+        "--expect-root",
+        &root,
+        "--json",
+    ]));
+    assert_eq!(moved["status"], "conflict");
+    assert_eq!(moved["failed_preconditions"][0], "name_is_available");
+
+    let tax = parse_json(&run(&["show", path(&db), "tax", "--json"]));
+    assert_eq!(tax["module"], "main");
+}

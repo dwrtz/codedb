@@ -171,6 +171,16 @@ pub(crate) struct MergeObjectPayload {
     pub(crate) payload: JsonValue,
 }
 
+struct ChangeSignatureApply<'a> {
+    input_root: &'a str,
+    module: &'a str,
+    symbol: &'a str,
+    name: &'a str,
+    params: &'a [ParamSpec],
+    return_type: &'a str,
+    effects: &'a [Effect],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MigrationStatus {
     Applied,
@@ -1167,20 +1177,41 @@ impl CodeDb {
                 symbol,
                 name,
                 new_module,
-            } => vec![
-                Precondition::RootIsCurrent {
-                    root: input_root.to_string(),
-                },
-                Precondition::PreferredNamePointsToSymbol {
-                    module: module.clone(),
-                    name: name.clone(),
-                    symbol: symbol.clone(),
-                },
-                Precondition::NameIsAvailable {
-                    module: new_module.clone(),
-                    name: name.clone(),
-                },
-            ],
+            } => {
+                let mut preconditions = vec![
+                    Precondition::RootIsCurrent {
+                        root: input_root.to_string(),
+                    },
+                    Precondition::PreferredNamePointsToSymbol {
+                        module: module.clone(),
+                        name: name.clone(),
+                        symbol: symbol.clone(),
+                    },
+                ];
+                if module == new_module {
+                    return preconditions;
+                }
+                if let Ok(root) = self.load_root(input_root) {
+                    for moved_name in root
+                        .names
+                        .iter()
+                        .filter(|binding| binding.module == *module && binding.symbol == *symbol)
+                        .map(|binding| binding.display_name.clone())
+                        .collect::<BTreeSet<_>>()
+                    {
+                        preconditions.push(Precondition::NameIsAvailable {
+                            module: new_module.clone(),
+                            name: moved_name,
+                        });
+                    }
+                } else {
+                    preconditions.push(Precondition::NameIsAvailable {
+                        module: new_module.clone(),
+                        name: name.clone(),
+                    });
+                }
+                preconditions
+            }
             Operation::ReplaceFunctionBody {
                 module,
                 symbol,
@@ -1930,7 +1961,7 @@ impl CodeDb {
                 params,
                 return_type,
                 effects,
-            } => self.apply_change_signature(
+            } => self.apply_change_signature(ChangeSignatureApply {
                 input_root,
                 module,
                 symbol,
@@ -1938,7 +1969,7 @@ impl CodeDb {
                 params,
                 return_type,
                 effects,
-            ),
+            }),
             Operation::AddParameter {
                 module,
                 symbol,
@@ -2287,16 +2318,16 @@ impl CodeDb {
         Ok(new_root)
     }
 
-    pub(crate) fn apply_change_signature(
-        &mut self,
-        input_root: &str,
-        module: &str,
-        symbol: &str,
-        name: &str,
-        params: &[ParamSpec],
-        return_type: &str,
-        effects: &[Effect],
-    ) -> Result<String> {
+    fn apply_change_signature(&mut self, change: ChangeSignatureApply<'_>) -> Result<String> {
+        let ChangeSignatureApply {
+            input_root,
+            module,
+            symbol,
+            name,
+            params,
+            return_type,
+            effects,
+        } = change;
         validate_param_names(params)?;
         let mut root = self.load_root(input_root)?;
         self.assert_name_points(&root, module, name, symbol)?;

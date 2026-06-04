@@ -302,7 +302,7 @@ impl CodeDb {
         let branch = self.branch(branch_name)?;
         let root = self.load_root(&branch.root_hash)?;
         let entry_symbol = self
-            .resolve_name(&branch.root_hash, "main", entry_name)
+            .resolve_symbol_or_name(&branch.root_hash, entry_name)
             .map_err(|err| anyhow!("unknown entry function {entry_name}: {err}"))?;
         self.prepare_link_plan(&branch.root_hash, &root, &entry_symbol, target_triple)
     }
@@ -447,7 +447,7 @@ impl CodeDb {
         let branch = self.branch(branch_name)?;
         let root = self.load_root(&branch.root_hash)?;
         let entry_symbol = self
-            .resolve_name(&branch.root_hash, "main", entry_name)
+            .resolve_symbol_or_name(&branch.root_hash, entry_name)
             .map_err(|err| anyhow!("unknown entry function {entry_name}: {err}"))?;
         self.plan_link_jobs(&branch.root_hash, &root, &entry_symbol, target_triple)
     }
