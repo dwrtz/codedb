@@ -169,6 +169,43 @@ fn pure_function_cannot_silently_call_external_io_ffi() {
 }
 
 #[test]
+fn external_function_requires_ffi_effect() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("ffi-required.sqlite");
+    let apply = temp.path().join("ffi-required.apply.json");
+
+    std::fs::write(
+        &apply,
+        serde_json::to_string_pretty(&json!({
+            "schema": "codedb/apply/v1",
+            "operations": [
+                {
+                    "kind": "create_external_function",
+                    "name": "host_value",
+                    "birth_seed": "ffi-host-value",
+                    "params": [],
+                    "return_type": "i64",
+                    "effects": ["io"],
+                    "abi": "c",
+                    "link_name": "host_value",
+                    "library": "c"
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    let result = parse_json(&run(&["apply", path(&db), "--json", path(&apply)]));
+    assert_eq!(result["status"], "error");
+    assert_eq!(result["committed"], false);
+    assert!(result["error"].as_str().unwrap().contains("ffi effect"));
+    let listed = parse_json(&run(&["list", path(&db), "--json"]));
+    assert!(listed["symbols"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn verify_reports_missing_external_link_metadata() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("ffi-corrupt.sqlite");

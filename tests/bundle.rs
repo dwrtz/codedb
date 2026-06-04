@@ -189,3 +189,55 @@ fn bundle_import_rejects_tampered_bundle() {
     let stderr = run_failure(&["bundle", "import", path(&tampered_db), path(&tampered)]);
     assert!(stderr.contains("bad_bundle"));
 }
+
+#[test]
+fn bundle_import_rejects_tampered_json_artifact_cache() {
+    let temp = tempdir().unwrap();
+    let source_db = temp.path().join("source-artifact-tamper.sqlite");
+    let tampered_db = temp.path().join("tampered-artifacts.sqlite");
+    let bundle = temp.path().join("with-artifacts.codedb.bundle");
+    let tampered = temp.path().join("with-artifacts-tampered.codedb.bundle");
+    let ir = temp.path().join("main.ir.json");
+
+    run(&["init", path(&source_db)]);
+    run(&["import", path(&source_db), "examples/shop.cdb"]);
+    run(&["emit-ir", path(&source_db), "main", "--out", path(&ir)]);
+    let source_branch = branch_state(&source_db);
+    run(&[
+        "bundle",
+        "export",
+        path(&source_db),
+        "--root",
+        &source_branch.0,
+        "--out",
+        path(&bundle),
+        "--include-artifacts",
+    ]);
+
+    let mut bundle_json = parse_json(&std::fs::read_to_string(&bundle).unwrap());
+    let artifact = bundle_json["artifact_cache"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|artifact| {
+            artifact["artifact_json"].is_object() && artifact["artifact_bytes_hex"].is_null()
+        })
+        .expect("JSON-only artifact cache entry");
+    artifact["artifact_json"]["metadata"]["schema"] = json!("tampered/artifact/v1");
+    std::fs::write(
+        &tampered,
+        format!("{}\n", serde_json::to_string(&bundle_json).unwrap()),
+    )
+    .unwrap();
+
+    run(&["init", path(&tampered_db)]);
+    let stderr = run_failure(&[
+        "bundle",
+        "import",
+        path(&tampered_db),
+        path(&tampered),
+        "--import-artifacts",
+    ]);
+    assert!(stderr.contains("bad_bundle_artifact"), "{stderr}");
+    assert!(stderr.contains("recomputes to"), "{stderr}");
+}

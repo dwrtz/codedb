@@ -27,8 +27,8 @@ use crate::store::{
     hash_bytes, hash_object_canonical,
 };
 use crate::types::{
-    type_spec_from_payload, validate_external_abi_tag, validate_external_library_name,
-    validate_external_link_name,
+    effect_names, type_payload_for_spec, type_spec_from_payload, validate_external_abi_tag,
+    validate_external_library_name, validate_external_link_name,
 };
 use crate::{BYTES_DOMAIN, SCHEMA_VERSION};
 
@@ -90,10 +90,18 @@ impl CodeDb {
                     if recomputed != hash {
                         errors.push(format!("bad_hash: {hash} recomputes to {recomputed}"));
                     }
-                    if kind == "Type"
-                        && let Err(err) = type_spec_from_payload(&value)
-                    {
-                        errors.push(format!("bad_type_object: {hash}: {err:#}"));
+                    if kind == "Type" {
+                        match type_spec_from_payload(&value) {
+                            Ok(spec) => {
+                                let expected = type_payload_for_spec(&spec)?;
+                                if canonical_json(&expected) != canonical {
+                                    errors.push(format!(
+                                        "bad_type_object: {hash}: payload is not canonical"
+                                    ));
+                                }
+                            }
+                            Err(err) => errors.push(format!("bad_type_object: {hash}: {err:#}")),
+                        }
                     }
                     self.verify_known_object_references(&hash, &kind, &value, errors)?;
                 }
@@ -422,22 +430,41 @@ impl CodeDb {
             return Ok(());
         };
         let mut effects = Vec::new();
+        let mut stored_names = Vec::new();
+        let mut has_parse_error = false;
         for effect in values {
             let Some(effect) = effect.as_str() else {
                 errors.push(format!(
                     "bad_signature_effects: {parent_hash} effect is not string"
                 ));
+                has_parse_error = true;
                 continue;
             };
+            stored_names.push(effect.to_string());
             match crate::types::Effect::from_str(effect) {
                 Ok(effect) => effects.push(effect),
-                Err(_) => errors.push(format!(
-                    "bad_signature_effects: {parent_hash} unknown effect {effect}"
-                )),
+                Err(_) => {
+                    has_parse_error = true;
+                    errors.push(format!(
+                        "bad_signature_effects: {parent_hash} unknown effect {effect}"
+                    ));
+                }
             }
         }
-        if let Err(err) = crate::types::normalize_effects(&effects) {
-            errors.push(format!("bad_signature_effects: {parent_hash} {err:#}"));
+        match crate::types::normalize_effects(&effects) {
+            Ok(normalized) if !has_parse_error => {
+                let canonical_names = effect_names(&normalized)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                if stored_names != canonical_names {
+                    errors.push(format!(
+                        "bad_signature_effects: {parent_hash} effects are not canonical"
+                    ));
+                }
+            }
+            Ok(_) => {}
+            Err(err) => errors.push(format!("bad_signature_effects: {parent_hash} {err:#}")),
         }
         Ok(())
     }

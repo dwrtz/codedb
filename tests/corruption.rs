@@ -538,6 +538,75 @@ fn verify_rejects_unknown_cache_artifact_kinds() {
 }
 
 #[test]
+fn verify_rejects_noncanonical_signature_effects() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("noncanonical-effects.sqlite");
+    run(&["init", db.to_str().unwrap()]);
+
+    let i64_hash = test_object_hash("Type", r#"{"type_kind":"I64"}"#);
+    let payload = json!({
+        "abi": "codedb-v0-internal",
+        "effects": ["io", "io"],
+        "params": [],
+        "return": i64_hash,
+    });
+    let canonical = test_canonical_json(&payload);
+    let signature_hash = test_object_hash("FunctionSignature", &canonical);
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO objects (hash, kind, schema_version, payload_json, payload_size_bytes)
+         VALUES (?1, 'FunctionSignature', 1, ?2, ?3)",
+        (&signature_hash, &canonical, canonical.len() as i64),
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO object_edges (parent_hash, child_hash, edge_label, edge_position)
+         VALUES (?1, ?2, 'ref', 0)",
+        (&signature_hash, &i64_hash),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_signature_effects"), "{stderr}");
+    assert!(stderr.contains("not canonical"), "{stderr}");
+}
+
+#[test]
+fn verify_rejects_noncanonical_structural_type_payloads() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("noncanonical-type.sqlite");
+    run(&["init", db.to_str().unwrap()]);
+
+    let i64_hash = test_object_hash("Type", r#"{"type_kind":"I64"}"#);
+    let payload = json!({
+        "type_kind": "Record",
+        "fields": [
+            { "name": "tax", "type": i64_hash },
+            { "name": "amount", "type": i64_hash },
+        ],
+    });
+    let canonical = test_canonical_json(&payload);
+    let type_hash = test_object_hash("Type", &canonical);
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO objects (hash, kind, schema_version, payload_json, payload_size_bytes)
+         VALUES (?1, 'Type', 1, ?2, ?3)",
+        (&type_hash, &canonical, canonical.len() as i64),
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO object_edges (parent_hash, child_hash, edge_label, edge_position)
+         VALUES (?1, ?2, 'ref', 0)",
+        (&type_hash, &i64_hash),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_type_object"), "{stderr}");
+    assert!(stderr.contains("not canonical"), "{stderr}");
+}
+
+#[test]
 fn verify_rejects_cache_key_payload_mismatch() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("cache-mismatch.sqlite");

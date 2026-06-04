@@ -6,7 +6,7 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
-use crate::artifact::CacheKeyInput;
+use crate::artifact::{ARTIFACT_METADATA_SCHEMA, CacheKeyInput};
 use crate::migrations::{Operation, history_hash, migration_hash};
 use crate::model::ProgramRootPayload;
 use crate::store::{
@@ -795,16 +795,7 @@ impl CodeDb {
                     artifact.cache_key
                 )
             })?;
-        if let Some(bytes) = artifact_bytes.as_deref() {
-            let recomputed_artifact = hash_bytes(BYTES_DOMAIN, bytes);
-            if recomputed_artifact != artifact.artifact_hash {
-                bail!(
-                    "bad_bundle_artifact: artifact {} recomputes to {}",
-                    artifact.artifact_hash,
-                    recomputed_artifact
-                );
-            }
-        }
+        validate_bundle_artifact_payload(&key_input, artifact, artifact_bytes.as_deref())?;
         self.write_cache_entry(
             &key_input,
             &artifact.artifact_hash,
@@ -812,6 +803,166 @@ impl CodeDb {
             artifact_bytes.as_deref(),
         )
     }
+}
+
+fn validate_bundle_artifact_payload(
+    key_input: &CacheKeyInput,
+    artifact: &BundleArtifact,
+    artifact_bytes: Option<&[u8]>,
+) -> Result<()> {
+    if let Some(artifact_json) = artifact.artifact_json.as_ref() {
+        validate_bundle_artifact_metadata(key_input, artifact, artifact_json, artifact_bytes)
+    } else if let Some(bytes) = artifact_bytes {
+        if !key_input.artifact_kind.requires_artifact_bytes() {
+            bail!(
+                "bad_bundle_artifact: artifact {} stores bytes without metadata for non-byte artifact kind {}",
+                artifact.cache_key,
+                key_input.artifact_kind
+            );
+        }
+        validate_bundle_artifact_bytes_hash(artifact, bytes)
+    } else {
+        bail!(
+            "bad_bundle_artifact: artifact {} has neither metadata nor bytes to validate",
+            artifact.cache_key
+        );
+    }
+}
+
+fn validate_bundle_artifact_metadata(
+    key_input: &CacheKeyInput,
+    artifact: &BundleArtifact,
+    artifact_json: &JsonValue,
+    artifact_bytes: Option<&[u8]>,
+) -> Result<()> {
+    if artifact_json.get("schema").and_then(JsonValue::as_str) != Some(ARTIFACT_METADATA_SCHEMA) {
+        bail!(
+            "bad_bundle_artifact: artifact {} metadata schema mismatch",
+            artifact.cache_key
+        );
+    }
+    if artifact_json
+        .get("artifact_kind")
+        .and_then(JsonValue::as_str)
+        != Some(key_input.artifact_kind.as_str())
+    {
+        bail!(
+            "bad_bundle_artifact: artifact {} kind does not match cache key",
+            artifact.cache_key
+        );
+    }
+    if artifact_json.get("input_hash").and_then(JsonValue::as_str)
+        != Some(key_input.input_hash.as_str())
+    {
+        bail!(
+            "bad_bundle_artifact: artifact {} input does not match cache key",
+            artifact.cache_key
+        );
+    }
+    if artifact_json.get("backend_id").and_then(JsonValue::as_str)
+        != Some(key_input.backend_id.as_str())
+    {
+        bail!(
+            "bad_bundle_artifact: artifact {} backend does not match cache key",
+            artifact.cache_key
+        );
+    }
+    if artifact_json
+        .get("target_triple")
+        .and_then(JsonValue::as_str)
+        != Some(key_input.target_triple.as_str())
+    {
+        bail!(
+            "bad_bundle_artifact: artifact {} target does not match cache key",
+            artifact.cache_key
+        );
+    }
+
+    match artifact_json
+        .get("content_kind")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("")
+    {
+        "text" => {
+            let text = artifact_json
+                .get("text")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "bad_bundle_artifact: text artifact {} missing text",
+                        artifact.cache_key
+                    )
+                })?;
+            let recomputed = hash_bytes(BYTES_DOMAIN, text.as_bytes());
+            validate_bundle_artifact_hash(artifact, &recomputed)?;
+            if artifact_json.get("text_hash").and_then(JsonValue::as_str)
+                != Some(artifact.artifact_hash.as_str())
+            {
+                bail!(
+                    "bad_bundle_artifact: text artifact {} metadata hash mismatch",
+                    artifact.cache_key
+                );
+            }
+        }
+        "json" => {
+            let metadata = artifact_json.get("metadata").ok_or_else(|| {
+                anyhow!(
+                    "bad_bundle_artifact: JSON artifact {} missing metadata",
+                    artifact.cache_key
+                )
+            })?;
+            let recomputed = hash_bytes(BYTES_DOMAIN, canonical_json(metadata).as_bytes());
+            validate_bundle_artifact_hash(artifact, &recomputed)?;
+            if artifact_json
+                .get("metadata_hash")
+                .and_then(JsonValue::as_str)
+                != Some(artifact.artifact_hash.as_str())
+            {
+                bail!(
+                    "bad_bundle_artifact: JSON artifact {} metadata hash mismatch",
+                    artifact.cache_key
+                );
+            }
+        }
+        "bytes" => {
+            let bytes = artifact_bytes.ok_or_else(|| {
+                anyhow!(
+                    "bad_bundle_artifact: bytes artifact {} missing bytes",
+                    artifact.cache_key
+                )
+            })?;
+            validate_bundle_artifact_bytes_hash(artifact, bytes)?;
+            if artifact_json.get("bytes_hash").and_then(JsonValue::as_str)
+                != Some(artifact.artifact_hash.as_str())
+            {
+                bail!(
+                    "bad_bundle_artifact: bytes artifact {} metadata hash mismatch",
+                    artifact.cache_key
+                );
+            }
+        }
+        other => bail!(
+            "bad_bundle_artifact: artifact {} has unknown content kind {other:?}",
+            artifact.cache_key
+        ),
+    }
+    Ok(())
+}
+
+fn validate_bundle_artifact_bytes_hash(artifact: &BundleArtifact, bytes: &[u8]) -> Result<()> {
+    let recomputed_artifact = hash_bytes(BYTES_DOMAIN, bytes);
+    validate_bundle_artifact_hash(artifact, &recomputed_artifact)
+}
+
+fn validate_bundle_artifact_hash(artifact: &BundleArtifact, recomputed: &str) -> Result<()> {
+    if recomputed != artifact.artifact_hash {
+        bail!(
+            "bad_bundle_artifact: artifact {} recomputes to {}",
+            artifact.artifact_hash,
+            recomputed
+        );
+    }
+    Ok(())
 }
 
 fn parse_bundle_document(text: &str) -> Result<BundleDocument> {

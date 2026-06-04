@@ -316,6 +316,7 @@ impl CodeDb {
         if let Some(library) = library {
             validate_external_library_name(library)?;
         }
+        self.validate_external_signature_effects(signature)?;
         let mut payload = serde_json::Map::new();
         payload.insert("symbol".to_string(), JsonValue::String(symbol.to_string()));
         payload.insert(
@@ -334,6 +335,14 @@ impl CodeDb {
             );
         }
         self.put_object("ExternalFunction", &JsonValue::Object(payload))
+    }
+
+    fn validate_external_signature_effects(&self, signature: &str) -> Result<()> {
+        let effects = self.signature_effects(signature)?;
+        if !effects.contains(&Effect::Ffi) {
+            bail!("external functions must declare the ffi effect");
+        }
+        Ok(())
     }
 
     pub(crate) fn function_body_hash(&self, definition_hash: &str) -> Result<String> {
@@ -1138,6 +1147,8 @@ impl CodeDb {
                 if external.signature != entry.signature {
                     bail!("bad_external: external function signature does not match root");
                 }
+                self.validate_external_signature_effects(&entry.signature)
+                    .context("bad_external: external function signature effects are invalid")?;
                 continue;
             }
             let body = self.function_body_hash(&entry.definition)?;
