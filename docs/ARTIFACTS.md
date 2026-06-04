@@ -343,8 +343,8 @@ JSON artifacts use:
   "schema": "codedb/artifact-metadata/v1",
   "artifact_kind": "lowered_ir",
   "input_hash": "sha256:function-def",
-  "backend_id": "lowering-v0",
-  "target_triple": "target-independent-ir-v0",
+  "backend_id": "lowering-v1",
+  "target_triple": "target-independent-memory-ir-v1",
   "content_kind": "json",
   "metadata": {},
   "metadata_hash": "sha256:bytes"
@@ -370,16 +370,17 @@ Byte artifacts use:
 
 ## Lowered IR
 
-Lowered functions use `codedb/lowered-function-ir/v1`:
+Lowered functions use `codedb/lowered-function-ir/v2`:
 
 ```json
 {
-  "schema": "codedb/lowered-function-ir/v1",
+  "schema": "codedb/lowered-function-ir/v2",
   "symbol_hash": "sha256:symbol",
   "function_def_hash": "sha256:function-def",
   "function_sig_hash": "sha256:function-signature",
   "typed_body_expr_hash": "sha256:expression",
   "params": [{ "slot": 0, "type_hash": "sha256:type" }],
+  "locals": [{ "slot": 0, "type_hash": "sha256:type" }],
   "return_type_hash": "sha256:type",
   "operations": [],
   "debug_map": {
@@ -403,9 +404,12 @@ Lowered functions use `codedb/lowered-function-ir/v1`:
 ```
 
 Operations include `param`, `const_i64`, `const_bool`, `const_unit`, `unary`,
-`binary`, `call`, `if`, and `return`. Calls target `target_symbol_hash`; they
-do not target display names. `debug_map` records stable lowered operation IDs
-for value-producing operations and maps expression hashes back to those IDs.
+`binary`, `call`, `if`, `addr_of_param`, `addr_of_local`, `addr_of_field`,
+`addr_of_index`, `load`, `store`, `copy`, `move`, `drop`, `borrow_debug`, and
+`return`. Calls target `target_symbol_hash`; they do not target display names.
+`debug_map` records stable lowered operation IDs for value-producing operations,
+including address and load/copy/move operations, and maps expression hashes back
+to those IDs.
 
 Inspect lowered IR:
 
@@ -434,7 +438,7 @@ Metadata for native objects uses `codedb/native-object/v1`:
   "function_def_hash": "sha256:function-def",
   "function_sig_hash": "sha256:function-signature",
   "typed_body_expr_hash": "sha256:expression",
-  "lowered_ir_schema": "codedb/lowered-function-ir/v1",
+  "lowered_ir_schema": "codedb/lowered-function-ir/v2",
   "defined_symbols": ["codedb_0123456789abcdef"],
   "called_symbols": ["sha256:callee-symbol"],
   "relocations": [

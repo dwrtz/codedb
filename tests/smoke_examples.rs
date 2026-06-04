@@ -170,7 +170,7 @@ fn readme_quickstart_and_cookbook_smoke() {
     run(&["emit-ir", path(&db), "main", "--out", path(&ir)]);
     let ir_json = parse_json(&std::fs::read_to_string(&ir).unwrap());
     assert_eq!(ir_json["schema"], "codedb/lowered-ir-inspection/v1");
-    assert_eq!(ir_json["ir"]["schema"], "codedb/lowered-function-ir/v1");
+    assert_eq!(ir_json["ir"]["schema"], "codedb/lowered-function-ir/v2");
 
     run(&[
         "emit-object",

@@ -1258,7 +1258,7 @@ mod tests {
                 "function_def_hash": input_hash,
                 "function_sig_hash": signature_hash,
                 "typed_body_expr_hash": body_hash,
-                "lowered_ir_schema": "codedb/lowered-function-ir/v1",
+                "lowered_ir_schema": "codedb/lowered-function-ir/v2",
                 "defined_symbols": [internal_symbol],
                 "called_symbols": [],
                 "relocations": [],

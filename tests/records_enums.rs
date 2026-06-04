@@ -68,7 +68,7 @@ fn main() -> i64 = add_tax({ amount: 100, tax: 20 })
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "lowering v0 does not support aggregate expression kind record_literal",
+            "lowering v1 does not support aggregate expression kind record_literal",
         ));
 }
 
@@ -122,6 +122,6 @@ fn main() -> i64 = case maybe_value() of none => 0 | some(x) => x + 1
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "lowering v0 does not support aggregate type enum {none: unit, some: i64}",
+            "lowering v1 does not support aggregate return type enum {none: unit, some: i64}",
         ));
 }

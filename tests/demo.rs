@@ -1534,7 +1534,7 @@ fn lowered_ir_uses_symbol_hash_calls_and_reuses_cache_across_rename() {
     ]);
     let tax_ir_text = std::fs::read_to_string(&tax_ir).unwrap();
     let tax_ir_json: JsonValue = serde_json::from_str(&tax_ir_text).unwrap();
-    assert_eq!(tax_ir_json["ir"]["schema"], "codedb/lowered-function-ir/v1");
+    assert_eq!(tax_ir_json["ir"]["schema"], "codedb/lowered-function-ir/v2");
     assert!(tax_ir_text.contains("division_by_zero"));
     assert!(tax_ir_text.contains("\"op\": \"return\""));
 

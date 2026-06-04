@@ -11,8 +11,8 @@ use crate::artifact::CacheKeyInput;
 use crate::backend::{ArtifactKind, ObjectBackend, ObjectBackendArtifact, ObjectBackendInput};
 use crate::jobs::{ArtifactJobClaim, artifact_job_error, new_worker_id};
 use crate::lowering::{
-    LoweredBlock, LoweredDebugOp, LoweredFunctionIr, LoweredOp, lowered_op_value_id,
-    lowered_value_debug_ops,
+    LoweredBlock, LoweredDebugOp, LoweredFunctionIr, LoweredLocalSlot, LoweredOp, LoweredParamSlot,
+    LoweredPlace, lowered_op_value_id, lowered_value_debug_ops,
 };
 use crate::model::ProgramRootPayload;
 use crate::store::{
@@ -556,6 +556,16 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::ConstUnit { .. }
             | LoweredOp::Unary { .. }
             | LoweredOp::Binary { .. }
+            | LoweredOp::AddrOfParam { .. }
+            | LoweredOp::AddrOfLocal { .. }
+            | LoweredOp::AddrOfField { .. }
+            | LoweredOp::AddrOfIndex { .. }
+            | LoweredOp::Load { .. }
+            | LoweredOp::Store { .. }
+            | LoweredOp::Copy { .. }
+            | LoweredOp::Move { .. }
+            | LoweredOp::Drop { .. }
+            | LoweredOp::BorrowDebug { .. }
             | LoweredOp::Return { .. } => {}
         }
     }
@@ -579,14 +589,34 @@ fn validate_native_ir(ir: &LoweredFunctionIr) -> Result<()> {
             bail!("native object backend v0 supports only i64 and bool parameters");
         }
     }
-    validate_native_ops(&ir.operations, &i64_type, &bool_type, &unit_type)
+    for local in &ir.locals {
+        if !is_native_scalar_type(&local.type_hash, &i64_type, &bool_type, &unit_type) {
+            bail!("native object backend v0 supports only scalar local slots");
+        }
+    }
+    let mut values = BTreeMap::new();
+    let mut addresses = BTreeMap::new();
+    validate_native_ops(
+        &ir.operations,
+        &ir.params,
+        &ir.locals,
+        &i64_type,
+        &bool_type,
+        &unit_type,
+        &mut values,
+        &mut addresses,
+    )
 }
 
 fn validate_native_ops(
     operations: &[LoweredOp],
+    params: &[LoweredParamSlot],
+    locals: &[LoweredLocalSlot],
     i64_type: &str,
     bool_type: &str,
     unit_type: &str,
+    values: &mut BTreeMap<String, String>,
+    addresses: &mut BTreeMap<String, String>,
 ) -> Result<()> {
     for op in operations {
         match op {
@@ -599,22 +629,288 @@ fn validate_native_ops(
             | LoweredOp::Call { type_hash, .. }
             | LoweredOp::If { type_hash, .. }
             | LoweredOp::Return { type_hash, .. } => {
-                if type_hash != i64_type && type_hash != bool_type && type_hash != unit_type {
+                if !is_native_scalar_type(type_hash, i64_type, bool_type, unit_type) {
                     bail!("native object backend v0 supports only i64, bool, and unit values");
                 }
             }
+            LoweredOp::AddrOfParam { place, .. } => {
+                let LoweredPlace::Param { slot, type_hash } = place else {
+                    bail!("addr_of_param must contain a param place");
+                };
+                if params
+                    .get(*slot)
+                    .is_none_or(|param| param.slot != *slot || param.type_hash != *type_hash)
+                {
+                    bail!("native object backend saw invalid addr_of_param");
+                }
+                if !is_native_scalar_type(type_hash, i64_type, bool_type, unit_type) {
+                    bail!("native object backend v0 supports only scalar addr_of_param");
+                }
+            }
+            LoweredOp::AddrOfLocal { place, .. } => {
+                let LoweredPlace::Local { slot, type_hash } = place else {
+                    bail!("addr_of_local must contain a local place");
+                };
+                if locals
+                    .get(*slot)
+                    .is_none_or(|local| local.slot != *slot || local.type_hash != *type_hash)
+                {
+                    bail!("native object backend saw invalid addr_of_local");
+                }
+                if !is_native_scalar_type(type_hash, i64_type, bool_type, unit_type) {
+                    bail!("native object backend v0 supports only scalar addr_of_local");
+                }
+            }
+            LoweredOp::AddrOfField { .. } | LoweredOp::AddrOfIndex { .. } => {
+                bail!("native object backend v0 does not support aggregate address operations");
+            }
+            LoweredOp::Load { type_hash, .. }
+            | LoweredOp::Store { type_hash, .. }
+            | LoweredOp::Copy { type_hash, .. }
+            | LoweredOp::Move { type_hash, .. }
+            | LoweredOp::Drop { type_hash, .. }
+            | LoweredOp::BorrowDebug { type_hash, .. } => {
+                if !is_native_scalar_type(type_hash, i64_type, bool_type, unit_type) {
+                    bail!("native object backend v0 supports only scalar memory values");
+                }
+            }
         }
+        validate_native_op_flow(op, params, locals, values, addresses)?;
         if let LoweredOp::If {
             then_block,
             else_block,
             ..
         } = op
         {
-            validate_native_ops(&then_block.operations, i64_type, bool_type, unit_type)?;
-            validate_native_ops(&else_block.operations, i64_type, bool_type, unit_type)?;
+            let mut then_values = values.clone();
+            let mut then_addresses = addresses.clone();
+            validate_native_ops(
+                &then_block.operations,
+                params,
+                locals,
+                i64_type,
+                bool_type,
+                unit_type,
+                &mut then_values,
+                &mut then_addresses,
+            )?;
+            let mut else_values = values.clone();
+            let mut else_addresses = addresses.clone();
+            validate_native_ops(
+                &else_block.operations,
+                params,
+                locals,
+                i64_type,
+                bool_type,
+                unit_type,
+                &mut else_values,
+                &mut else_addresses,
+            )?;
         }
     }
     Ok(())
+}
+
+fn is_native_scalar_type(
+    type_hash: &str,
+    i64_type: &str,
+    bool_type: &str,
+    unit_type: &str,
+) -> bool {
+    type_hash == i64_type || type_hash == bool_type || type_hash == unit_type
+}
+
+fn validate_native_op_flow(
+    op: &LoweredOp,
+    params: &[LoweredParamSlot],
+    locals: &[LoweredLocalSlot],
+    values: &mut BTreeMap<String, String>,
+    addresses: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    match op {
+        LoweredOp::Param {
+            id,
+            slot,
+            type_hash,
+        } => {
+            if params
+                .get(*slot)
+                .is_none_or(|param| param.slot != *slot || param.type_hash != *type_hash)
+            {
+                bail!("native object backend saw invalid param op");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::ConstI64 { id, type_hash, .. }
+        | LoweredOp::ConstBool { id, type_hash, .. }
+        | LoweredOp::ConstUnit { id, type_hash } => {
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::Unary {
+            id,
+            value,
+            type_hash,
+            ..
+        } => {
+            native_value_type(values, value)?;
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::Binary {
+            id,
+            left,
+            right,
+            type_hash,
+            ..
+        } => {
+            native_value_type(values, left)?;
+            native_value_type(values, right)?;
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::Call {
+            id,
+            args,
+            type_hash,
+            ..
+        } => {
+            for arg in args {
+                native_value_type(values, arg)?;
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::If {
+            id,
+            cond,
+            type_hash,
+            ..
+        } => {
+            native_value_type(values, cond)?;
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::AddrOfParam { id, place } => {
+            let LoweredPlace::Param { slot, type_hash } = place else {
+                bail!("addr_of_param must contain a param place");
+            };
+            if params
+                .get(*slot)
+                .is_none_or(|param| param.slot != *slot || param.type_hash != *type_hash)
+            {
+                bail!("native object backend saw invalid addr_of_param");
+            }
+            native_insert_address(addresses, id, type_hash)?;
+        }
+        LoweredOp::AddrOfLocal { id, place } => {
+            let LoweredPlace::Local { slot, type_hash } = place else {
+                bail!("addr_of_local must contain a local place");
+            };
+            if locals
+                .get(*slot)
+                .is_none_or(|local| local.slot != *slot || local.type_hash != *type_hash)
+            {
+                bail!("native object backend saw invalid addr_of_local");
+            }
+            native_insert_address(addresses, id, type_hash)?;
+        }
+        LoweredOp::AddrOfField { .. } | LoweredOp::AddrOfIndex { .. } => {}
+        LoweredOp::Load {
+            id,
+            address,
+            type_hash,
+        } => {
+            if native_address_type(addresses, address)? != type_hash {
+                bail!("native object backend saw load type mismatch");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::Store {
+            address,
+            value,
+            type_hash,
+        } => {
+            if native_address_type(addresses, address)? != type_hash {
+                bail!("native object backend saw store address type mismatch");
+            }
+            if native_value_type(values, value)? != type_hash {
+                bail!("native object backend saw store value type mismatch");
+            }
+        }
+        LoweredOp::Copy {
+            id,
+            value,
+            type_hash,
+        } => {
+            if native_value_type(values, value)? != type_hash {
+                bail!("native object backend saw copy type mismatch");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::Move {
+            id,
+            address,
+            type_hash,
+        } => {
+            if native_address_type(addresses, address)? != type_hash {
+                bail!("native object backend saw move type mismatch");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::Drop { address, type_hash }
+        | LoweredOp::BorrowDebug {
+            address, type_hash, ..
+        } => {
+            if native_address_type(addresses, address)? != type_hash {
+                bail!("native object backend saw metadata/drop type mismatch");
+            }
+        }
+        LoweredOp::Return { value, type_hash } => {
+            if native_value_type(values, value)? != type_hash {
+                bail!("native object backend saw return type mismatch");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn native_insert_value(
+    values: &mut BTreeMap<String, String>,
+    id: &str,
+    type_hash: &str,
+) -> Result<()> {
+    if values
+        .insert(id.to_string(), type_hash.to_string())
+        .is_some()
+    {
+        bail!("duplicate native lowered value id {id}");
+    }
+    Ok(())
+}
+
+fn native_insert_address(
+    addresses: &mut BTreeMap<String, String>,
+    id: &str,
+    type_hash: &str,
+) -> Result<()> {
+    if addresses
+        .insert(id.to_string(), type_hash.to_string())
+        .is_some()
+    {
+        bail!("duplicate native lowered address id {id}");
+    }
+    Ok(())
+}
+
+fn native_value_type<'a>(values: &'a BTreeMap<String, String>, id: &str) -> Result<&'a String> {
+    values
+        .get(id)
+        .ok_or_else(|| anyhow!("unknown native lowered value id {id}"))
+}
+
+fn native_address_type<'a>(
+    addresses: &'a BTreeMap<String, String>,
+    id: &str,
+) -> Result<&'a String> {
+    addresses
+        .get(id)
+        .ok_or_else(|| anyhow!("unknown native lowered address id {id}"))
 }
 
 fn native_debug_metadata(compiled: &CompiledFunction) -> JsonValue {
@@ -670,6 +966,7 @@ struct TextRelocation {
 #[derive(Debug)]
 struct StackLayout {
     param_offsets: Vec<i32>,
+    local_offsets: BTreeMap<usize, i32>,
     value_offsets: BTreeMap<String, i32>,
     stack_size: i32,
 }
@@ -723,6 +1020,15 @@ impl StackLayout {
         collect_value_ids(&ir.operations, &mut ids)?;
         let mut value_offsets = BTreeMap::new();
         let mut next_slot = ir.params.len();
+        let mut local_offsets = BTreeMap::new();
+        for local in &ir.locals {
+            if local.slot != local_offsets.len() {
+                bail!("lowered local slots must be sequential");
+            }
+            let offset = -8 * (next_slot as i32 + 1);
+            local_offsets.insert(local.slot, offset);
+            next_slot += 1;
+        }
         for id in ids {
             let offset = -8 * (next_slot as i32 + 1);
             value_offsets.insert(id, offset);
@@ -739,6 +1045,7 @@ impl StackLayout {
         };
         Ok(Self {
             param_offsets,
+            local_offsets,
             value_offsets,
             stack_size,
         })
@@ -763,7 +1070,14 @@ fn collect_value_ids_inner(
             | LoweredOp::ConstUnit { id, .. }
             | LoweredOp::Unary { id, .. }
             | LoweredOp::Binary { id, .. }
-            | LoweredOp::Call { id, .. } => push_value_id(ids, seen, id)?,
+            | LoweredOp::Call { id, .. }
+            | LoweredOp::AddrOfParam { id, .. }
+            | LoweredOp::AddrOfLocal { id, .. }
+            | LoweredOp::AddrOfField { id, .. }
+            | LoweredOp::AddrOfIndex { id, .. }
+            | LoweredOp::Load { id, .. }
+            | LoweredOp::Copy { id, .. }
+            | LoweredOp::Move { id, .. } => push_value_id(ids, seen, id)?,
             LoweredOp::If {
                 id,
                 then_block,
@@ -774,7 +1088,10 @@ fn collect_value_ids_inner(
                 collect_value_ids_inner(&then_block.operations, ids, seen)?;
                 collect_value_ids_inner(&else_block.operations, ids, seen)?;
             }
-            LoweredOp::Return { .. } => {}
+            LoweredOp::Store { .. }
+            | LoweredOp::Drop { .. }
+            | LoweredOp::BorrowDebug { .. }
+            | LoweredOp::Return { .. } => {}
         }
     }
     Ok(())
@@ -906,6 +1223,64 @@ impl FunctionEmitter {
             } => {
                 self.emit_if(id, cond, then_block, else_block)?;
             }
+            LoweredOp::AddrOfParam { id, place } => {
+                let LoweredPlace::Param { slot, .. } = place else {
+                    bail!("addr_of_param must contain a param place");
+                };
+                let offset = *self
+                    .layout
+                    .param_offsets
+                    .get(*slot)
+                    .ok_or_else(|| anyhow!("parameter slot out of bounds {slot}"))?;
+                self.lea_rax_stack(offset);
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::AddrOfLocal { id, place } => {
+                let LoweredPlace::Local { slot, .. } = place else {
+                    bail!("addr_of_local must contain a local place");
+                };
+                self.lea_rax_stack(self.local_offset(*slot)?);
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::AddrOfField { .. } | LoweredOp::AddrOfIndex { .. } => {
+                bail!("native x86_64 backend v0 does not support aggregate address operations");
+            }
+            LoweredOp::Load {
+                id,
+                address,
+                type_hash: _,
+            } => {
+                self.mov_rax_stack(self.value_offset(address)?);
+                self.mov_rax_mem_rax();
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::Store {
+                address,
+                value,
+                type_hash: _,
+            } => {
+                self.mov_rax_stack(self.value_offset(address)?);
+                self.mov_rcx_stack(self.value_offset(value)?);
+                self.mov_mem_rax_rcx();
+            }
+            LoweredOp::Copy {
+                id,
+                value,
+                type_hash: _,
+            } => {
+                self.mov_rax_stack(self.value_offset(value)?);
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::Move {
+                id,
+                address,
+                type_hash: _,
+            } => {
+                self.mov_rax_stack(self.value_offset(address)?);
+                self.mov_rax_mem_rax();
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::Drop { .. } | LoweredOp::BorrowDebug { .. } => {}
             LoweredOp::Return { .. } => {
                 bail!("return is only valid as the final lowered operation");
             }
@@ -1014,6 +1389,14 @@ impl FunctionEmitter {
             .ok_or_else(|| anyhow!("unknown lowered value id {id}"))
     }
 
+    fn local_offset(&self, slot: usize) -> Result<i32> {
+        self.layout
+            .local_offsets
+            .get(&slot)
+            .copied()
+            .ok_or_else(|| anyhow!("unknown lowered local slot {slot}"))
+    }
+
     fn mov_rax_imm64(&mut self, value: i64) {
         self.text.extend_from_slice(&[0x48, 0xb8]);
         self.text.extend_from_slice(&(value as u64).to_le_bytes());
@@ -1029,9 +1412,22 @@ impl FunctionEmitter {
         self.push_i32(offset);
     }
 
+    fn lea_rax_stack(&mut self, offset: i32) {
+        self.text.extend_from_slice(&[0x48, 0x8d, 0x85]);
+        self.push_i32(offset);
+    }
+
+    fn mov_rax_mem_rax(&mut self) {
+        self.text.extend_from_slice(&[0x48, 0x8b, 0x00]);
+    }
+
     fn mov_rcx_stack(&mut self, offset: i32) {
         self.text.extend_from_slice(&[0x48, 0x8b, 0x8d]);
         self.push_i32(offset);
+    }
+
+    fn mov_mem_rax_rcx(&mut self) {
+        self.text.extend_from_slice(&[0x48, 0x89, 0x08]);
     }
 
     fn mov_stack_rax(&mut self, offset: i32) {
@@ -1106,6 +1502,7 @@ impl FunctionEmitter {
 #[derive(Debug)]
 struct Arm64StackLayout {
     param_offsets: Vec<u32>,
+    local_offsets: BTreeMap<usize, u32>,
     value_offsets: BTreeMap<String, u32>,
     stack_size: u32,
 }
@@ -1159,6 +1556,15 @@ impl Arm64StackLayout {
         collect_value_ids(&ir.operations, &mut ids)?;
         let mut value_offsets = BTreeMap::new();
         let mut next_slot = ir.params.len();
+        let mut local_offsets = BTreeMap::new();
+        for local in &ir.locals {
+            if local.slot != local_offsets.len() {
+                bail!("lowered local slots must be sequential");
+            }
+            let offset = 8 * next_slot as u32;
+            local_offsets.insert(local.slot, offset);
+            next_slot += 1;
+        }
         for id in ids {
             let offset = 8 * next_slot as u32;
             value_offsets.insert(id, offset);
@@ -1178,6 +1584,7 @@ impl Arm64StackLayout {
         }
         Ok(Self {
             param_offsets,
+            local_offsets,
             value_offsets,
             stack_size,
         })
@@ -1300,6 +1707,64 @@ impl Arm64Emitter {
             } => {
                 self.emit_if(id, cond, then_block, else_block)?;
             }
+            LoweredOp::AddrOfParam { id, place } => {
+                let LoweredPlace::Param { slot, .. } = place else {
+                    bail!("addr_of_param must contain a param place");
+                };
+                let offset = *self
+                    .layout
+                    .param_offsets
+                    .get(*slot)
+                    .ok_or_else(|| anyhow!("parameter slot out of bounds {slot}"))?;
+                self.add_reg_sp_imm(0, offset)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::AddrOfLocal { id, place } => {
+                let LoweredPlace::Local { slot, .. } = place else {
+                    bail!("addr_of_local must contain a local place");
+                };
+                self.add_reg_sp_imm(0, self.local_offset(*slot)?)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::AddrOfField { .. } | LoweredOp::AddrOfIndex { .. } => {
+                bail!("native arm64 backend v0 does not support aggregate address operations");
+            }
+            LoweredOp::Load {
+                id,
+                address,
+                type_hash: _,
+            } => {
+                self.ldr_stack(0, self.value_offset(address)?)?;
+                self.ldr_reg_addr(0, 0)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::Store {
+                address,
+                value,
+                type_hash: _,
+            } => {
+                self.ldr_stack(0, self.value_offset(value)?)?;
+                self.ldr_stack(1, self.value_offset(address)?)?;
+                self.str_reg_addr(0, 1)?;
+            }
+            LoweredOp::Copy {
+                id,
+                value,
+                type_hash: _,
+            } => {
+                self.ldr_stack(0, self.value_offset(value)?)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::Move {
+                id,
+                address,
+                type_hash: _,
+            } => {
+                self.ldr_stack(0, self.value_offset(address)?)?;
+                self.ldr_reg_addr(0, 0)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::Drop { .. } | LoweredOp::BorrowDebug { .. } => {}
             LoweredOp::Return { .. } => {
                 bail!("return is only valid as the final lowered operation");
             }
@@ -1405,6 +1870,14 @@ impl Arm64Emitter {
             .ok_or_else(|| anyhow!("unknown lowered value id {id}"))
     }
 
+    fn local_offset(&self, slot: usize) -> Result<u32> {
+        self.layout
+            .local_offsets
+            .get(&slot)
+            .copied()
+            .ok_or_else(|| anyhow!("unknown lowered local slot {slot}"))
+    }
+
     fn sub_sp_imm(&mut self, imm: u32) -> Result<()> {
         if imm > 4095 {
             bail!("arm64 stack adjustment too large");
@@ -1421,12 +1894,31 @@ impl Arm64Emitter {
         Ok(())
     }
 
+    fn add_reg_sp_imm(&mut self, reg: u8, imm: u32) -> Result<()> {
+        if reg > 30 {
+            bail!("invalid arm64 general register x{reg}");
+        }
+        if imm > 4095 {
+            bail!("arm64 stack address offset too large");
+        }
+        self.emit_u32(0x910003e0 | (imm << 10) | u32::from(reg));
+        Ok(())
+    }
+
     fn str_stack(&mut self, reg: u8, offset: u32) -> Result<()> {
         self.stack_mem_op(0xf90003e0, reg, offset)
     }
 
     fn ldr_stack(&mut self, reg: u8, offset: u32) -> Result<()> {
         self.stack_mem_op(0xf94003e0, reg, offset)
+    }
+
+    fn ldr_reg_addr(&mut self, reg: u8, base_reg: u8) -> Result<()> {
+        self.reg_mem_op(0xf9400000, reg, base_reg)
+    }
+
+    fn str_reg_addr(&mut self, reg: u8, base_reg: u8) -> Result<()> {
+        self.reg_mem_op(0xf9000000, reg, base_reg)
     }
 
     fn stack_mem_op(&mut self, base: u32, reg: u8, offset: u32) -> Result<()> {
@@ -1437,6 +1929,14 @@ impl Arm64Emitter {
             bail!("arm64 stack offset cannot be encoded");
         }
         self.emit_u32(base | ((offset / 8) << 10) | u32::from(reg));
+        Ok(())
+    }
+
+    fn reg_mem_op(&mut self, base: u32, reg: u8, base_reg: u8) -> Result<()> {
+        if reg > 30 || base_reg > 30 {
+            bail!("invalid arm64 general register");
+        }
+        self.emit_u32(base | (u32::from(base_reg) << 5) | u32::from(reg));
         Ok(())
     }
 

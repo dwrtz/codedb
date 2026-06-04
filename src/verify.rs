@@ -3726,6 +3726,16 @@ fn collect_lowered_call_targets(
             | LoweredOp::ConstUnit { .. }
             | LoweredOp::Unary { .. }
             | LoweredOp::Binary { .. }
+            | LoweredOp::AddrOfParam { .. }
+            | LoweredOp::AddrOfLocal { .. }
+            | LoweredOp::AddrOfField { .. }
+            | LoweredOp::AddrOfIndex { .. }
+            | LoweredOp::Load { .. }
+            | LoweredOp::Store { .. }
+            | LoweredOp::Copy { .. }
+            | LoweredOp::Move { .. }
+            | LoweredOp::Drop { .. }
+            | LoweredOp::BorrowDebug { .. }
             | LoweredOp::Return { .. } => {}
         }
     }

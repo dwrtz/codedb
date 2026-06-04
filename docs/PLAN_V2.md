@@ -326,6 +326,14 @@ verify recomputes layouts and catches malformed layout artifacts
 
 Goal: introduce the IR foundation required for references, field addresses, loads, stores, moves, and drops.
 
+Status: implemented. Lowered IR v2 now includes semantic `Place`
+representations, address-producing ops for params/locals/fields/indexes,
+explicit `load`/`store`/`copy`/`move`/`drop` scaffolding, borrow debug metadata,
+addressable local slots, verifier tracking for value ids versus address ids,
+and scalar native backend support for the new stack-address/load/store lowering
+path. Aggregate field/index address ops are inspectable and verifiable IR
+scaffold; full native aggregate codegen remains in later phases.
+
 Deliverables:
 
 ```text
