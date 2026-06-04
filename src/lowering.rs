@@ -311,6 +311,9 @@ impl CodeDb {
             );
         }
         let (param_types, return_type) = self.signature_parts(&entry.signature)?;
+        for type_hash in param_types.iter().chain(std::iter::once(&return_type)) {
+            self.ensure_lowerable_v0_type(type_hash)?;
+        }
         let body = self.function_body_hash(&entry.definition)?;
         let actual_return = self.verify_expr_type(&body, root, &param_types)?;
         if actual_return != return_type {
@@ -632,7 +635,18 @@ impl CodeDb {
                     type_hash,
                 })
             }
+            "record_literal" | "field_access" | "enum_construct" | "case" => {
+                bail!("lowering v0 does not support aggregate expression kind {expr_kind}")
+            }
             other => bail!("unknown expression kind {other}"),
+        }
+    }
+
+    fn ensure_lowerable_v0_type(&self, type_hash: &str) -> Result<()> {
+        let type_name = self.type_name(type_hash)?;
+        match type_name.as_str() {
+            "i64" | "bool" | "unit" => Ok(()),
+            _ => bail!("lowering v0 does not support aggregate type {type_name}"),
         }
     }
 

@@ -124,6 +124,23 @@ migration. If live call sites exist, `default` is required.
 Incremental test impact uses the category to decide whether rename/export-only
 changes should select a test.
 
+## Types
+
+Function signatures, parameters, let bindings, enum constructors, and structural
+JSON operations accept these type strings:
+
+```text
+i64
+bool
+unit
+record {amount: i64, tax: i64}
+enum {none: unit, some: i64}
+```
+
+Record fields and enum variants are projection-safe identifiers. Record and enum
+type objects are structural and content-addressed; they do not imply heap
+allocation or a managed runtime.
+
 ## Expressions
 
 Bodies use structural `RawExpr` JSON:
@@ -139,6 +156,26 @@ Bodies use structural `RawExpr` JSON:
 { "kind": "unary", "op": "!", "expr": {} }
 { "kind": "let", "name": "x", "type": "i64", "value": {}, "body": {} }
 { "kind": "if", "cond": {}, "then": {}, "else": {} }
+{ "kind": "record", "fields": [{ "name": "amount", "value": {} }] }
+{ "kind": "field_access", "target": {}, "field": "amount" }
+{ "kind": "enum_construct", "type": "enum {none: unit, some: i64}", "variant": "some", "value": {} }
+{
+  "kind": "case",
+  "expr": {},
+  "arms": [
+    { "variant": "none", "body": {} },
+    { "variant": "some", "binding": "x", "body": {} }
+  ]
+}
+```
+
+Projection syntax supports the same surface:
+
+```text
+{amount: 100, tax: 20}
+order.amount
+enum {none: unit, some: i64}::some(41)
+case maybe_value() of none => 0 | some(x) => x + 1
 ```
 
 See [examples/shop.apply.json](../examples/shop.apply.json) for a complete

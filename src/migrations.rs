@@ -608,6 +608,39 @@ fn append_default_arg_to_calls(expr: &RawExpr, target_name: &str, default: &RawE
             then_expr: Box::new(append_default_arg_to_calls(then_expr, target_name, default)),
             else_expr: Box::new(append_default_arg_to_calls(else_expr, target_name, default)),
         },
+        RawExpr::Record { fields } => RawExpr::Record {
+            fields: fields
+                .iter()
+                .map(|field| crate::expr::RawRecordField {
+                    name: field.name.clone(),
+                    value: append_default_arg_to_calls(&field.value, target_name, default),
+                })
+                .collect(),
+        },
+        RawExpr::FieldAccess { target, field } => RawExpr::FieldAccess {
+            target: Box::new(append_default_arg_to_calls(target, target_name, default)),
+            field: field.clone(),
+        },
+        RawExpr::EnumConstruct {
+            enum_type,
+            variant,
+            value,
+        } => RawExpr::EnumConstruct {
+            enum_type: enum_type.clone(),
+            variant: variant.clone(),
+            value: Box::new(append_default_arg_to_calls(value, target_name, default)),
+        },
+        RawExpr::Case { expr, arms } => RawExpr::Case {
+            expr: Box::new(append_default_arg_to_calls(expr, target_name, default)),
+            arms: arms
+                .iter()
+                .map(|arm| crate::expr::RawCaseArm {
+                    variant: arm.variant.clone(),
+                    binding: arm.binding.clone(),
+                    body: append_default_arg_to_calls(&arm.body, target_name, default),
+                })
+                .collect(),
+        },
     }
 }
 
@@ -1664,9 +1697,9 @@ impl CodeDb {
         let (actual_params, actual_return_type) = self.signature_parts(&entry.signature)?;
         let expected_params = params
             .iter()
-            .map(|param| self.resolve_type(&param.ty))
+            .map(|param| self.type_hash_for_source(&param.ty))
             .collect::<Result<Vec<_>>>()?;
-        let expected_return_type = self.resolve_type(return_type)?;
+        let expected_return_type = self.type_hash_for_source(return_type)?;
         let expected_names = params
             .iter()
             .map(|param| param.name.clone())
@@ -2366,9 +2399,11 @@ impl CodeDb {
             );
         }
         for (idx, (arg, type_hash)) in args.iter().zip(param_types.iter()).enumerate() {
-            validate_test_value_type(arg, self.type_name(type_hash)?, &format!("argument {idx}"))?;
+            let type_name = self.type_name(type_hash)?;
+            validate_test_value_type(arg, &type_name, &format!("argument {idx}"))?;
         }
-        validate_test_value_type(expected, self.type_name(&return_type)?, "expected value")?;
+        let return_type_name = self.type_name(&return_type)?;
+        validate_test_value_type(expected, &return_type_name, "expected value")?;
         let case = TestCasePayload {
             schema: crate::model::TEST_CASE_SCHEMA.to_string(),
             category,
@@ -3275,6 +3310,60 @@ fn normalize_param_refs_scoped(
                 local_bindings,
             )),
         },
+        RawExpr::Record { fields } => RawExpr::Record {
+            fields: fields
+                .iter()
+                .map(|field| crate::expr::RawRecordField {
+                    name: field.name.clone(),
+                    value: normalize_param_refs_scoped(&field.value, local_params, local_bindings),
+                })
+                .collect(),
+        },
+        RawExpr::FieldAccess { target, field } => RawExpr::FieldAccess {
+            target: Box::new(normalize_param_refs_scoped(
+                target,
+                local_params,
+                local_bindings,
+            )),
+            field: field.clone(),
+        },
+        RawExpr::EnumConstruct {
+            enum_type,
+            variant,
+            value,
+        } => RawExpr::EnumConstruct {
+            enum_type: enum_type.clone(),
+            variant: variant.clone(),
+            value: Box::new(normalize_param_refs_scoped(
+                value,
+                local_params,
+                local_bindings,
+            )),
+        },
+        RawExpr::Case { expr, arms } => {
+            let expr = normalize_param_refs_scoped(expr, local_params, local_bindings);
+            let arms = arms
+                .iter()
+                .map(|arm| {
+                    if let Some(binding) = &arm.binding {
+                        local_bindings.push(binding.clone());
+                    }
+                    let body = normalize_param_refs_scoped(&arm.body, local_params, local_bindings);
+                    if arm.binding.is_some() {
+                        local_bindings.pop();
+                    }
+                    crate::expr::RawCaseArm {
+                        variant: arm.variant.clone(),
+                        binding: arm.binding.clone(),
+                        body,
+                    }
+                })
+                .collect::<Vec<_>>();
+            RawExpr::Case {
+                expr: Box::new(expr),
+                arms,
+            }
+        }
     }
 }
 

@@ -112,7 +112,8 @@ impl CodeDb {
             .zip(param_types.iter())
             .enumerate()
             .map(|(idx, (arg, type_hash))| {
-                parse_test_value_arg(arg, self.type_name(type_hash)?, idx)
+                let type_name = self.type_name(type_hash)?;
+                parse_test_value_arg(arg, &type_name, idx)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Operation::CreateTest {
@@ -207,13 +208,11 @@ impl CodeDb {
             );
         }
         for (idx, (arg, type_hash)) in case.args.iter().zip(param_types.iter()).enumerate() {
-            validate_test_value_type(arg, self.type_name(type_hash)?, &format!("argument {idx}"))?;
+            let type_name = self.type_name(type_hash)?;
+            validate_test_value_type(arg, &type_name, &format!("argument {idx}"))?;
         }
-        validate_test_value_type(
-            &case.expected,
-            self.type_name(&return_type)?,
-            "expected value",
-        )?;
+        let return_type_name = self.type_name(&return_type)?;
+        validate_test_value_type(&case.expected, &return_type_name, "expected value")?;
         let args = case
             .args
             .iter()
@@ -1152,6 +1151,9 @@ pub(crate) fn test_value_from_value(value: &Value) -> TestValue {
         },
         Value::Bool(value) => TestValue::Bool { value: *value },
         Value::Unit => TestValue::Unit,
+        Value::Record(_) | Value::Enum { .. } => {
+            panic!("semantic test values do not support aggregate actual values")
+        }
     }
 }
 
@@ -1253,6 +1255,7 @@ fn expected_native_exit_code(value: &Value) -> Option<i32> {
             .filter(|value| (0..=255).contains(value)),
         Value::Bool(value) => Some(i32::from(*value)),
         Value::Unit => None,
+        Value::Record(_) | Value::Enum { .. } => None,
     }
 }
 

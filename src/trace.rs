@@ -44,9 +44,26 @@ pub struct TraceLocation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TraceValue {
-    I64 { value: String },
-    Bool { value: bool },
+    I64 {
+        value: String,
+    },
+    Bool {
+        value: bool,
+    },
     Unit,
+    Record {
+        fields: Vec<TraceRecordField>,
+    },
+    Enum {
+        variant: String,
+        value: Box<TraceValue>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceRecordField {
+    pub name: String,
+    pub value: TraceValue,
 }
 
 impl TraceValue {
@@ -57,6 +74,19 @@ impl TraceValue {
             },
             Value::Bool(value) => TraceValue::Bool { value: *value },
             Value::Unit => TraceValue::Unit,
+            Value::Record(fields) => TraceValue::Record {
+                fields: fields
+                    .iter()
+                    .map(|(name, value)| TraceRecordField {
+                        name: name.clone(),
+                        value: TraceValue::from_value(value),
+                    })
+                    .collect(),
+            },
+            Value::Enum { variant, value } => TraceValue::Enum {
+                variant: variant.clone(),
+                value: Box::new(TraceValue::from_value(value)),
+            },
         }
     }
 }
@@ -352,7 +382,10 @@ impl CodeDb {
             .iter()
             .zip(param_types.iter())
             .enumerate()
-            .map(|(idx, (arg, type_hash))| parse_eval_arg(arg, self.type_name(type_hash)?, idx))
+            .map(|(idx, (arg, type_hash))| {
+                let type_name = self.type_name(type_hash)?;
+                parse_eval_arg(arg, &type_name, idx)
+            })
             .collect::<Result<Vec<_>>>()
         {
             Ok(args) => args,
@@ -423,12 +456,12 @@ impl CodeDb {
             );
         }
         for (idx, (arg, ty)) in args.iter().zip(param_types.iter()).enumerate() {
-            match (arg, self.type_name(ty)?) {
-                (Value::I64(_), "i64") | (Value::Bool(_), "bool") | (Value::Unit, "unit") => {}
-                _ => bail!(
-                    "argument {idx} has wrong type for {}",
-                    self.qualified_symbol_display(&state.root, symbol)?
-                ),
+            if !self.value_has_type(arg, ty)? {
+                bail!(
+                    "argument {idx} has wrong type for {}: expected {}, got {arg}",
+                    self.qualified_symbol_display(&state.root, symbol)?,
+                    self.type_name(ty)?,
+                );
             }
         }
 
@@ -855,6 +888,159 @@ impl CodeDb {
                     args,
                     locals,
                 )?;
+                state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
+                Ok(value)
+            }
+            "record_literal" => {
+                let mut values = std::collections::BTreeMap::new();
+                for field in payload
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("record_literal missing fields"))?
+                {
+                    let name = field
+                        .get("name")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("record field missing name"))?
+                        .to_string();
+                    let value_hash = field
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("record field missing value"))?;
+                    values.insert(
+                        name,
+                        self.trace_expr(
+                            state,
+                            frame,
+                            symbol_hash,
+                            function_def_hash,
+                            value_hash,
+                            args,
+                            locals,
+                        )?,
+                    );
+                }
+                let value = Value::Record(values);
+                state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
+                Ok(value)
+            }
+            "field_access" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing target"))?;
+                let field = payload
+                    .get("field")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing field"))?;
+                let target = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    target_hash,
+                    args,
+                    locals,
+                )?;
+                let value = match target {
+                    Value::Record(fields) => fields
+                        .get(field)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("record value has no field {field}")),
+                    other => bail!("field access target evaluated to non-record {other}"),
+                };
+                self.finish_current_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    expr_hash,
+                    value,
+                )
+            }
+            "enum_construct" => {
+                let variant = payload
+                    .get("variant")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing variant"))?
+                    .to_string();
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing value"))?;
+                let payload_value = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    value_hash,
+                    args,
+                    locals,
+                )?;
+                let value = Value::Enum {
+                    variant,
+                    value: Box::new(payload_value),
+                };
+                state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
+                Ok(value)
+            }
+            "case" => {
+                let scrutinee_hash = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("case missing expr"))?;
+                let scrutinee = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    scrutinee_hash,
+                    args,
+                    locals,
+                )?;
+                let Value::Enum { variant, value } = scrutinee else {
+                    bail!("case expression evaluated to non-enum {scrutinee}");
+                };
+                let arms = payload
+                    .get("arms")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("case missing arms"))?;
+                let arm = arms
+                    .iter()
+                    .find(|arm| arm.get("variant").and_then(JsonValue::as_str) == Some(&variant))
+                    .ok_or_else(|| anyhow!("case missing arm for variant {variant}"))?;
+                let body_hash = arm
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("case arm missing body"))?;
+                let value = if arm
+                    .get("binding_name")
+                    .and_then(JsonValue::as_str)
+                    .is_some()
+                {
+                    locals.push(*value);
+                    let body = self.trace_expr(
+                        state,
+                        frame,
+                        symbol_hash,
+                        function_def_hash,
+                        body_hash,
+                        args,
+                        locals,
+                    );
+                    locals.pop();
+                    body?
+                } else {
+                    self.trace_expr(
+                        state,
+                        frame,
+                        symbol_hash,
+                        function_def_hash,
+                        body_hash,
+                        args,
+                        locals,
+                    )?
+                };
                 state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
                 Ok(value)
             }

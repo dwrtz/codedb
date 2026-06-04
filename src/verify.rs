@@ -26,6 +26,7 @@ use crate::store::{
     CodeDb, cache_key_for_input, canonical_json, extract_hash_strings, function_interface_metadata,
     hash_bytes, hash_object_canonical,
 };
+use crate::types::type_spec_from_payload;
 use crate::{BYTES_DOMAIN, SCHEMA_VERSION};
 
 impl CodeDb {
@@ -86,6 +87,11 @@ impl CodeDb {
                     if recomputed != hash {
                         errors.push(format!("bad_hash: {hash} recomputes to {recomputed}"));
                     }
+                    if kind == "Type"
+                        && let Err(err) = type_spec_from_payload(&value)
+                    {
+                        errors.push(format!("bad_type_object: {hash}: {err:#}"));
+                    }
                     self.verify_known_object_references(&hash, &kind, &value, errors)?;
                 }
                 Err(err) => errors.push(format!("corrupt_object: {hash}: {err}")),
@@ -102,7 +108,10 @@ impl CodeDb {
         errors: &mut Vec<String>,
     ) -> Result<()> {
         match kind {
-            "Type" | "SymbolBirth" => {}
+            "Type" => {
+                self.verify_type_object_references(parent_hash, payload, errors)?;
+            }
+            "SymbolBirth" => {}
             "FunctionSignature" => {
                 self.check_hash_array_refs(parent_hash, "params", payload.get("params"), errors)?;
                 self.check_hash_ref(parent_hash, "return", payload.get("return"), errors)?;
@@ -143,6 +152,57 @@ impl CodeDb {
                         self.check_hash_ref(parent_hash, "cond", payload.get("cond"), errors)?;
                         self.check_hash_ref(parent_hash, "then", payload.get("then"), errors)?;
                         self.check_hash_ref(parent_hash, "else", payload.get("else"), errors)?;
+                    }
+                    Some("record_literal") => {
+                        for (idx, field) in payload
+                            .get("fields")
+                            .and_then(JsonValue::as_array)
+                            .into_iter()
+                            .flatten()
+                            .enumerate()
+                        {
+                            self.check_hash_ref(
+                                parent_hash,
+                                &format!("fields[{idx}].value"),
+                                field.get("value"),
+                                errors,
+                            )?;
+                            self.check_hash_ref(
+                                parent_hash,
+                                &format!("fields[{idx}].type"),
+                                field.get("type"),
+                                errors,
+                            )?;
+                        }
+                    }
+                    Some("field_access") => {
+                        self.check_hash_ref(parent_hash, "target", payload.get("target"), errors)?;
+                    }
+                    Some("enum_construct") => {
+                        self.check_hash_ref(
+                            parent_hash,
+                            "enum_type",
+                            payload.get("enum_type"),
+                            errors,
+                        )?;
+                        self.check_hash_ref(parent_hash, "value", payload.get("value"), errors)?;
+                    }
+                    Some("case") => {
+                        self.check_hash_ref(parent_hash, "expr", payload.get("expr"), errors)?;
+                        for (idx, arm) in payload
+                            .get("arms")
+                            .and_then(JsonValue::as_array)
+                            .into_iter()
+                            .flatten()
+                            .enumerate()
+                        {
+                            self.check_hash_ref(
+                                parent_hash,
+                                &format!("arms[{idx}].body"),
+                                arm.get("body"),
+                                errors,
+                            )?;
+                        }
                     }
                     Some(_) | None => {}
                 }
@@ -309,6 +369,51 @@ impl CodeDb {
             .enumerate()
         {
             self.check_hash_ref(parent_hash, &format!("{field}[{idx}]"), Some(value), errors)?;
+        }
+        Ok(())
+    }
+
+    fn verify_type_object_references(
+        &self,
+        parent_hash: &str,
+        payload: &JsonValue,
+        errors: &mut Vec<String>,
+    ) -> Result<()> {
+        match payload.get("type_kind").and_then(JsonValue::as_str) {
+            Some("I64" | "Bool" | "Unit") => {}
+            Some("Record") => {
+                for (idx, field) in payload
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("fields[{idx}].type"),
+                        field.get("type"),
+                        errors,
+                    )?;
+                }
+            }
+            Some("Enum") => {
+                for (idx, variant) in payload
+                    .get("variants")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("variants[{idx}].type"),
+                        variant.get("type"),
+                        errors,
+                    )?;
+                }
+            }
+            Some(_) | None => {}
         }
         Ok(())
     }

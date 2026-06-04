@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -25,6 +27,19 @@ struct LocalTypeBinding {
     type_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TypeFieldSpec {
+    pub(crate) name: String,
+    pub(crate) type_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TypeSpec {
+    Builtin(String),
+    Record(Vec<TypeFieldSpec>),
+    Enum(Vec<TypeFieldSpec>),
+}
+
 impl CodeDb {
     pub(crate) fn insert_builtin_types(&mut self) -> Result<()> {
         for type_name in ["I64", "Bool", "Unit"] {
@@ -33,25 +48,105 @@ impl CodeDb {
         Ok(())
     }
 
-    pub(crate) fn resolve_type(&self, ty: &str) -> Result<String> {
-        match ty {
-            "i64" | "I64" => Ok(type_hash_for("I64")),
-            "bool" | "Bool" => Ok(type_hash_for("Bool")),
-            "unit" | "Unit" | "()" => Ok(type_hash_for("Unit")),
-            other => bail!("unknown type {other}"),
+    pub(crate) fn resolve_type(&mut self, ty: &str) -> Result<String> {
+        let parsed = parse_type_source(ty)?;
+        self.put_type_spec(&parsed)
+    }
+
+    pub(crate) fn type_hash_for_source(&self, ty: &str) -> Result<String> {
+        let parsed = parse_type_source(ty)?;
+        Ok(type_hash_for_spec(&parsed))
+    }
+
+    pub(crate) fn type_name(&self, hash: &str) -> Result<String> {
+        if hash == type_hash_for("I64") {
+            Ok("i64".to_string())
+        } else if hash == type_hash_for("Bool") {
+            Ok("bool".to_string())
+        } else if hash == type_hash_for("Unit") {
+            Ok("unit".to_string())
+        } else {
+            self.type_spec(hash)?.to_source(self)
         }
     }
 
-    pub(crate) fn type_name(&self, hash: &str) -> Result<&'static str> {
+    pub(crate) fn type_spec(&self, hash: &str) -> Result<TypeSpec> {
         if hash == type_hash_for("I64") {
-            Ok("i64")
-        } else if hash == type_hash_for("Bool") {
-            Ok("bool")
-        } else if hash == type_hash_for("Unit") {
-            Ok("unit")
-        } else {
-            bail!("unknown type hash {hash}")
+            return Ok(TypeSpec::Builtin("I64".to_string()));
         }
+        if hash == type_hash_for("Bool") {
+            return Ok(TypeSpec::Builtin("Bool".to_string()));
+        }
+        if hash == type_hash_for("Unit") {
+            return Ok(TypeSpec::Builtin("Unit".to_string()));
+        }
+        if self.get_kind(hash)? != "Type" {
+            bail!("type hash points to non-Type object {hash}");
+        }
+        type_spec_from_payload(&self.get_payload(hash)?)
+    }
+
+    pub(crate) fn record_field_type(&self, type_hash: &str, field: &str) -> Result<String> {
+        match self.type_spec(type_hash)? {
+            TypeSpec::Record(fields) => fields
+                .into_iter()
+                .find(|candidate| candidate.name == field)
+                .map(|candidate| candidate.type_hash)
+                .ok_or_else(|| anyhow!("record has no field {field}")),
+            other => bail!(
+                "field access requires record type, got {}",
+                other.to_source(self)?
+            ),
+        }
+    }
+
+    pub(crate) fn enum_variant_type(&self, type_hash: &str, variant: &str) -> Result<String> {
+        match self.type_spec(type_hash)? {
+            TypeSpec::Enum(variants) => variants
+                .into_iter()
+                .find(|candidate| candidate.name == variant)
+                .map(|candidate| candidate.type_hash)
+                .ok_or_else(|| anyhow!("enum has no variant {variant}")),
+            other => bail!(
+                "enum variant construction requires enum type, got {}",
+                other.to_source(self)?
+            ),
+        }
+    }
+
+    fn put_type_spec(&mut self, spec: &ParsedTypeSpec) -> Result<String> {
+        match spec {
+            ParsedTypeSpec::Builtin(kind) => Ok(type_hash_for(kind)),
+            ParsedTypeSpec::Record(fields) => {
+                let fields = fields
+                    .iter()
+                    .map(|field| {
+                        Ok(TypeFieldSpec {
+                            name: field.name.clone(),
+                            type_hash: self.put_type_spec(&field.ty)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.put_structural_type(TypeSpec::Record(fields))
+            }
+            ParsedTypeSpec::Enum(variants) => {
+                let variants = variants
+                    .iter()
+                    .map(|variant| {
+                        Ok(TypeFieldSpec {
+                            name: variant.name.clone(),
+                            type_hash: self.put_type_spec(&variant.ty)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.put_structural_type(TypeSpec::Enum(variants))
+            }
+        }
+    }
+
+    fn put_structural_type(&mut self, spec: TypeSpec) -> Result<String> {
+        let payload = type_payload_for_spec(&spec)?;
+        self.put_object("Type", &payload)
     }
 
     pub(crate) fn put_signature(
@@ -274,6 +369,22 @@ impl CodeDb {
                 })
             }
             RawExpr::ParamName { name } => {
+                if let Some((base, fields)) = name.split_once('.') {
+                    let mut typed = self.type_expr_with_locals(
+                        current_module,
+                        &RawExpr::ParamName {
+                            name: base.to_string(),
+                        },
+                        root,
+                        param_names,
+                        param_types,
+                        locals,
+                    )?;
+                    for field in fields.split('.') {
+                        typed = self.type_field_access(&typed, field)?;
+                    }
+                    return Ok(typed);
+                }
                 if let Some((depth, binding)) = local_binding_at_name(locals, name) {
                     let type_hash = binding.type_hash.clone();
                     let expr_hash = self.put_object(
@@ -581,7 +692,251 @@ impl CodeDb {
                     type_hash: then_expr.type_hash,
                 })
             }
+            RawExpr::Record { fields } => {
+                if fields.is_empty() {
+                    bail!("record literal must have at least one field");
+                }
+                let mut names = BTreeSet::new();
+                let mut typed_values = Vec::with_capacity(fields.len());
+                for field in fields {
+                    validate_projection_identifier("record field", &field.name)?;
+                    if !names.insert(field.name.clone()) {
+                        bail!("duplicate record field {}", field.name);
+                    }
+                    let typed = self.type_expr_with_locals(
+                        current_module,
+                        &field.value,
+                        root,
+                        param_names,
+                        param_types,
+                        locals,
+                    )?;
+                    typed_values.push((field.name.clone(), typed));
+                }
+                let type_hash = self.put_structural_type(TypeSpec::Record(
+                    typed_values
+                        .iter()
+                        .map(|(name, typed)| TypeFieldSpec {
+                            name: name.clone(),
+                            type_hash: typed.type_hash.clone(),
+                        })
+                        .collect(),
+                ))?;
+                let fields_json = typed_values
+                    .iter()
+                    .map(|(name, typed)| {
+                        json!({
+                            "name": name,
+                            "value": typed.expr_hash,
+                            "type": typed.type_hash,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "record_literal",
+                        "fields": fields_json,
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
+            RawExpr::FieldAccess { target, field } => {
+                validate_projection_identifier("record field", field)?;
+                let target = self.type_expr_with_locals(
+                    current_module,
+                    target,
+                    root,
+                    param_names,
+                    param_types,
+                    locals,
+                )?;
+                self.type_field_access(&target, field)
+            }
+            RawExpr::EnumConstruct {
+                enum_type,
+                variant,
+                value,
+            } => {
+                validate_projection_identifier("enum variant", variant)?;
+                let enum_type_hash = self.resolve_type(enum_type)?;
+                let variant_type = self.enum_variant_type(&enum_type_hash, variant)?;
+                let typed_value = self.type_expr_with_locals(
+                    current_module,
+                    value,
+                    root,
+                    param_names,
+                    param_types,
+                    locals,
+                )?;
+                require_type(
+                    &typed_value.type_hash,
+                    &variant_type,
+                    "enum variant payload",
+                    self,
+                )?;
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "enum_construct",
+                        "enum_type": enum_type_hash,
+                        "variant": variant,
+                        "value": typed_value.expr_hash,
+                        "type": enum_type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": enum_type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash: enum_type_hash,
+                })
+            }
+            RawExpr::Case { expr, arms } => {
+                let scrutinee = self.type_expr_with_locals(
+                    current_module,
+                    expr,
+                    root,
+                    param_names,
+                    param_types,
+                    locals,
+                )?;
+                let TypeSpec::Enum(variants) = self.type_spec(&scrutinee.type_hash)? else {
+                    bail!(
+                        "case expression requires enum type, got {}",
+                        self.type_name(&scrutinee.type_hash)?
+                    );
+                };
+                if arms.is_empty() {
+                    bail!("case expression must have at least one arm");
+                }
+                let mut seen = BTreeSet::new();
+                let mut result_type: Option<String> = None;
+                let mut arms_json = Vec::with_capacity(arms.len());
+                for arm in arms {
+                    validate_projection_identifier("enum variant", &arm.variant)?;
+                    if !seen.insert(arm.variant.clone()) {
+                        bail!("duplicate case arm {}", arm.variant);
+                    }
+                    let variant_type = variants
+                        .iter()
+                        .find(|variant| variant.name == arm.variant)
+                        .map(|variant| variant.type_hash.clone())
+                        .ok_or_else(|| anyhow!("case arm uses unknown variant {}", arm.variant))?;
+                    if let Some(binding) = &arm.binding {
+                        validate_projection_identifier("case binding", binding)?;
+                        locals.push(LocalTypeBinding {
+                            name: binding.clone(),
+                            type_hash: variant_type.clone(),
+                        });
+                    } else if variant_type != type_hash_for("Unit") {
+                        bail!("case arm {} must bind its payload", arm.variant);
+                    }
+                    let body = self.type_expr_with_locals(
+                        current_module,
+                        &arm.body,
+                        root,
+                        param_names,
+                        param_types,
+                        locals,
+                    );
+                    if arm.binding.is_some() {
+                        locals.pop();
+                    }
+                    let body = body?;
+                    if let Some(expected) = &result_type {
+                        if expected != &body.type_hash {
+                            bail!(
+                                "case arm {} returns {}, expected {}",
+                                arm.variant,
+                                self.type_name(&body.type_hash)?,
+                                self.type_name(expected)?
+                            );
+                        }
+                    } else {
+                        result_type = Some(body.type_hash.clone());
+                    }
+                    arms_json.push(json!({
+                        "variant": arm.variant,
+                        "binding_name": arm.binding,
+                        "body": body.expr_hash,
+                    }));
+                }
+                let expected_variants = variants
+                    .iter()
+                    .map(|variant| variant.name.clone())
+                    .collect::<BTreeSet<_>>();
+                if seen != expected_variants {
+                    bail!("case expression must cover every enum variant");
+                }
+                let type_hash =
+                    result_type.ok_or_else(|| anyhow!("case expression has no arms"))?;
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "case",
+                        "expr": scrutinee.expr_hash,
+                        "arms": arms_json,
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
         }
+    }
+
+    fn type_field_access(
+        &mut self,
+        target: &TypeCheckResult,
+        field: &str,
+    ) -> Result<TypeCheckResult> {
+        let field_type = self.record_field_type(&target.type_hash, field)?;
+        let expr_hash = self.put_object(
+            "Expression",
+            &json!({
+                "expr_kind": "field_access",
+                "target": target.expr_hash,
+                "field": field,
+                "type": field_type,
+            }),
+        )?;
+        self.write_cache_json(
+            &expr_hash,
+            "typechecker",
+            "typed-dag",
+            ArtifactKind::TypedExpression,
+            &json!({ "type": field_type }),
+        )?;
+        Ok(TypeCheckResult {
+            expr_hash,
+            type_hash: field_type,
+        })
     }
 
     pub(crate) fn type_check_root(&self, root_hash: &str) -> Result<()> {
@@ -818,6 +1173,142 @@ impl CodeDb {
                 }
                 then_type
             }
+            "record_literal" => {
+                let mut names = BTreeSet::new();
+                let mut fields = Vec::new();
+                for field in payload
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("record_literal missing fields"))?
+                {
+                    let name = field
+                        .get("name")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("record field missing name"))?
+                        .to_string();
+                    validate_projection_identifier("record field", &name)?;
+                    if !names.insert(name.clone()) {
+                        bail!("duplicate record field {name}");
+                    }
+                    let value_hash = field
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("record field missing value"))?;
+                    let field_type =
+                        self.verify_expr_type_with_locals(value_hash, root, param_types, locals)?;
+                    if field.get("type").and_then(JsonValue::as_str) != Some(field_type.as_str()) {
+                        bail!("record field type mismatch for {name}");
+                    }
+                    fields.push(TypeFieldSpec {
+                        name,
+                        type_hash: field_type,
+                    });
+                }
+                hash_for_type_spec(&TypeSpec::Record(fields))?
+            }
+            "field_access" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing target"))?;
+                let field = payload
+                    .get("field")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing field"))?;
+                validate_projection_identifier("record field", field)?;
+                let target_type =
+                    self.verify_expr_type_with_locals(target_hash, root, param_types, locals)?;
+                self.record_field_type(&target_type, field)?
+            }
+            "enum_construct" => {
+                let enum_type = payload
+                    .get("enum_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing enum_type"))?;
+                if declared_type != enum_type {
+                    bail!("enum_construct declared type must match enum_type");
+                }
+                let variant = payload
+                    .get("variant")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing variant"))?;
+                validate_projection_identifier("enum variant", variant)?;
+                let variant_type = self.enum_variant_type(enum_type, variant)?;
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing value"))?;
+                let value_type =
+                    self.verify_expr_type_with_locals(value_hash, root, param_types, locals)?;
+                if value_type != variant_type {
+                    bail!("enum variant payload type mismatch for {variant}");
+                }
+                enum_type.to_string()
+            }
+            "case" => {
+                let scrutinee_hash = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("case missing expr"))?;
+                let scrutinee_type =
+                    self.verify_expr_type_with_locals(scrutinee_hash, root, param_types, locals)?;
+                let TypeSpec::Enum(variants) = self.type_spec(&scrutinee_type)? else {
+                    bail!("case scrutinee must be enum");
+                };
+                let arms = payload
+                    .get("arms")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("case missing arms"))?;
+                let mut seen = BTreeSet::new();
+                let mut result_type = None;
+                for arm in arms {
+                    let variant = arm
+                        .get("variant")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("case arm missing variant"))?;
+                    validate_projection_identifier("enum variant", variant)?;
+                    if !seen.insert(variant.to_string()) {
+                        bail!("duplicate case arm {variant}");
+                    }
+                    let variant_type = variants
+                        .iter()
+                        .find(|candidate| candidate.name == variant)
+                        .map(|candidate| candidate.type_hash.clone())
+                        .ok_or_else(|| anyhow!("case arm uses unknown variant {variant}"))?;
+                    let binding = arm.get("binding_name").and_then(JsonValue::as_str);
+                    if let Some(binding) = binding {
+                        validate_projection_identifier("case binding", binding)?;
+                        locals.push(variant_type.clone());
+                    } else if variant_type != type_hash_for("Unit") {
+                        bail!("case arm {variant} must bind its payload");
+                    }
+                    let body_hash = arm
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("case arm missing body"))?;
+                    let body_type =
+                        self.verify_expr_type_with_locals(body_hash, root, param_types, locals);
+                    if binding.is_some() {
+                        locals.pop();
+                    }
+                    let body_type = body_type?;
+                    if let Some(expected) = &result_type {
+                        if expected != &body_type {
+                            bail!("case arm type mismatch");
+                        }
+                    } else {
+                        result_type = Some(body_type);
+                    }
+                }
+                let expected_variants = variants
+                    .iter()
+                    .map(|variant| variant.name.clone())
+                    .collect::<BTreeSet<_>>();
+                if seen != expected_variants {
+                    bail!("case expression must cover every enum variant");
+                }
+                result_type.ok_or_else(|| anyhow!("case expression has no arms"))?
+            }
             other => bail!("unknown expression kind {other}"),
         };
         if declared_type != actual_type {
@@ -865,4 +1356,344 @@ pub(crate) fn type_hash_for(type_kind: &str) -> String {
         SCHEMA_VERSION,
         &canonical_json(&json!({ "type_kind": type_kind })),
     )
+}
+
+impl TypeSpec {
+    pub(crate) fn to_source(&self, db: &CodeDb) -> Result<String> {
+        match self {
+            TypeSpec::Builtin(kind) => match kind.as_str() {
+                "I64" => Ok("i64".to_string()),
+                "Bool" => Ok("bool".to_string()),
+                "Unit" => Ok("unit".to_string()),
+                other => bail!("unknown builtin type kind {other}"),
+            },
+            TypeSpec::Record(fields) => {
+                let rendered = fields
+                    .iter()
+                    .map(|field| {
+                        Ok(format!(
+                            "{}: {}",
+                            field.name,
+                            db.type_name(&field.type_hash)?
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(format!("record {{{}}}", rendered.join(", ")))
+            }
+            TypeSpec::Enum(variants) => {
+                let rendered = variants
+                    .iter()
+                    .map(|variant| {
+                        Ok(format!(
+                            "{}: {}",
+                            variant.name,
+                            db.type_name(&variant.type_hash)?
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(format!("enum {{{}}}", rendered.join(", ")))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedTypeField {
+    name: String,
+    ty: ParsedTypeSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParsedTypeSpec {
+    Builtin(String),
+    Record(Vec<ParsedTypeField>),
+    Enum(Vec<ParsedTypeField>),
+}
+
+impl ParsedTypeSpec {
+    fn to_payload_spec(&self) -> TypeSpec {
+        match self {
+            ParsedTypeSpec::Builtin(kind) => TypeSpec::Builtin(kind.clone()),
+            ParsedTypeSpec::Record(fields) => TypeSpec::Record(
+                fields
+                    .iter()
+                    .map(|field| TypeFieldSpec {
+                        name: field.name.clone(),
+                        type_hash: type_hash_for_spec(&field.ty),
+                    })
+                    .collect(),
+            ),
+            ParsedTypeSpec::Enum(variants) => TypeSpec::Enum(
+                variants
+                    .iter()
+                    .map(|variant| TypeFieldSpec {
+                        name: variant.name.clone(),
+                        type_hash: type_hash_for_spec(&variant.ty),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
+fn parse_type_source(source: &str) -> Result<ParsedTypeSpec> {
+    let mut parser = TypeParser::new(source)?;
+    let spec = parser.parse_type()?;
+    parser.expect_eof()?;
+    Ok(spec)
+}
+
+fn type_hash_for_spec(spec: &ParsedTypeSpec) -> String {
+    match spec {
+        ParsedTypeSpec::Builtin(kind) => type_hash_for(kind),
+        ParsedTypeSpec::Record(_) | ParsedTypeSpec::Enum(_) => {
+            let payload = type_payload_for_spec(&spec.to_payload_spec())
+                .expect("parsed type spec is already validated");
+            hash_object_canonical("Type", SCHEMA_VERSION, &canonical_json(&payload))
+        }
+    }
+}
+
+pub(crate) fn type_payload_for_spec(spec: &TypeSpec) -> Result<JsonValue> {
+    Ok(match spec {
+        TypeSpec::Builtin(kind) => json!({ "type_kind": kind }),
+        TypeSpec::Record(fields) => {
+            let fields = canonical_type_fields("record field", fields)?;
+            json!({
+                "type_kind": "Record",
+                "fields": fields
+                    .into_iter()
+                    .map(|field| json!({ "name": field.name, "type": field.type_hash }))
+                    .collect::<Vec<_>>(),
+            })
+        }
+        TypeSpec::Enum(variants) => {
+            let variants = canonical_type_fields("enum variant", variants)?;
+            json!({
+                "type_kind": "Enum",
+                "variants": variants
+                    .into_iter()
+                    .map(|variant| json!({ "name": variant.name, "type": variant.type_hash }))
+                    .collect::<Vec<_>>(),
+            })
+        }
+    })
+}
+
+pub(crate) fn type_spec_from_payload(payload: &JsonValue) -> Result<TypeSpec> {
+    match payload
+        .get("type_kind")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| anyhow!("Type object missing type_kind"))?
+    {
+        "I64" => Ok(TypeSpec::Builtin("I64".to_string())),
+        "Bool" => Ok(TypeSpec::Builtin("Bool".to_string())),
+        "Unit" => Ok(TypeSpec::Builtin("Unit".to_string())),
+        "Record" => Ok(TypeSpec::Record(type_fields_from_payload(
+            "record field",
+            payload.get("fields"),
+        )?)),
+        "Enum" => Ok(TypeSpec::Enum(type_fields_from_payload(
+            "enum variant",
+            payload.get("variants"),
+        )?)),
+        other => bail!("unknown Type object kind {other}"),
+    }
+}
+
+fn type_fields_from_payload(label: &str, value: Option<&JsonValue>) -> Result<Vec<TypeFieldSpec>> {
+    let fields = value
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| anyhow!("{label}s must be an array"))?
+        .iter()
+        .map(|entry| {
+            let name = entry
+                .get("name")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("{label} missing name"))?
+                .to_string();
+            validate_projection_identifier(label, &name)?;
+            let type_hash = entry
+                .get("type")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("{label} missing type"))?
+                .to_string();
+            Ok(TypeFieldSpec { name, type_hash })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    canonical_type_fields(label, &fields)
+}
+
+fn canonical_type_fields(label: &str, fields: &[TypeFieldSpec]) -> Result<Vec<TypeFieldSpec>> {
+    if fields.is_empty() {
+        bail!("{label}s must not be empty");
+    }
+    let mut names = BTreeSet::new();
+    let mut out = Vec::with_capacity(fields.len());
+    for field in fields {
+        validate_projection_identifier(label, &field.name)?;
+        if !names.insert(field.name.clone()) {
+            bail!("duplicate {label} {}", field.name);
+        }
+        out.push(field.clone());
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+fn hash_for_type_spec(spec: &TypeSpec) -> Result<String> {
+    let payload = type_payload_for_spec(spec)?;
+    Ok(hash_object_canonical(
+        "Type",
+        SCHEMA_VERSION,
+        &canonical_json(&payload),
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypeToken {
+    Ident(String),
+    Symbol(String),
+    Eof,
+}
+
+struct TypeParser {
+    tokens: Vec<TypeToken>,
+    pos: usize,
+}
+
+impl TypeParser {
+    fn new(source: &str) -> Result<Self> {
+        Ok(Self {
+            tokens: lex_type(source)?,
+            pos: 0,
+        })
+    }
+
+    fn parse_type(&mut self) -> Result<ParsedTypeSpec> {
+        match self.next() {
+            TypeToken::Ident(value) if value == "i64" || value == "I64" => {
+                Ok(ParsedTypeSpec::Builtin("I64".to_string()))
+            }
+            TypeToken::Ident(value) if value == "bool" || value == "Bool" => {
+                Ok(ParsedTypeSpec::Builtin("Bool".to_string()))
+            }
+            TypeToken::Ident(value) if value == "unit" || value == "Unit" => {
+                Ok(ParsedTypeSpec::Builtin("Unit".to_string()))
+            }
+            TypeToken::Ident(value) if value == "record" => {
+                Ok(ParsedTypeSpec::Record(self.parse_fields("record field")?))
+            }
+            TypeToken::Ident(value) if value == "enum" => {
+                Ok(ParsedTypeSpec::Enum(self.parse_fields("enum variant")?))
+            }
+            TypeToken::Symbol(value) if value == "(" => {
+                self.expect_symbol(")")?;
+                Ok(ParsedTypeSpec::Builtin("Unit".to_string()))
+            }
+            other => bail!("expected type, got {other:?}"),
+        }
+    }
+
+    fn parse_fields(&mut self, label: &str) -> Result<Vec<ParsedTypeField>> {
+        self.expect_symbol("{")?;
+        let mut fields = Vec::new();
+        if self.consume_symbol("}") {
+            bail!("{label}s must not be empty");
+        }
+        loop {
+            let name = self.expect_ident()?;
+            validate_projection_identifier(label, &name)?;
+            self.expect_symbol(":")?;
+            let ty = self.parse_type()?;
+            fields.push(ParsedTypeField { name, ty });
+            if self.consume_symbol("}") {
+                break;
+            }
+            self.expect_symbol(",")?;
+        }
+        validate_parsed_type_fields(label, fields)
+    }
+
+    fn expect_eof(&self) -> Result<()> {
+        if matches!(self.peek(), TypeToken::Eof) {
+            Ok(())
+        } else {
+            bail!("unexpected token at end of type: {:?}", self.peek())
+        }
+    }
+
+    fn expect_ident(&mut self) -> Result<String> {
+        match self.next() {
+            TypeToken::Ident(value) => Ok(value),
+            other => bail!("expected identifier, got {other:?}"),
+        }
+    }
+
+    fn expect_symbol(&mut self, expected: &str) -> Result<()> {
+        match self.next() {
+            TypeToken::Symbol(value) if value == expected => Ok(()),
+            other => bail!("expected symbol {expected}, got {other:?}"),
+        }
+    }
+
+    fn consume_symbol(&mut self, expected: &str) -> bool {
+        match self.peek() {
+            TypeToken::Symbol(value) if value == expected => {
+                self.pos += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn peek(&self) -> &TypeToken {
+        self.tokens.get(self.pos).unwrap_or(&TypeToken::Eof)
+    }
+
+    fn next(&mut self) -> TypeToken {
+        let token = self.tokens.get(self.pos).cloned().unwrap_or(TypeToken::Eof);
+        if !matches!(token, TypeToken::Eof) {
+            self.pos += 1;
+        }
+        token
+    }
+}
+
+fn validate_parsed_type_fields(
+    label: &str,
+    mut fields: Vec<ParsedTypeField>,
+) -> Result<Vec<ParsedTypeField>> {
+    let mut names = BTreeSet::new();
+    for field in &fields {
+        if !names.insert(field.name.clone()) {
+            bail!("duplicate {label} {}", field.name);
+        }
+    }
+    fields.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(fields)
+}
+
+fn lex_type(source: &str) -> Result<Vec<TypeToken>> {
+    let mut tokens = Vec::new();
+    let chars = source.chars().collect::<Vec<_>>();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch.is_whitespace() {
+            i += 1;
+        } else if ch.is_ascii_alphabetic() || ch == '_' {
+            let start = i;
+            i += 1;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            tokens.push(TypeToken::Ident(chars[start..i].iter().collect()));
+        } else {
+            tokens.push(TypeToken::Symbol(ch.to_string()));
+            i += 1;
+        }
+    }
+    tokens.push(TypeToken::Eof);
+    Ok(tokens)
 }

@@ -154,7 +154,10 @@ impl CodeDb {
             .iter()
             .zip(param_types.iter())
             .enumerate()
-            .map(|(idx, (arg, type_hash))| parse_eval_arg(arg, self.type_name(type_hash)?, idx))
+            .map(|(idx, (arg, type_hash))| {
+                let type_name = self.type_name(type_hash)?;
+                parse_eval_arg(arg, &type_name, idx)
+            })
             .collect::<Result<Vec<_>>>()?;
         self.eval_name(&branch.root_hash, function_name, parsed_args)
     }

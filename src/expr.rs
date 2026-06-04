@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display};
 
 use anyhow::{Result, anyhow, bail};
@@ -11,7 +11,7 @@ use crate::model::{
     root_module_names,
 };
 use crate::store::CodeDb;
-use crate::types::ParamSpec;
+use crate::types::{ParamSpec, TypeSpec};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -56,6 +56,39 @@ pub enum RawExpr {
         #[serde(rename = "else")]
         else_expr: Box<RawExpr>,
     },
+    Record {
+        fields: Vec<RawRecordField>,
+    },
+    FieldAccess {
+        target: Box<RawExpr>,
+        field: String,
+    },
+    EnumConstruct {
+        #[serde(rename = "type")]
+        enum_type: String,
+        variant: String,
+        value: Box<RawExpr>,
+    },
+    Case {
+        expr: Box<RawExpr>,
+        arms: Vec<RawCaseArm>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawRecordField {
+    pub name: String,
+    pub value: RawExpr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawCaseArm {
+    pub variant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<String>,
+    pub body: RawExpr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +105,8 @@ pub enum Value {
     I64(i64),
     Bool(bool),
     Unit,
+    Record(BTreeMap<String, Value>),
+    Enum { variant: String, value: Box<Value> },
 }
 
 impl Display for Value {
@@ -80,6 +115,20 @@ impl Display for Value {
             Value::I64(value) => write!(f, "{value}"),
             Value::Bool(value) => write!(f, "{value}"),
             Value::Unit => write!(f, "()"),
+            Value::Record(fields) => {
+                let rendered = fields
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}"))
+                    .collect::<Vec<_>>();
+                write!(f, "{{{}}}", rendered.join(", "))
+            }
+            Value::Enum { variant, value } => {
+                if matches!(value.as_ref(), Value::Unit) {
+                    write!(f, "{variant}")
+                } else {
+                    write!(f, "{variant}({value})")
+                }
+            }
         }
     }
 }
@@ -115,12 +164,12 @@ impl CodeDb {
             );
         }
         for (idx, (arg, ty)) in args.iter().zip(param_types.iter()).enumerate() {
-            match (arg, self.type_name(ty)?) {
-                (Value::I64(_), "i64") | (Value::Bool(_), "bool") | (Value::Unit, "unit") => {}
-                _ => bail!(
-                    "argument {idx} has wrong type for {}",
-                    self.symbol_display(&root, symbol)?
-                ),
+            if !self.value_has_type(arg, ty)? {
+                bail!(
+                    "argument {idx} has wrong type for {}: expected {}, got {arg}",
+                    self.symbol_display(&root, symbol)?,
+                    self.type_name(ty)?,
+                );
             }
         }
         let body = self.function_body_hash(&root_symbol.definition)?;
@@ -134,6 +183,36 @@ impl CodeDb {
         args: &[Value],
     ) -> Result<Value> {
         self.eval_expr_with_locals(root_hash, expr_hash, args, &mut Vec::new())
+    }
+
+    pub(crate) fn value_has_type(&self, value: &Value, type_hash: &str) -> Result<bool> {
+        match (value, self.type_spec(type_hash)?) {
+            (Value::I64(_), TypeSpec::Builtin(kind)) => Ok(kind == "I64"),
+            (Value::Bool(_), TypeSpec::Builtin(kind)) => Ok(kind == "Bool"),
+            (Value::Unit, TypeSpec::Builtin(kind)) => Ok(kind == "Unit"),
+            (Value::Record(values), TypeSpec::Record(fields)) => {
+                if values.len() != fields.len() {
+                    return Ok(false);
+                }
+                for field in fields {
+                    let Some(value) = values.get(&field.name) else {
+                        return Ok(false);
+                    };
+                    if !self.value_has_type(value, &field.type_hash)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            (Value::Enum { variant, value }, TypeSpec::Enum(variants)) => {
+                let Some(variant) = variants.iter().find(|candidate| candidate.name == *variant)
+                else {
+                    return Ok(false);
+                };
+                self.value_has_type(value, &variant.type_hash)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn eval_expr_with_locals(
@@ -268,6 +347,97 @@ impl CodeDb {
                         self.eval_expr_with_locals(root_hash, else_hash, args, locals)
                     }
                     other => bail!("if condition evaluated to non-bool {other}"),
+                }
+            }
+            "record_literal" => {
+                let mut values = BTreeMap::new();
+                for field in payload
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("record_literal missing fields"))?
+                {
+                    let name = field
+                        .get("name")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("record field missing name"))?
+                        .to_string();
+                    let value_hash = field
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("record field missing value"))?;
+                    values.insert(
+                        name,
+                        self.eval_expr_with_locals(root_hash, value_hash, args, locals)?,
+                    );
+                }
+                Ok(Value::Record(values))
+            }
+            "field_access" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing target"))?;
+                let field = payload
+                    .get("field")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing field"))?;
+                match self.eval_expr_with_locals(root_hash, target_hash, args, locals)? {
+                    Value::Record(fields) => fields
+                        .get(field)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("record value has no field {field}")),
+                    other => bail!("field access target evaluated to non-record {other}"),
+                }
+            }
+            "enum_construct" => {
+                let variant = payload
+                    .get("variant")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing variant"))?
+                    .to_string();
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing value"))?;
+                Ok(Value::Enum {
+                    variant,
+                    value: Box::new(
+                        self.eval_expr_with_locals(root_hash, value_hash, args, locals)?,
+                    ),
+                })
+            }
+            "case" => {
+                let expr_hash = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("case missing expr"))?;
+                let value = self.eval_expr_with_locals(root_hash, expr_hash, args, locals)?;
+                let Value::Enum { variant, value } = value else {
+                    bail!("case expression evaluated to non-enum {value}");
+                };
+                let arms = payload
+                    .get("arms")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("case missing arms"))?;
+                let arm = arms
+                    .iter()
+                    .find(|arm| arm.get("variant").and_then(JsonValue::as_str) == Some(&variant))
+                    .ok_or_else(|| anyhow!("case missing arm for variant {variant}"))?;
+                let body_hash = arm
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("case arm missing body"))?;
+                if arm
+                    .get("binding_name")
+                    .and_then(JsonValue::as_str)
+                    .is_some()
+                {
+                    locals.push(*value);
+                    let result = self.eval_expr_with_locals(root_hash, body_hash, args, locals);
+                    locals.pop();
+                    result
+                } else {
+                    self.eval_expr_with_locals(root_hash, body_hash, args, locals)
                 }
             }
             other => bail!("unknown expression kind {other}"),
@@ -672,6 +842,160 @@ impl CodeDb {
                     expr
                 }
             }
+            "record_literal" => {
+                let fields = payload
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("record_literal missing fields"))?
+                    .iter()
+                    .map(|field| {
+                        let name = field
+                            .get("name")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("record field missing name"))?;
+                        let value = field
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("record field missing value"))?;
+                        Ok(format!(
+                            "{name}: {}",
+                            self.expr_to_source_with_locals(
+                                value,
+                                root,
+                                current_module,
+                                local_params,
+                                local_names,
+                                0,
+                            )?
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                format!("{{{}}}", fields.join(", "))
+            }
+            "field_access" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing target"))?;
+                let field = payload
+                    .get("field")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing field"))?;
+                let expr = format!(
+                    "{}.{field}",
+                    self.expr_to_source_with_locals(
+                        target,
+                        root,
+                        current_module,
+                        local_params,
+                        local_names,
+                        field_access_precedence(),
+                    )?
+                );
+                if field_access_precedence() < parent_prec {
+                    format!("({expr})")
+                } else {
+                    expr
+                }
+            }
+            "enum_construct" => {
+                let enum_type = payload
+                    .get("enum_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing enum_type"))?;
+                let variant = payload
+                    .get("variant")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing variant"))?;
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing value"))?;
+                if payload.get("value").is_some()
+                    && payload.get("value").and_then(JsonValue::as_str).is_some()
+                    && self
+                        .get_payload(value)?
+                        .get("expr_kind")
+                        .and_then(JsonValue::as_str)
+                        == Some("literal_unit")
+                {
+                    format!("{}::{variant}", self.type_name(enum_type)?)
+                } else {
+                    format!(
+                        "{}::{variant}({})",
+                        self.type_name(enum_type)?,
+                        self.expr_to_source_with_locals(
+                            value,
+                            root,
+                            current_module,
+                            local_params,
+                            local_names,
+                            0,
+                        )?
+                    )
+                }
+            }
+            "case" => {
+                let expr_hash = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("case missing expr"))?;
+                let arms = payload
+                    .get("arms")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("case missing arms"))?;
+                let rendered_arms = arms
+                    .iter()
+                    .map(|arm| {
+                        let variant = arm
+                            .get("variant")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("case arm missing variant"))?;
+                        let binding = arm.get("binding_name").and_then(JsonValue::as_str);
+                        let body = arm
+                            .get("body")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("case arm missing body"))?;
+                        if let Some(binding) = binding {
+                            local_names.push(binding.to_string());
+                        }
+                        let rendered_body = self.expr_to_source_with_locals(
+                            body,
+                            root,
+                            current_module,
+                            local_params,
+                            local_names,
+                            0,
+                        );
+                        if binding.is_some() {
+                            local_names.pop();
+                        }
+                        Ok(match binding {
+                            Some(binding) => {
+                                format!("{variant}({binding}) => {}", rendered_body?)
+                            }
+                            None => format!("{variant} => {}", rendered_body?),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let expr = format!(
+                    "case {} of {}",
+                    self.expr_to_source_with_locals(
+                        expr_hash,
+                        root,
+                        current_module,
+                        local_params,
+                        local_names,
+                        0,
+                    )?,
+                    rendered_arms.join(" | ")
+                );
+                if parent_prec > 0 {
+                    format!("({expr})")
+                } else {
+                    expr
+                }
+            }
             other => bail!("unknown expression kind {other}"),
         };
         Ok(rendered)
@@ -886,6 +1210,124 @@ impl CodeDb {
                     )?,
                 ),
             }),
+            "record_literal" => Ok(RawExpr::Record {
+                fields: payload
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("record_literal missing fields"))?
+                    .iter()
+                    .map(|field| {
+                        let name = field
+                            .get("name")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("record field missing name"))?
+                            .to_string();
+                        let value = self.typed_expr_to_raw_with_locals(
+                            field
+                                .get("value")
+                                .and_then(JsonValue::as_str)
+                                .ok_or_else(|| anyhow!("record field missing value"))?,
+                            root,
+                            current_module,
+                            local_names,
+                        )?;
+                        Ok(RawRecordField { name, value })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            }),
+            "field_access" => Ok(RawExpr::FieldAccess {
+                target: Box::new(
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("target")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("field_access missing target"))?,
+                        root,
+                        current_module,
+                        local_names,
+                    )?,
+                ),
+                field: payload
+                    .get("field")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing field"))?
+                    .to_string(),
+            }),
+            "enum_construct" => Ok(RawExpr::EnumConstruct {
+                enum_type: self.type_name(
+                    payload
+                        .get("enum_type")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("enum_construct missing enum_type"))?,
+                )?,
+                variant: payload
+                    .get("variant")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing variant"))?
+                    .to_string(),
+                value: Box::new(
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("enum_construct missing value"))?,
+                        root,
+                        current_module,
+                        local_names,
+                    )?,
+                ),
+            }),
+            "case" => {
+                let expr = self.typed_expr_to_raw_with_locals(
+                    payload
+                        .get("expr")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("case missing expr"))?,
+                    root,
+                    current_module,
+                    local_names,
+                )?;
+                let arms = payload
+                    .get("arms")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("case missing arms"))?
+                    .iter()
+                    .map(|arm| {
+                        let variant = arm
+                            .get("variant")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("case arm missing variant"))?
+                            .to_string();
+                        let binding = arm
+                            .get("binding_name")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string);
+                        if let Some(binding) = &binding {
+                            local_names.push(binding.clone());
+                        }
+                        let body = self.typed_expr_to_raw_with_locals(
+                            arm.get("body")
+                                .and_then(JsonValue::as_str)
+                                .ok_or_else(|| anyhow!("case arm missing body"))?,
+                            root,
+                            current_module,
+                            local_names,
+                        );
+                        if binding.is_some() {
+                            local_names.pop();
+                        }
+                        Ok(RawCaseArm {
+                            variant,
+                            binding,
+                            body: body?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(RawExpr::Case {
+                    expr: Box::new(expr),
+                    arms,
+                })
+            }
             other => bail!("unknown expression kind {other}"),
         }
     }
@@ -932,6 +1374,23 @@ pub(crate) fn op_precedence(op: &str) -> u8 {
 
 pub(crate) fn unary_precedence() -> u8 {
     7
+}
+
+fn field_access_precedence() -> u8 {
+    8
+}
+
+fn field_access_from_path(path: &str) -> RawExpr {
+    let mut parts = path.split('.');
+    let first = parts.next().unwrap_or_default().to_string();
+    let mut expr = RawExpr::ParamName { name: first };
+    for field in parts {
+        expr = RawExpr::FieldAccess {
+            target: Box::new(expr),
+            field: field.to_string(),
+        };
+    }
+    expr
 }
 
 impl CodeDb {
@@ -1015,6 +1474,51 @@ impl CodeDb {
                     self.collect_expr_deps(root, child, deps)?;
                 }
             }
+            "record_literal" => {
+                for field in payload
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("record_literal missing fields"))?
+                {
+                    let child = field
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("record field missing value"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
+            }
+            "field_access" => {
+                let child = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing target"))?;
+                self.collect_expr_deps(root, child, deps)?;
+            }
+            "enum_construct" => {
+                let child = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing value"))?;
+                self.collect_expr_deps(root, child, deps)?;
+            }
+            "case" => {
+                let child = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("case missing expr"))?;
+                self.collect_expr_deps(root, child, deps)?;
+                for arm in payload
+                    .get("arms")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("case missing arms"))?
+                {
+                    let child = arm
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("case arm missing body"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
+            }
             other => bail!("unknown expression kind {other}"),
         }
         Ok(())
@@ -1034,7 +1538,7 @@ pub(crate) fn parse_program(source: &str) -> Result<Vec<FunctionSource>> {
     let mut functions = Vec::new();
     while !parser.at_eof() {
         if parser.consume_ident_value("module") {
-            let module = parser.expect_ident()?;
+            let module = parser.expect_name_path()?;
             parser.expect_symbol("{")?;
             while !parser.consume_symbol("}") {
                 if parser.at_eof() {
@@ -1101,7 +1605,7 @@ impl Parser {
             loop {
                 let param_name = self.expect_ident()?;
                 self.expect_symbol(":")?;
-                let ty = self.expect_ident()?;
+                let ty = self.parse_type_source()?;
                 params.push(ParamSpec {
                     name: param_name,
                     ty,
@@ -1113,7 +1617,7 @@ impl Parser {
             }
         }
         self.expect_symbol("->")?;
-        let return_type = self.expect_ident_or_unit()?;
+        let return_type = self.parse_type_source()?;
         self.expect_symbol("=")?;
         let body = self.parse_expr()?;
         Ok(FunctionSource {
@@ -1133,7 +1637,7 @@ impl Parser {
         if self.consume_ident_value("let") {
             let name = self.expect_ident()?;
             self.expect_symbol(":")?;
-            let ty = self.expect_ident_or_unit()?;
+            let ty = self.parse_type_source()?;
             self.expect_symbol("=")?;
             let value = self.parse_expr()?;
             self.expect_ident_value("in")?;
@@ -1160,6 +1664,40 @@ impl Parser {
                 cond: Box::new(cond),
                 then_expr: Box::new(then_expr),
                 else_expr: Box::new(else_expr),
+            })
+        } else {
+            self.parse_case()
+        }
+    }
+
+    fn parse_case(&mut self) -> Result<RawExpr> {
+        if self.consume_ident_value("case") {
+            let expr = self.parse_expr()?;
+            self.expect_ident_value("of")?;
+            let mut arms = Vec::new();
+            loop {
+                let variant = self.expect_ident()?;
+                let binding = if self.consume_symbol("(") {
+                    let binding = self.expect_ident()?;
+                    self.expect_symbol(")")?;
+                    Some(binding)
+                } else {
+                    None
+                };
+                self.expect_symbol("=>")?;
+                let body = self.parse_expr()?;
+                arms.push(RawCaseArm {
+                    variant,
+                    binding,
+                    body,
+                });
+                if !self.consume_symbol("|") {
+                    break;
+                }
+            }
+            Ok(RawExpr::Case {
+                expr: Box::new(expr),
+                arms,
             })
         } else {
             self.parse_binary_prec(1)
@@ -1208,6 +1746,24 @@ impl Parser {
             Token::Ident(name) if name == "true" => Ok(RawExpr::LiteralBool { value: true }),
             Token::Ident(name) if name == "false" => Ok(RawExpr::LiteralBool { value: false }),
             Token::Ident(name) => {
+                if name == "enum" && matches!(self.peek(), Token::Symbol(symbol) if symbol == "{") {
+                    let enum_type = self.parse_type_source_after_ident(name)?;
+                    self.expect_symbol("::")?;
+                    let variant = self.expect_ident()?;
+                    let value = if self.consume_symbol("(") {
+                        let value = self.parse_expr()?;
+                        self.expect_symbol(")")?;
+                        value
+                    } else {
+                        RawExpr::Unit
+                    };
+                    return Ok(RawExpr::EnumConstruct {
+                        enum_type,
+                        variant,
+                        value: Box::new(value),
+                    });
+                }
+                let path = self.finish_name_path(name)?;
                 if self.consume_symbol("(") {
                     let mut args = Vec::new();
                     if !self.consume_symbol(")") {
@@ -1219,9 +1775,11 @@ impl Parser {
                             self.expect_symbol(",")?;
                         }
                     }
-                    Ok(RawExpr::Call { name, args })
+                    Ok(RawExpr::Call { name: path, args })
+                } else if path.contains('.') {
+                    Ok(field_access_from_path(&path))
                 } else {
-                    Ok(RawExpr::ParamName { name })
+                    Ok(RawExpr::ParamName { name: path })
                 }
             }
             Token::Symbol(symbol) if symbol == "(" => {
@@ -1232,8 +1790,73 @@ impl Parser {
                 self.expect_symbol(")")?;
                 Ok(expr)
             }
+            Token::Symbol(symbol) if symbol == "{" => {
+                let mut fields = Vec::new();
+                if self.consume_symbol("}") {
+                    bail!("record literal must have at least one field");
+                }
+                loop {
+                    let name = self.expect_ident()?;
+                    self.expect_symbol(":")?;
+                    let value = self.parse_expr()?;
+                    fields.push(RawRecordField { name, value });
+                    if self.consume_symbol("}") {
+                        break;
+                    }
+                    self.expect_symbol(",")?;
+                }
+                Ok(RawExpr::Record { fields })
+            }
             other => bail!("unexpected token in expression: {other:?}"),
         }
+    }
+
+    fn parse_type_source(&mut self) -> Result<String> {
+        match self.next() {
+            Token::Ident(name) => self.parse_type_source_after_ident(name),
+            Token::Symbol(symbol) if symbol == "(" => {
+                self.expect_symbol(")")?;
+                Ok("unit".to_string())
+            }
+            other => bail!("expected type, got {other:?}"),
+        }
+    }
+
+    fn parse_type_source_after_ident(&mut self, name: String) -> Result<String> {
+        match name.as_str() {
+            "i64" | "I64" => Ok("i64".to_string()),
+            "bool" | "Bool" => Ok("bool".to_string()),
+            "unit" | "Unit" => Ok("unit".to_string()),
+            "record" => {
+                let fields = self.parse_type_fields()?;
+                Ok(format!("record {{{}}}", fields.join(", ")))
+            }
+            "enum" => {
+                let variants = self.parse_type_fields()?;
+                Ok(format!("enum {{{}}}", variants.join(", ")))
+            }
+            other => bail!("unknown type {other}"),
+        }
+    }
+
+    fn parse_type_fields(&mut self) -> Result<Vec<String>> {
+        self.expect_symbol("{")?;
+        let mut fields = Vec::new();
+        if self.consume_symbol("}") {
+            bail!("type fields must not be empty");
+        }
+        loop {
+            let name = self.expect_ident()?;
+            self.expect_symbol(":")?;
+            let ty = self.parse_type_source()?;
+            fields.push(format!("{name}: {ty}"));
+            if self.consume_symbol("}") {
+                break;
+            }
+            self.expect_symbol(",")?;
+        }
+        fields.sort();
+        Ok(fields)
     }
 
     fn expect_ident(&mut self) -> Result<String> {
@@ -1243,13 +1866,17 @@ impl Parser {
         }
     }
 
-    fn expect_ident_or_unit(&mut self) -> Result<String> {
-        if self.consume_symbol("(") {
-            self.expect_symbol(")")?;
-            Ok("unit".to_string())
-        } else {
-            self.expect_ident()
+    fn expect_name_path(&mut self) -> Result<String> {
+        let first = self.expect_ident()?;
+        self.finish_name_path(first)
+    }
+
+    fn finish_name_path(&mut self, first: String) -> Result<String> {
+        let mut parts = vec![first];
+        while self.consume_symbol(".") {
+            parts.push(self.expect_ident()?);
         }
+        Ok(parts.join("."))
     }
 
     fn expect_ident_value(&mut self, expected: &str) -> Result<()> {
@@ -1310,9 +1937,7 @@ fn lex(source: &str) -> Result<Vec<Token>> {
         } else if ch.is_ascii_alphabetic() || ch == '_' {
             let start = i;
             i += 1;
-            while i < chars.len()
-                && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '.')
-            {
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
                 i += 1;
             }
             tokens.push(Token::Ident(chars[start..i].iter().collect()));
@@ -1325,7 +1950,10 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             tokens.push(Token::Number(chars[start..i].iter().collect()));
         } else if i + 1 < chars.len() {
             let two = [chars[i], chars[i + 1]].iter().collect::<String>();
-            if matches!(two.as_str(), "->" | "==" | "!=" | "<=" | ">=" | "&&" | "||") {
+            if matches!(
+                two.as_str(),
+                "->" | "==" | "!=" | "<=" | ">=" | "&&" | "||" | "::" | "=>"
+            ) {
                 tokens.push(Token::Symbol(two));
                 i += 2;
             } else {

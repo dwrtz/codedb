@@ -65,11 +65,12 @@ impl CodeDb {
     }
 
     pub(crate) fn c_type(&self, type_hash: &str) -> Result<&'static str> {
-        match self.type_name(type_hash)? {
+        let type_name = self.type_name(type_hash)?;
+        match type_name.as_str() {
             "i64" => Ok("long"),
             "bool" => Ok("int"),
             "unit" => Ok("void"),
-            _ => unreachable!(),
+            _ => bail!("C projection v0 does not support aggregate type {type_name}"),
         }
     }
 
@@ -285,6 +286,15 @@ impl CodeDb {
                     self.c_expr_with_locals(cond, root, local_params, locals, 0)?,
                     self.c_expr_with_locals(then_hash, root, local_params, locals, 0)?,
                     self.c_expr_with_locals(else_hash, root, local_params, locals, 0)?
+                )
+            }
+            "record_literal" | "field_access" | "enum_construct" | "case" => {
+                bail!(
+                    "C projection v0 does not support {other}",
+                    other = payload
+                        .get("expr_kind")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("aggregate expression")
                 )
             }
             other => bail!("unknown expression kind {other}"),

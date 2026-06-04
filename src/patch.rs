@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::MAIN_BRANCH;
-use crate::expr::RawExpr;
+use crate::expr::{RawCaseArm, RawExpr, RawRecordField};
 use crate::migrations::{MigrationOutcome, MigrationReport, Operation};
 use crate::model::{ProgramRootPayload, resolve_name_in_root};
 use crate::store::{CodeDb, canonical_json, hash_bytes};
@@ -1006,7 +1006,7 @@ impl CodeDb {
             None => matched
                 .type_hash
                 .as_deref()
-                .map(|type_hash| self.type_name(type_hash).map(str::to_string))
+                .map(|type_hash| self.type_name(type_hash))
                 .transpose()?
                 .ok_or_else(|| {
                     anyhow!("extract_function requires return_type for untyped match")
@@ -1863,7 +1863,7 @@ impl CodeDb {
         let Some(name) = name else {
             bail!("type match requires type_hash or name");
         };
-        self.resolve_type(name)
+        self.type_hash_for_source(name)
     }
 }
 
@@ -2534,6 +2534,43 @@ fn substitute_param_refs(expr: &RawExpr, args: &[RawExpr]) -> Result<RawExpr> {
             then_expr: Box::new(substitute_param_refs(then_expr, args)?),
             else_expr: Box::new(substitute_param_refs(else_expr, args)?),
         },
+        RawExpr::Record { fields } => RawExpr::Record {
+            fields: fields
+                .iter()
+                .map(|field| {
+                    Ok(RawRecordField {
+                        name: field.name.clone(),
+                        value: substitute_param_refs(&field.value, args)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        },
+        RawExpr::FieldAccess { target, field } => RawExpr::FieldAccess {
+            target: Box::new(substitute_param_refs(target, args)?),
+            field: field.clone(),
+        },
+        RawExpr::EnumConstruct {
+            enum_type,
+            variant,
+            value,
+        } => RawExpr::EnumConstruct {
+            enum_type: enum_type.clone(),
+            variant: variant.clone(),
+            value: Box::new(substitute_param_refs(value, args)?),
+        },
+        RawExpr::Case { expr, arms } => RawExpr::Case {
+            expr: Box::new(substitute_param_refs(expr, args)?),
+            arms: arms
+                .iter()
+                .map(|arm| {
+                    Ok(RawCaseArm {
+                        variant: arm.variant.clone(),
+                        binding: arm.binding.clone(),
+                        body: substitute_param_refs(&arm.body, args)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        },
     })
 }
 
@@ -2578,6 +2615,29 @@ fn collect_free_param_names(
             collect_free_param_names(cond, bound_locals, names);
             collect_free_param_names(then_expr, bound_locals, names);
             collect_free_param_names(else_expr, bound_locals, names);
+        }
+        RawExpr::Record { fields } => {
+            for field in fields {
+                collect_free_param_names(&field.value, bound_locals, names);
+            }
+        }
+        RawExpr::FieldAccess { target, .. } => {
+            collect_free_param_names(target, bound_locals, names);
+        }
+        RawExpr::EnumConstruct { value, .. } => {
+            collect_free_param_names(value, bound_locals, names);
+        }
+        RawExpr::Case { expr, arms } => {
+            collect_free_param_names(expr, bound_locals, names);
+            for arm in arms {
+                if let Some(binding) = &arm.binding {
+                    bound_locals.push(binding.clone());
+                }
+                collect_free_param_names(&arm.body, bound_locals, names);
+                if arm.binding.is_some() {
+                    bound_locals.pop();
+                }
+            }
         }
     }
 }
@@ -2673,6 +2733,68 @@ fn alpha_rename_let_bindings_with_scope(
                 renamed_locals,
             )),
         },
+        RawExpr::Record { fields } => RawExpr::Record {
+            fields: fields
+                .iter()
+                .map(|field| RawRecordField {
+                    name: field.name.clone(),
+                    value: alpha_rename_let_bindings_with_scope(
+                        &field.value,
+                        used_names,
+                        renamed_locals,
+                    ),
+                })
+                .collect(),
+        },
+        RawExpr::FieldAccess { target, field } => RawExpr::FieldAccess {
+            target: Box::new(alpha_rename_let_bindings_with_scope(
+                target,
+                used_names,
+                renamed_locals,
+            )),
+            field: field.clone(),
+        },
+        RawExpr::EnumConstruct {
+            enum_type,
+            variant,
+            value,
+        } => RawExpr::EnumConstruct {
+            enum_type: enum_type.clone(),
+            variant: variant.clone(),
+            value: Box::new(alpha_rename_let_bindings_with_scope(
+                value,
+                used_names,
+                renamed_locals,
+            )),
+        },
+        RawExpr::Case { expr, arms } => {
+            let expr = alpha_rename_let_bindings_with_scope(expr, used_names, renamed_locals);
+            let arms = arms
+                .iter()
+                .map(|arm| {
+                    let renamed_binding = arm.binding.as_ref().map(|binding| {
+                        let renamed = unique_inline_local_name(binding, used_names);
+                        used_names.insert(renamed.clone());
+                        renamed_locals.push((binding.clone(), renamed.clone()));
+                        renamed
+                    });
+                    let body =
+                        alpha_rename_let_bindings_with_scope(&arm.body, used_names, renamed_locals);
+                    if arm.binding.is_some() {
+                        renamed_locals.pop();
+                    }
+                    RawCaseArm {
+                        variant: arm.variant.clone(),
+                        binding: renamed_binding,
+                        body,
+                    }
+                })
+                .collect();
+            RawExpr::Case {
+                expr: Box::new(expr),
+                arms,
+            }
+        }
     }
 }
 
