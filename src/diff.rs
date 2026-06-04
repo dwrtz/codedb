@@ -5,7 +5,7 @@ use rusqlite::{Connection, params};
 use serde_json::{Value as JsonValue, json};
 
 use crate::abi::internal_abi_symbol;
-use crate::model::{ProgramRootPayload, aliases_for};
+use crate::model::ProgramRootPayload;
 use crate::store::{CodeDb, canonical_json};
 
 impl CodeDb {
@@ -58,14 +58,22 @@ impl CodeDb {
                     ));
                 }
                 (Some(a_entry), Some(b_entry)) => {
-                    let a_name = self.symbol_display(&a, &symbol)?;
-                    let b_name = self.symbol_display(&b, &symbol)?;
+                    let a_binding = self
+                        .preferred_binding(&a, &symbol)
+                        .ok_or_else(|| anyhow::anyhow!("symbol has no name {symbol}"))?;
+                    let b_binding = self
+                        .preferred_binding(&b, &symbol)
+                        .ok_or_else(|| anyhow::anyhow!("symbol has no name {symbol}"))?;
+                    let a_name = format!("{}.{}", a_binding.module, a_binding.display_name);
+                    let b_name = format!("{}.{}", b_binding.module, b_binding.display_name);
                     if a_name != b_name {
                         emitted = true;
-                        out.push_str("symbol_renamed:\n");
-                        out.push_str(&format!(
-                            "  symbol: {symbol}\n  main.{a_name} -> main.{b_name}\n"
-                        ));
+                        if a_binding.display_name == b_binding.display_name {
+                            out.push_str("symbol_moved:\n");
+                        } else {
+                            out.push_str("symbol_renamed:\n");
+                        }
+                        out.push_str(&format!("  symbol: {symbol}\n  {a_name} -> {b_name}\n"));
                         if a_entry.signature == b_entry.signature {
                             out.push_str("  signature hash: unchanged\n");
                         }
@@ -77,31 +85,31 @@ impl CodeDb {
                         out.push_str("  compile impact: metadata_only\n\n");
                     }
 
-                    let a_aliases = aliases_for(&a, &symbol);
-                    let b_aliases = aliases_for(&b, &symbol);
+                    let a_aliases = qualified_aliases_for(&a, &symbol);
+                    let b_aliases = qualified_aliases_for(&b, &symbol);
                     for alias in b_aliases.difference(&a_aliases) {
                         emitted = true;
                         out.push_str("alias_added:\n");
-                        out.push_str(&format!("  symbol: {symbol}\n  alias: main.{alias}\n\n"));
+                        out.push_str(&format!("  symbol: {symbol}\n  alias: {alias}\n\n"));
                     }
                     for alias in a_aliases.difference(&b_aliases) {
                         emitted = true;
                         out.push_str("alias_removed:\n");
-                        out.push_str(&format!("  symbol: {symbol}\n  alias: main.{alias}\n\n"));
+                        out.push_str(&format!("  symbol: {symbol}\n  alias: {alias}\n\n"));
                     }
 
                     if a_entry.signature != b_entry.signature {
                         emitted = true;
                         out.push_str("interface_changed:\n");
                         out.push_str(&format!(
-                            "  function: main.{b_name}\n  symbol: {symbol}\n  from: {}\n  to:   {}\n  compile impact: recompile_dependents\n\n",
+                            "  function: {b_name}\n  symbol: {symbol}\n  from: {}\n  to:   {}\n  compile impact: recompile_dependents\n\n",
                             a_entry.signature, b_entry.signature
                         ));
                     } else if a_entry.definition != b_entry.definition {
                         emitted = true;
                         out.push_str("implementation_changed:\n");
                         out.push_str(&format!(
-                            "  function: main.{b_name}\n  symbol: {symbol}\n  signature: unchanged\n  compile impact: recompile_symbols\n"
+                            "  function: {b_name}\n  symbol: {symbol}\n  signature: unchanged\n  compile impact: recompile_symbols\n"
                         ));
                         let a_body = self.function_body_hash(&a_entry.definition)?;
                         let b_body = self.function_body_hash(&b_entry.definition)?;
@@ -204,34 +212,40 @@ impl CodeDb {
                     "name": self.symbol_display(&a, &symbol)?,
                 })),
                 (Some(a_entry), Some(b_entry)) => {
-                    let a_name = self.symbol_display(&a, &symbol)?;
-                    let b_name = self.symbol_display(&b, &symbol)?;
+                    let a_binding = self
+                        .preferred_binding(&a, &symbol)
+                        .ok_or_else(|| anyhow::anyhow!("symbol has no name {symbol}"))?;
+                    let b_binding = self
+                        .preferred_binding(&b, &symbol)
+                        .ok_or_else(|| anyhow::anyhow!("symbol has no name {symbol}"))?;
+                    let a_name = format!("{}.{}", a_binding.module, a_binding.display_name);
+                    let b_name = format!("{}.{}", b_binding.module, b_binding.display_name);
                     if a_name != b_name {
                         changes.push(json!({
-                            "kind": "symbol_renamed",
+                            "kind": if a_binding.display_name == b_binding.display_name { "symbol_moved" } else { "symbol_renamed" },
                             "symbol": &symbol,
-                            "from": format!("main.{a_name}"),
-                            "to": format!("main.{b_name}"),
+                            "from": a_name,
+                            "to": b_name,
                             "signature_hash_unchanged": a_entry.signature == b_entry.signature,
                             "body_hash_unchanged": self.function_body_hash(&a_entry.definition)?
                                 == self.function_body_hash(&b_entry.definition)?,
                         }));
                     }
 
-                    let a_aliases = aliases_for(&a, &symbol);
-                    let b_aliases = aliases_for(&b, &symbol);
+                    let a_aliases = qualified_aliases_for(&a, &symbol);
+                    let b_aliases = qualified_aliases_for(&b, &symbol);
                     for alias in b_aliases.difference(&a_aliases) {
                         changes.push(json!({
                             "kind": "alias_added",
                             "symbol": &symbol,
-                            "alias": format!("main.{alias}"),
+                            "alias": alias,
                         }));
                     }
                     for alias in a_aliases.difference(&b_aliases) {
                         changes.push(json!({
                             "kind": "alias_removed",
                             "symbol": &symbol,
-                            "alias": format!("main.{alias}"),
+                            "alias": alias,
                         }));
                     }
 
@@ -239,7 +253,7 @@ impl CodeDb {
                         changes.push(json!({
                             "kind": "interface_changed",
                             "symbol": &symbol,
-                            "function": format!("main.{b_name}"),
+                            "function": b_name,
                             "from": &a_entry.signature,
                             "to": &b_entry.signature,
                         }));
@@ -247,7 +261,7 @@ impl CodeDb {
                         changes.push(json!({
                             "kind": "implementation_changed",
                             "symbol": &symbol,
-                            "function": format!("main.{b_name}"),
+                            "function": b_name,
                             "signature_hash_unchanged": true,
                             "from_body": self.function_body_hash(&a_entry.definition)?,
                             "to_body": self.function_body_hash(&b_entry.definition)?,
@@ -495,6 +509,14 @@ fn export_pairs(root: &ProgramRootPayload) -> BTreeSet<(String, String)> {
     root.exports
         .iter()
         .map(|binding| (binding.symbol.clone(), binding.exported_name.clone()))
+        .collect()
+}
+
+fn qualified_aliases_for(root: &ProgramRootPayload, symbol: &str) -> BTreeSet<String> {
+    root.names
+        .iter()
+        .filter(|binding| binding.symbol == symbol && !binding.is_preferred)
+        .map(|binding| format!("{}.{}", binding.module, binding.display_name))
         .collect()
 }
 

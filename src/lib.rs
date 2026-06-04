@@ -37,7 +37,7 @@ pub use types::ParamSpec;
 use backend::ArtifactKind;
 use expr::{parse_expr_source, parse_program, parse_signature_source};
 use migrations::Operation;
-use model::{param_names, preferred_names};
+use model::{param_names, preferred_names, root_module_names};
 
 pub(crate) const SCHEMA_SQL: &str = include_str!("../schema.sql");
 pub(crate) const OBJECT_DOMAIN: &[u8] = b"codedb/object/v1\0";
@@ -269,7 +269,13 @@ impl CodeDb {
         ));
         out.push_str(&format!(
             "body_source {}\n",
-            self.expr_to_source(&body_hash, &root, &param_names(&root, &symbol), 0)?
+            self.expr_to_source_in_module(
+                &body_hash,
+                &root,
+                &binding.module,
+                &param_names(&root, &symbol),
+                0
+            )?
         ));
         if deps.is_empty() {
             out.push_str("dependencies none\n");
@@ -325,7 +331,7 @@ impl CodeDb {
             "internal_abi_symbol": abi::internal_abi_symbol(&symbol)?,
             "exported_abi_symbols": abi::exported_abi_names(&root, &symbol),
             "signature": self.signature_source(&root_symbol.signature, &local_param_names)?,
-            "body_source": self.expr_to_source(&body_hash, &root, &local_param_names, 0)?,
+            "body_source": self.expr_to_source_in_module(&body_hash, &root, &binding.module, &local_param_names, 0)?,
             "dependencies": dependencies,
         });
         Ok(format!("{}\n", store::canonical_json(&payload)))
@@ -626,6 +632,152 @@ impl CodeDb {
             symbol,
             name: name.to_string(),
             exported_name: exported_name.to_string(),
+        };
+        let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
+        Ok(format_outcome(outcome, json))
+    }
+
+    pub fn list_modules_main_branch(&self) -> Result<String> {
+        self.list_modules_branch(MAIN_BRANCH)
+    }
+
+    pub fn list_modules_main_branch_json(&self) -> Result<String> {
+        self.list_modules_branch_json(MAIN_BRANCH)
+    }
+
+    pub(crate) fn list_modules_branch(&self, branch_name: &str) -> Result<String> {
+        let branch = self.branch(branch_name)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let mut out = String::new();
+        for module in root_module_names(&root) {
+            let symbol_count = root
+                .names
+                .iter()
+                .filter(|binding| binding.module == module && binding.is_preferred)
+                .count();
+            out.push_str(&format!("{module} symbols {symbol_count}\n"));
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn list_modules_branch_json(&self, branch_name: &str) -> Result<String> {
+        let branch = self.branch(branch_name)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let modules = root_module_names(&root)
+            .into_iter()
+            .map(|module| {
+                let symbols = preferred_names(&root)
+                    .into_iter()
+                    .filter(|binding| binding.module == module)
+                    .map(|binding| {
+                        json!({
+                            "name": binding.display_name,
+                            "symbol_hash": binding.symbol,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                json!({
+                    "name": module,
+                    "symbol_count": symbols.len(),
+                    "symbols": symbols,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(format!(
+            "{}\n",
+            store::canonical_json(&json!({
+                "schema": "codedb/modules/v1",
+                "branch": branch_name,
+                "root_hash": branch.root_hash,
+                "history_hash": branch.history_hash,
+                "modules": modules,
+            }))
+        ))
+    }
+
+    pub fn show_module_main_branch(&self, module: &str) -> Result<String> {
+        self.show_module_branch(MAIN_BRANCH, module)
+    }
+
+    pub fn show_module_main_branch_json(&self, module: &str) -> Result<String> {
+        self.show_module_branch_json(MAIN_BRANCH, module)
+    }
+
+    pub(crate) fn show_module_branch(&self, branch_name: &str, module: &str) -> Result<String> {
+        let branch = self.branch(branch_name)?;
+        let root = self.load_root(&branch.root_hash)?;
+        if !root_module_names(&root).contains(module) {
+            anyhow::bail!("unknown module {module}");
+        }
+        let mut out = String::new();
+        out.push_str(&format!("module {module}\n"));
+        out.push_str(&format!("root {}\n", branch.root_hash));
+        for binding in preferred_names(&root)
+            .into_iter()
+            .filter(|binding| binding.module == module)
+        {
+            out.push_str(&format!(
+                "symbol {} {}\n",
+                binding.display_name, binding.symbol
+            ));
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn show_module_branch_json(
+        &self,
+        branch_name: &str,
+        module: &str,
+    ) -> Result<String> {
+        let branch = self.branch(branch_name)?;
+        let root = self.load_root(&branch.root_hash)?;
+        if !root_module_names(&root).contains(module) {
+            anyhow::bail!("unknown module {module}");
+        }
+        let symbols = preferred_names(&root)
+            .into_iter()
+            .filter(|binding| binding.module == module)
+            .map(|binding| {
+                json!({
+                    "name": binding.display_name,
+                    "symbol_hash": binding.symbol,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(format!(
+            "{}\n",
+            store::canonical_json(&json!({
+                "schema": "codedb/module/v1",
+                "branch": branch_name,
+                "root_hash": branch.root_hash,
+                "history_hash": branch.history_hash,
+                "module": module,
+                "symbol_count": symbols.len(),
+                "symbols": symbols,
+            }))
+        ))
+    }
+
+    pub fn move_symbol_main_branch_expected_format(
+        &mut self,
+        symbol_or_name: &str,
+        new_module: &str,
+        expected_root: Option<&str>,
+        json: bool,
+    ) -> Result<String> {
+        self.ensure_initialized()?;
+        let branch = self.branch(MAIN_BRANCH)?;
+        let operation_root = expected_root.unwrap_or(&branch.root_hash).to_string();
+        let symbol = self.resolve_symbol_or_name(&operation_root, symbol_or_name)?;
+        let root = self.load_root(&operation_root)?;
+        let binding = self
+            .preferred_binding(&root, &symbol)
+            .ok_or_else(|| anyhow!("symbol has no preferred name {symbol}"))?;
+        let op = Operation::MoveSymbol {
+            module: binding.module.clone(),
+            symbol,
+            name: binding.display_name.clone(),
+            new_module: new_module.to_string(),
         };
         let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
         Ok(format_outcome(outcome, json))

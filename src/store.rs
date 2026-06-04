@@ -11,8 +11,9 @@ use crate::abi::{internal_abi_symbol, validate_export_map};
 use crate::artifact::{ARTIFACT_METADATA_SCHEMA, CacheKeyInput};
 use crate::backend::ArtifactKind;
 use crate::model::{
-    BranchState, NameBinding, ProgramRootPayload, RootSymbolPayload, normalize_root, param_names,
-    preferred_names, resolve_name_in_root,
+    BranchState, NameBinding, ProgramRootPayload, RootSymbolPayload, normalize_root,
+    preferred_binding as preferred_binding_in_root, preferred_names, qualified_symbol_display,
+    resolve_name_in_root, split_qualified_name, symbol_display_in_module,
 };
 use crate::{BYTES_DOMAIN, CACHE_DOMAIN, MAIN_BRANCH, OBJECT_DOMAIN, SCHEMA_SQL, SCHEMA_VERSION};
 
@@ -548,13 +549,7 @@ impl CodeDb {
         for binding in preferred_names(&root) {
             let symbol = binding.symbol.clone();
             if let Some(entry) = self.root_symbol(&root, &symbol) {
-                let body = self.function_body_hash(&entry.definition)?;
-                let source = format!(
-                    "fn {}{} = {}",
-                    binding.display_name,
-                    self.signature_source(&entry.signature, &param_names(&root, &symbol))?,
-                    self.expr_to_source(&body, &root, &param_names(&root, &symbol), 0)?
-                );
+                let source = self.render_function_source(&root, &binding, entry)?;
                 self.conn.execute(
                     "INSERT INTO source_search (root_hash, symbol_hash, rendered_source)
                      VALUES (?1, ?2, ?3)",
@@ -645,7 +640,27 @@ impl CodeDb {
         if symbol_or_name.starts_with("sha256:") {
             return Ok(symbol_or_name.to_string());
         }
-        self.resolve_name(root_hash, "main", symbol_or_name)
+        let root = self.load_root(root_hash)?;
+        if let Some((module, name)) = split_qualified_name(symbol_or_name) {
+            return resolve_name_in_root(&root, module, name)
+                .ok_or_else(|| anyhow!("unknown name {module}.{name}"));
+        }
+        if let Some(symbol) = resolve_name_in_root(&root, "main", symbol_or_name) {
+            return Ok(symbol);
+        }
+        let matches = root
+            .names
+            .iter()
+            .filter(|binding| binding.display_name == symbol_or_name)
+            .map(|binding| (binding.module.clone(), binding.symbol.clone()))
+            .collect::<BTreeSet<_>>();
+        match matches.len() {
+            0 => Err(anyhow!("unknown name main.{symbol_or_name}")),
+            1 => Ok(matches.into_iter().next().expect("one match").1),
+            _ => Err(anyhow!(
+                "ambiguous name {symbol_or_name}; use a module-qualified name"
+            )),
+        }
     }
 
     pub(crate) fn root_symbol<'a>(
@@ -661,15 +676,31 @@ impl CodeDb {
         root: &'a ProgramRootPayload,
         symbol: &str,
     ) -> Option<&'a NameBinding> {
-        root.names
-            .iter()
-            .find(|binding| binding.symbol == symbol && binding.is_preferred)
-            .or_else(|| root.names.iter().find(|binding| binding.symbol == symbol))
+        preferred_binding_in_root(root, symbol)
     }
 
     pub(crate) fn symbol_display(&self, root: &ProgramRootPayload, symbol: &str) -> Result<String> {
         self.preferred_binding(root, symbol)
             .map(|binding| binding.display_name.clone())
+            .ok_or_else(|| anyhow!("symbol has no display name {symbol}"))
+    }
+
+    pub(crate) fn symbol_display_for_module(
+        &self,
+        root: &ProgramRootPayload,
+        current_module: &str,
+        symbol: &str,
+    ) -> Result<String> {
+        symbol_display_in_module(root, current_module, symbol)
+            .ok_or_else(|| anyhow!("symbol has no display name {symbol}"))
+    }
+
+    pub(crate) fn qualified_symbol_display(
+        &self,
+        root: &ProgramRootPayload,
+        symbol: &str,
+    ) -> Result<String> {
+        qualified_symbol_display(root, symbol)
             .ok_or_else(|| anyhow!("symbol has no display name {symbol}"))
     }
 

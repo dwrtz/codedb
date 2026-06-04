@@ -54,6 +54,21 @@ enum ApiOperation {
         #[serde(default, alias = "expect_root")]
         expect_root_hash: Option<String>,
     },
+    MoveSymbol {
+        #[serde(
+            default = "default_module",
+            alias = "from_module",
+            alias = "old_module"
+        )]
+        module: String,
+        #[serde(default)]
+        symbol: Option<String>,
+        name: String,
+        #[serde(alias = "to_module", alias = "target_module")]
+        new_module: String,
+        #[serde(default, alias = "expect_root")]
+        expect_root_hash: Option<String>,
+    },
     ReplaceFunctionBody {
         #[serde(default = "default_module")]
         module: String,
@@ -173,6 +188,9 @@ impl ApiOperation {
                 expect_root_hash, ..
             }
             | ApiOperation::RenameSymbol {
+                expect_root_hash, ..
+            }
+            | ApiOperation::MoveSymbol {
                 expect_root_hash, ..
             }
             | ApiOperation::ReplaceFunctionBody {
@@ -513,6 +531,18 @@ impl CodeDb {
                     new_name: new_name.clone(),
                 })
             }
+            ApiOperation::MoveSymbol {
+                module,
+                symbol,
+                name,
+                new_module,
+                ..
+            } => Ok(Operation::MoveSymbol {
+                module: module.clone(),
+                symbol: self.symbol_or_resolve(expected_root, module, name, symbol)?,
+                name: name.clone(),
+                new_module: new_module.clone(),
+            }),
             ApiOperation::ReplaceFunctionBody {
                 module,
                 symbol,

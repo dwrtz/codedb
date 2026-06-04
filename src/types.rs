@@ -5,10 +5,11 @@ use serde_json::{Value as JsonValue, json};
 use crate::backend::ArtifactKind;
 use crate::expr::RawExpr;
 use crate::model::{
-    ProgramRootPayload, TypeCheckResult, resolve_name_in_root, validate_projection_identifier,
+    ProgramRootPayload, TypeCheckResult, resolve_function_name_in_root,
+    validate_projection_identifier,
 };
 use crate::store::{CodeDb, canonical_json, hash_object_canonical};
-use crate::{ABI_TAG, SCHEMA_VERSION};
+use crate::{ABI_TAG, MAIN_BRANCH, SCHEMA_VERSION};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -140,6 +141,7 @@ impl CodeDb {
             .ok_or_else(|| anyhow!("function definition missing function_sig_hash"))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn type_expr(
         &mut self,
         expr: &RawExpr,
@@ -147,11 +149,30 @@ impl CodeDb {
         param_names: &[String],
         param_types: &[String],
     ) -> Result<TypeCheckResult> {
-        self.type_expr_with_locals(expr, root, param_names, param_types, &mut Vec::new())
+        self.type_expr_in_module(MAIN_BRANCH, expr, root, param_names, param_types)
+    }
+
+    pub(crate) fn type_expr_in_module(
+        &mut self,
+        current_module: &str,
+        expr: &RawExpr,
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+    ) -> Result<TypeCheckResult> {
+        self.type_expr_with_locals(
+            current_module,
+            expr,
+            root,
+            param_names,
+            param_types,
+            &mut Vec::new(),
+        )
     }
 
     fn type_expr_with_locals(
         &mut self,
+        current_module: &str,
         expr: &RawExpr,
         root: &ProgramRootPayload,
         param_names: &[String],
@@ -280,6 +301,7 @@ impl CodeDb {
                         .position(|candidate| candidate == name)
                         .ok_or_else(|| anyhow!("unknown parameter {name}"))?;
                     self.type_expr_with_locals(
+                        current_module,
                         &RawExpr::ParamRef { index },
                         root,
                         param_names,
@@ -289,7 +311,7 @@ impl CodeDb {
                 }
             }
             RawExpr::Call { name, args } => {
-                let symbol = resolve_name_in_root(root, "main", name)
+                let symbol = resolve_function_name_in_root(root, current_module, name)
                     .ok_or_else(|| anyhow!("unknown function {name}"))?;
                 let callee = self
                     .root_symbol(root, &symbol)
@@ -304,8 +326,14 @@ impl CodeDb {
                 }
                 let mut typed_args = Vec::with_capacity(args.len());
                 for (idx, arg) in args.iter().enumerate() {
-                    let typed =
-                        self.type_expr_with_locals(arg, root, param_names, param_types, locals)?;
+                    let typed = self.type_expr_with_locals(
+                        current_module,
+                        arg,
+                        root,
+                        param_names,
+                        param_types,
+                        locals,
+                    )?;
                     if typed.type_hash != expected_params[idx] {
                         bail!(
                             "call arg {} for {name} expected {}, got {}",
@@ -338,10 +366,22 @@ impl CodeDb {
                 })
             }
             RawExpr::Binary { op, left, right } => {
-                let left =
-                    self.type_expr_with_locals(left, root, param_names, param_types, locals)?;
-                let right =
-                    self.type_expr_with_locals(right, root, param_names, param_types, locals)?;
+                let left = self.type_expr_with_locals(
+                    current_module,
+                    left,
+                    root,
+                    param_names,
+                    param_types,
+                    locals,
+                )?;
+                let right = self.type_expr_with_locals(
+                    current_module,
+                    right,
+                    root,
+                    param_names,
+                    param_types,
+                    locals,
+                )?;
                 let i64_hash = type_hash_for("I64");
                 let bool_hash = type_hash_for("Bool");
                 let result_type = match op.as_str() {
@@ -385,8 +425,14 @@ impl CodeDb {
                 })
             }
             RawExpr::Unary { op, expr } => {
-                let typed =
-                    self.type_expr_with_locals(expr, root, param_names, param_types, locals)?;
+                let typed = self.type_expr_with_locals(
+                    current_module,
+                    expr,
+                    root,
+                    param_names,
+                    param_types,
+                    locals,
+                )?;
                 let i64_hash = type_hash_for("I64");
                 let bool_hash = type_hash_for("Bool");
                 let result_type = match op.as_str() {
@@ -429,14 +475,27 @@ impl CodeDb {
             } => {
                 validate_projection_identifier("let binding", name)?;
                 let binding_type = self.resolve_type(ty)?;
-                let value =
-                    self.type_expr_with_locals(value, root, param_names, param_types, locals)?;
+                let value = self.type_expr_with_locals(
+                    current_module,
+                    value,
+                    root,
+                    param_names,
+                    param_types,
+                    locals,
+                )?;
                 require_type(&value.type_hash, &binding_type, "let binding", self)?;
                 locals.push(LocalTypeBinding {
                     name: name.clone(),
                     type_hash: binding_type.clone(),
                 });
-                let body = self.type_expr_with_locals(body, root, param_names, param_types, locals);
+                let body = self.type_expr_with_locals(
+                    current_module,
+                    body,
+                    root,
+                    param_names,
+                    param_types,
+                    locals,
+                );
                 locals.pop();
                 let body = body?;
                 let expr_hash = self.put_object(
@@ -467,14 +526,32 @@ impl CodeDb {
                 then_expr,
                 else_expr,
             } => {
-                let cond =
-                    self.type_expr_with_locals(cond, root, param_names, param_types, locals)?;
+                let cond = self.type_expr_with_locals(
+                    current_module,
+                    cond,
+                    root,
+                    param_names,
+                    param_types,
+                    locals,
+                )?;
                 let bool_hash = type_hash_for("Bool");
                 require_type(&cond.type_hash, &bool_hash, "if condition", self)?;
-                let then_expr =
-                    self.type_expr_with_locals(then_expr, root, param_names, param_types, locals)?;
-                let else_expr =
-                    self.type_expr_with_locals(else_expr, root, param_names, param_types, locals)?;
+                let then_expr = self.type_expr_with_locals(
+                    current_module,
+                    then_expr,
+                    root,
+                    param_names,
+                    param_types,
+                    locals,
+                )?;
+                let else_expr = self.type_expr_with_locals(
+                    current_module,
+                    else_expr,
+                    root,
+                    param_names,
+                    param_types,
+                    locals,
+                )?;
                 if then_expr.type_hash != else_expr.type_hash {
                     bail!(
                         "if branches differ: {} vs {}",

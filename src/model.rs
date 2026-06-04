@@ -16,6 +16,8 @@ pub(crate) struct ProgramRootPayload {
     pub(crate) metadata: BTreeMap<String, JsonValue>,
 }
 
+pub(crate) const ROOT_MODULES_METADATA_KEY: &str = "modules";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RootSymbolPayload {
     pub(crate) symbol: String,
@@ -125,6 +127,48 @@ pub(crate) fn normalize_root(mut root: ProgramRootPayload) -> ProgramRootPayload
     root
 }
 
+pub(crate) fn root_module_names(root: &ProgramRootPayload) -> BTreeSet<String> {
+    let mut modules = root
+        .metadata
+        .get(ROOT_MODULES_METADATA_KEY)
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("name").and_then(JsonValue::as_str))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    modules.extend(root.names.iter().map(|binding| binding.module.clone()));
+    if modules.is_empty() {
+        modules.insert("main".to_string());
+    }
+    modules
+}
+
+pub(crate) fn synchronize_module_metadata(root: &mut ProgramRootPayload) {
+    let modules = root
+        .names
+        .iter()
+        .map(|binding| binding.module.clone())
+        .collect::<BTreeSet<_>>();
+    if modules.is_empty() {
+        root.metadata.remove(ROOT_MODULES_METADATA_KEY);
+        return;
+    }
+    root.metadata.insert(
+        ROOT_MODULES_METADATA_KEY.to_string(),
+        JsonValue::Array(
+            modules
+                .into_iter()
+                .map(|name| {
+                    let mut object = serde_json::Map::new();
+                    object.insert("name".to_string(), JsonValue::String(name));
+                    JsonValue::Object(object)
+                })
+                .collect(),
+        ),
+    );
+}
+
 pub(crate) fn root_symbol_index(root: &ProgramRootPayload, symbol: &str) -> Result<usize> {
     root.symbols
         .iter()
@@ -168,6 +212,16 @@ pub(crate) fn preferred_names(root: &ProgramRootPayload) -> Vec<NameBinding> {
     names
 }
 
+pub(crate) fn preferred_binding<'a>(
+    root: &'a ProgramRootPayload,
+    symbol: &str,
+) -> Option<&'a NameBinding> {
+    root.names
+        .iter()
+        .find(|binding| binding.symbol == symbol && binding.is_preferred)
+        .or_else(|| root.names.iter().find(|binding| binding.symbol == symbol))
+}
+
 pub(crate) fn aliases_for(root: &ProgramRootPayload, symbol: &str) -> BTreeSet<String> {
     root.names
         .iter()
@@ -202,9 +256,56 @@ pub(crate) fn resolve_name_in_root(
         .map(|binding| binding.symbol.clone())
 }
 
+pub(crate) fn split_qualified_name(name: &str) -> Option<(&str, &str)> {
+    let (module, local_name) = name.rsplit_once('.')?;
+    if module.is_empty() || local_name.is_empty() {
+        return None;
+    }
+    Some((module, local_name))
+}
+
+pub(crate) fn resolve_function_name_in_root(
+    root: &ProgramRootPayload,
+    current_module: &str,
+    name: &str,
+) -> Option<String> {
+    if let Some((module, local_name)) = split_qualified_name(name) {
+        return resolve_name_in_root(root, module, local_name);
+    }
+    resolve_name_in_root(root, current_module, name)
+}
+
+pub(crate) fn symbol_display_in_module(
+    root: &ProgramRootPayload,
+    current_module: &str,
+    symbol: &str,
+) -> Option<String> {
+    let binding = preferred_binding(root, symbol)?;
+    if binding.module == current_module {
+        Some(binding.display_name.clone())
+    } else {
+        Some(format!("{}.{}", binding.module, binding.display_name))
+    }
+}
+
+pub(crate) fn qualified_symbol_display(root: &ProgramRootPayload, symbol: &str) -> Option<String> {
+    let binding = preferred_binding(root, symbol)?;
+    Some(format!("{}.{}", binding.module, binding.display_name))
+}
+
 pub(crate) fn validate_projection_identifier(label: &str, name: &str) -> Result<()> {
     if !is_projection_identifier(name) {
         anyhow::bail!("{label} must be a projection-safe identifier: {name:?}");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_module_path(label: &str, module: &str) -> Result<()> {
+    if module.is_empty() {
+        anyhow::bail!("{label} must not be empty");
+    }
+    for segment in module.split('.') {
+        validate_projection_identifier(label, segment)?;
     }
     Ok(())
 }

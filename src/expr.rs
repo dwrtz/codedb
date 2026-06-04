@@ -5,7 +5,11 @@ use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::model::{ProgramRootPayload, param_names, preferred_names};
+use crate::MAIN_BRANCH;
+use crate::model::{
+    NameBinding, ProgramRootPayload, RootSymbolPayload, param_names, preferred_names,
+    root_module_names,
+};
 use crate::store::CodeDb;
 use crate::types::ParamSpec;
 
@@ -273,20 +277,43 @@ impl CodeDb {
     pub(crate) fn render_source(&self, root_hash: &str) -> Result<String> {
         let root = self.load_root(root_hash)?;
         let mut chunks = Vec::new();
+        let has_non_main_modules = root_module_names(&root)
+            .iter()
+            .any(|name| name != MAIN_BRANCH);
         for binding in self.source_projection_order(&root)? {
-            let symbol = binding.symbol;
+            let symbol = binding.symbol.clone();
             let root_symbol = self
                 .root_symbol(&root, &symbol)
                 .ok_or_else(|| anyhow!("root name points to missing symbol {symbol}"))?;
-            let body = self.function_body_hash(&root_symbol.definition)?;
-            chunks.push(format!(
-                "fn {}{} = {}",
-                binding.display_name,
-                self.signature_source(&root_symbol.signature, &param_names(&root, &symbol))?,
-                self.expr_to_source(&body, &root, &param_names(&root, &symbol), 0)?
-            ));
+            let source = self.render_function_source(&root, &binding, root_symbol)?;
+            if has_non_main_modules && binding.module != MAIN_BRANCH {
+                chunks.push(format!("module {} {{\n{}\n}}", binding.module, source));
+            } else {
+                chunks.push(source);
+            }
         }
         Ok(format!("{}\n", chunks.join("\n\n")))
+    }
+
+    pub(crate) fn render_function_source(
+        &self,
+        root: &ProgramRootPayload,
+        binding: &NameBinding,
+        root_symbol: &RootSymbolPayload,
+    ) -> Result<String> {
+        let body = self.function_body_hash(&root_symbol.definition)?;
+        Ok(format!(
+            "fn {}{} = {}",
+            binding.display_name,
+            self.signature_source(&root_symbol.signature, &param_names(root, &binding.symbol),)?,
+            self.expr_to_source_in_module(
+                &body,
+                root,
+                &binding.module,
+                &param_names(root, &binding.symbol),
+                0,
+            )?
+        ))
     }
 
     fn source_projection_order(
@@ -387,13 +414,32 @@ impl CodeDb {
         local_params: &[String],
         parent_prec: u8,
     ) -> Result<String> {
-        self.expr_to_source_with_locals(expr_hash, root, local_params, &mut Vec::new(), parent_prec)
+        self.expr_to_source_in_module(expr_hash, root, MAIN_BRANCH, local_params, parent_prec)
+    }
+
+    pub(crate) fn expr_to_source_in_module(
+        &self,
+        expr_hash: &str,
+        root: &ProgramRootPayload,
+        current_module: &str,
+        local_params: &[String],
+        parent_prec: u8,
+    ) -> Result<String> {
+        self.expr_to_source_with_locals(
+            expr_hash,
+            root,
+            current_module,
+            local_params,
+            &mut Vec::new(),
+            parent_prec,
+        )
     }
 
     fn expr_to_source_with_locals(
         &self,
         expr_hash: &str,
         root: &ProgramRootPayload,
+        current_module: &str,
         local_params: &[String],
         local_names: &mut Vec<String>,
         parent_prec: u8,
@@ -451,12 +497,19 @@ impl CodeDb {
                         let hash = arg
                             .as_str()
                             .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                        self.expr_to_source_with_locals(hash, root, local_params, local_names, 0)
+                        self.expr_to_source_with_locals(
+                            hash,
+                            root,
+                            current_module,
+                            local_params,
+                            local_names,
+                            0,
+                        )
                     })
                     .collect::<Result<Vec<_>>>()?;
                 format!(
                     "{}({})",
-                    self.symbol_display(root, symbol)?,
+                    self.symbol_display_for_module(root, current_module, symbol)?,
                     rendered_args.join(", ")
                 )
             }
@@ -476,11 +529,19 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("binary missing right"))?;
                 let expr = format!(
                     "{} {} {}",
-                    self.expr_to_source_with_locals(left, root, local_params, local_names, prec)?,
+                    self.expr_to_source_with_locals(
+                        left,
+                        root,
+                        current_module,
+                        local_params,
+                        local_names,
+                        prec,
+                    )?,
                     op,
                     self.expr_to_source_with_locals(
                         right,
                         root,
+                        current_module,
                         local_params,
                         local_names,
                         prec + 1,
@@ -504,7 +565,14 @@ impl CodeDb {
                 let prec = unary_precedence();
                 let expr = format!(
                     "{op}{}",
-                    self.expr_to_source_with_locals(child, root, local_params, local_names, prec)?
+                    self.expr_to_source_with_locals(
+                        child,
+                        root,
+                        current_module,
+                        local_params,
+                        local_names,
+                        prec,
+                    )?
                 );
                 if prec < parent_prec {
                     format!("({expr})")
@@ -532,13 +600,20 @@ impl CodeDb {
                 let value = self.expr_to_source_with_locals(
                     value_hash,
                     root,
+                    current_module,
                     local_params,
                     local_names,
                     0,
                 )?;
                 local_names.push(name.to_string());
-                let body =
-                    self.expr_to_source_with_locals(body_hash, root, local_params, local_names, 0);
+                let body = self.expr_to_source_with_locals(
+                    body_hash,
+                    root,
+                    current_module,
+                    local_params,
+                    local_names,
+                    0,
+                );
                 local_names.pop();
                 let expr = format!(
                     "let {name}: {} = {value} in {}",
@@ -566,9 +641,30 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("if missing else"))?;
                 let expr = format!(
                     "if {} then {} else {}",
-                    self.expr_to_source_with_locals(cond, root, local_params, local_names, 0)?,
-                    self.expr_to_source_with_locals(then_hash, root, local_params, local_names, 0)?,
-                    self.expr_to_source_with_locals(else_hash, root, local_params, local_names, 0)?
+                    self.expr_to_source_with_locals(
+                        cond,
+                        root,
+                        current_module,
+                        local_params,
+                        local_names,
+                        0,
+                    )?,
+                    self.expr_to_source_with_locals(
+                        then_hash,
+                        root,
+                        current_module,
+                        local_params,
+                        local_names,
+                        0,
+                    )?,
+                    self.expr_to_source_with_locals(
+                        else_hash,
+                        root,
+                        current_module,
+                        local_params,
+                        local_names,
+                        0,
+                    )?
                 );
                 if parent_prec > 0 {
                     format!("({expr})")
@@ -586,13 +682,23 @@ impl CodeDb {
         expr_hash: &str,
         root: &ProgramRootPayload,
     ) -> Result<RawExpr> {
-        self.typed_expr_to_raw_with_locals(expr_hash, root, &mut Vec::new())
+        self.typed_expr_to_raw_in_module(expr_hash, root, MAIN_BRANCH)
+    }
+
+    pub(crate) fn typed_expr_to_raw_in_module(
+        &self,
+        expr_hash: &str,
+        root: &ProgramRootPayload,
+        current_module: &str,
+    ) -> Result<RawExpr> {
+        self.typed_expr_to_raw_with_locals(expr_hash, root, current_module, &mut Vec::new())
     }
 
     fn typed_expr_to_raw_with_locals(
         &self,
         expr_hash: &str,
         root: &ProgramRootPayload,
+        current_module: &str,
         local_names: &mut Vec<String>,
     ) -> Result<RawExpr> {
         let payload = self.get_payload(expr_hash)?;
@@ -644,14 +750,19 @@ impl CodeDb {
                     .and_then(JsonValue::as_array)
                     .ok_or_else(|| anyhow!("call missing args"))?;
                 Ok(RawExpr::Call {
-                    name: self.symbol_display(root, symbol)?,
+                    name: self.symbol_display_for_module(root, current_module, symbol)?,
                     args: args
                         .iter()
                         .map(|arg| {
                             let hash = arg
                                 .as_str()
                                 .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                            self.typed_expr_to_raw_with_locals(hash, root, local_names)
+                            self.typed_expr_to_raw_with_locals(
+                                hash,
+                                root,
+                                current_module,
+                                local_names,
+                            )
                         })
                         .collect::<Result<Vec<_>>>()?,
                 })
@@ -669,6 +780,7 @@ impl CodeDb {
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("binary missing left"))?,
                         root,
+                        current_module,
                         local_names,
                     )?,
                 ),
@@ -679,6 +791,7 @@ impl CodeDb {
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("binary missing right"))?,
                         root,
+                        current_module,
                         local_names,
                     )?,
                 ),
@@ -696,6 +809,7 @@ impl CodeDb {
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("unary missing expr"))?,
                         root,
+                        current_module,
                         local_names,
                     )?,
                 ),
@@ -716,6 +830,7 @@ impl CodeDb {
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("let missing value"))?,
                     root,
+                    current_module,
                     local_names,
                 )?;
                 local_names.push(name.clone());
@@ -725,6 +840,7 @@ impl CodeDb {
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("let missing body"))?,
                     root,
+                    current_module,
                     local_names,
                 );
                 local_names.pop();
@@ -743,6 +859,7 @@ impl CodeDb {
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("if missing cond"))?,
                         root,
+                        current_module,
                         local_names,
                     )?,
                 ),
@@ -753,6 +870,7 @@ impl CodeDb {
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("if missing then"))?,
                         root,
+                        current_module,
                         local_names,
                     )?,
                 ),
@@ -763,6 +881,7 @@ impl CodeDb {
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("if missing else"))?,
                         root,
+                        current_module,
                         local_names,
                     )?,
                 ),
@@ -914,7 +1033,18 @@ pub(crate) fn parse_program(source: &str) -> Result<Vec<FunctionSource>> {
     let mut parser = Parser::new(source)?;
     let mut functions = Vec::new();
     while !parser.at_eof() {
-        functions.push(parser.parse_function()?);
+        if parser.consume_ident_value("module") {
+            let module = parser.expect_ident()?;
+            parser.expect_symbol("{")?;
+            while !parser.consume_symbol("}") {
+                if parser.at_eof() {
+                    bail!("unterminated module {module}");
+                }
+                functions.push(parser.parse_function_in_module(module.clone())?);
+            }
+        } else {
+            functions.push(parser.parse_function_in_module(MAIN_BRANCH.to_string())?);
+        }
     }
     Ok(functions)
 }
@@ -959,6 +1089,10 @@ impl Parser {
     }
 
     fn parse_function(&mut self) -> Result<FunctionSource> {
+        self.parse_function_in_module(MAIN_BRANCH.to_string())
+    }
+
+    fn parse_function_in_module(&mut self, module: String) -> Result<FunctionSource> {
         self.expect_ident_value("fn")?;
         let name = self.expect_ident()?;
         self.expect_symbol("(")?;
@@ -983,7 +1117,7 @@ impl Parser {
         self.expect_symbol("=")?;
         let body = self.parse_expr()?;
         Ok(FunctionSource {
-            module: "main".to_string(),
+            module,
             name,
             params,
             return_type,
@@ -1176,7 +1310,9 @@ fn lex(source: &str) -> Result<Vec<Token>> {
         } else if ch.is_ascii_alphabetic() || ch == '_' {
             let start = i;
             i += 1;
-            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+            while i < chars.len()
+                && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '.')
+            {
                 i += 1;
             }
             tokens.push(Token::Ident(chars[start..i].iter().collect()));

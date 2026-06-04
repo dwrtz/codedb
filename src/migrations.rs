@@ -12,7 +12,8 @@ use crate::expr::RawExpr;
 use crate::model::{
     BranchState, ExportBinding, NameBinding, ParamNames, ProgramRootPayload, RootSymbolPayload,
     RootTestBinding, TestCasePayload, TestCategory, TestValue, param_names, root_symbol_index,
-    test_binding_for, upsert_param_names, validate_projection_identifier,
+    synchronize_module_metadata, test_binding_for, upsert_param_names, validate_module_path,
+    validate_projection_identifier,
 };
 use crate::store::{CodeDb, canonical_json, hash_bytes};
 use crate::tests::{test_points_to_entry_symbol, validate_test_value_type};
@@ -38,6 +39,12 @@ pub(crate) enum Operation {
         symbol: String,
         old_name: String,
         new_name: String,
+    },
+    MoveSymbol {
+        module: String,
+        symbol: String,
+        name: String,
+        new_module: String,
     },
     ReplaceFunctionBody {
         module: String,
@@ -123,6 +130,7 @@ impl Operation {
         match self {
             Operation::CreateFunction { .. } => "create_function",
             Operation::RenameSymbol { .. } => "rename_symbol",
+            Operation::MoveSymbol { .. } => "move_symbol",
             Operation::ReplaceFunctionBody { .. } => "replace_function_body",
             Operation::ChangeFunctionSignature { .. } => "change_function_signature",
             Operation::AddParameter { .. } => "add_parameter",
@@ -340,6 +348,7 @@ impl MigrationSummary {
 pub(crate) enum SemanticImpact {
     FunctionCreated,
     SymbolRenamed,
+    SymbolMoved,
     ImplementationChanged,
     InterfaceChanged,
     SymbolDeleted,
@@ -357,6 +366,7 @@ impl SemanticImpact {
         match self {
             SemanticImpact::FunctionCreated => "function_created",
             SemanticImpact::SymbolRenamed => "symbol_renamed",
+            SemanticImpact::SymbolMoved => "symbol_moved",
             SemanticImpact::ImplementationChanged => "implementation_changed",
             SemanticImpact::InterfaceChanged => "interface_changed",
             SemanticImpact::SymbolDeleted => "symbol_deleted",
@@ -618,6 +628,16 @@ fn operation_summary_parts(op: &Operation) -> (String, SemanticImpact, Typecheck
             SemanticImpact::SymbolRenamed,
             TypecheckImpact::Unchanged,
         ),
+        Operation::MoveSymbol {
+            module,
+            name,
+            new_module,
+            ..
+        } => (
+            format!("{module}.{name} -> {new_module}.{name}"),
+            SemanticImpact::SymbolMoved,
+            TypecheckImpact::Unchanged,
+        ),
         Operation::ReplaceFunctionBody { module, name, .. } => (
             format!("{module}.{name}"),
             SemanticImpact::ImplementationChanged,
@@ -716,6 +736,7 @@ fn fallback_build_impact(op: &Operation) -> BuildImpact {
             vec![BuildImpactReason::SymbolAdded],
         ),
         Operation::RenameSymbol { .. }
+        | Operation::MoveSymbol { .. }
         | Operation::CreateAlias { .. }
         | Operation::RemoveAlias { .. } => (
             BuildImpactKind::MetadataOnly,
@@ -1067,6 +1088,25 @@ impl CodeDb {
                     name: new_name.clone(),
                 },
             ],
+            Operation::MoveSymbol {
+                module,
+                symbol,
+                name,
+                new_module,
+            } => vec![
+                Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                },
+                Precondition::PreferredNamePointsToSymbol {
+                    module: module.clone(),
+                    name: name.clone(),
+                    symbol: symbol.clone(),
+                },
+                Precondition::NameIsAvailable {
+                    module: new_module.clone(),
+                    name: name.clone(),
+                },
+            ],
             Operation::ReplaceFunctionBody {
                 module,
                 symbol,
@@ -1251,6 +1291,25 @@ impl CodeDb {
                 Postcondition::NameAbsent {
                     module: module.clone(),
                     name: old_name.clone(),
+                },
+            ],
+            Operation::MoveSymbol {
+                module,
+                symbol,
+                name,
+                new_module,
+            } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::NamePointsToSymbol {
+                    module: new_module.clone(),
+                    name: name.clone(),
+                    symbol: symbol.clone(),
+                },
+                Postcondition::NameAbsent {
+                    module: module.clone(),
+                    name: name.clone(),
                 },
             ],
             Operation::ReplaceFunctionBody {
@@ -1517,7 +1576,13 @@ impl CodeDb {
                     .collect::<Vec<_>>();
                 Ok(
                     self.function_signature_source_matches(root, &symbol, params, return_type)?
-                        && self.function_body_source_matches(root, &symbol, body, &param_names)?,
+                        && self.function_body_source_matches(
+                            root,
+                            module,
+                            &symbol,
+                            body,
+                            &param_names,
+                        )?,
                 )
             }
             Postcondition::NamePointsToSymbol {
@@ -1538,7 +1603,13 @@ impl CodeDb {
                 if !name_points_to_symbol(root, module, name, symbol) {
                     return Ok(false);
                 }
-                self.function_body_source_matches(root, symbol, body, &param_names(root, symbol))
+                self.function_body_source_matches(
+                    root,
+                    module,
+                    symbol,
+                    body,
+                    &param_names(root, symbol),
+                )
             }
             Postcondition::SignatureSourceMatches {
                 module,
@@ -1608,6 +1679,7 @@ impl CodeDb {
     fn function_body_source_matches(
         &self,
         root: &ProgramRootPayload,
+        module: &str,
         symbol: &str,
         expected_body: &RawExpr,
         local_params: &[String],
@@ -1616,7 +1688,7 @@ impl CodeDb {
             return Ok(false);
         };
         let body = self.function_body_hash(&entry.definition)?;
-        let actual = self.typed_expr_to_raw(&body, root)?;
+        let actual = self.typed_expr_to_raw_in_module(&body, root, module)?;
         let expected = normalize_param_refs(expected_body, local_params);
         Ok(actual == expected)
     }
@@ -1651,6 +1723,12 @@ impl CodeDb {
                 old_name,
                 new_name,
             } => self.apply_rename_symbol(input_root, module, symbol, old_name, new_name),
+            Operation::MoveSymbol {
+                module,
+                symbol,
+                name,
+                new_module,
+            } => self.apply_move_symbol(input_root, module, symbol, name, new_module),
             Operation::ReplaceFunctionBody {
                 module,
                 symbol,
@@ -1747,6 +1825,7 @@ impl CodeDb {
         return_type: &str,
         body: &RawExpr,
     ) -> Result<String> {
+        validate_module_path("module", module)?;
         validate_projection_identifier("function name", name)?;
         validate_param_names(params)?;
         let mut root = self.load_root(input_root)?;
@@ -1769,7 +1848,8 @@ impl CodeDb {
             .iter()
             .map(|param| param.name.clone())
             .collect::<Vec<_>>();
-        let typed_body = self.type_expr(body, &root, &param_name_list, &param_types)?;
+        let typed_body =
+            self.type_expr_in_module(module, body, &root, &param_name_list, &param_types)?;
         if typed_body.type_hash != return_type_hash {
             bail!(
                 "function {module}.{name} body type {} does not match return type {}",
@@ -1794,6 +1874,13 @@ impl CodeDb {
             symbol,
             names: param_name_list,
         });
+        if module != MAIN_BRANCH
+            || root
+                .metadata
+                .contains_key(crate::model::ROOT_MODULES_METADATA_KEY)
+        {
+            synchronize_module_metadata(&mut root);
+        }
         let new_root = self.put_program_root(&root)?;
         self.index_root(&new_root)?;
         self.type_check_root(&new_root)?;
@@ -1808,6 +1895,7 @@ impl CodeDb {
         old_name: &str,
         new_name: &str,
     ) -> Result<String> {
+        validate_module_path("module", module)?;
         validate_projection_identifier("function name", new_name)?;
         let mut root = self.load_root(input_root)?;
         if root
@@ -1836,6 +1924,66 @@ impl CodeDb {
         Ok(new_root)
     }
 
+    pub(crate) fn apply_move_symbol(
+        &mut self,
+        input_root: &str,
+        module: &str,
+        symbol: &str,
+        name: &str,
+        new_module: &str,
+    ) -> Result<String> {
+        validate_module_path("module", module)?;
+        validate_module_path("new module", new_module)?;
+        let mut root = self.load_root(input_root)?;
+        if module == new_module {
+            self.assert_name_points(&root, module, name, symbol)?;
+            return Ok(input_root.to_string());
+        }
+        if !root.names.iter().any(|binding| {
+            binding.module == module
+                && binding.display_name == name
+                && binding.symbol == symbol
+                && binding.is_preferred
+        }) {
+            bail!("precondition failed: {module}.{name} does not point to {symbol}");
+        }
+
+        let moved_names = root
+            .names
+            .iter()
+            .filter(|binding| binding.module == module && binding.symbol == symbol)
+            .map(|binding| binding.display_name.clone())
+            .collect::<BTreeSet<_>>();
+        if moved_names.is_empty() {
+            bail!("precondition failed: no names for {symbol} in module {module}");
+        }
+        for moved_name in &moved_names {
+            if root.names.iter().any(|binding| {
+                binding.module == new_module
+                    && binding.display_name == *moved_name
+                    && binding.symbol != symbol
+            }) {
+                bail!("name already exists: {new_module}.{moved_name}");
+            }
+        }
+
+        let mut changed = false;
+        for binding in &mut root.names {
+            if binding.module == module && binding.symbol == symbol {
+                binding.module = new_module.to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            bail!("precondition failed: {module}.{name} does not point to {symbol}");
+        }
+        synchronize_module_metadata(&mut root);
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)?;
+        Ok(new_root)
+    }
+
     pub(crate) fn apply_replace_body(
         &mut self,
         input_root: &str,
@@ -1850,7 +1998,8 @@ impl CodeDb {
         let signature = root.symbols[idx].signature.clone();
         let (param_types, return_type) = self.signature_parts(&signature)?;
         let param_name_list = param_names(&root, symbol);
-        let typed_body = self.type_expr(body, &root, &param_name_list, &param_types)?;
+        let typed_body =
+            self.type_expr_in_module(module, body, &root, &param_name_list, &param_types)?;
         if typed_body.type_hash != return_type {
             bail!(
                 "replacement body type {} does not match return type {}",
@@ -1881,7 +2030,7 @@ impl CodeDb {
         let idx = root_symbol_index(&root, symbol)?;
         let old_definition = root.symbols[idx].definition.clone();
         let old_body_hash = self.function_body_hash(&old_definition)?;
-        let raw_body = self.typed_expr_to_raw(&old_body_hash, &root)?;
+        let raw_body = self.typed_expr_to_raw_in_module(&old_body_hash, &root, module)?;
         let param_types = params
             .iter()
             .map(|param| self.resolve_type(&param.ty))
@@ -1892,7 +2041,8 @@ impl CodeDb {
             .iter()
             .map(|param| param.name.clone())
             .collect::<Vec<_>>();
-        let typed_body = self.type_expr(&raw_body, &root, &param_name_list, &param_types)?;
+        let typed_body =
+            self.type_expr_in_module(module, &raw_body, &root, &param_name_list, &param_types)?;
         if typed_body.type_hash != return_type_hash {
             bail!(
                 "body type {} does not match new return type {}",
@@ -1938,7 +2088,7 @@ impl CodeDb {
         let old_signature = root.symbols[idx].signature.clone();
         let old_definition = root.symbols[idx].definition.clone();
         let old_body_hash = self.function_body_hash(&old_definition)?;
-        let old_body = self.typed_expr_to_raw(&old_body_hash, &root)?;
+        let old_body = self.typed_expr_to_raw_in_module(&old_body_hash, &root, module)?;
         let (mut param_types, return_type) = self.signature_parts(&old_signature)?;
         let mut param_name_list = param_names(&root, symbol);
         param_types.push(self.resolve_type(&param.ty)?);
@@ -1969,7 +2119,8 @@ impl CodeDb {
         } else {
             old_body
         };
-        let typed_body = self.type_expr(&target_body, &root, &param_name_list, &param_types)?;
+        let typed_body =
+            self.type_expr_in_module(module, &target_body, &root, &param_name_list, &param_types)?;
         if typed_body.type_hash != return_type {
             bail!(
                 "body type {} does not match new return type {}",
@@ -1989,7 +2140,12 @@ impl CodeDb {
                 let caller_signature = root.symbols[caller_idx].signature.clone();
                 let caller_definition = root.symbols[caller_idx].definition.clone();
                 let caller_body_hash = self.function_body_hash(&caller_definition)?;
-                let caller_body = self.typed_expr_to_raw(&caller_body_hash, &root)?;
+                let caller_module = self
+                    .preferred_binding(&root, &caller)
+                    .map(|binding| binding.module.clone())
+                    .unwrap_or_else(|| MAIN_BRANCH.to_string());
+                let caller_body =
+                    self.typed_expr_to_raw_in_module(&caller_body_hash, &root, &caller_module)?;
                 let patched_body = append_default_arg_to_calls(&caller_body, &target_name, default);
                 if patched_body == caller_body {
                     continue;
@@ -1997,7 +2153,8 @@ impl CodeDb {
                 let (caller_param_types, caller_return_type) =
                     self.signature_parts(&caller_signature)?;
                 let caller_param_names = param_names(&root, &caller);
-                let typed_caller = self.type_expr(
+                let typed_caller = self.type_expr_in_module(
+                    &caller_module,
                     &patched_body,
                     &root,
                     &caller_param_names,

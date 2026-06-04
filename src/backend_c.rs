@@ -23,7 +23,7 @@ impl CodeDb {
             out.push_str(&format!(
                 "{} {}({});\n",
                 self.c_return_type(&entry.signature)?,
-                c_symbol_name(&binding.display_name),
+                c_symbol_name_for_binding(&binding.module, &binding.display_name),
                 self.c_param_list(&root, &binding.symbol, &entry.signature)?
             ));
         }
@@ -37,7 +37,7 @@ impl CodeDb {
             out.push_str(&format!(
                 "{} {}({}) {{\n",
                 self.c_return_type(&entry.signature)?,
-                c_symbol_name(&binding.display_name),
+                c_symbol_name_for_binding(&binding.module, &binding.display_name),
                 self.c_param_list(&root, &binding.symbol, &entry.signature)?
             ));
             let return_type = self.signature_parts(&entry.signature)?.1;
@@ -182,7 +182,7 @@ impl CodeDb {
                     .collect::<Result<Vec<_>>>()?;
                 format!(
                     "{}({})",
-                    c_symbol_name(&self.symbol_display(root, symbol)?),
+                    self.c_symbol_name_for_symbol(root, symbol)?,
                     rendered_args.join(", ")
                 )
             }
@@ -291,6 +291,16 @@ impl CodeDb {
         };
         Ok(rendered)
     }
+
+    fn c_symbol_name_for_symbol(&self, root: &ProgramRootPayload, symbol: &str) -> Result<String> {
+        let binding = self
+            .preferred_binding(root, symbol)
+            .ok_or_else(|| anyhow!("symbol has no display name {symbol}"))?;
+        Ok(c_symbol_name_for_binding(
+            &binding.module,
+            &binding.display_name,
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -302,7 +312,7 @@ struct CBinding {
 fn ensure_unique_c_projection_symbols(root: &ProgramRootPayload) -> Result<()> {
     let mut names = BTreeSet::new();
     for binding in preferred_names(root) {
-        let c_name = c_symbol_name(&binding.display_name);
+        let c_name = c_symbol_name_for_binding(&binding.module, &binding.display_name);
         if !names.insert(c_name.clone()) {
             bail!(
                 "C projection symbol collision after identifier normalization: {}",
@@ -315,6 +325,18 @@ fn ensure_unique_c_projection_symbols(root: &ProgramRootPayload) -> Result<()> {
 
 fn c_symbol_name(display_name: &str) -> String {
     format!("codedb_{}", c_identifier(display_name))
+}
+
+fn c_symbol_name_for_binding(module: &str, display_name: &str) -> String {
+    if module == "main" {
+        c_symbol_name(display_name)
+    } else {
+        format!(
+            "codedb_{}_{}",
+            c_identifier(module),
+            c_identifier(display_name)
+        )
+    }
 }
 
 fn c_identifier(name: &str) -> String {

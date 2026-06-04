@@ -458,6 +458,9 @@ fn dispatch_workspace_method(
         "symbols.show" => symbols_show(db, params),
         "symbols.resolve" => symbols_resolve(db, params),
         "symbols.callers" => symbols_callers(db, params),
+        "modules.list" | "module.list" => modules_list(db, params),
+        "modules.show" | "module.show" => modules_show(db, params),
+        "modules.move_symbol" | "module.move_symbol" => modules_move_symbol(db, params),
         "provenance.blame_symbol" | "blame.symbol" => provenance_blame_symbol(db, params),
         "provenance.blame_expr" | "blame.expr" => provenance_blame_expr(db, params),
         "roots.diff" => roots_diff(db, params),
@@ -801,6 +804,103 @@ fn symbols_callers(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMet
         "callers": callers,
     });
     let snapshot = workspace_snapshot(db, &branch_name)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn modules_list(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let branch = branch_param(params)?;
+    let result = parse_json_payload(
+        db.list_modules_branch_json(&branch)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, &branch)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn modules_show(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let branch = branch_param(params)?;
+    let object = params_object(params)?;
+    let module = required_str_any(object, &["module", "name"])?;
+    let result = parse_json_payload(
+        db.show_module_branch_json(&branch, module)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, &branch)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn modules_move_symbol(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let object = params_object(params)?;
+    let branch = optional_str(object, "branch")?.unwrap_or(MAIN_BRANCH);
+    let expected_root = required_str_any(
+        object,
+        &[
+            "expect_root_hash",
+            "expected_root_hash",
+            "expect_root",
+            "expected_root",
+        ],
+    )?;
+    let new_module = required_str_any(
+        object,
+        &["module", "new_module", "to_module", "target_module"],
+    )?;
+    let current_snapshot = workspace_snapshot(db, branch)?;
+    if current_snapshot.root_hash != expected_root {
+        return Err(WorkspaceMethodError::stale_root(
+            format!(
+                "branch {branch:?} moved before modules.move_symbol; expected root {expected_root}, actual root {}",
+                current_snapshot.root_hash
+            ),
+            current_snapshot.clone(),
+            expected_root,
+            current_snapshot.root_hash,
+        ));
+    }
+
+    let symbol_or_name = optional_str(object, "symbol_or_name")?
+        .or_else(|| optional_str(object, "name").ok().flatten())
+        .or_else(|| optional_str(object, "symbol").ok().flatten())
+        .ok_or_else(|| {
+            WorkspaceMethodError::invalid_params(
+                "modules.move_symbol requires symbol_or_name, name, or symbol",
+            )
+        })?;
+    let symbol = db
+        .resolve_symbol_or_name(expected_root, symbol_or_name)
+        .map_err(WorkspaceMethodError::method)?;
+    let root = db
+        .load_root(expected_root)
+        .map_err(WorkspaceMethodError::method)?;
+    let binding = db.preferred_binding(&root, &symbol).ok_or_else(|| {
+        WorkspaceMethodError::new("method_error", format!("symbol has no name: {symbol}"))
+    })?;
+    let from_module = optional_str(object, "from_module")?
+        .or_else(|| optional_str(object, "old_module").ok().flatten())
+        .unwrap_or(&binding.module);
+    let name = optional_str(object, "display_name")?
+        .or_else(|| optional_str(object, "old_name").ok().flatten())
+        .unwrap_or(&binding.display_name);
+    let apply_document = json!({
+        "schema": APPLY_SCHEMA,
+        "branch": branch,
+        "expect_root_hash": expected_root,
+        "operations": [{
+            "kind": "move_symbol",
+            "module": from_module,
+            "symbol": symbol,
+            "name": name,
+            "new_module": new_module,
+        }],
+    });
+    let result = parse_json_payload(
+        db.apply_json_str(&canonical_json(&apply_document))
+            .map_err(|err| WorkspaceMethodError::new("invalid_operation", format!("{err:#}")))?,
+    )?;
+    let snapshot = workspace_snapshot(db, branch)?;
+    if let Some(err) = apply_result_workspace_error(&result, snapshot.clone()) {
+        return Err(err);
+    }
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
 

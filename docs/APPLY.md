@@ -47,6 +47,10 @@ are rejected.
 ```
 
 ```json
+{ "kind": "move_symbol", "name": "tax", "new_module": "billing" }
+```
+
+```json
 {
   "kind": "replace_function_body",
   "name": "tax",
@@ -108,7 +112,9 @@ are rejected.
 
 For non-create operations, `module` defaults to `main`. `symbol` may be supplied
 to bind directly to stable identity; otherwise CodeDB resolves `name` in the
-expected root.
+expected root. `move_symbol` changes the module metadata for the symbol's names
+without changing `symbol_hash`, function definitions, signatures, or native
+object cache keys.
 
 `add_parameter` extends the target function signature and, when `default` is
 provided, appends that argument at direct call sites in the same atomic

@@ -19,7 +19,8 @@ use crate::lowering::{
 };
 use crate::migrations::{Operation, history_hash, migration_hash};
 use crate::model::{
-    ProgramRootPayload, param_names, preferred_names, validate_projection_identifier,
+    ProgramRootPayload, ROOT_MODULES_METADATA_KEY, preferred_names, validate_module_path,
+    validate_projection_identifier,
 };
 use crate::store::{
     CodeDb, cache_key_for_input, canonical_json, extract_hash_strings, function_interface_metadata,
@@ -729,6 +730,7 @@ impl CodeDb {
             errors.push(format!("bad_index: root_names mismatch for {root_hash}"));
         }
         self.verify_projection_names(root_hash, root, errors);
+        self.verify_module_metadata(root_hash, root, errors);
 
         let root_symbols = root
             .symbols
@@ -805,13 +807,7 @@ impl CodeDb {
         for binding in preferred_names(root) {
             let symbol = binding.symbol.clone();
             if let Some(entry) = self.root_symbol(root, &symbol) {
-                let body = self.function_body_hash(&entry.definition)?;
-                let source = format!(
-                    "fn {}{} = {}",
-                    binding.display_name,
-                    self.signature_source(&entry.signature, &param_names(root, &symbol))?,
-                    self.expr_to_source(&body, root, &param_names(root, &symbol), 0)?
-                );
+                let source = self.render_function_source(root, &binding, entry)?;
                 *expected.entry((symbol, source)).or_insert(0) += 1;
             }
         }
@@ -842,6 +838,12 @@ impl CodeDb {
         errors: &mut Vec<String>,
     ) {
         for binding in &root.names {
+            if let Err(err) = validate_module_path("module", &binding.module) {
+                errors.push(format!(
+                    "bad_index: invalid module for {} in {root_hash}: {err:#}",
+                    binding.symbol
+                ));
+            }
             if let Err(err) = validate_projection_identifier("display name", &binding.display_name)
             {
                 errors.push(format!(
@@ -866,6 +868,52 @@ impl CodeDb {
                     ));
                 }
             }
+        }
+    }
+
+    fn verify_module_metadata(
+        &self,
+        root_hash: &str,
+        root: &ProgramRootPayload,
+        errors: &mut Vec<String>,
+    ) {
+        let Some(value) = root.metadata.get(ROOT_MODULES_METADATA_KEY) else {
+            return;
+        };
+        let Some(entries) = value.as_array() else {
+            errors.push(format!(
+                "bad_index: modules metadata must be an array in {root_hash}"
+            ));
+            return;
+        };
+        let actual_modules = root
+            .names
+            .iter()
+            .map(|binding| binding.module.clone())
+            .collect::<BTreeSet<_>>();
+        let mut metadata_modules = BTreeSet::new();
+        for entry in entries {
+            let Some(name) = entry.get("name").and_then(JsonValue::as_str) else {
+                errors.push(format!(
+                    "bad_index: module metadata entry missing name in {root_hash}"
+                ));
+                continue;
+            };
+            if let Err(err) = validate_module_path("module", name) {
+                errors.push(format!(
+                    "bad_index: invalid module metadata {name:?} in {root_hash}: {err:#}"
+                ));
+            }
+            if !metadata_modules.insert(name.to_string()) {
+                errors.push(format!(
+                    "bad_index: duplicate module metadata {name:?} in {root_hash}"
+                ));
+            }
+        }
+        if metadata_modules != actual_modules {
+            errors.push(format!(
+                "bad_index: modules metadata mismatch for {root_hash}"
+            ));
         }
     }
 

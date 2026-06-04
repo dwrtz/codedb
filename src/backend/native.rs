@@ -207,7 +207,7 @@ impl CodeDb {
         self.ensure_initialized()?;
         let branch = self.branch(MAIN_BRANCH)?;
         let symbol = self
-            .resolve_name(&branch.root_hash, "main", function_name)
+            .resolve_symbol_or_name(&branch.root_hash, function_name)
             .map_err(|err| anyhow!("unknown entry function {function_name}: {err}"))?;
         self.emit_object_for_symbol(&branch.root_hash, &symbol, target_triple)
     }

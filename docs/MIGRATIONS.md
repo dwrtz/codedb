@@ -103,6 +103,31 @@ Effects:
 - Regenerates source and C projections because projections are human-facing.
 - Reusing the same rename returns `already_applied`.
 
+## Move Symbol Between Modules
+
+```bash
+ROOT=<root-from-list-json>
+cargo run -- module move-symbol "$DB" tax billing --expect-root "$ROOT"
+cargo run -- module list "$DB" --json
+cargo run -- show "$DB" billing.tax
+```
+
+JSON:
+
+```json
+{ "kind": "move_symbol", "name": "tax", "new_module": "billing" }
+```
+
+Effects:
+
+- Updates module metadata in `ProgramRoot.names`.
+- Does not change `symbol_hash`, `FunctionDef`, signature hash, body hash, or
+  native object artifact cache keys.
+- Has `metadata_only` build impact.
+- Name conflicts are scoped by target module, so `main.tax` and `billing.tax`
+  can coexist, but moving `main.tax` into `billing` conflicts if
+  `billing.tax` already exists.
+
 ## Replace Function Body
 
 ```bash

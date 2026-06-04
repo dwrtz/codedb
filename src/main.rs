@@ -351,6 +351,11 @@ enum Command {
         #[command(subcommand)]
         command: PatchCommand,
     },
+    #[command(about = "Inspect and update semantic module boundaries")]
+    Module {
+        #[command(subcommand)]
+        command: ModuleCommand,
+    },
     Replay {
         db: PathBuf,
         #[arg(long)]
@@ -443,6 +448,30 @@ enum PatchCommand {
         db: PathBuf,
         #[arg(long)]
         json: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModuleCommand {
+    List {
+        db: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Show {
+        db: PathBuf,
+        module: String,
+        #[arg(long)]
+        json: bool,
+    },
+    MoveSymbol {
+        db: PathBuf,
+        symbol_or_name: String,
+        module: String,
+        #[arg(long)]
+        expect_root: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1095,6 +1124,42 @@ fn main() -> Result<()> {
             PatchCommand::Apply { db, json } => {
                 let mut codedb = codedb::CodeDb::open(db)?;
                 print!("{}", codedb.apply_semantic_patch_json_file(&json)?);
+            }
+        },
+        Command::Module { command } => match command {
+            ModuleCommand::List { db, json } => {
+                let codedb = codedb::CodeDb::open(db)?;
+                if json {
+                    print!("{}", codedb.list_modules_main_branch_json()?);
+                } else {
+                    print!("{}", codedb.list_modules_main_branch()?);
+                }
+            }
+            ModuleCommand::Show { db, module, json } => {
+                let codedb = codedb::CodeDb::open(db)?;
+                if json {
+                    print!("{}", codedb.show_module_main_branch_json(&module)?);
+                } else {
+                    print!("{}", codedb.show_module_main_branch(&module)?);
+                }
+            }
+            ModuleCommand::MoveSymbol {
+                db,
+                symbol_or_name,
+                module,
+                expect_root,
+                json,
+            } => {
+                let mut codedb = codedb::CodeDb::open(db)?;
+                print!(
+                    "{}",
+                    codedb.move_symbol_main_branch_expected_format(
+                        &symbol_or_name,
+                        &module,
+                        Some(&expect_root),
+                        json
+                    )?
+                );
             }
         },
         Command::Replay { db, from_genesis } => {

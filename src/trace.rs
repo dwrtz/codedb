@@ -919,13 +919,6 @@ impl CodeDb {
             }
         }
     }
-
-    fn qualified_symbol_display(&self, root: &ProgramRootPayload, symbol: &str) -> Result<String> {
-        let binding = self
-            .preferred_binding(root, symbol)
-            .ok_or_else(|| anyhow!("symbol has no display name {symbol}"))?;
-        Ok(format!("{}.{}", binding.module, binding.display_name))
-    }
 }
 
 fn trace_report(

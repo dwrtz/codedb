@@ -121,7 +121,7 @@ stale writes instead of applying against a branch that has moved.
 
 `codedb apply <db> --json <file>` accepts an atomic structural
 `codedb/apply/v1` JSON document with operations such as `create_function`,
-`rename_symbol`, `replace_function_body`, `create_alias`, and `set_export`.
+`rename_symbol`, `move_symbol`, `replace_function_body`, `create_alias`, and `set_export`.
 Function bodies are structural expression JSON objects, so agents do not need
 to write projection text to mutate the database. The document `branch` field
 selects the branch to mutate and defaults to `main`. See
@@ -150,13 +150,14 @@ optional JSON-RPC `id` fields. Responses use the stable
 `codedb/response/v1` envelope. The workspace API exposes read methods:
 `workspace.current`, `workspace.branches`, `symbols.list`, `symbols.show`,
 `symbols.resolve`, `symbols.callers`, `roots.diff`, `roots.export_projection`,
-`build.plan`, `build.execute`, `build.artifact_status`, `trace.run`,
+`modules.list`, `modules.show`, `build.plan`, `build.execute`, `build.artifact_status`, `trace.run`,
 `debug.run`, `tests.list`, `tests.run`, `tests.impact`, `history.list`,
 `history.bisect`, `provenance.blame_symbol`, `provenance.blame_expr`,
 `why.run`, and `verify.run`. It also exposes `workspace.branch.create`,
 `workspace.branch.fast_forward`, `workspace.branch.delete`,
 `workspace.branch.compare`, `ops.apply` for atomic `codedb/apply/v1`
 structural writes, and `ops.preview` for rollback-only previews.
+`modules.move_symbol` moves a symbol to a different module against an expected root.
 `patch.preview`, `patch.apply`, `merge.preview`, and `merge.apply` expose
 Milestone C semantic patch and conservative merge workflows through the same
 response envelope.
@@ -239,6 +240,9 @@ cargo run -- change-signature <db> <name> "<signature>" [--expect-root <root>] [
 cargo run -- delete-symbol <db> <name> [--force] [--expect-root <root>] [--json]
 cargo run -- create-alias <db> <name> <alias> [--expect-root <root>] [--json]
 cargo run -- remove-alias <db> <name> <alias> [--expect-root <root>] [--json]
+cargo run -- module list <db> [--json]
+cargo run -- module show <db> <module> [--json]
+cargo run -- module move-symbol <db> <symbol-or-name> <module> --expect-root <root> [--json]
 cargo run -- set-export <db> <name> <exported-name> [--expect-root <root>] [--json]
 cargo run -- remove-export <db> <name> <exported-name> [--expect-root <root>] [--json]
 ```

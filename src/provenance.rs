@@ -642,6 +642,14 @@ impl CodeDb {
                     reasons.insert("rename");
                 }
             }
+            Operation::MoveSymbol {
+                symbol: changed, ..
+            } => {
+                if changed == symbol {
+                    reasons.insert("name");
+                    reasons.insert("move");
+                }
+            }
             Operation::ReplaceFunctionBody {
                 symbol: changed, ..
             } => {
