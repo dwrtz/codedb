@@ -152,12 +152,14 @@ optional JSON-RPC `id` fields. Responses use the stable
 `symbols.resolve`, `symbols.callers`, `roots.diff`, `roots.export_projection`,
 `build.plan`, `build.execute`, `build.artifact_status`, `trace.run`,
 `debug.run`, `tests.list`, `tests.run`, `tests.impact`, `history.list`,
-`provenance.blame_symbol`, `provenance.blame_expr`, and `verify.run`. It also exposes
-`workspace.branch.create`, `workspace.branch.fast_forward`,
-`workspace.branch.delete`, `workspace.branch.compare`, `ops.apply` for atomic
-`codedb/apply/v1` structural writes, and `ops.preview` for rollback-only
-previews. `patch.preview` exposes the semantic patch preview layer through the
-same response envelope.
+`history.bisect`, `provenance.blame_symbol`, `provenance.blame_expr`,
+`why.run`, and `verify.run`. It also exposes `workspace.branch.create`,
+`workspace.branch.fast_forward`, `workspace.branch.delete`,
+`workspace.branch.compare`, `ops.apply` for atomic `codedb/apply/v1`
+structural writes, and `ops.preview` for rollback-only previews.
+`patch.preview`, `patch.apply`, `merge.preview`, and `merge.apply` expose
+Milestone C semantic patch and conservative merge workflows through the same
+response envelope.
 
 `ops.apply` responses include both `operations` and the older `results` field
 for the per-operation records. `trace.run` and `debug.run` return a top-level
