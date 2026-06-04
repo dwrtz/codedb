@@ -1019,6 +1019,7 @@ impl CodeDb {
             birth_seed: birth_seed
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("semantic-patch:extract-function:{name}")),
+            region_params: Vec::new(),
             params: params.to_vec(),
             return_type,
             effects: Vec::new(),
@@ -2515,6 +2516,10 @@ fn substitute_param_refs(expr: &RawExpr, args: &[RawExpr]) -> Result<RawExpr> {
             op: op.clone(),
             expr: Box::new(substitute_param_refs(expr, args)?),
         },
+        RawExpr::BorrowShared { region, target } => RawExpr::BorrowShared {
+            region: region.clone(),
+            target: Box::new(substitute_param_refs(target, args)?),
+        },
         RawExpr::Let {
             name,
             ty,
@@ -2600,6 +2605,9 @@ fn collect_free_param_names(
             collect_free_param_names(right, bound_locals, names);
         }
         RawExpr::Unary { expr, .. } => collect_free_param_names(expr, bound_locals, names),
+        RawExpr::BorrowShared { target, .. } => {
+            collect_free_param_names(target, bound_locals, names)
+        }
         RawExpr::Let {
             name, value, body, ..
         } => {
@@ -2690,6 +2698,14 @@ fn alpha_rename_let_bindings_with_scope(
             op: op.clone(),
             expr: Box::new(alpha_rename_let_bindings_with_scope(
                 expr,
+                used_names,
+                renamed_locals,
+            )),
+        },
+        RawExpr::BorrowShared { region, target } => RawExpr::BorrowShared {
+            region: region.clone(),
+            target: Box::new(alpha_rename_let_bindings_with_scope(
+                target,
                 used_names,
                 renamed_locals,
             )),

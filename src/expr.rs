@@ -12,8 +12,8 @@ use crate::model::{
 };
 use crate::store::CodeDb;
 use crate::types::{
-    Effect, ParamSpec, TypeDefinition, TypeDefinitionKind, TypeMemberSpec, TypeSpec,
-    normalize_effects, visible_effects,
+    Effect, ParamSpec, RegionParamDef, TypeDefinition, TypeDefinitionKind, TypeMemberSpec,
+    TypeSpec, normalize_effects, visible_effects,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +44,11 @@ pub enum RawExpr {
     Unary {
         op: String,
         expr: Box<RawExpr>,
+    },
+    BorrowShared {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
+        target: Box<RawExpr>,
     },
     Let {
         name: String,
@@ -98,6 +103,8 @@ pub struct RawCaseArm {
 pub struct FunctionSource {
     pub module: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub region_params: Vec<String>,
     pub params: Vec<ParamSpec>,
     pub return_type: String,
     #[serde(default)]
@@ -109,6 +116,7 @@ pub struct FunctionSource {
 pub struct ExternalFunctionSource {
     pub module: String,
     pub name: String,
+    pub region_params: Vec<String>,
     pub params: Vec<ParamSpec>,
     pub return_type: String,
     pub effects: Vec<Effect>,
@@ -137,6 +145,7 @@ pub enum Value {
     I64(i64),
     Bool(bool),
     Unit,
+    SharedRef(Box<Value>),
     Record(BTreeMap<String, Value>),
     Enum { variant: String, value: Box<Value> },
 }
@@ -147,6 +156,7 @@ impl Display for Value {
             Value::I64(value) => write!(f, "{value}"),
             Value::Bool(value) => write!(f, "{value}"),
             Value::Unit => write!(f, "()"),
+            Value::SharedRef(value) => write!(f, "&{value}"),
             Value::Record(fields) => {
                 let rendered = fields
                     .iter()
@@ -233,6 +243,14 @@ impl CodeDb {
             (Value::I64(_), TypeSpec::Builtin(kind)) => Ok(kind == "I64"),
             (Value::Bool(_), TypeSpec::Builtin(kind)) => Ok(kind == "Bool"),
             (Value::Unit, TypeSpec::Builtin(kind)) => Ok(kind == "Unit"),
+            (
+                Value::SharedRef(value),
+                TypeSpec::Reference {
+                    mutable: false,
+                    referent,
+                    ..
+                },
+            ) => self.value_has_type(root, value, &referent),
             (Value::Record(values), TypeSpec::Record(fields)) => {
                 if values.len() != fields.len() {
                     return Ok(false);
@@ -354,6 +372,18 @@ impl CodeDb {
                 let value = self.eval_expr_with_locals(root_hash, expr_hash, args, locals)?;
                 eval_unary(op, value)
             }
+            "borrow_shared" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_shared missing target"))?;
+                Ok(Value::SharedRef(Box::new(self.eval_expr_with_locals(
+                    root_hash,
+                    target_hash,
+                    args,
+                    locals,
+                )?)))
+            }
             "let" => {
                 let value_hash = payload
                     .get("value")
@@ -429,6 +459,13 @@ impl CodeDb {
                         .get(field)
                         .cloned()
                         .ok_or_else(|| anyhow!("record value has no field {field}")),
+                    Value::SharedRef(value) => match value.as_ref() {
+                        Value::Record(fields) => fields
+                            .get(field)
+                            .cloned()
+                            .ok_or_else(|| anyhow!("record value has no field {field}")),
+                        other => bail!("field access target evaluated to non-record ref {other}"),
+                    },
                     other => bail!("field access target evaluated to non-record {other}"),
                 }
             }
@@ -548,6 +585,8 @@ impl CodeDb {
             return Ok(source);
         }
         let body = self.function_body_hash(&root_symbol.definition)?;
+        let region_names =
+            signature_region_name_map(&self.signature_region_params(&root_symbol.signature)?);
         Ok(format!(
             "fn {}{} = {}",
             binding.display_name,
@@ -557,11 +596,12 @@ impl CodeDb {
                 &root_symbol.signature,
                 &param_names(root, &binding.symbol),
             )?,
-            self.expr_to_source_in_module(
+            self.expr_to_source_in_module_with_regions(
                 &body,
                 root,
                 &binding.module,
                 &param_names(root, &binding.symbol),
+                &region_names,
                 0,
             )?
         ))
@@ -780,6 +820,8 @@ impl CodeDb {
         signature_hash: &str,
         param_names: &[String],
     ) -> Result<String> {
+        let region_params = self.signature_region_params(signature_hash)?;
+        let region_names = signature_region_name_map(&region_params);
         let (params, return_type) = self.signature_parts(signature_hash)?;
         let effects = self.signature_effects(signature_hash)?;
         let rendered_params = params
@@ -790,13 +832,17 @@ impl CodeDb {
                     .get(idx)
                     .cloned()
                     .unwrap_or_else(|| format!("p{idx}"));
-                Ok(format!("{name}: {}", self.type_name(ty)?))
+                Ok(format!(
+                    "{name}: {}",
+                    self.type_name_with_regions(ty, &region_names)?
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
         let mut source = format!(
-            "({}) -> {}",
+            "{}({}) -> {}",
+            signature_region_suffix(&region_params),
             rendered_params.join(", "),
-            self.type_name(&return_type)?
+            self.type_name_with_regions(&return_type, &region_names)?
         );
         if !effects.is_empty() {
             let rendered_effects = visible_effects(&effects)
@@ -816,6 +862,8 @@ impl CodeDb {
         param_names: &[String],
         abi: &str,
     ) -> Result<String> {
+        let region_params = self.signature_region_params(signature_hash)?;
+        let region_names = signature_region_name_map(&region_params);
         let (params, return_type) = self.signature_parts(signature_hash)?;
         let effects = self.signature_effects(signature_hash)?;
         let rendered_params = params
@@ -826,13 +874,17 @@ impl CodeDb {
                     .get(idx)
                     .cloned()
                     .unwrap_or_else(|| format!("p{idx}"));
-                Ok(format!("{name}: {}", self.type_name(ty)?))
+                Ok(format!(
+                    "{name}: {}",
+                    self.type_name_with_regions(ty, &region_names)?
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
         let mut source = format!(
-            "({}) -> {} abi[{abi}]",
+            "{}({}) -> {} abi[{abi}]",
+            signature_region_suffix(&region_params),
             rendered_params.join(", "),
-            self.type_name(&return_type)?
+            self.type_name_with_regions(&return_type, &region_names)?
         );
         if !effects.is_empty() {
             let rendered_effects = visible_effects(&effects)
@@ -852,6 +904,8 @@ impl CodeDb {
         signature_hash: &str,
         param_names: &[String],
     ) -> Result<String> {
+        let region_params = self.signature_region_params(signature_hash)?;
+        let region_names = signature_region_name_map(&region_params);
         let (params, return_type) = self.signature_parts(signature_hash)?;
         let effects = self.signature_effects(signature_hash)?;
         let rendered_params = params
@@ -864,14 +918,20 @@ impl CodeDb {
                     .unwrap_or_else(|| format!("p{idx}"));
                 Ok(format!(
                     "{name}: {}",
-                    self.type_name_in_root(root, current_module, ty)?
+                    self.type_name_in_root_with_regions(root, current_module, ty, &region_names)?
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
         let mut source = format!(
-            "({}) -> {}",
+            "{}({}) -> {}",
+            signature_region_suffix(&region_params),
             rendered_params.join(", "),
-            self.type_name_in_root(root, current_module, &return_type)?
+            self.type_name_in_root_with_regions(
+                root,
+                current_module,
+                &return_type,
+                &region_names,
+            )?
         );
         if !effects.is_empty() {
             let rendered_effects = visible_effects(&effects)
@@ -917,11 +977,31 @@ impl CodeDb {
         local_params: &[String],
         parent_prec: u8,
     ) -> Result<String> {
+        self.expr_to_source_in_module_with_regions(
+            expr_hash,
+            root,
+            current_module,
+            local_params,
+            &BTreeMap::new(),
+            parent_prec,
+        )
+    }
+
+    fn expr_to_source_in_module_with_regions(
+        &self,
+        expr_hash: &str,
+        root: &ProgramRootPayload,
+        current_module: &str,
+        local_params: &[String],
+        region_names: &BTreeMap<String, String>,
+        parent_prec: u8,
+    ) -> Result<String> {
         self.expr_to_source_with_locals(
             expr_hash,
             root,
             current_module,
             local_params,
+            region_names,
             &mut Vec::new(),
             parent_prec,
         )
@@ -933,6 +1013,7 @@ impl CodeDb {
         root: &ProgramRootPayload,
         current_module: &str,
         local_params: &[String],
+        region_names: &BTreeMap<String, String>,
         local_names: &mut Vec<String>,
         parent_prec: u8,
     ) -> Result<String> {
@@ -994,6 +1075,7 @@ impl CodeDb {
                             root,
                             current_module,
                             local_params,
+                            region_names,
                             local_names,
                             0,
                         )
@@ -1026,6 +1108,7 @@ impl CodeDb {
                         root,
                         current_module,
                         local_params,
+                        region_names,
                         local_names,
                         prec,
                     )?,
@@ -1035,6 +1118,7 @@ impl CodeDb {
                         root,
                         current_module,
                         local_params,
+                        region_names,
                         local_names,
                         prec + 1,
                     )?
@@ -1062,11 +1146,37 @@ impl CodeDb {
                         root,
                         current_module,
                         local_params,
+                        region_names,
                         local_names,
                         prec,
                     )?
                 );
                 if prec < parent_prec {
+                    format!("({expr})")
+                } else {
+                    expr
+                }
+            }
+            "borrow_shared" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_shared missing target"))?;
+                let region = payload.get("region_name").and_then(JsonValue::as_str);
+                let rendered_target = self.expr_to_source_with_locals(
+                    target,
+                    root,
+                    current_module,
+                    local_params,
+                    region_names,
+                    local_names,
+                    unary_precedence(),
+                )?;
+                let expr = match region {
+                    Some(region) => format!("&'{region} {rendered_target}"),
+                    None => format!("&{rendered_target}"),
+                };
+                if unary_precedence() < parent_prec {
                     format!("({expr})")
                 } else {
                     expr
@@ -1094,6 +1204,7 @@ impl CodeDb {
                     root,
                     current_module,
                     local_params,
+                    region_names,
                     local_names,
                     0,
                 )?;
@@ -1103,13 +1214,19 @@ impl CodeDb {
                     root,
                     current_module,
                     local_params,
+                    region_names,
                     local_names,
                     0,
                 );
                 local_names.pop();
                 let expr = format!(
                     "let {name}: {} = {value} in {}",
-                    self.type_name_in_root(root, current_module, binding_type)?,
+                    self.type_name_in_root_with_regions(
+                        root,
+                        current_module,
+                        binding_type,
+                        region_names,
+                    )?,
                     body?
                 );
                 if parent_prec > 0 {
@@ -1138,6 +1255,7 @@ impl CodeDb {
                         root,
                         current_module,
                         local_params,
+                        region_names,
                         local_names,
                         0,
                     )?,
@@ -1146,6 +1264,7 @@ impl CodeDb {
                         root,
                         current_module,
                         local_params,
+                        region_names,
                         local_names,
                         0,
                     )?,
@@ -1154,6 +1273,7 @@ impl CodeDb {
                         root,
                         current_module,
                         local_params,
+                        region_names,
                         local_names,
                         0,
                     )?
@@ -1186,6 +1306,7 @@ impl CodeDb {
                                 root,
                                 current_module,
                                 local_params,
+                                region_names,
                                 local_names,
                                 0,
                             )?
@@ -1210,6 +1331,7 @@ impl CodeDb {
                         root,
                         current_module,
                         local_params,
+                        region_names,
                         local_names,
                         field_access_precedence(),
                     )?
@@ -1243,17 +1365,28 @@ impl CodeDb {
                 {
                     format!(
                         "{}::{variant}",
-                        self.type_name_in_root(root, current_module, enum_type)?
+                        self.type_name_in_root_with_regions(
+                            root,
+                            current_module,
+                            enum_type,
+                            region_names,
+                        )?
                     )
                 } else {
                     format!(
                         "{}::{variant}({})",
-                        self.type_name_in_root(root, current_module, enum_type)?,
+                        self.type_name_in_root_with_regions(
+                            root,
+                            current_module,
+                            enum_type,
+                            region_names,
+                        )?,
                         self.expr_to_source_with_locals(
                             value,
                             root,
                             current_module,
                             local_params,
+                            region_names,
                             local_names,
                             0,
                         )?
@@ -1289,6 +1422,7 @@ impl CodeDb {
                             root,
                             current_module,
                             local_params,
+                            region_names,
                             local_names,
                             0,
                         );
@@ -1310,6 +1444,7 @@ impl CodeDb {
                         root,
                         current_module,
                         local_params,
+                        region_names,
                         local_names,
                         0,
                     )?,
@@ -1340,7 +1475,28 @@ impl CodeDb {
         root: &ProgramRootPayload,
         current_module: &str,
     ) -> Result<RawExpr> {
-        self.typed_expr_to_raw_with_locals(expr_hash, root, current_module, &mut Vec::new())
+        self.typed_expr_to_raw_in_module_with_regions(
+            expr_hash,
+            root,
+            current_module,
+            &BTreeMap::new(),
+        )
+    }
+
+    pub(crate) fn typed_expr_to_raw_in_module_with_regions(
+        &self,
+        expr_hash: &str,
+        root: &ProgramRootPayload,
+        current_module: &str,
+        region_names: &BTreeMap<String, String>,
+    ) -> Result<RawExpr> {
+        self.typed_expr_to_raw_with_locals(
+            expr_hash,
+            root,
+            current_module,
+            region_names,
+            &mut Vec::new(),
+        )
     }
 
     fn typed_expr_to_raw_with_locals(
@@ -1348,6 +1504,7 @@ impl CodeDb {
         expr_hash: &str,
         root: &ProgramRootPayload,
         current_module: &str,
+        region_names: &BTreeMap<String, String>,
         local_names: &mut Vec<String>,
     ) -> Result<RawExpr> {
         let payload = self.get_payload(expr_hash)?;
@@ -1410,6 +1567,7 @@ impl CodeDb {
                                 hash,
                                 root,
                                 current_module,
+                                region_names,
                                 local_names,
                             )
                         })
@@ -1430,6 +1588,7 @@ impl CodeDb {
                             .ok_or_else(|| anyhow!("binary missing left"))?,
                         root,
                         current_module,
+                        region_names,
                         local_names,
                     )?,
                 ),
@@ -1441,6 +1600,7 @@ impl CodeDb {
                             .ok_or_else(|| anyhow!("binary missing right"))?,
                         root,
                         current_module,
+                        region_names,
                         local_names,
                     )?,
                 ),
@@ -1459,6 +1619,25 @@ impl CodeDb {
                             .ok_or_else(|| anyhow!("unary missing expr"))?,
                         root,
                         current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ),
+            }),
+            "borrow_shared" => Ok(RawExpr::BorrowShared {
+                region: payload
+                    .get("region_name")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string),
+                target: Box::new(
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("target")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("borrow_shared missing target"))?,
+                        root,
+                        current_module,
+                        region_names,
                         local_names,
                     )?,
                 ),
@@ -1480,6 +1659,7 @@ impl CodeDb {
                         .ok_or_else(|| anyhow!("let missing value"))?,
                     root,
                     current_module,
+                    region_names,
                     local_names,
                 )?;
                 local_names.push(name.clone());
@@ -1490,13 +1670,19 @@ impl CodeDb {
                         .ok_or_else(|| anyhow!("let missing body"))?,
                     root,
                     current_module,
+                    region_names,
                     local_names,
                 );
                 local_names.pop();
                 Ok(RawExpr::Let {
                     name,
                     ty: self
-                        .type_name_in_root(root, current_module, binding_type)?
+                        .type_name_in_root_with_regions(
+                            root,
+                            current_module,
+                            binding_type,
+                            region_names,
+                        )?
                         .to_string(),
                     value: Box::new(value),
                     body: Box::new(body?),
@@ -1511,6 +1697,7 @@ impl CodeDb {
                             .ok_or_else(|| anyhow!("if missing cond"))?,
                         root,
                         current_module,
+                        region_names,
                         local_names,
                     )?,
                 ),
@@ -1522,6 +1709,7 @@ impl CodeDb {
                             .ok_or_else(|| anyhow!("if missing then"))?,
                         root,
                         current_module,
+                        region_names,
                         local_names,
                     )?,
                 ),
@@ -1533,6 +1721,7 @@ impl CodeDb {
                             .ok_or_else(|| anyhow!("if missing else"))?,
                         root,
                         current_module,
+                        region_names,
                         local_names,
                     )?,
                 ),
@@ -1556,6 +1745,7 @@ impl CodeDb {
                                 .ok_or_else(|| anyhow!("record field missing value"))?,
                             root,
                             current_module,
+                            region_names,
                             local_names,
                         )?;
                         Ok(RawRecordField { name, value })
@@ -1571,6 +1761,7 @@ impl CodeDb {
                             .ok_or_else(|| anyhow!("field_access missing target"))?,
                         root,
                         current_module,
+                        region_names,
                         local_names,
                     )?,
                 ),
@@ -1581,13 +1772,14 @@ impl CodeDb {
                     .to_string(),
             }),
             "enum_construct" => Ok(RawExpr::EnumConstruct {
-                enum_type: self.type_name_in_root(
+                enum_type: self.type_name_in_root_with_regions(
                     root,
                     current_module,
                     payload
                         .get("enum_type")
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("enum_construct missing enum_type"))?,
+                    region_names,
                 )?,
                 variant: payload
                     .get("variant")
@@ -1602,6 +1794,7 @@ impl CodeDb {
                             .ok_or_else(|| anyhow!("enum_construct missing value"))?,
                         root,
                         current_module,
+                        region_names,
                         local_names,
                     )?,
                 ),
@@ -1614,6 +1807,7 @@ impl CodeDb {
                         .ok_or_else(|| anyhow!("case missing expr"))?,
                     root,
                     current_module,
+                    region_names,
                     local_names,
                 )?;
                 let arms = payload
@@ -1640,6 +1834,7 @@ impl CodeDb {
                                 .ok_or_else(|| anyhow!("case arm missing body"))?,
                             root,
                             current_module,
+                            region_names,
                             local_names,
                         );
                         if binding.is_some() {
@@ -1707,6 +1902,28 @@ pub(crate) fn unary_precedence() -> u8 {
 
 fn field_access_precedence() -> u8 {
     8
+}
+
+fn signature_region_name_map(params: &[RegionParamDef]) -> BTreeMap<String, String> {
+    params
+        .iter()
+        .map(|param| (param.region.clone(), param.name.clone()))
+        .collect()
+}
+
+fn signature_region_suffix(params: &[RegionParamDef]) -> String {
+    if params.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<{}>",
+            params
+                .iter()
+                .map(|param| format!("'{}", param.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
 }
 
 fn field_access_from_path(path: &str) -> RawExpr {
@@ -1845,6 +2062,13 @@ impl CodeDb {
                     .get("expr")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("unary missing expr"))?;
+                self.collect_expr_deps(root, child, deps)?;
+            }
+            "borrow_shared" => {
+                let child = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_shared missing target"))?;
                 self.collect_expr_deps(root, child, deps)?;
             }
             "let" => {
@@ -2051,6 +2275,7 @@ impl Parser {
     fn parse_function_in_module(&mut self, module: String) -> Result<FunctionSource> {
         self.expect_ident_value("fn")?;
         let name = self.expect_ident()?;
+        let region_params = self.parse_optional_region_params()?;
         let (params, return_type) = self.parse_function_signature_tail()?;
         let effects = if self.consume_ident_value("effects") {
             self.parse_effect_list()?
@@ -2062,6 +2287,7 @@ impl Parser {
         Ok(FunctionSource {
             module,
             name,
+            region_params,
             params,
             return_type,
             effects,
@@ -2075,6 +2301,7 @@ impl Parser {
     ) -> Result<ExternalFunctionSource> {
         self.expect_ident_value("fn")?;
         let name = self.expect_ident()?;
+        let region_params = self.parse_optional_region_params()?;
         let (params, return_type) = self.parse_function_signature_tail()?;
         self.expect_ident_value("abi")?;
         let abi = self.parse_bracketed_ident("abi")?;
@@ -2093,6 +2320,7 @@ impl Parser {
         Ok(ExternalFunctionSource {
             module,
             name,
+            region_params,
             params,
             return_type,
             effects,
@@ -2277,6 +2505,18 @@ impl Parser {
                 Ok(RawExpr::Unary {
                     op,
                     expr: Box::new(self.parse_unary()?),
+                })
+            }
+            Token::Symbol(op) if op == "&" => {
+                self.next();
+                let region = if self.consume_symbol("'") {
+                    Some(self.expect_ident()?)
+                } else {
+                    None
+                };
+                Ok(RawExpr::BorrowShared {
+                    region,
+                    target: Box::new(self.parse_unary()?),
                 })
             }
             _ => self.parse_primary(),

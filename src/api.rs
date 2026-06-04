@@ -37,6 +37,8 @@ enum ApiOperation {
         name: String,
         #[serde(default)]
         birth_seed: Option<String>,
+        #[serde(default)]
+        region_params: Vec<String>,
         params: Vec<ParamSpec>,
         return_type: String,
         #[serde(default)]
@@ -51,6 +53,8 @@ enum ApiOperation {
         name: String,
         #[serde(default)]
         birth_seed: Option<String>,
+        #[serde(default)]
+        region_params: Vec<String>,
         params: Vec<ParamSpec>,
         return_type: String,
         #[serde(default)]
@@ -226,6 +230,8 @@ enum ApiOperation {
         #[serde(default)]
         symbol: Option<String>,
         name: String,
+        #[serde(default)]
+        region_params: Vec<String>,
         params: Vec<ParamSpec>,
         return_type: String,
         #[serde(default)]
@@ -671,6 +677,7 @@ impl CodeDb {
                 module,
                 name,
                 birth_seed,
+                region_params,
                 params,
                 return_type,
                 effects,
@@ -682,6 +689,7 @@ impl CodeDb {
                 birth_seed: birth_seed
                     .clone()
                     .unwrap_or_else(|| format!("json:{module}:{name}")),
+                region_params: region_params.clone(),
                 params: params.clone(),
                 return_type: return_type.clone(),
                 effects: effects.clone(),
@@ -691,6 +699,7 @@ impl CodeDb {
                 module,
                 name,
                 birth_seed,
+                region_params,
                 params,
                 return_type,
                 effects,
@@ -704,6 +713,7 @@ impl CodeDb {
                 birth_seed: birth_seed
                     .clone()
                     .unwrap_or_else(|| format!("json:extern:{module}:{name}")),
+                region_params: region_params.clone(),
                 params: params.clone(),
                 return_type: return_type.clone(),
                 effects: effects.clone(),
@@ -954,6 +964,7 @@ impl CodeDb {
                 module,
                 symbol,
                 name,
+                region_params,
                 params,
                 return_type,
                 effects,
@@ -962,6 +973,7 @@ impl CodeDb {
                 module: module.clone(),
                 symbol: self.symbol_or_resolve(expected_root, module, name, symbol)?,
                 name: name.clone(),
+                region_params: region_params.clone(),
                 params: params.clone(),
                 return_type: return_type.clone(),
                 effects: effects.clone(),

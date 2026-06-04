@@ -68,7 +68,7 @@ fn main() -> i64 = add_tax({ amount: 100, tax: 20 })
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "lowering v1 does not support aggregate expression kind record_literal",
+            "lowering v1 supports record literals only as typed let initializers",
         ));
 }
 

@@ -190,6 +190,16 @@ impl CodeDb {
                 )?;
             }
             "FunctionSignature" => {
+                if let Some(params) = payload.get("region_params").and_then(JsonValue::as_array) {
+                    for (idx, param) in params.iter().enumerate() {
+                        self.check_hash_ref(
+                            parent_hash,
+                            &format!("region_params[{idx}].region"),
+                            param.get("region"),
+                            errors,
+                        )?;
+                    }
+                }
                 self.check_hash_array_refs(parent_hash, "params", payload.get("params"), errors)?;
                 self.check_hash_ref(parent_hash, "return", payload.get("return"), errors)?;
                 self.check_signature_effects(parent_hash, payload.get("effects"), errors)?;
@@ -215,6 +225,16 @@ impl CodeDb {
                     }
                     Some("unary") => {
                         self.check_hash_ref(parent_hash, "expr", payload.get("expr"), errors)?;
+                    }
+                    Some("borrow_shared") => {
+                        self.check_hash_ref(parent_hash, "target", payload.get("target"), errors)?;
+                        self.check_hash_ref(parent_hash, "region", payload.get("region"), errors)?;
+                        self.check_hash_ref(
+                            parent_hash,
+                            "referent_type",
+                            payload.get("referent_type"),
+                            errors,
+                        )?;
                     }
                     Some("let") => {
                         self.check_hash_ref(
@@ -3730,6 +3750,8 @@ fn collect_lowered_call_targets(
             | LoweredOp::AddrOfLocal { .. }
             | LoweredOp::AddrOfField { .. }
             | LoweredOp::AddrOfIndex { .. }
+            | LoweredOp::BorrowShared { .. }
+            | LoweredOp::DerefShared { .. }
             | LoweredOp::Load { .. }
             | LoweredOp::Store { .. }
             | LoweredOp::Copy { .. }

@@ -379,6 +379,11 @@ native backend can ignore borrow metadata while preserving debug maps
 
 Goal: support read-only references as semantic types and native pointers.
 
+Status: implemented. Shared references now have projection syntax, function
+region parameters, typed borrow expressions, deref/field-read lowering, record
+field storage, trace support, local-borrow escape rejection, and native pointer
+codegen for the `line_view_refs.cdb` acceptance program.
+
 Deliverables:
 
 ```text

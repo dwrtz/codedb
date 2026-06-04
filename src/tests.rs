@@ -1358,7 +1358,7 @@ pub(crate) fn test_value_from_value(value: &Value) -> TestValue {
         },
         Value::Bool(value) => TestValue::Bool { value: *value },
         Value::Unit => TestValue::Unit,
-        Value::Record(_) | Value::Enum { .. } => {
+        Value::SharedRef(_) | Value::Record(_) | Value::Enum { .. } => {
             panic!("semantic test values do not support aggregate actual values")
         }
     }
@@ -1462,7 +1462,7 @@ fn expected_native_exit_code(value: &Value) -> Option<i32> {
             .filter(|value| (0..=255).contains(value)),
         Value::Bool(value) => Some(i32::from(*value)),
         Value::Unit => None,
-        Value::Record(_) | Value::Enum { .. } => None,
+        Value::SharedRef(_) | Value::Record(_) | Value::Enum { .. } => None,
     }
 }
 
@@ -1476,7 +1476,7 @@ fn native_test_value_from_exit_code(expected: &Value, code: i32) -> Option<TestV
             1 => Some(TestValue::Bool { value: true }),
             _ => None,
         },
-        Value::Unit | Value::Record(_) | Value::Enum { .. } => None,
+        Value::Unit | Value::SharedRef(_) | Value::Record(_) | Value::Enum { .. } => None,
     }
 }
 

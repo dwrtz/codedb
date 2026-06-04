@@ -1,0 +1,16 @@
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+record LineView<'a> {
+  line: &'a Line
+}
+
+fn line_total<'a>(view: LineView<'a>) -> i64 =
+  view.line.price_cents * view.line.qty
+
+fn main<'a>() -> i64 =
+  let line: Line = { price_cents: 25, qty: 4 } in
+  let view: LineView<'a> = { line: &'a line } in
+  line_total(view)

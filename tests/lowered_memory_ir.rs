@@ -123,21 +123,17 @@ fn main() -> i64 = add_tax({ amount: 100, tax: 20 })
     assert!(debug_kinds.contains(&"addr_of_field".to_string()));
     assert!(debug_kinds.contains(&"load".to_string()));
 
-    bin()
-        .args([
-            "emit-object",
-            path(&db),
-            "add_tax",
-            "--target",
-            codedb::LINUX_X86_64_TARGET,
-            "--out",
-            path(&object_path),
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "native object backend v0 supports only i64 and bool parameters",
-        ));
+    run(&[
+        "emit-object",
+        path(&db),
+        "add_tax",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        path(&object_path),
+    ]);
+    let object_bytes = std::fs::read(&object_path).unwrap();
+    assert_eq!(&object_bytes[..4], b"\x7fELF");
 }
 
 #[test]

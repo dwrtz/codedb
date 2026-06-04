@@ -490,6 +490,79 @@ impl CodeDb {
         }
     }
 
+    pub(crate) fn type_name_with_regions(
+        &self,
+        hash: &str,
+        region_names: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        if hash == type_hash_for("I64") {
+            return Ok("i64".to_string());
+        }
+        if hash == type_hash_for("Bool") {
+            return Ok("bool".to_string());
+        }
+        if hash == type_hash_for("Unit") {
+            return Ok("unit".to_string());
+        }
+        match self.type_spec(hash)? {
+            TypeSpec::Reference {
+                region,
+                mutable,
+                referent,
+            } => {
+                let region_name = region_names
+                    .get(&region)
+                    .map(String::as_str)
+                    .unwrap_or(region.as_str());
+                let referent = self.type_name_with_regions(&referent, region_names)?;
+                if mutable {
+                    Ok(format!("&'{region_name} mut {referent}"))
+                } else {
+                    Ok(format!("&'{region_name} {referent}"))
+                }
+            }
+            TypeSpec::RawPointer { mutable, pointee } => {
+                let pointee = self.type_name_with_regions(&pointee, region_names)?;
+                if mutable {
+                    Ok(format!("raw_mut_ptr<{pointee}>"))
+                } else {
+                    Ok(format!("raw_ptr<{pointee}>"))
+                }
+            }
+            TypeSpec::FixedArray { element, len } => Ok(format!(
+                "array<{}, {len}>",
+                self.type_name_with_regions(&element, region_names)?
+            )),
+            TypeSpec::Record(fields) => {
+                let rendered = fields
+                    .iter()
+                    .map(|field| {
+                        Ok(format!(
+                            "{}: {}",
+                            field.name,
+                            self.type_name_with_regions(&field.type_hash, region_names)?
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(format!("record {{{}}}", rendered.join(", ")))
+            }
+            TypeSpec::Enum(variants) => {
+                let rendered = variants
+                    .iter()
+                    .map(|variant| {
+                        Ok(format!(
+                            "{}: {}",
+                            variant.name,
+                            self.type_name_with_regions(&variant.type_hash, region_names)?
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(format!("enum {{{}}}", rendered.join(", ")))
+            }
+            other => other.to_source(self),
+        }
+    }
+
     pub(crate) fn type_name_in_root(
         &self,
         root: &ProgramRootPayload,
@@ -705,6 +778,80 @@ impl CodeDb {
                 "enum variant construction requires enum type, got {}",
                 other.to_source(self)?
             ),
+        }
+    }
+
+    pub(crate) fn field_access_type_in_root(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+        field: &str,
+    ) -> Result<String> {
+        match self.type_spec(type_hash)? {
+            TypeSpec::Reference {
+                mutable: false,
+                referent,
+                ..
+            } => self.record_field_type_in_root(root, &referent, field),
+            TypeSpec::Reference { mutable: true, .. } => {
+                bail!("mutable reference field access is reserved for phase 7")
+            }
+            _ => self.record_field_type_in_root(root, type_hash, field),
+        }
+    }
+
+    pub(crate) fn type_assignable_in_root(
+        &self,
+        root: &ProgramRootPayload,
+        actual: &str,
+        expected: &str,
+    ) -> Result<bool> {
+        if actual == expected {
+            return Ok(true);
+        }
+        match (
+            self.type_spec_in_root(root, actual)?,
+            self.type_spec_in_root(root, expected)?,
+        ) {
+            (
+                TypeSpec::Reference {
+                    mutable: actual_mutable,
+                    referent: actual_referent,
+                    ..
+                },
+                TypeSpec::Reference {
+                    mutable: expected_mutable,
+                    referent: expected_referent,
+                    ..
+                },
+            ) => {
+                if actual_mutable != expected_mutable {
+                    return Ok(false);
+                }
+                self.type_assignable_in_root(root, &actual_referent, &expected_referent)
+            }
+            (TypeSpec::Record(actual_fields), TypeSpec::Record(expected_fields)) => {
+                if actual_fields.len() != expected_fields.len() {
+                    return Ok(false);
+                }
+                for expected_field in expected_fields {
+                    let Some(actual_field) = actual_fields
+                        .iter()
+                        .find(|field| field.name == expected_field.name)
+                    else {
+                        return Ok(false);
+                    };
+                    if !self.type_assignable_in_root(
+                        root,
+                        &actual_field.type_hash,
+                        &expected_field.type_hash,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
         }
     }
 
@@ -970,16 +1117,35 @@ impl CodeDb {
         return_type: &str,
         effects: &[Effect],
     ) -> Result<String> {
+        self.put_signature_with_effects_and_regions(param_types, return_type, effects, &[])
+    }
+
+    pub(crate) fn put_signature_with_effects_and_regions(
+        &mut self,
+        param_types: &[String],
+        return_type: &str,
+        effects: &[Effect],
+        region_params: &[RegionParamDef],
+    ) -> Result<String> {
         let effects = normalize_effects(effects)?;
-        self.put_object(
-            "FunctionSignature",
-            &json!({
-                "params": param_types,
-                "return": return_type,
-                "abi": ABI_TAG,
-                "effects": effect_names(&effects),
-            }),
-        )
+        validate_region_params(region_params)?;
+        let mut payload = serde_json::Map::new();
+        if !region_params.is_empty() {
+            payload.insert(
+                "region_params".to_string(),
+                json!(
+                    region_params
+                        .iter()
+                        .map(|param| json!({ "region": param.region, "name": param.name }))
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+        payload.insert("params".to_string(), json!(param_types));
+        payload.insert("return".to_string(), json!(return_type));
+        payload.insert("abi".to_string(), json!(ABI_TAG));
+        payload.insert("effects".to_string(), json!(effect_names(&effects)));
+        self.put_object("FunctionSignature", &JsonValue::Object(payload))
     }
 
     pub(crate) fn signature_parts(&self, signature_hash: &str) -> Result<(Vec<String>, String)> {
@@ -1028,6 +1194,14 @@ impl CodeDb {
             .into_iter()
             .map(|effect| effect.as_str().to_string())
             .collect())
+    }
+
+    pub(crate) fn signature_region_params(
+        &self,
+        signature_hash: &str,
+    ) -> Result<Vec<RegionParamDef>> {
+        let payload = self.get_payload(signature_hash)?;
+        region_params_from_payload(payload.get("region_params"))
     }
 
     pub(crate) fn put_symbol_birth(
@@ -1209,12 +1383,32 @@ impl CodeDb {
         param_names: &[String],
         param_types: &[String],
     ) -> Result<TypeCheckResult> {
+        self.type_expr_in_module_with_regions(
+            current_module,
+            expr,
+            root,
+            param_names,
+            param_types,
+            &BTreeMap::new(),
+        )
+    }
+
+    pub(crate) fn type_expr_in_module_with_regions(
+        &mut self,
+        current_module: &str,
+        expr: &RawExpr,
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
+    ) -> Result<TypeCheckResult> {
         self.type_expr_with_locals(
             current_module,
             expr,
             root,
             param_names,
             param_types,
+            region_scope,
             &mut Vec::new(),
         )
     }
@@ -1226,6 +1420,7 @@ impl CodeDb {
         root: &ProgramRootPayload,
         param_names: &[String],
         param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
         locals: &mut Vec<LocalTypeBinding>,
     ) -> Result<TypeCheckResult> {
         match expr {
@@ -1332,6 +1527,7 @@ impl CodeDb {
                         root,
                         param_names,
                         param_types,
+                        region_scope,
                         locals,
                     )?;
                     for field in fields.split('.') {
@@ -1371,6 +1567,7 @@ impl CodeDb {
                         root,
                         param_names,
                         param_types,
+                        region_scope,
                         locals,
                     )
                 }
@@ -1397,9 +1594,14 @@ impl CodeDb {
                         root,
                         param_names,
                         param_types,
+                        region_scope,
                         locals,
                     )?;
-                    if typed.type_hash != expected_params[idx] {
+                    if !self.type_assignable_in_root(
+                        root,
+                        &typed.type_hash,
+                        &expected_params[idx],
+                    )? {
                         bail!(
                             "call arg {} for {name} expected {}, got {}",
                             idx,
@@ -1437,6 +1639,7 @@ impl CodeDb {
                     root,
                     param_names,
                     param_types,
+                    region_scope,
                     locals,
                 )?;
                 let right = self.type_expr_with_locals(
@@ -1445,6 +1648,7 @@ impl CodeDb {
                     root,
                     param_names,
                     param_types,
+                    region_scope,
                     locals,
                 )?;
                 let i64_hash = type_hash_for("I64");
@@ -1496,6 +1700,7 @@ impl CodeDb {
                     root,
                     param_names,
                     param_types,
+                    region_scope,
                     locals,
                 )?;
                 let i64_hash = type_hash_for("I64");
@@ -1532,6 +1737,64 @@ impl CodeDb {
                     type_hash: result_type,
                 })
             }
+            RawExpr::BorrowShared { region, target } => {
+                let target = self.type_expr_with_locals(
+                    current_module,
+                    target,
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                let (region_name, region_hash) = match region {
+                    Some(name) => (
+                        name.clone(),
+                        region_scope
+                            .get(name)
+                            .cloned()
+                            .ok_or_else(|| anyhow!("unknown region parameter '{name}"))?,
+                    ),
+                    None if region_scope.len() == 1 => {
+                        let (name, hash) = region_scope
+                            .iter()
+                            .next()
+                            .expect("region_scope length was checked");
+                        (name.clone(), hash.clone())
+                    }
+                    None => bail!(
+                        "shared borrow requires an explicit region when the function has {} region parameters",
+                        region_scope.len()
+                    ),
+                };
+                let type_hash = self.put_structural_type(TypeSpec::Reference {
+                    region: region_hash.clone(),
+                    mutable: false,
+                    referent: target.type_hash.clone(),
+                })?;
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "borrow_shared",
+                        "target": target.expr_hash,
+                        "region": region_hash,
+                        "region_name": region_name,
+                        "referent_type": target.type_hash,
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
             RawExpr::Let {
                 name,
                 ty,
@@ -1539,16 +1802,20 @@ impl CodeDb {
                 body,
             } => {
                 validate_projection_identifier("let binding", name)?;
-                let binding_type = self.resolve_type_in_root(current_module, root, ty)?;
+                let binding_type =
+                    self.resolve_type_in_root_with_regions(current_module, root, ty, region_scope)?;
                 let value = self.type_expr_with_locals(
                     current_module,
                     value,
                     root,
                     param_names,
                     param_types,
+                    region_scope,
                     locals,
                 )?;
-                require_type(&value.type_hash, &binding_type, "let binding", self)?;
+                if !self.type_assignable_in_root(root, &value.type_hash, &binding_type)? {
+                    require_type(&value.type_hash, &binding_type, "let binding", self)?;
+                }
                 locals.push(LocalTypeBinding {
                     name: name.clone(),
                     type_hash: binding_type.clone(),
@@ -1559,6 +1826,7 @@ impl CodeDb {
                     root,
                     param_names,
                     param_types,
+                    region_scope,
                     locals,
                 );
                 locals.pop();
@@ -1597,6 +1865,7 @@ impl CodeDb {
                     root,
                     param_names,
                     param_types,
+                    region_scope,
                     locals,
                 )?;
                 let bool_hash = type_hash_for("Bool");
@@ -1607,6 +1876,7 @@ impl CodeDb {
                     root,
                     param_names,
                     param_types,
+                    region_scope,
                     locals,
                 )?;
                 let else_expr = self.type_expr_with_locals(
@@ -1615,6 +1885,7 @@ impl CodeDb {
                     root,
                     param_names,
                     param_types,
+                    region_scope,
                     locals,
                 )?;
                 if then_expr.type_hash != else_expr.type_hash {
@@ -1663,6 +1934,7 @@ impl CodeDb {
                         root,
                         param_names,
                         param_types,
+                        region_scope,
                         locals,
                     )?;
                     typed_values.push((field.name.clone(), typed));
@@ -1714,6 +1986,7 @@ impl CodeDb {
                     root,
                     param_names,
                     param_types,
+                    region_scope,
                     locals,
                 )?;
                 self.type_field_access(root, &target, field)
@@ -1724,7 +1997,12 @@ impl CodeDb {
                 value,
             } => {
                 validate_projection_identifier("enum variant", variant)?;
-                let enum_type_hash = self.resolve_type_in_root(current_module, root, enum_type)?;
+                let enum_type_hash = self.resolve_type_in_root_with_regions(
+                    current_module,
+                    root,
+                    enum_type,
+                    region_scope,
+                )?;
                 let variant_type =
                     self.enum_variant_type_in_root(root, &enum_type_hash, variant)?;
                 let typed_value = self.type_expr_with_locals(
@@ -1733,6 +2011,7 @@ impl CodeDb {
                     root,
                     param_names,
                     param_types,
+                    region_scope,
                     locals,
                 )?;
                 require_type(
@@ -1770,6 +2049,7 @@ impl CodeDb {
                     root,
                     param_names,
                     param_types,
+                    region_scope,
                     locals,
                 )?;
                 let TypeSpec::Enum(variants) =
@@ -1811,6 +2091,7 @@ impl CodeDb {
                         root,
                         param_names,
                         param_types,
+                        region_scope,
                         locals,
                     );
                     if arm.binding.is_some() {
@@ -1874,7 +2155,7 @@ impl CodeDb {
         target: &TypeCheckResult,
         field: &str,
     ) -> Result<TypeCheckResult> {
-        let field_type = self.record_field_type_in_root(root, &target.type_hash, field)?;
+        let field_type = self.field_access_type_in_root(root, &target.type_hash, field)?;
         let expr_hash = self.put_object(
             "Expression",
             &json!({
@@ -1902,11 +2183,17 @@ impl CodeDb {
         self.validate_root_type_definitions(&root)?;
         for entry in &root.symbols {
             let (param_types, return_type) = self.signature_parts(&entry.signature)?;
+            let region_params = self.signature_region_params(&entry.signature)?;
+            validate_region_params(&region_params)?;
+            let allowed_regions = region_params
+                .iter()
+                .map(|param| param.region.clone())
+                .collect::<BTreeSet<_>>();
             self.signature_effects(&entry.signature)?;
             for param_type in &param_types {
-                self.validate_type_hash_in_root(&root, param_type, &BTreeSet::new())?;
+                self.validate_type_hash_in_root(&root, param_type, &allowed_regions)?;
             }
-            self.validate_type_hash_in_root(&root, &return_type, &BTreeSet::new())?;
+            self.validate_type_hash_in_root(&root, &return_type, &allowed_regions)?;
             let definition_signature = self.function_signature_hash(&entry.definition)?;
             if definition_signature != entry.signature {
                 bail!(
@@ -1937,10 +2224,153 @@ impl CodeDb {
                     self.type_name(&actual)?
                 );
             }
+            if self.expr_escapes_local_borrow(&body, &mut Vec::new())? {
+                bail!(
+                    "bad_borrow: function {} returns reference to local storage",
+                    self.symbol_display(&root, &entry.symbol)?
+                );
+            }
             self.verify_function_effects(&root, entry)?;
         }
         self.validate_tests_for_root(root_hash, &root)?;
         Ok(())
+    }
+
+    fn expr_escapes_local_borrow(
+        &self,
+        expr_hash: &str,
+        locals_with_local_borrows: &mut Vec<bool>,
+    ) -> Result<bool> {
+        let payload = self.get_payload(expr_hash)?;
+        let expr_kind = payload
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?;
+        match expr_kind {
+            "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" => Ok(false),
+            "local_ref" => {
+                let depth = payload
+                    .get("depth")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
+                    as usize;
+                Ok(local_bool_at_depth(locals_with_local_borrows, depth).unwrap_or(false))
+            }
+            "borrow_shared" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_shared missing target"))?;
+                self.borrow_target_is_local_storage(target)
+            }
+            "let" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing value"))?;
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing body"))?;
+                let value_has_local_borrow =
+                    self.expr_escapes_local_borrow(value_hash, locals_with_local_borrows)?;
+                locals_with_local_borrows.push(value_has_local_borrow);
+                let body_result =
+                    self.expr_escapes_local_borrow(body_hash, locals_with_local_borrows);
+                locals_with_local_borrows.pop();
+                body_result
+            }
+            "record_literal" => {
+                for field in payload
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let value_hash = field
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("record field missing value"))?;
+                    if self.expr_escapes_local_borrow(value_hash, locals_with_local_borrows)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            "field_access" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing target"))?;
+                self.expr_escapes_local_borrow(target, locals_with_local_borrows)
+            }
+            "if" => {
+                let then_hash = payload
+                    .get("then")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("if missing then"))?;
+                let else_hash = payload
+                    .get("else")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("if missing else"))?;
+                Ok(
+                    self.expr_escapes_local_borrow(then_hash, locals_with_local_borrows)?
+                        || self.expr_escapes_local_borrow(else_hash, locals_with_local_borrows)?,
+                )
+            }
+            "case" => {
+                for arm in payload
+                    .get("arms")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let body_hash = arm
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("case arm missing body"))?;
+                    if arm
+                        .get("binding_name")
+                        .is_some_and(|value| !value.is_null())
+                    {
+                        locals_with_local_borrows.push(false);
+                    }
+                    let body_result =
+                        self.expr_escapes_local_borrow(body_hash, locals_with_local_borrows);
+                    if arm
+                        .get("binding_name")
+                        .is_some_and(|value| !value.is_null())
+                    {
+                        locals_with_local_borrows.pop();
+                    }
+                    if body_result? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            "call" | "binary" | "unary" | "enum_construct" => Ok(false),
+            other => bail!("unknown expression kind {other}"),
+        }
+    }
+
+    fn borrow_target_is_local_storage(&self, expr_hash: &str) -> Result<bool> {
+        let payload = self.get_payload(expr_hash)?;
+        let expr_kind = payload
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?;
+        match expr_kind {
+            "param_ref" | "local_ref" => Ok(true),
+            "field_access" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing target"))?;
+                self.borrow_target_is_local_storage(target)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn validate_root_type_definitions(&self, root: &ProgramRootPayload) -> Result<()> {
@@ -2135,7 +2565,7 @@ impl CodeDb {
                         .ok_or_else(|| anyhow!("call arg must be hash"))?;
                     let arg_type =
                         self.verify_expr_type_with_locals(arg_hash, root, param_types, locals)?;
-                    if arg_type != expected_params[idx] {
+                    if !self.type_assignable_in_root(root, &arg_type, &expected_params[idx])? {
                         bail!("call arg type mismatch for {symbol} at arg {idx}");
                     }
                 }
@@ -2209,6 +2639,30 @@ impl CodeDb {
                     _ => bail!("unsupported unary op {op}"),
                 }
             }
+            "borrow_shared" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_shared missing target"))?;
+                let target_type =
+                    self.verify_expr_type_with_locals(target, root, param_types, locals)?;
+                let region = payload
+                    .get("region")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_shared missing region"))?;
+                let referent_type = payload
+                    .get("referent_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_shared missing referent_type"))?;
+                if referent_type != target_type {
+                    bail!("borrow_shared referent type mismatch");
+                }
+                hash_for_type_spec(&TypeSpec::Reference {
+                    region: region.to_string(),
+                    mutable: false,
+                    referent: target_type,
+                })?
+            }
             "let" => {
                 let binding_type = payload
                     .get("binding_type")
@@ -2230,7 +2684,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("let missing body"))?;
                 let value_type =
                     self.verify_expr_type_with_locals(value_hash, root, param_types, locals)?;
-                if value_type != binding_type {
+                if !self.type_assignable_in_root(root, &value_type, &binding_type)? {
                     bail!("let binding type mismatch");
                 }
                 locals.push(binding_type);
@@ -2311,7 +2765,7 @@ impl CodeDb {
                 validate_projection_identifier("record field", field)?;
                 let target_type =
                     self.verify_expr_type_with_locals(target_hash, root, param_types, locals)?;
-                self.record_field_type_in_root(root, &target_type, field)?
+                self.field_access_type_in_root(root, &target_type, field)?
             }
             "enum_construct" => {
                 let enum_type = payload
@@ -2442,6 +2896,14 @@ fn local_type_at_depth(locals: &[String], depth: usize) -> Option<&String> {
         .len()
         .checked_sub(depth + 1)
         .and_then(|idx| locals.get(idx))
+}
+
+fn local_bool_at_depth(locals: &[bool], depth: usize) -> Option<bool> {
+    locals
+        .len()
+        .checked_sub(depth + 1)
+        .and_then(|idx| locals.get(idx))
+        .copied()
 }
 
 pub(crate) fn type_hash_for(type_kind: &str) -> String {

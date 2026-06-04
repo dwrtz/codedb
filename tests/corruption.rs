@@ -458,18 +458,18 @@ fn verify_allows_succeeded_artifact_job_without_disposable_cache_entry() {
     ]);
 
     let conn = Connection::open(&db).unwrap();
-    let cache_key: String = conn
-        .query_row(
-            "SELECT cache_key FROM artifact_jobs
-             WHERE status = 'succeeded'
-             ORDER BY cache_key LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
     conn.execute(
-        "DELETE FROM compile_cache WHERE cache_key = ?1",
-        [&cache_key],
+        "INSERT INTO artifact_jobs
+         (cache_key, artifact_kind, status, worker_id, started_at, finished_at)
+         VALUES (
+           'sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+           'canonical_source',
+           'succeeded',
+           'worker:test',
+           CURRENT_TIMESTAMP,
+           CURRENT_TIMESTAMP
+         )",
+        [],
     )
     .unwrap();
 

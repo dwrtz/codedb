@@ -556,6 +556,8 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::ConstUnit { .. }
             | LoweredOp::Unary { .. }
             | LoweredOp::Binary { .. }
+            | LoweredOp::BorrowShared { .. }
+            | LoweredOp::DerefShared { .. }
             | LoweredOp::AddrOfParam { .. }
             | LoweredOp::AddrOfLocal { .. }
             | LoweredOp::AddrOfField { .. }
@@ -584,14 +586,9 @@ fn validate_native_ir(ir: &LoweredFunctionIr) -> Result<()> {
     if ir.params.len() > 6 {
         bail!("native object backend v0 supports at most 6 parameters");
     }
-    for param in &ir.params {
-        if param.type_hash != i64_type && param.type_hash != bool_type {
-            bail!("native object backend v0 supports only i64 and bool parameters");
-        }
-    }
     for local in &ir.locals {
-        if !is_native_scalar_type(&local.type_hash, &i64_type, &bool_type, &unit_type) {
-            bail!("native object backend v0 supports only scalar local slots");
+        if local.size_bytes == 0 || !local.size_bytes.is_multiple_of(8) {
+            bail!("native object backend v0 local slots must be nonzero multiples of 8 bytes");
         }
     }
     let mut values = BTreeMap::new();
@@ -633,8 +630,12 @@ fn validate_native_ops(
                     bail!("native object backend v0 supports only i64, bool, and unit values");
                 }
             }
+            LoweredOp::BorrowShared { .. } | LoweredOp::DerefShared { .. } => {}
             LoweredOp::AddrOfParam { place, .. } => {
-                let LoweredPlace::Param { slot, type_hash } = place else {
+                let LoweredPlace::Param {
+                    slot, type_hash, ..
+                } = place
+                else {
                     bail!("addr_of_param must contain a param place");
                 };
                 if params
@@ -642,9 +643,6 @@ fn validate_native_ops(
                     .is_none_or(|param| param.slot != *slot || param.type_hash != *type_hash)
                 {
                     bail!("native object backend saw invalid addr_of_param");
-                }
-                if !is_native_scalar_type(type_hash, i64_type, bool_type, unit_type) {
-                    bail!("native object backend v0 supports only scalar addr_of_param");
                 }
             }
             LoweredOp::AddrOfLocal { place, .. } => {
@@ -657,12 +655,10 @@ fn validate_native_ops(
                 {
                     bail!("native object backend saw invalid addr_of_local");
                 }
-                if !is_native_scalar_type(type_hash, i64_type, bool_type, unit_type) {
-                    bail!("native object backend v0 supports only scalar addr_of_local");
-                }
             }
-            LoweredOp::AddrOfField { .. } | LoweredOp::AddrOfIndex { .. } => {
-                bail!("native object backend v0 does not support aggregate address operations");
+            LoweredOp::AddrOfField { .. } => {}
+            LoweredOp::AddrOfIndex { .. } => {
+                bail!("native object backend v0 does not support index address operations");
             }
             LoweredOp::Load { type_hash, .. }
             | LoweredOp::Store { type_hash, .. }
@@ -670,9 +666,7 @@ fn validate_native_ops(
             | LoweredOp::Move { type_hash, .. }
             | LoweredOp::Drop { type_hash, .. }
             | LoweredOp::BorrowDebug { type_hash, .. } => {
-                if !is_native_scalar_type(type_hash, i64_type, bool_type, unit_type) {
-                    bail!("native object backend v0 supports only scalar memory values");
-                }
+                let _ = type_hash;
             }
         }
         validate_native_op_flow(op, params, locals, values, addresses)?;
@@ -786,8 +780,32 @@ fn validate_native_op_flow(
             native_value_type(values, cond)?;
             native_insert_value(values, id, type_hash)?;
         }
+        LoweredOp::BorrowShared {
+            id,
+            address,
+            referent_type_hash,
+            type_hash,
+            ..
+        } => {
+            if native_address_type(addresses, address)? != referent_type_hash {
+                bail!("native object backend saw borrow_shared referent mismatch");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::DerefShared {
+            id,
+            reference,
+            referent_type_hash,
+        } => {
+            native_value_type(values, reference)?;
+            native_insert_address(addresses, id, referent_type_hash)?;
+            native_insert_value(values, id, referent_type_hash)?;
+        }
         LoweredOp::AddrOfParam { id, place } => {
-            let LoweredPlace::Param { slot, type_hash } = place else {
+            let LoweredPlace::Param {
+                slot, type_hash, ..
+            } = place
+            else {
                 bail!("addr_of_param must contain a param place");
             };
             if params
@@ -797,6 +815,7 @@ fn validate_native_op_flow(
                 bail!("native object backend saw invalid addr_of_param");
             }
             native_insert_address(addresses, id, type_hash)?;
+            native_insert_value(values, id, type_hash)?;
         }
         LoweredOp::AddrOfLocal { id, place } => {
             let LoweredPlace::Local { slot, type_hash } = place else {
@@ -809,8 +828,25 @@ fn validate_native_op_flow(
                 bail!("native object backend saw invalid addr_of_local");
             }
             native_insert_address(addresses, id, type_hash)?;
+            native_insert_value(values, id, type_hash)?;
         }
-        LoweredOp::AddrOfField { .. } | LoweredOp::AddrOfIndex { .. } => {}
+        LoweredOp::AddrOfField { id, place } => {
+            let LoweredPlace::Field {
+                base,
+                owner_type_hash,
+                type_hash,
+                ..
+            } = place
+            else {
+                bail!("addr_of_field must contain a field place");
+            };
+            if native_address_type(addresses, base)? != owner_type_hash {
+                bail!("native object backend saw addr_of_field owner mismatch");
+            }
+            native_insert_address(addresses, id, type_hash)?;
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::AddrOfIndex { .. } => {}
         LoweredOp::Load {
             id,
             address,
@@ -1019,25 +1055,27 @@ impl StackLayout {
         let mut ids = Vec::new();
         collect_value_ids(&ir.operations, &mut ids)?;
         let mut value_offsets = BTreeMap::new();
-        let mut next_slot = ir.params.len();
+        let mut next_offset = ir.params.len() as i32 * 8;
         let mut local_offsets = BTreeMap::new();
         for local in &ir.locals {
             if local.slot != local_offsets.len() {
                 bail!("lowered local slots must be sequential");
             }
-            let offset = -8 * (next_slot as i32 + 1);
+            let size = i32::try_from(local.size_bytes)?;
+            let size = ((size + 7) / 8) * 8;
+            let offset = -(next_offset + size);
             local_offsets.insert(local.slot, offset);
-            next_slot += 1;
+            next_offset += size;
         }
         for id in ids {
-            let offset = -8 * (next_slot as i32 + 1);
+            let offset = -(next_offset + 8);
             value_offsets.insert(id, offset);
-            next_slot += 1;
+            next_offset += 8;
         }
         let param_offsets = (0..ir.params.len())
             .map(|idx| -8 * (idx as i32 + 1))
             .collect::<Vec<_>>();
-        let raw_size = next_slot as i32 * 8;
+        let raw_size = next_offset;
         let stack_size = if raw_size == 0 {
             0
         } else {
@@ -1071,6 +1109,8 @@ fn collect_value_ids_inner(
             | LoweredOp::Unary { id, .. }
             | LoweredOp::Binary { id, .. }
             | LoweredOp::Call { id, .. }
+            | LoweredOp::BorrowShared { id, .. }
+            | LoweredOp::DerefShared { id, .. }
             | LoweredOp::AddrOfParam { id, .. }
             | LoweredOp::AddrOfLocal { id, .. }
             | LoweredOp::AddrOfField { id, .. }
@@ -1223,8 +1263,16 @@ impl FunctionEmitter {
             } => {
                 self.emit_if(id, cond, then_block, else_block)?;
             }
+            LoweredOp::BorrowShared { id, address, .. } => {
+                self.mov_rax_stack(self.value_offset(address)?);
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::DerefShared { id, reference, .. } => {
+                self.mov_rax_stack(self.value_offset(reference)?);
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
             LoweredOp::AddrOfParam { id, place } => {
-                let LoweredPlace::Param { slot, .. } = place else {
+                let LoweredPlace::Param { slot, indirect, .. } = place else {
                     bail!("addr_of_param must contain a param place");
                 };
                 let offset = *self
@@ -1232,7 +1280,11 @@ impl FunctionEmitter {
                     .param_offsets
                     .get(*slot)
                     .ok_or_else(|| anyhow!("parameter slot out of bounds {slot}"))?;
-                self.lea_rax_stack(offset);
+                if *indirect {
+                    self.mov_rax_stack(offset);
+                } else {
+                    self.lea_rax_stack(offset);
+                }
                 self.mov_stack_rax(self.value_offset(id)?);
             }
             LoweredOp::AddrOfLocal { id, place } => {
@@ -1242,8 +1294,19 @@ impl FunctionEmitter {
                 self.lea_rax_stack(self.local_offset(*slot)?);
                 self.mov_stack_rax(self.value_offset(id)?);
             }
-            LoweredOp::AddrOfField { .. } | LoweredOp::AddrOfIndex { .. } => {
-                bail!("native x86_64 backend v0 does not support aggregate address operations");
+            LoweredOp::AddrOfField { id, place } => {
+                let LoweredPlace::Field {
+                    base, offset_bytes, ..
+                } = place
+                else {
+                    bail!("addr_of_field must contain a field place");
+                };
+                self.mov_rax_stack(self.value_offset(base)?);
+                self.add_rax_imm32(i32::try_from(*offset_bytes)?);
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::AddrOfIndex { .. } => {
+                bail!("native x86_64 backend v0 does not support index address operations");
             }
             LoweredOp::Load {
                 id,
@@ -1421,6 +1484,14 @@ impl FunctionEmitter {
         self.text.extend_from_slice(&[0x48, 0x8b, 0x00]);
     }
 
+    fn add_rax_imm32(&mut self, value: i32) {
+        if value == 0 {
+            return;
+        }
+        self.text.extend_from_slice(&[0x48, 0x05]);
+        self.push_i32(value);
+    }
+
     fn mov_rcx_stack(&mut self, offset: i32) {
         self.text.extend_from_slice(&[0x48, 0x8b, 0x8d]);
         self.push_i32(offset);
@@ -1555,25 +1626,27 @@ impl Arm64StackLayout {
         let mut ids = Vec::new();
         collect_value_ids(&ir.operations, &mut ids)?;
         let mut value_offsets = BTreeMap::new();
-        let mut next_slot = ir.params.len();
+        let mut next_offset = ir.params.len() as u32 * 8;
         let mut local_offsets = BTreeMap::new();
         for local in &ir.locals {
             if local.slot != local_offsets.len() {
                 bail!("lowered local slots must be sequential");
             }
-            let offset = 8 * next_slot as u32;
+            let size = u32::try_from(local.size_bytes)?;
+            let size = size.div_ceil(8) * 8;
+            let offset = next_offset;
             local_offsets.insert(local.slot, offset);
-            next_slot += 1;
+            next_offset += size;
         }
         for id in ids {
-            let offset = 8 * next_slot as u32;
+            let offset = next_offset;
             value_offsets.insert(id, offset);
-            next_slot += 1;
+            next_offset += 8;
         }
         let param_offsets = (0..ir.params.len())
             .map(|idx| 8 * idx as u32)
             .collect::<Vec<_>>();
-        let raw_size = next_slot as u32 * 8;
+        let raw_size = next_offset;
         let stack_size = if raw_size == 0 {
             0
         } else {
@@ -1707,8 +1780,16 @@ impl Arm64Emitter {
             } => {
                 self.emit_if(id, cond, then_block, else_block)?;
             }
+            LoweredOp::BorrowShared { id, address, .. } => {
+                self.ldr_stack(0, self.value_offset(address)?)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::DerefShared { id, reference, .. } => {
+                self.ldr_stack(0, self.value_offset(reference)?)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
             LoweredOp::AddrOfParam { id, place } => {
-                let LoweredPlace::Param { slot, .. } = place else {
+                let LoweredPlace::Param { slot, indirect, .. } = place else {
                     bail!("addr_of_param must contain a param place");
                 };
                 let offset = *self
@@ -1716,7 +1797,11 @@ impl Arm64Emitter {
                     .param_offsets
                     .get(*slot)
                     .ok_or_else(|| anyhow!("parameter slot out of bounds {slot}"))?;
-                self.add_reg_sp_imm(0, offset)?;
+                if *indirect {
+                    self.ldr_stack(0, offset)?;
+                } else {
+                    self.add_reg_sp_imm(0, offset)?;
+                }
                 self.str_stack(0, self.value_offset(id)?)?;
             }
             LoweredOp::AddrOfLocal { id, place } => {
@@ -1726,8 +1811,19 @@ impl Arm64Emitter {
                 self.add_reg_sp_imm(0, self.local_offset(*slot)?)?;
                 self.str_stack(0, self.value_offset(id)?)?;
             }
-            LoweredOp::AddrOfField { .. } | LoweredOp::AddrOfIndex { .. } => {
-                bail!("native arm64 backend v0 does not support aggregate address operations");
+            LoweredOp::AddrOfField { id, place } => {
+                let LoweredPlace::Field {
+                    base, offset_bytes, ..
+                } = place
+                else {
+                    bail!("addr_of_field must contain a field place");
+                };
+                self.ldr_stack(0, self.value_offset(base)?)?;
+                self.add_reg_imm(0, 0, u32::try_from(*offset_bytes)?)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::AddrOfIndex { .. } => {
+                bail!("native arm64 backend v0 does not support index address operations");
             }
             LoweredOp::Load {
                 id,
@@ -1902,6 +1998,20 @@ impl Arm64Emitter {
             bail!("arm64 stack address offset too large");
         }
         self.emit_u32(0x910003e0 | (imm << 10) | u32::from(reg));
+        Ok(())
+    }
+
+    fn add_reg_imm(&mut self, rd: u8, rn: u8, imm: u32) -> Result<()> {
+        if rd > 30 || rn > 30 {
+            bail!("invalid arm64 general register");
+        }
+        if imm == 0 {
+            return Ok(());
+        }
+        if imm > 4095 {
+            bail!("arm64 register add offset too large");
+        }
+        self.emit_u32(0x91000000 | (imm << 10) | (u32::from(rn) << 5) | u32::from(rd));
         Ok(())
     }
 

@@ -74,6 +74,12 @@ impl TraceValue {
             },
             Value::Bool(value) => TraceValue::Bool { value: *value },
             Value::Unit => TraceValue::Unit,
+            Value::SharedRef(value) => TraceValue::Record {
+                fields: vec![TraceRecordField {
+                    name: "ref".to_string(),
+                    value: TraceValue::from_value(value),
+                }],
+            },
             Value::Record(fields) => TraceValue::Record {
                 fields: fields
                     .iter()
@@ -769,6 +775,31 @@ impl CodeDb {
                     value,
                 )
             }
+            "borrow_shared" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_shared missing target"))?;
+                let value = self
+                    .trace_expr(
+                        state,
+                        frame,
+                        symbol_hash,
+                        function_def_hash,
+                        target_hash,
+                        args,
+                        locals,
+                    )
+                    .map(|value| Value::SharedRef(Box::new(value)));
+                self.finish_current_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    expr_hash,
+                    value,
+                )
+            }
             "let" => {
                 let name = payload
                     .get("binding_name")
@@ -950,6 +981,13 @@ impl CodeDb {
                         .get(field)
                         .cloned()
                         .ok_or_else(|| anyhow!("record value has no field {field}")),
+                    Value::SharedRef(value) => match value.as_ref() {
+                        Value::Record(fields) => fields
+                            .get(field)
+                            .cloned()
+                            .ok_or_else(|| anyhow!("record value has no field {field}")),
+                        other => bail!("field access target evaluated to non-record {other}"),
+                    },
                     other => bail!("field access target evaluated to non-record {other}"),
                 };
                 self.finish_current_expr(

@@ -33,6 +33,8 @@ pub(crate) enum Operation {
         module: String,
         name: String,
         birth_seed: String,
+        #[serde(default)]
+        region_params: Vec<String>,
         params: Vec<ParamSpec>,
         return_type: String,
         #[serde(default)]
@@ -43,6 +45,8 @@ pub(crate) enum Operation {
         module: String,
         name: String,
         birth_seed: String,
+        #[serde(default)]
+        region_params: Vec<String>,
         params: Vec<ParamSpec>,
         return_type: String,
         #[serde(default)]
@@ -138,6 +142,8 @@ pub(crate) enum Operation {
         module: String,
         symbol: String,
         name: String,
+        #[serde(default)]
+        region_params: Vec<String>,
         params: Vec<ParamSpec>,
         return_type: String,
         #[serde(default)]
@@ -256,6 +262,7 @@ struct ChangeSignatureApply<'a> {
     module: &'a str,
     symbol: &'a str,
     name: &'a str,
+    region_params: &'a [String],
     params: &'a [ParamSpec],
     return_type: &'a str,
     effects: &'a [Effect],
@@ -625,6 +632,7 @@ pub(crate) enum Postcondition {
     FunctionSourceMatches {
         module: String,
         name: String,
+        region_params: Vec<String>,
         params: Vec<ParamSpec>,
         return_type: String,
         effects: Vec<Effect>,
@@ -633,6 +641,7 @@ pub(crate) enum Postcondition {
     ExternalFunctionSourceMatches {
         module: String,
         name: String,
+        region_params: Vec<String>,
         params: Vec<ParamSpec>,
         return_type: String,
         effects: Vec<Effect>,
@@ -694,6 +703,7 @@ pub(crate) enum Postcondition {
         module: String,
         name: String,
         symbol: String,
+        region_params: Vec<String>,
         params: Vec<ParamSpec>,
         return_type: String,
         effects: Vec<Effect>,
@@ -803,6 +813,10 @@ fn append_default_arg_to_calls(expr: &RawExpr, target_name: &str, default: &RawE
         RawExpr::Unary { op, expr } => RawExpr::Unary {
             op: op.clone(),
             expr: Box::new(append_default_arg_to_calls(expr, target_name, default)),
+        },
+        RawExpr::BorrowShared { region, target } => RawExpr::BorrowShared {
+            region: region.clone(),
+            target: Box::new(append_default_arg_to_calls(target, target_name, default)),
         },
         RawExpr::Let {
             name,
@@ -1850,6 +1864,7 @@ impl CodeDb {
             Operation::CreateFunction {
                 module,
                 name,
+                region_params,
                 params,
                 return_type,
                 effects,
@@ -1862,6 +1877,7 @@ impl CodeDb {
                 Postcondition::FunctionSourceMatches {
                     module: module.clone(),
                     name: name.clone(),
+                    region_params: region_params.clone(),
                     params: params.clone(),
                     return_type: return_type.clone(),
                     effects: effects.clone(),
@@ -1871,6 +1887,7 @@ impl CodeDb {
             Operation::CreateExternalFunction {
                 module,
                 name,
+                region_params,
                 params,
                 return_type,
                 effects,
@@ -1885,6 +1902,7 @@ impl CodeDb {
                 Postcondition::ExternalFunctionSourceMatches {
                     module: module.clone(),
                     name: name.clone(),
+                    region_params: region_params.clone(),
                     params: params.clone(),
                     return_type: return_type.clone(),
                     effects: effects.clone(),
@@ -2124,6 +2142,7 @@ impl CodeDb {
                 module,
                 symbol,
                 name,
+                region_params,
                 params,
                 return_type,
                 effects,
@@ -2135,6 +2154,7 @@ impl CodeDb {
                     module: module.clone(),
                     name: name.clone(),
                     symbol: symbol.clone(),
+                    region_params: region_params.clone(),
                     params: params.clone(),
                     return_type: return_type.clone(),
                     effects: effects.clone(),
@@ -2391,6 +2411,7 @@ impl CodeDb {
             Postcondition::FunctionSourceMatches {
                 module,
                 name,
+                region_params,
                 params,
                 return_type,
                 effects,
@@ -2407,6 +2428,7 @@ impl CodeDb {
                     root,
                     module,
                     &symbol,
+                    region_params,
                     params,
                     return_type,
                     effects,
@@ -2421,6 +2443,7 @@ impl CodeDb {
             Postcondition::ExternalFunctionSourceMatches {
                 module,
                 name,
+                region_params,
                 params,
                 return_type,
                 effects,
@@ -2435,6 +2458,7 @@ impl CodeDb {
                     root,
                     module,
                     &symbol,
+                    region_params,
                     params,
                     return_type,
                     effects,
@@ -2508,6 +2532,7 @@ impl CodeDb {
                 module,
                 name,
                 symbol,
+                region_params,
                 params,
                 return_type,
                 effects,
@@ -2519,6 +2544,7 @@ impl CodeDb {
                     root,
                     module,
                     symbol,
+                    region_params,
                     params,
                     return_type,
                     effects,
@@ -2557,6 +2583,7 @@ impl CodeDb {
         root: &ProgramRootPayload,
         module: &str,
         symbol: &str,
+        region_param_names: &[String],
         params: &[ParamSpec],
         return_type: &str,
         effects: &[Effect],
@@ -2565,11 +2592,33 @@ impl CodeDb {
             return Ok(false);
         };
         let (actual_params, actual_return_type) = self.signature_parts(&entry.signature)?;
+        let actual_region_params = self.signature_region_params(&entry.signature)?;
+        if actual_region_params
+            .iter()
+            .map(|param| param.name.clone())
+            .collect::<Vec<_>>()
+            != region_param_names
+        {
+            return Ok(false);
+        }
+        let region_scope = region_scope_from_params(&actual_region_params);
         let expected_params = params
             .iter()
-            .map(|param| self.type_hash_for_source_in_root(module, root, &param.ty))
+            .map(|param| {
+                self.type_hash_for_source_in_root_with_regions(
+                    module,
+                    root,
+                    &param.ty,
+                    &region_scope,
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
-        let expected_return_type = self.type_hash_for_source_in_root(module, root, return_type)?;
+        let expected_return_type = self.type_hash_for_source_in_root_with_regions(
+            module,
+            root,
+            return_type,
+            &region_scope,
+        )?;
         let expected_effects = crate::types::normalize_effects(effects)?;
         let actual_effects = self.signature_effects(&entry.signature)?;
         let expected_names = params
@@ -2588,6 +2637,7 @@ impl CodeDb {
         root: &ProgramRootPayload,
         module: &str,
         symbol: &str,
+        region_params: &[String],
         params: &[ParamSpec],
         return_type: &str,
         effects: &[Effect],
@@ -2602,6 +2652,7 @@ impl CodeDb {
             root,
             module,
             symbol,
+            region_params,
             params,
             return_type,
             effects,
@@ -2629,7 +2680,13 @@ impl CodeDb {
             return Ok(false);
         };
         let body = self.function_body_hash(&entry.definition)?;
-        let actual = self.typed_expr_to_raw_in_module(&body, root, module)?;
+        let region_names = self
+            .signature_region_params(&entry.signature)?
+            .into_iter()
+            .map(|param| (param.region, param.name))
+            .collect::<BTreeMap<_, _>>();
+        let actual =
+            self.typed_expr_to_raw_in_module_with_regions(&body, root, module, &region_names)?;
         let expected = normalize_param_refs(expected_body, local_params);
         Ok(actual == expected)
     }
@@ -2645,6 +2702,7 @@ impl CodeDb {
                 module,
                 name,
                 birth_seed,
+                region_params,
                 params,
                 return_type,
                 effects,
@@ -2655,6 +2713,7 @@ impl CodeDb {
                 module,
                 name,
                 birth_seed,
+                region_params,
                 params,
                 return_type,
                 effects,
@@ -2664,6 +2723,7 @@ impl CodeDb {
                 module,
                 name,
                 birth_seed,
+                region_params,
                 params,
                 return_type,
                 effects,
@@ -2676,6 +2736,7 @@ impl CodeDb {
                 module,
                 name,
                 birth_seed,
+                region_params,
                 params,
                 return_type,
                 effects,
@@ -2822,6 +2883,7 @@ impl CodeDb {
                 module,
                 symbol,
                 name,
+                region_params,
                 params,
                 return_type,
                 effects,
@@ -2830,6 +2892,7 @@ impl CodeDb {
                 module,
                 symbol,
                 name,
+                region_params,
                 params,
                 return_type,
                 effects,
@@ -2917,6 +2980,7 @@ impl CodeDb {
         module: &str,
         name: &str,
         birth_seed: &str,
+        region_param_names: &[String],
         params: &[ParamSpec],
         return_type: &str,
         effects: &[Effect],
@@ -2935,19 +2999,40 @@ impl CodeDb {
         }
 
         let symbol = self.put_symbol_birth(parent_history_hash, birth_seed)?;
+        validate_region_param_names(region_param_names)?;
+        let region_params = self.function_region_params(
+            parent_history_hash,
+            &symbol,
+            birth_seed,
+            region_param_names,
+        )?;
+        let region_scope = region_scope_from_params(&region_params);
         let param_types = params
             .iter()
-            .map(|param| self.resolve_type_in_root(module, &root, &param.ty))
+            .map(|param| {
+                self.resolve_type_in_root_with_regions(module, &root, &param.ty, &region_scope)
+            })
             .collect::<Result<Vec<_>>>()?;
-        let return_type_hash = self.resolve_type_in_root(module, &root, return_type)?;
-        let signature =
-            self.put_signature_with_effects(&param_types, &return_type_hash, effects)?;
+        let return_type_hash =
+            self.resolve_type_in_root_with_regions(module, &root, return_type, &region_scope)?;
+        let signature = self.put_signature_with_effects_and_regions(
+            &param_types,
+            &return_type_hash,
+            effects,
+            &region_params,
+        )?;
         let param_name_list = params
             .iter()
             .map(|param| param.name.clone())
             .collect::<Vec<_>>();
-        let typed_body =
-            self.type_expr_in_module(module, body, &root, &param_name_list, &param_types)?;
+        let typed_body = self.type_expr_in_module_with_regions(
+            module,
+            body,
+            &root,
+            &param_name_list,
+            &param_types,
+            &region_scope,
+        )?;
         if typed_body.type_hash != return_type_hash {
             bail!(
                 "function {module}.{name} body type {} does not match return type {}",
@@ -2993,6 +3078,7 @@ impl CodeDb {
         module: &str,
         name: &str,
         birth_seed: &str,
+        region_param_names: &[String],
         params: &[ParamSpec],
         return_type: &str,
         effects: &[Effect],
@@ -3013,13 +3099,28 @@ impl CodeDb {
         }
 
         let symbol = self.put_symbol_birth(parent_history_hash, birth_seed)?;
+        validate_region_param_names(region_param_names)?;
+        let region_params = self.function_region_params(
+            parent_history_hash,
+            &symbol,
+            birth_seed,
+            region_param_names,
+        )?;
+        let region_scope = region_scope_from_params(&region_params);
         let param_types = params
             .iter()
-            .map(|param| self.resolve_type_in_root(module, &root, &param.ty))
+            .map(|param| {
+                self.resolve_type_in_root_with_regions(module, &root, &param.ty, &region_scope)
+            })
             .collect::<Result<Vec<_>>>()?;
-        let return_type_hash = self.resolve_type_in_root(module, &root, return_type)?;
-        let signature =
-            self.put_signature_with_effects(&param_types, &return_type_hash, effects)?;
+        let return_type_hash =
+            self.resolve_type_in_root_with_regions(module, &root, return_type, &region_scope)?;
+        let signature = self.put_signature_with_effects_and_regions(
+            &param_types,
+            &return_type_hash,
+            effects,
+            &region_params,
+        )?;
         let definition =
             self.put_external_function(&symbol, &signature, abi, link_name, library)?;
         let param_name_list = params
@@ -3621,9 +3722,16 @@ impl CodeDb {
             bail!("cannot replace body for external function {module}.{name}");
         }
         let (param_types, return_type) = self.signature_parts(&signature)?;
+        let region_scope = region_scope_from_params(&self.signature_region_params(&signature)?);
         let param_name_list = param_names(&root, symbol);
-        let typed_body =
-            self.type_expr_in_module(module, body, &root, &param_name_list, &param_types)?;
+        let typed_body = self.type_expr_in_module_with_regions(
+            module,
+            body,
+            &root,
+            &param_name_list,
+            &param_types,
+            &region_scope,
+        )?;
         if typed_body.type_hash != return_type {
             bail!(
                 "replacement body type {} does not match return type {}",
@@ -3645,22 +3753,34 @@ impl CodeDb {
             module,
             symbol,
             name,
+            region_params: region_param_names,
             params,
             return_type,
             effects,
         } = change;
         validate_param_names(params)?;
+        validate_region_param_names(region_param_names)?;
         let mut root = self.load_root(input_root)?;
         self.assert_name_points(&root, module, name, symbol)?;
         let idx = root_symbol_index(&root, symbol)?;
         let old_definition = root.symbols[idx].definition.clone();
+        let region_params =
+            self.function_region_params(None, symbol, "change_signature", region_param_names)?;
+        let region_scope = region_scope_from_params(&region_params);
         let param_types = params
             .iter()
-            .map(|param| self.resolve_type_in_root(module, &root, &param.ty))
+            .map(|param| {
+                self.resolve_type_in_root_with_regions(module, &root, &param.ty, &region_scope)
+            })
             .collect::<Result<Vec<_>>>()?;
-        let return_type_hash = self.resolve_type_in_root(module, &root, return_type)?;
-        let signature =
-            self.put_signature_with_effects(&param_types, &return_type_hash, effects)?;
+        let return_type_hash =
+            self.resolve_type_in_root_with_regions(module, &root, return_type, &region_scope)?;
+        let signature = self.put_signature_with_effects_and_regions(
+            &param_types,
+            &return_type_hash,
+            effects,
+            &region_params,
+        )?;
         let param_name_list = params
             .iter()
             .map(|param| param.name.clone())
@@ -3684,9 +3804,25 @@ impl CodeDb {
             return Ok(new_root);
         }
         let old_body_hash = self.function_body_hash(&old_definition)?;
-        let raw_body = self.typed_expr_to_raw_in_module(&old_body_hash, &root, module)?;
-        let typed_body =
-            self.type_expr_in_module(module, &raw_body, &root, &param_name_list, &param_types)?;
+        let old_region_names = self
+            .signature_region_params(&root.symbols[idx].signature)?
+            .into_iter()
+            .map(|param| (param.region, param.name))
+            .collect::<BTreeMap<_, _>>();
+        let raw_body = self.typed_expr_to_raw_in_module_with_regions(
+            &old_body_hash,
+            &root,
+            module,
+            &old_region_names,
+        )?;
+        let typed_body = self.type_expr_in_module_with_regions(
+            module,
+            &raw_body,
+            &root,
+            &param_name_list,
+            &param_types,
+            &region_scope,
+        )?;
         if typed_body.type_hash != return_type_hash {
             bail!(
                 "body type {} does not match new return type {}",
@@ -3735,11 +3871,28 @@ impl CodeDb {
             bail!("cannot add parameter to external function {module}.{name}");
         }
         let old_body_hash = self.function_body_hash(&old_definition)?;
-        let old_body = self.typed_expr_to_raw_in_module(&old_body_hash, &root, module)?;
+        let old_region_names = self
+            .signature_region_params(&old_signature)?
+            .into_iter()
+            .map(|param| (param.region, param.name))
+            .collect::<BTreeMap<_, _>>();
+        let old_body = self.typed_expr_to_raw_in_module_with_regions(
+            &old_body_hash,
+            &root,
+            module,
+            &old_region_names,
+        )?;
         let (mut param_types, return_type) = self.signature_parts(&old_signature)?;
+        let region_params = self.signature_region_params(&old_signature)?;
+        let region_scope = region_scope_from_params(&region_params);
         let effects = self.signature_effects(&old_signature)?;
         let mut param_name_list = param_names(&root, symbol);
-        param_types.push(self.resolve_type_in_root(module, &root, &param.ty)?);
+        param_types.push(self.resolve_type_in_root_with_regions(
+            module,
+            &root,
+            &param.ty,
+            &region_scope,
+        )?);
         param_name_list.push(param.name.clone());
         let params = param_types
             .iter()
@@ -3753,7 +3906,12 @@ impl CodeDb {
             .collect::<Result<Vec<_>>>()?;
         validate_param_names(&params)?;
 
-        let signature = self.put_signature_with_effects(&param_types, &return_type, &effects)?;
+        let signature = self.put_signature_with_effects_and_regions(
+            &param_types,
+            &return_type,
+            &effects,
+            &region_params,
+        )?;
         root.symbols[idx].signature = signature.clone();
         upsert_param_names(&mut root, symbol, param_name_list.clone());
 
@@ -3767,8 +3925,14 @@ impl CodeDb {
         } else {
             old_body
         };
-        let typed_body =
-            self.type_expr_in_module(module, &target_body, &root, &param_name_list, &param_types)?;
+        let typed_body = self.type_expr_in_module_with_regions(
+            module,
+            &target_body,
+            &root,
+            &param_name_list,
+            &param_types,
+            &region_scope,
+        )?;
         if typed_body.type_hash != return_type {
             bail!(
                 "body type {} does not match new return type {}",
@@ -3792,8 +3956,17 @@ impl CodeDb {
                     .preferred_binding(&root, &caller)
                     .map(|binding| binding.module.clone())
                     .unwrap_or_else(|| MAIN_BRANCH.to_string());
-                let caller_body =
-                    self.typed_expr_to_raw_in_module(&caller_body_hash, &root, &caller_module)?;
+                let caller_region_names = self
+                    .signature_region_params(&caller_signature)?
+                    .into_iter()
+                    .map(|param| (param.region, param.name))
+                    .collect::<BTreeMap<_, _>>();
+                let caller_body = self.typed_expr_to_raw_in_module_with_regions(
+                    &caller_body_hash,
+                    &root,
+                    &caller_module,
+                    &caller_region_names,
+                )?;
                 let caller_target_name =
                     self.symbol_display_for_module(&root, &caller_module, symbol)?;
                 let patched_body =
@@ -3803,13 +3976,16 @@ impl CodeDb {
                 }
                 let (caller_param_types, caller_return_type) =
                     self.signature_parts(&caller_signature)?;
+                let caller_region_scope =
+                    region_scope_from_params(&self.signature_region_params(&caller_signature)?);
                 let caller_param_names = param_names(&root, &caller);
-                let typed_caller = self.type_expr_in_module(
+                let typed_caller = self.type_expr_in_module_with_regions(
                     &caller_module,
                     &patched_body,
                     &root,
                     &caller_param_names,
                     &caller_param_types,
+                    &caller_region_scope,
                 )?;
                 if typed_caller.type_hash != caller_return_type {
                     bail!(
@@ -5220,6 +5396,31 @@ fn region_scope_from_params(params: &[RegionParamDef]) -> BTreeMap<String, Strin
         .collect()
 }
 
+impl CodeDb {
+    fn function_region_params(
+        &mut self,
+        parent_history_hash: Option<&str>,
+        owner_symbol: &str,
+        birth_seed: &str,
+        names: &[String],
+    ) -> Result<Vec<RegionParamDef>> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| {
+                Ok(RegionParamDef {
+                    region: self.put_region_param_birth(
+                        parent_history_hash,
+                        owner_symbol,
+                        &format!("{birth_seed}:region:{idx}:{name}"),
+                    )?,
+                    name: name.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
 fn normalize_param_refs(expr: &RawExpr, local_params: &[String]) -> RawExpr {
     normalize_param_refs_scoped(expr, local_params, &mut Vec::new())
 }
@@ -5271,6 +5472,14 @@ fn normalize_param_refs_scoped(
             op: op.clone(),
             expr: Box::new(normalize_param_refs_scoped(
                 expr,
+                local_params,
+                local_bindings,
+            )),
+        },
+        RawExpr::BorrowShared { region, target } => RawExpr::BorrowShared {
+            region: region.clone(),
+            target: Box::new(normalize_param_refs_scoped(
+                target,
                 local_params,
                 local_bindings,
             )),
