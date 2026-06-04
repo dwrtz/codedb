@@ -268,6 +268,10 @@ impl CodeDb {
         } else if document.manifest.root_hash != genesis_root {
             bail!("bad_bundle_history: non-genesis bundle root requires a migration slice");
         }
+        if import_artifacts && imported_artifacts > 0 {
+            self.verify()
+                .context("bad_bundle_artifact: imported artifact cache failed verification")?;
+        }
 
         Ok(format!(
             "imported bundle\nroot {}\nhistory {}\npackage {}\nobjects {}\nmigrations {}\nartifacts {}\n",

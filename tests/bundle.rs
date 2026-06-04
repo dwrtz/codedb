@@ -3,6 +3,7 @@ use std::path::Path;
 use assert_cmd::Command;
 use rusqlite::Connection;
 use serde_json::{Value as JsonValue, json};
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 fn bin() -> Command {
@@ -66,6 +67,13 @@ fn cache_kinds_in_bundle(bundle: &Path) -> Vec<String> {
         .collect::<Vec<_>>();
     kinds.sort();
     kinds
+}
+
+fn test_bytes_hash(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codedb/bytes/v1\0");
+    hasher.update(bytes);
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 #[test]
@@ -397,4 +405,69 @@ fn bundle_import_rejects_tampered_json_artifact_cache() {
     ]);
     assert!(stderr.contains("bad_bundle_artifact"), "{stderr}");
     assert!(stderr.contains("recomputes to"), "{stderr}");
+}
+
+#[test]
+fn bundle_import_rejects_tampered_object_artifact_bytes() {
+    let temp = tempdir().unwrap();
+    let source_db = temp.path().join("source-object-tamper.sqlite");
+    let tampered_db = temp.path().join("tampered-object-artifacts.sqlite");
+    let bundle = temp.path().join("with-object-artifact.codedb.bundle");
+    let tampered = temp
+        .path()
+        .join("with-object-artifact-tampered.codedb.bundle");
+    let object = temp.path().join("tax.o");
+
+    run(&["init", path(&source_db)]);
+    run(&["import", path(&source_db), "examples/shop.cdb"]);
+    run(&[
+        "emit-object",
+        path(&source_db),
+        "tax",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        path(&object),
+    ]);
+    let source_branch = branch_state(&source_db);
+    run(&[
+        "bundle",
+        "export",
+        path(&source_db),
+        "--root",
+        &source_branch.0,
+        "--out",
+        path(&bundle),
+        "--include-artifacts",
+    ]);
+
+    let mut bundle_json = parse_json(&std::fs::read_to_string(&bundle).unwrap());
+    let artifact = bundle_json["artifact_cache"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|artifact| artifact["cache_key_input"]["artifact_kind"] == "object_file")
+        .expect("object artifact cache entry");
+    let bad_bytes = b"not a native object\n";
+    let bad_hash = test_bytes_hash(bad_bytes);
+    artifact["artifact_hash"] = json!(bad_hash);
+    artifact["artifact_bytes_hex"] = json!(hex::encode(bad_bytes));
+    artifact["artifact_json"]["bytes_hash"] = artifact["artifact_hash"].clone();
+    std::fs::write(
+        &tampered,
+        format!("{}\n", serde_json::to_string(&bundle_json).unwrap()),
+    )
+    .unwrap();
+
+    run(&["init", path(&tampered_db)]);
+    let stderr = run_failure(&[
+        "bundle",
+        "import",
+        path(&tampered_db),
+        path(&tampered),
+        "--import-artifacts",
+    ]);
+    assert!(stderr.contains("bad_bundle_artifact"), "{stderr}");
+    assert!(stderr.contains("bad_object_artifact"), "{stderr}");
+    assert_eq!(cache_row_count_by_kind(&tampered_db, "object_file"), 0);
 }
