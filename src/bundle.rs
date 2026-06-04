@@ -194,6 +194,7 @@ impl CodeDb {
     ) -> Result<String> {
         validate_bundle_manifest(&document)?;
         let objects_by_hash = validate_bundle_objects(&document)?;
+        validate_bundle_object_closure(&document, &objects_by_hash)?;
 
         for object in objects_by_hash.values() {
             self.insert_bundle_object(object)?;
@@ -1079,6 +1080,220 @@ fn validate_bundle_objects(document: &BundleDocument) -> Result<BTreeMap<String,
         }
     }
     Ok(objects)
+}
+
+fn validate_bundle_object_closure(
+    document: &BundleDocument,
+    objects_by_hash: &BTreeMap<String, BundleObject>,
+) -> Result<()> {
+    let mut roots = BTreeSet::from([document.manifest.root_hash.clone()]);
+    for migration in &document.migrations {
+        roots.insert(migration.input_root_hash.clone());
+        roots.insert(migration.output_root_hash.clone());
+    }
+    let expected = bundle_object_closure_from_map(&roots, objects_by_hash)?;
+    let actual = objects_by_hash.keys().cloned().collect::<BTreeSet<_>>();
+    if expected != actual {
+        let missing = expected
+            .difference(&actual)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        let extra = actual
+            .difference(&expected)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        bail!(
+            "bad_bundle_closure: object set does not match root closure; missing [{}], extra [{}]",
+            missing,
+            extra
+        );
+    }
+    Ok(())
+}
+
+fn bundle_object_closure_from_map(
+    roots: &BTreeSet<String>,
+    objects_by_hash: &BTreeMap<String, BundleObject>,
+) -> Result<BTreeSet<String>> {
+    let mut seen = BTreeSet::new();
+    let mut frontier = roots.iter().cloned().collect::<Vec<_>>();
+    while let Some(hash) = frontier.pop() {
+        if !seen.insert(hash.clone()) {
+            continue;
+        }
+        let object = objects_by_hash
+            .get(&hash)
+            .ok_or_else(|| anyhow!("bad_bundle_closure: missing object {hash}"))?;
+        let mut refs = Vec::new();
+        collect_bundle_object_refs(&object.kind, &object.payload, &mut refs);
+        for child_hash in refs {
+            if !objects_by_hash.contains_key(&child_hash) {
+                bail!("bad_bundle_closure: missing object {child_hash} referenced by {hash}");
+            }
+            if !seen.contains(&child_hash) {
+                frontier.push(child_hash);
+            }
+        }
+    }
+    Ok(seen)
+}
+
+fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<String>) {
+    match kind {
+        "Type" => match payload.get("type_kind").and_then(JsonValue::as_str) {
+            Some("Record") => {
+                for field in payload
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    push_hash_ref(field.get("type"), refs);
+                }
+            }
+            Some("Enum") => {
+                for variant in payload
+                    .get("variants")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    push_hash_ref(variant.get("type"), refs);
+                }
+            }
+            _ => {}
+        },
+        "SymbolBirth" => {}
+        "FunctionSignature" => {
+            push_hash_array_refs(payload.get("params"), refs);
+            push_hash_ref(payload.get("return"), refs);
+        }
+        "Expression" => {
+            push_hash_ref(payload.get("type"), refs);
+            match payload.get("expr_kind").and_then(JsonValue::as_str) {
+                Some("call") => {
+                    push_hash_ref(payload.get("symbol"), refs);
+                    push_hash_array_refs(payload.get("args"), refs);
+                }
+                Some("binary") => {
+                    push_hash_ref(payload.get("left"), refs);
+                    push_hash_ref(payload.get("right"), refs);
+                }
+                Some("unary") => push_hash_ref(payload.get("expr"), refs),
+                Some("let") => {
+                    push_hash_ref(payload.get("binding_type"), refs);
+                    push_hash_ref(payload.get("value"), refs);
+                    push_hash_ref(payload.get("body"), refs);
+                }
+                Some("if") => {
+                    push_hash_ref(payload.get("cond"), refs);
+                    push_hash_ref(payload.get("then"), refs);
+                    push_hash_ref(payload.get("else"), refs);
+                }
+                Some("record_literal") => {
+                    for field in payload
+                        .get("fields")
+                        .and_then(JsonValue::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        push_hash_ref(field.get("value"), refs);
+                        push_hash_ref(field.get("type"), refs);
+                    }
+                }
+                Some("field_access") => push_hash_ref(payload.get("target"), refs),
+                Some("enum_construct") => {
+                    push_hash_ref(payload.get("enum_type"), refs);
+                    push_hash_ref(payload.get("value"), refs);
+                }
+                Some("case") => {
+                    push_hash_ref(payload.get("expr"), refs);
+                    for arm in payload
+                        .get("arms")
+                        .and_then(JsonValue::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        push_hash_ref(arm.get("body"), refs);
+                    }
+                }
+                _ => {}
+            }
+        }
+        "FunctionDef" => {
+            push_hash_ref(payload.get("symbol"), refs);
+            push_hash_ref(payload.get("function_sig_hash"), refs);
+            push_hash_ref(payload.get("typed_body_expr_hash"), refs);
+        }
+        "ExternalFunction" => {
+            push_hash_ref(payload.get("symbol"), refs);
+            push_hash_ref(payload.get("function_sig_hash"), refs);
+        }
+        "FunctionInterface" => {
+            push_hash_ref(payload.get("symbol_hash"), refs);
+            push_hash_ref(payload.get("signature_hash"), refs);
+        }
+        "ProgramRoot" => {
+            for entry in payload
+                .get("symbols")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_hash_ref(entry.get("symbol"), refs);
+                push_hash_ref(entry.get("definition"), refs);
+                push_hash_ref(entry.get("signature"), refs);
+            }
+            for binding in payload
+                .get("names")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_hash_ref(binding.get("symbol"), refs);
+            }
+            for entry in payload
+                .get("param_names")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_hash_ref(entry.get("symbol"), refs);
+            }
+            for binding in payload
+                .get("exports")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_hash_ref(binding.get("symbol"), refs);
+            }
+            for binding in payload
+                .get("tests")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_hash_ref(binding.get("test"), refs);
+            }
+        }
+        "TestCase" => push_hash_ref(payload.get("entry_symbol"), refs),
+        _ => extract_hash_strings(payload, refs),
+    }
+}
+
+fn push_hash_ref(value: Option<&JsonValue>, refs: &mut Vec<String>) {
+    if let Some(hash) = value.and_then(JsonValue::as_str) {
+        refs.push(hash.to_string());
+    }
+}
+
+fn push_hash_array_refs(value: Option<&JsonValue>, refs: &mut Vec<String>) {
+    for item in value.and_then(JsonValue::as_array).into_iter().flatten() {
+        push_hash_ref(Some(item), refs);
+    }
 }
 
 fn bundle_api_hash() -> String {

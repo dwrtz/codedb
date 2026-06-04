@@ -802,8 +802,13 @@ fn symbols_callers(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMet
         .map_err(WorkspaceMethodError::method)?
         .into_iter()
         .map(|caller| {
+            let binding = db
+                .preferred_binding(&root, &caller)
+                .ok_or_else(|| anyhow::anyhow!("symbol has no preferred name {caller}"))?;
             Ok(json!({
-                "name": db.symbol_display(&root, &caller)?,
+                "module": binding.module,
+                "name": binding.display_name,
+                "qualified_name": format!("{}.{}", binding.module, binding.display_name),
                 "symbol_hash": caller,
             }))
         })

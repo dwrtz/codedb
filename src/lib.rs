@@ -376,8 +376,13 @@ impl CodeDb {
         let dependencies = deps
             .iter()
             .map(|dep| {
+                let binding = self
+                    .preferred_binding(&root, dep)
+                    .ok_or_else(|| anyhow!("symbol has no preferred name {dep}"))?;
                 Ok(json!({
-                    "name": self.symbol_display(&root, dep)?,
+                    "module": binding.module,
+                    "name": binding.display_name,
+                    "qualified_name": format!("{}.{}", binding.module, binding.display_name),
                     "symbol_hash": dep,
                 }))
             })

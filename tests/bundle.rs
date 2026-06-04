@@ -191,6 +191,76 @@ fn bundle_import_rejects_tampered_bundle() {
 }
 
 #[test]
+fn bundle_import_rejects_extra_unreachable_object() {
+    let temp = tempdir().unwrap();
+    let source_db = temp.path().join("source-extra.sqlite");
+    let unrelated_db = temp.path().join("unrelated-extra.sqlite");
+    let tampered_db = temp.path().join("tampered-extra.sqlite");
+    let source = temp.path().join("source.cdb");
+    let unrelated_source = temp.path().join("unrelated.cdb");
+    let bundle = temp.path().join("source.codedb.bundle");
+    let unrelated_bundle = temp.path().join("unrelated.codedb.bundle");
+    let tampered = temp.path().join("source-extra-object.codedb.bundle");
+
+    std::fs::write(&source, "fn main() -> i64 = 1\n").unwrap();
+    std::fs::write(&unrelated_source, "fn other() -> i64 = 2\n").unwrap();
+
+    run(&["init", path(&source_db)]);
+    run(&["import", path(&source_db), path(&source)]);
+    let source_branch = branch_state(&source_db);
+    run(&[
+        "bundle",
+        "export",
+        path(&source_db),
+        "--root",
+        &source_branch.0,
+        "--out",
+        path(&bundle),
+    ]);
+
+    run(&["init", path(&unrelated_db)]);
+    run(&["import", path(&unrelated_db), path(&unrelated_source)]);
+    let unrelated_branch = branch_state(&unrelated_db);
+    run(&[
+        "bundle",
+        "export",
+        path(&unrelated_db),
+        "--root",
+        &unrelated_branch.0,
+        "--out",
+        path(&unrelated_bundle),
+    ]);
+
+    let mut bundle_json = parse_json(&std::fs::read_to_string(&bundle).unwrap());
+    let unrelated_json = parse_json(&std::fs::read_to_string(&unrelated_bundle).unwrap());
+    let source_hashes = bundle_json["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|object| object["hash"].as_str().unwrap().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    let extra = unrelated_json["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|object| !source_hashes.contains(object["hash"].as_str().unwrap()))
+        .expect("unrelated object")
+        .clone();
+    let objects = bundle_json["objects"].as_array_mut().unwrap();
+    objects.push(extra);
+    bundle_json["manifest"]["object_count"] = json!(objects.len());
+    std::fs::write(
+        &tampered,
+        format!("{}\n", serde_json::to_string(&bundle_json).unwrap()),
+    )
+    .unwrap();
+
+    run(&["init", path(&tampered_db)]);
+    let stderr = run_failure(&["bundle", "import", path(&tampered_db), path(&tampered)]);
+    assert!(stderr.contains("bad_bundle_closure"), "{stderr}");
+}
+
+#[test]
 fn bundle_import_rejects_tampered_json_artifact_cache() {
     let temp = tempdir().unwrap();
     let source_db = temp.path().join("source-artifact-tamper.sqlite");

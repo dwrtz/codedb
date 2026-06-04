@@ -2436,7 +2436,7 @@ impl CodeDb {
         root.symbols[idx].signature = signature.clone();
         upsert_param_names(&mut root, symbol, param_name_list.clone());
 
-        let target_name = self.symbol_display(&root, symbol)?;
+        let target_name = self.symbol_display_for_module(&root, module, symbol)?;
         let target_body = if callers.iter().any(|caller| caller == symbol) {
             append_default_arg_to_calls(
                 &old_body,
@@ -2473,7 +2473,10 @@ impl CodeDb {
                     .unwrap_or_else(|| MAIN_BRANCH.to_string());
                 let caller_body =
                     self.typed_expr_to_raw_in_module(&caller_body_hash, &root, &caller_module)?;
-                let patched_body = append_default_arg_to_calls(&caller_body, &target_name, default);
+                let caller_target_name =
+                    self.symbol_display_for_module(&root, &caller_module, symbol)?;
+                let patched_body =
+                    append_default_arg_to_calls(&caller_body, &caller_target_name, default);
                 if patched_body == caller_body {
                     continue;
                 }

@@ -258,6 +258,43 @@ fn workspace_module_methods_list_show_and_move_symbols() {
     let result = shown.result.unwrap();
     assert_eq!(result["module"], "billing");
     assert_eq!(result["symbols"][0]["name"], "tax");
+
+    let total = codedb::workspace::execute_workspace_request(
+        &mut db,
+        codedb::workspace::WorkspaceRequest {
+            schema: None,
+            jsonrpc: None,
+            method: "symbols.show".to_string(),
+            params: json!({ "symbol_or_name": "total" }),
+            id: None,
+            request_id: None,
+        },
+    );
+    assert_eq!(total.status, "ok");
+    let total_result = total.result.unwrap();
+    assert_eq!(total_result["dependencies"][0]["module"], "billing");
+    assert_eq!(total_result["dependencies"][0]["name"], "tax");
+    assert_eq!(
+        total_result["dependencies"][0]["qualified_name"],
+        "billing.tax"
+    );
+
+    let callers = codedb::workspace::execute_workspace_request(
+        &mut db,
+        codedb::workspace::WorkspaceRequest {
+            schema: None,
+            jsonrpc: None,
+            method: "symbols.callers".to_string(),
+            params: json!({ "symbol_or_name": "billing.tax" }),
+            id: None,
+            request_id: None,
+        },
+    );
+    assert_eq!(callers.status, "ok");
+    let callers_result = callers.result.unwrap();
+    assert_eq!(callers_result["callers"][0]["module"], "main");
+    assert_eq!(callers_result["callers"][0]["name"], "total");
+    assert_eq!(callers_result["callers"][0]["qualified_name"], "main.total");
 }
 
 #[test]
@@ -348,4 +385,52 @@ fn alt(x: i64) -> i64 = x + 1
 
     let tax = parse_json(&run(&["show", path(&db), "tax", "--json"]));
     assert_eq!(tax["module"], "main");
+}
+
+#[test]
+fn add_parameter_default_updates_cross_module_callers() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("module-add-param.sqlite");
+    let source = temp.path().join("source.cdb");
+    let apply = temp.path().join("add-param.apply.json");
+    std::fs::write(
+        &source,
+        r#"
+module billing {
+fn tax(subtotal: i64) -> i64 = subtotal + 1
+}
+fn main() -> i64 = billing.tax(41)
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    let root = current_root(&db);
+    let tax = parse_json(&run(&["show", path(&db), "billing.tax", "--json"]));
+    let tax_symbol = tax["symbol_hash"].as_str().unwrap();
+    std::fs::write(
+        &apply,
+        serde_json::to_string_pretty(&json!({
+            "schema": "codedb/apply/v1",
+            "expect_root_hash": root,
+            "operations": [{
+                "kind": "add_parameter",
+                "module": "billing",
+                "symbol": tax_symbol,
+                "name": "tax",
+                "param": { "name": "rate", "type": "i64" },
+                "default": { "kind": "literal_i64", "value": "0" }
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let applied = parse_json(&run(&["apply", "--json", path(&apply), path(&db)]));
+    assert_eq!(applied["status"], "applied");
+    let main = parse_json(&run(&["show", path(&db), "main", "--json"]));
+    assert_eq!(main["body_source"], "billing.tax(41, 0)");
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "42");
+    run(&["verify", path(&db)]);
 }
