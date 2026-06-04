@@ -129,6 +129,10 @@ add native-done checklist to docs
 mark v2 feature gates as native-required
 ```
 
+The native-done gate is documented in [NATIVE_DONE.md](NATIVE_DONE.md). Every
+future v2 feature gate is native-required: evaluator-only behavior may be used
+as an oracle, but it cannot close a v2 feature gate.
+
 Files likely touched:
 
 ```text

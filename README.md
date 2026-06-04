@@ -1,8 +1,8 @@
 # codedb
 
-`codedb` is a Rust proof of concept for the v0 model in [docs/SPEC.md](docs/SPEC.md):
-programs are stored as immutable, content-addressed semantic objects in
-SQLite, and source files are projections.
+`codedb` is a Rust proof of concept for semantic programming models tracked in
+the v0, v1, and v2 docs. Programs are stored as immutable,
+content-addressed semantic objects in SQLite, and source files are projections.
 
 The compiler path is object-artifact first:
 
@@ -173,12 +173,20 @@ caller wants to pin the exact source root.
 
 ## Documentation Map
 
-- [docs/SPEC.md](docs/SPEC.md): v0 design contract and current implemented
+- [docs/SPEC.md](docs/SPEC.md): v0 design contract for the current implemented
   proof-of-concept architecture.
 - [docs/PLAN.md](docs/PLAN.md): v0 implementation plan and current status.
 - [docs/SPEC_V1.md](docs/SPEC_V1.md): v1 semantic workspace design track.
 - [docs/PLAN_V1.md](docs/PLAN_V1.md): v1 semantic workspace implementation
   roadmap.
+- [docs/SPEC_V2.md](docs/SPEC_V2.md): v2 native semantic programming design
+  track.
+- [docs/PLAN_V2.md](docs/PLAN_V2.md): v2 native semantic programming roadmap
+  and phase plan.
+- [docs/NATIVE_DONE.md](docs/NATIVE_DONE.md): native-required checklist for v2
+  feature completion gates.
+- [examples/v2/README.md](examples/v2/README.md): v2 native acceptance program
+  index.
 - [docs/ARTIFACTS.md](docs/ARTIFACTS.md): object payloads, artifact cache model,
   native object metadata, link plans, and SQLite table roles.
 - [docs/MIGRATIONS.md](docs/MIGRATIONS.md): migration cookbook for every
