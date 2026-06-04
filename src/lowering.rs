@@ -121,6 +121,8 @@ pub(crate) enum LoweredOp {
     Call {
         id: String,
         target_symbol_hash: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_abi_symbol: Option<String>,
         args: Vec<String>,
         type_hash: String,
     },
@@ -287,7 +289,7 @@ impl CodeDb {
         root: &ProgramRootPayload,
         entry: &RootSymbolPayload,
     ) -> Result<LoweredFunctionIr> {
-        if self.get_kind(&entry.definition)? != "FunctionDef" {
+        if !self.definition_is_internal_function(&entry.definition)? {
             bail!("lowering input is not a FunctionDef {}", entry.definition);
         }
         let definition = self.get_payload(&entry.definition)?;
@@ -465,6 +467,17 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("call missing symbol"))?
                     .to_string();
+                let target = self
+                    .root_symbol(root, &target_symbol_hash)
+                    .ok_or_else(|| anyhow!("call target missing from root {target_symbol_hash}"))?;
+                let target_abi_symbol = if self.definition_is_external(&target.definition)? {
+                    Some(
+                        self.external_function_metadata(&target.definition)?
+                            .link_name,
+                    )
+                } else {
+                    None
+                };
                 if self.root_symbol(root, &target_symbol_hash).is_none() {
                     bail!("call target missing from root {target_symbol_hash}");
                 }
@@ -487,6 +500,7 @@ impl CodeDb {
                 operations.push(LoweredOp::Call {
                     id: id.clone(),
                     target_symbol_hash,
+                    target_abi_symbol,
                     args: arg_values,
                     type_hash: type_hash.clone(),
                 });
@@ -947,6 +961,7 @@ impl CodeDb {
                 LoweredOp::Call {
                     id,
                     target_symbol_hash,
+                    target_abi_symbol,
                     args,
                     type_hash,
                 } => {
@@ -969,6 +984,17 @@ impl CodeDb {
                     }
                     if type_hash != &expected_return {
                         bail!("lowered call return type mismatch");
+                    }
+                    let expected_abi_symbol = if self.definition_is_external(&target.definition)? {
+                        Some(
+                            self.external_function_metadata(&target.definition)?
+                                .link_name,
+                        )
+                    } else {
+                        None
+                    };
+                    if target_abi_symbol != &expected_abi_symbol {
+                        bail!("lowered call ABI symbol does not match target definition");
                     }
                     insert_value(values, id, type_hash)?;
                 }

@@ -243,8 +243,16 @@ impl CodeDb {
                         .dependencies_for_symbol(new_root_hash, &symbol)?
                         .into_iter()
                         .collect::<BTreeSet<_>>();
-                    let old_body = self.function_body_hash(&old_entry.definition)?;
-                    let new_body = self.function_body_hash(&new_entry.definition)?;
+                    let old_body = if self.definition_is_external(&old_entry.definition)? {
+                        None
+                    } else {
+                        Some(self.function_body_hash(&old_entry.definition)?)
+                    };
+                    let new_body = if self.definition_is_external(&new_entry.definition)? {
+                        None
+                    } else {
+                        Some(self.function_body_hash(&new_entry.definition)?)
+                    };
 
                     if old_entry.signature != new_entry.signature {
                         raise_kind(&mut kind, BuildImpactKind::RecompileDependents);

@@ -79,6 +79,15 @@ pub(crate) enum TypeSpec {
     Enum(Vec<TypeFieldSpec>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternalFunctionMetadata {
+    pub(crate) symbol: String,
+    pub(crate) signature: String,
+    pub(crate) abi: String,
+    pub(crate) link_name: String,
+    pub(crate) library: Option<String>,
+}
+
 impl CodeDb {
     pub(crate) fn insert_builtin_types(&mut self) -> Result<()> {
         for type_name in ["I64", "Bool", "Unit"] {
@@ -294,6 +303,39 @@ impl CodeDb {
         )
     }
 
+    pub(crate) fn put_external_function(
+        &mut self,
+        symbol: &str,
+        signature: &str,
+        abi: &str,
+        link_name: &str,
+        library: Option<&str>,
+    ) -> Result<String> {
+        validate_external_abi_tag(abi)?;
+        validate_external_link_name(link_name)?;
+        if let Some(library) = library {
+            validate_external_library_name(library)?;
+        }
+        let mut payload = serde_json::Map::new();
+        payload.insert("symbol".to_string(), JsonValue::String(symbol.to_string()));
+        payload.insert(
+            "function_sig_hash".to_string(),
+            JsonValue::String(signature.to_string()),
+        );
+        payload.insert("abi".to_string(), JsonValue::String(abi.to_string()));
+        payload.insert(
+            "link_name".to_string(),
+            JsonValue::String(link_name.to_string()),
+        );
+        if let Some(library) = library {
+            payload.insert(
+                "library".to_string(),
+                JsonValue::String(library.to_string()),
+            );
+        }
+        self.put_object("ExternalFunction", &JsonValue::Object(payload))
+    }
+
     pub(crate) fn function_body_hash(&self, definition_hash: &str) -> Result<String> {
         let payload = self.get_payload(definition_hash)?;
         payload
@@ -304,12 +346,72 @@ impl CodeDb {
     }
 
     pub(crate) fn function_signature_hash(&self, definition_hash: &str) -> Result<String> {
+        self.definition_signature_hash(definition_hash)
+    }
+
+    pub(crate) fn definition_signature_hash(&self, definition_hash: &str) -> Result<String> {
         let payload = self.get_payload(definition_hash)?;
         payload
             .get("function_sig_hash")
             .and_then(JsonValue::as_str)
             .map(str::to_string)
-            .ok_or_else(|| anyhow!("function definition missing function_sig_hash"))
+            .ok_or_else(|| anyhow!("definition missing function_sig_hash"))
+    }
+
+    pub(crate) fn definition_is_external(&self, definition_hash: &str) -> Result<bool> {
+        Ok(self.get_kind(definition_hash)? == "ExternalFunction")
+    }
+
+    pub(crate) fn definition_is_internal_function(&self, definition_hash: &str) -> Result<bool> {
+        Ok(self.get_kind(definition_hash)? == "FunctionDef")
+    }
+
+    pub(crate) fn external_function_metadata(
+        &self,
+        definition_hash: &str,
+    ) -> Result<ExternalFunctionMetadata> {
+        let kind = self.get_kind(definition_hash)?;
+        if kind != "ExternalFunction" {
+            bail!("definition is not ExternalFunction {definition_hash}");
+        }
+        let payload = self.get_payload(definition_hash)?;
+        let symbol = payload
+            .get("symbol")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("external function missing symbol"))?
+            .to_string();
+        let signature = payload
+            .get("function_sig_hash")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("external function missing function_sig_hash"))?
+            .to_string();
+        let abi = payload
+            .get("abi")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("external function missing abi"))?
+            .to_string();
+        let link_name = payload
+            .get("link_name")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("external function missing link_name"))?
+            .to_string();
+        let library = match payload.get("library") {
+            Some(JsonValue::String(value)) => Some(value.clone()),
+            Some(_) => bail!("external function library must be a string"),
+            None => None,
+        };
+        validate_external_abi_tag(&abi)?;
+        validate_external_link_name(&link_name)?;
+        if let Some(library) = &library {
+            validate_external_library_name(library)?;
+        }
+        Ok(ExternalFunctionMetadata {
+            symbol,
+            signature,
+            abi,
+            link_name,
+            library,
+        })
     }
 
     #[allow(dead_code)]
@@ -1020,6 +1122,24 @@ impl CodeDb {
         for entry in &root.symbols {
             let (param_types, return_type) = self.signature_parts(&entry.signature)?;
             self.signature_effects(&entry.signature)?;
+            let definition_signature = self.function_signature_hash(&entry.definition)?;
+            if definition_signature != entry.signature {
+                bail!(
+                    "bad_signature: root signature {} does not match definition signature {}",
+                    entry.signature,
+                    definition_signature
+                );
+            }
+            if self.definition_is_external(&entry.definition)? {
+                let external = self.external_function_metadata(&entry.definition)?;
+                if external.symbol != entry.symbol {
+                    bail!("bad_external: external function symbol does not match root symbol");
+                }
+                if external.signature != entry.signature {
+                    bail!("bad_external: external function signature does not match root");
+                }
+                continue;
+            }
             let body = self.function_body_hash(&entry.definition)?;
             let actual = self.verify_expr_type(&body, &root, &param_types)?;
             if actual != return_type {
@@ -1028,14 +1148,6 @@ impl CodeDb {
                     self.symbol_display(&root, &entry.symbol)?,
                     self.type_name(&return_type)?,
                     self.type_name(&actual)?
-                );
-            }
-            let definition_signature = self.function_signature_hash(&entry.definition)?;
-            if definition_signature != entry.signature {
-                bail!(
-                    "bad_signature: root signature {} does not match definition signature {}",
-                    entry.signature,
-                    definition_signature
                 );
             }
             self.verify_function_effects(&root, entry)?;
@@ -1049,6 +1161,9 @@ impl CodeDb {
         root: &ProgramRootPayload,
         entry: &crate::model::RootSymbolPayload,
     ) -> Result<()> {
+        if self.definition_is_external(&entry.definition)? {
+            return Ok(());
+        }
         let declared = self
             .signature_effects(&entry.signature)?
             .into_iter()
@@ -1485,6 +1600,42 @@ pub(crate) fn visible_effects(effects: &[Effect]) -> Vec<Effect> {
 
 pub(crate) fn effect_names(effects: &[Effect]) -> Vec<&'static str> {
     effects.iter().map(|effect| effect.as_str()).collect()
+}
+
+pub(crate) fn validate_external_abi_tag(abi: &str) -> Result<()> {
+    match abi {
+        "c" => Ok(()),
+        other => bail!("unsupported external ABI tag {other}; supported ABI tags: c"),
+    }
+}
+
+pub(crate) fn validate_external_link_name(name: &str) -> Result<()> {
+    if !is_native_link_identifier(name) {
+        bail!("external link_name must be a native identifier: {name:?}");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_external_library_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' || byte == b'.')
+        })
+    {
+        bail!("external library name must be non-empty and contain only alnum, _, -, or .");
+    }
+    Ok(())
+}
+
+fn is_native_link_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first != '_' && !first.is_ascii_alphabetic() {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 impl TypeSpec {

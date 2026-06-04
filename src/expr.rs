@@ -103,6 +103,24 @@ pub struct FunctionSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalFunctionSource {
+    pub module: String,
+    pub name: String,
+    pub params: Vec<ParamSpec>,
+    pub return_type: String,
+    pub effects: Vec<Effect>,
+    pub abi: String,
+    pub link_name: String,
+    pub library: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgramItem {
+    Function(FunctionSource),
+    ExternalFunction(ExternalFunctionSource),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     I64(i64),
     Bool(bool),
@@ -173,6 +191,12 @@ impl CodeDb {
                     self.type_name(ty)?,
                 );
             }
+        }
+        if self.definition_is_external(&root_symbol.definition)? {
+            bail!(
+                "cannot evaluate external function {}",
+                self.symbol_display(&root, symbol)?
+            );
         }
         let body = self.function_body_hash(&root_symbol.definition)?;
         self.eval_expr(root_hash, &body, &args)
@@ -473,6 +497,23 @@ impl CodeDb {
         binding: &NameBinding,
         root_symbol: &RootSymbolPayload,
     ) -> Result<String> {
+        if self.definition_is_external(&root_symbol.definition)? {
+            let external = self.external_function_metadata(&root_symbol.definition)?;
+            let mut source = format!(
+                "extern fn {}{} link_name \"{}\"",
+                binding.display_name,
+                self.external_signature_source(
+                    &root_symbol.signature,
+                    &param_names(root, &binding.symbol),
+                    &external.abi,
+                )?,
+                source_string_literal(&external.link_name),
+            );
+            if let Some(library) = external.library {
+                source.push_str(&format!(" library \"{}\"", source_string_literal(&library)));
+            }
+            return Ok(source);
+        }
         let body = self.function_body_hash(&root_symbol.definition)?;
         Ok(format!(
             "fn {}{} = {}",
@@ -575,6 +616,41 @@ impl CodeDb {
             .collect::<Result<Vec<_>>>()?;
         let mut source = format!(
             "({}) -> {}",
+            rendered_params.join(", "),
+            self.type_name(&return_type)?
+        );
+        if !effects.is_empty() {
+            let rendered_effects = visible_effects(&effects)
+                .into_iter()
+                .map(|effect| effect.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            source.push_str(&format!(" effects[{rendered_effects}]"));
+        }
+        Ok(source)
+    }
+
+    pub(crate) fn external_signature_source(
+        &self,
+        signature_hash: &str,
+        param_names: &[String],
+        abi: &str,
+    ) -> Result<String> {
+        let (params, return_type) = self.signature_parts(signature_hash)?;
+        let effects = self.signature_effects(signature_hash)?;
+        let rendered_params = params
+            .iter()
+            .enumerate()
+            .map(|(idx, ty)| {
+                let name = param_names
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| format!("p{idx}"));
+                Ok(format!("{name}: {}", self.type_name(ty)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut source = format!(
+            "({}) -> {} abi[{abi}]",
             rendered_params.join(", "),
             self.type_name(&return_type)?
         );
@@ -1405,12 +1481,28 @@ fn field_access_from_path(path: &str) -> RawExpr {
     expr
 }
 
+fn source_string_literal(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| match ch {
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\t' => "\\t".chars().collect::<Vec<_>>(),
+            other => vec![other],
+        })
+        .collect()
+}
+
 impl CodeDb {
     pub(crate) fn dependencies_for_definition(
         &self,
         root: &ProgramRootPayload,
         definition_hash: &str,
     ) -> Result<BTreeSet<String>> {
+        if self.definition_is_external(definition_hash)? {
+            return Ok(BTreeSet::new());
+        }
         let body = self.function_body_hash(definition_hash)?;
         let mut deps = BTreeSet::new();
         self.collect_expr_deps(root, &body, &mut deps)?;
@@ -1541,13 +1633,14 @@ impl CodeDb {
 enum Token {
     Ident(String),
     Number(String),
+    String(String),
     Symbol(String),
     Eof,
 }
 
-pub(crate) fn parse_program(source: &str) -> Result<Vec<FunctionSource>> {
+pub(crate) fn parse_program(source: &str) -> Result<Vec<ProgramItem>> {
     let mut parser = Parser::new(source)?;
-    let mut functions = Vec::new();
+    let mut items = Vec::new();
     while !parser.at_eof() {
         if parser.consume_ident_value("module") {
             let module = parser.expect_name_path()?;
@@ -1556,13 +1649,13 @@ pub(crate) fn parse_program(source: &str) -> Result<Vec<FunctionSource>> {
                 if parser.at_eof() {
                     bail!("unterminated module {module}");
                 }
-                functions.push(parser.parse_function_in_module(module.clone())?);
+                items.push(parser.parse_program_item_in_module(module.clone())?);
             }
         } else {
-            functions.push(parser.parse_function_in_module(MAIN_BRANCH.to_string())?);
+            items.push(parser.parse_program_item_in_module(MAIN_BRANCH.to_string())?);
         }
     }
-    Ok(functions)
+    Ok(items)
 }
 
 pub(crate) fn parse_expr_source(source: &str) -> Result<RawExpr> {
@@ -1610,9 +1703,73 @@ impl Parser {
         self.parse_function_in_module(MAIN_BRANCH.to_string())
     }
 
+    fn parse_program_item_in_module(&mut self, module: String) -> Result<ProgramItem> {
+        if self.consume_ident_value("extern") {
+            Ok(ProgramItem::ExternalFunction(
+                self.parse_external_function_in_module(module)?,
+            ))
+        } else {
+            Ok(ProgramItem::Function(
+                self.parse_function_in_module(module)?,
+            ))
+        }
+    }
+
     fn parse_function_in_module(&mut self, module: String) -> Result<FunctionSource> {
         self.expect_ident_value("fn")?;
         let name = self.expect_ident()?;
+        let (params, return_type) = self.parse_function_signature_tail()?;
+        let effects = if self.consume_ident_value("effects") {
+            self.parse_effect_list()?
+        } else {
+            Vec::new()
+        };
+        self.expect_symbol("=")?;
+        let body = self.parse_expr()?;
+        Ok(FunctionSource {
+            module,
+            name,
+            params,
+            return_type,
+            effects,
+            body,
+        })
+    }
+
+    fn parse_external_function_in_module(
+        &mut self,
+        module: String,
+    ) -> Result<ExternalFunctionSource> {
+        self.expect_ident_value("fn")?;
+        let name = self.expect_ident()?;
+        let (params, return_type) = self.parse_function_signature_tail()?;
+        self.expect_ident_value("abi")?;
+        let abi = self.parse_bracketed_ident("abi")?;
+        let effects = if self.consume_ident_value("effects") {
+            self.parse_effect_list()?
+        } else {
+            Vec::new()
+        };
+        self.expect_ident_value("link_name")?;
+        let link_name = self.expect_string()?;
+        let library = if self.consume_ident_value("library") {
+            Some(self.expect_string()?)
+        } else {
+            None
+        };
+        Ok(ExternalFunctionSource {
+            module,
+            name,
+            params,
+            return_type,
+            effects,
+            abi,
+            link_name,
+            library,
+        })
+    }
+
+    fn parse_function_signature_tail(&mut self) -> Result<(Vec<ParamSpec>, String)> {
         self.expect_symbol("(")?;
         let mut params = Vec::new();
         if !self.consume_symbol(")") {
@@ -1632,21 +1789,7 @@ impl Parser {
         }
         self.expect_symbol("->")?;
         let return_type = self.parse_type_source()?;
-        let effects = if self.consume_ident_value("effects") {
-            self.parse_effect_list()?
-        } else {
-            Vec::new()
-        };
-        self.expect_symbol("=")?;
-        let body = self.parse_expr()?;
-        Ok(FunctionSource {
-            module,
-            name,
-            params,
-            return_type,
-            effects,
-            body,
-        })
+        Ok((params, return_type))
     }
 
     fn parse_effect_list(&mut self) -> Result<Vec<Effect>> {
@@ -1664,6 +1807,16 @@ impl Parser {
             self.expect_symbol(",")?;
         }
         normalize_effects(&effects)
+    }
+
+    fn parse_bracketed_ident(&mut self, label: &str) -> Result<String> {
+        self.expect_symbol("[")?;
+        let value = self.expect_ident()?;
+        self.expect_symbol("]")?;
+        if value.is_empty() {
+            bail!("{label} must not be empty");
+        }
+        Ok(value)
     }
 
     fn parse_expr(&mut self) -> Result<RawExpr> {
@@ -1903,6 +2056,13 @@ impl Parser {
         }
     }
 
+    fn expect_string(&mut self) -> Result<String> {
+        match self.next() {
+            Token::String(value) => Ok(value),
+            other => bail!("expected string literal, got {other:?}"),
+        }
+    }
+
     fn expect_name_path(&mut self) -> Result<String> {
         let first = self.expect_ident()?;
         self.finish_name_path(first)
@@ -1985,6 +2145,35 @@ fn lex(source: &str) -> Result<Vec<Token>> {
                 i += 1;
             }
             tokens.push(Token::Number(chars[start..i].iter().collect()));
+        } else if ch == '"' {
+            i += 1;
+            let mut value = String::new();
+            while i < chars.len() {
+                match chars[i] {
+                    '"' => {
+                        i += 1;
+                        break;
+                    }
+                    '\\' if i + 1 < chars.len() => {
+                        let escaped = chars[i + 1];
+                        match escaped {
+                            '"' | '\\' => value.push(escaped),
+                            'n' => value.push('\n'),
+                            't' => value.push('\t'),
+                            other => bail!("unsupported string escape \\{other}"),
+                        }
+                        i += 2;
+                    }
+                    ch => {
+                        value.push(ch);
+                        i += 1;
+                    }
+                }
+            }
+            if i > chars.len() || chars.get(i.saturating_sub(1)) != Some(&'"') {
+                bail!("unterminated string literal");
+            }
+            tokens.push(Token::String(value));
         } else if i + 1 < chars.len() {
             let two = [chars[i], chars[i + 1]].iter().collect::<String>();
             if matches!(

@@ -173,6 +173,37 @@ call propagation: a function that calls an `io`, `ffi`, or otherwise effectful
 function must declare those effects itself. Built-in arithmetic is still treated
 as pure in this phase.
 
+## External Functions
+
+External functions are explicit semantic declarations. They have a symbol,
+signature, ABI tag, link name, and optional library metadata, but no CodeDB body.
+
+Projection syntax:
+
+```text
+extern fn host_value() -> i64 abi[c] effects[io, ffi] link_name "host_value" library "c"
+```
+
+Structural apply operation:
+
+```json
+{
+  "kind": "create_external_function",
+  "name": "host_value",
+  "birth_seed": "ffi-host-value",
+  "params": [],
+  "return_type": "i64",
+  "effects": ["io", "ffi"],
+  "abi": "c",
+  "link_name": "host_value",
+  "library": "c"
+}
+```
+
+Calls to externs type-check like normal calls. Their effects must be declared by
+callers, and native link plans include them under `external_symbols` instead of
+emitting CodeDB object files for them.
+
 ## Expressions
 
 Bodies use structural `RawExpr` JSON:

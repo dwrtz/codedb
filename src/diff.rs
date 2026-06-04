@@ -77,8 +77,8 @@ impl CodeDb {
                         if a_entry.signature == b_entry.signature {
                             out.push_str("  signature hash: unchanged\n");
                         }
-                        if self.function_body_hash(&a_entry.definition)?
-                            == self.function_body_hash(&b_entry.definition)?
+                        if self.definition_body_hash_opt(&a_entry.definition)?
+                            == self.definition_body_hash_opt(&b_entry.definition)?
                         {
                             out.push_str("  function body hash: unchanged\n");
                         }
@@ -111,9 +111,12 @@ impl CodeDb {
                         out.push_str(&format!(
                             "  function: {b_name}\n  symbol: {symbol}\n  signature: unchanged\n  compile impact: recompile_symbols\n"
                         ));
-                        let a_body = self.function_body_hash(&a_entry.definition)?;
-                        let b_body = self.function_body_hash(&b_entry.definition)?;
-                        self.diff_exprs(&a, &b, &a_body, &b_body, &mut out, "  ")?;
+                        if let (Some(a_body), Some(b_body)) = (
+                            self.definition_body_hash_opt(&a_entry.definition)?,
+                            self.definition_body_hash_opt(&b_entry.definition)?,
+                        ) {
+                            self.diff_exprs(&a, &b, &a_body, &b_body, &mut out, "  ")?;
+                        }
                         out.push('\n');
                     }
                 }
@@ -227,8 +230,8 @@ impl CodeDb {
                             "from": a_name,
                             "to": b_name,
                             "signature_hash_unchanged": a_entry.signature == b_entry.signature,
-                            "body_hash_unchanged": self.function_body_hash(&a_entry.definition)?
-                                == self.function_body_hash(&b_entry.definition)?,
+                            "body_hash_unchanged": self.definition_body_hash_opt(&a_entry.definition)?
+                                == self.definition_body_hash_opt(&b_entry.definition)?,
                         }));
                     }
 
@@ -263,8 +266,8 @@ impl CodeDb {
                             "symbol": &symbol,
                             "function": b_name,
                             "signature_hash_unchanged": true,
-                            "from_body": self.function_body_hash(&a_entry.definition)?,
-                            "to_body": self.function_body_hash(&b_entry.definition)?,
+                            "from_body": self.definition_body_hash_opt(&a_entry.definition)?,
+                            "to_body": self.definition_body_hash_opt(&b_entry.definition)?,
                         }));
                     }
                 }
@@ -487,6 +490,14 @@ impl CodeDb {
             out.push_str(&format!("{indent}type_changed: {type_a} -> {type_b}\n"));
         }
         Ok(())
+    }
+
+    fn definition_body_hash_opt(&self, definition_hash: &str) -> Result<Option<String>> {
+        if self.definition_is_external(definition_hash)? {
+            Ok(None)
+        } else {
+            Ok(Some(self.function_body_hash(definition_hash)?))
+        }
     }
 }
 

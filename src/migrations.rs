@@ -36,6 +36,19 @@ pub(crate) enum Operation {
         effects: Vec<Effect>,
         body: RawExpr,
     },
+    CreateExternalFunction {
+        module: String,
+        name: String,
+        birth_seed: String,
+        params: Vec<ParamSpec>,
+        return_type: String,
+        #[serde(default)]
+        effects: Vec<Effect>,
+        abi: String,
+        link_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        library: Option<String>,
+    },
     RenameSymbol {
         module: String,
         symbol: String,
@@ -133,6 +146,7 @@ impl Operation {
     pub(crate) fn kind_name(&self) -> &'static str {
         match self {
             Operation::CreateFunction { .. } => "create_function",
+            Operation::CreateExternalFunction { .. } => "create_external_function",
             Operation::RenameSymbol { .. } => "rename_symbol",
             Operation::MoveSymbol { .. } => "move_symbol",
             Operation::ReplaceFunctionBody { .. } => "replace_function_body",
@@ -351,6 +365,7 @@ impl MigrationSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SemanticImpact {
     FunctionCreated,
+    ExternalFunctionCreated,
     SymbolRenamed,
     SymbolMoved,
     ImplementationChanged,
@@ -369,6 +384,7 @@ impl SemanticImpact {
     fn as_str(self) -> &'static str {
         match self {
             SemanticImpact::FunctionCreated => "function_created",
+            SemanticImpact::ExternalFunctionCreated => "external_function_created",
             SemanticImpact::SymbolRenamed => "symbol_renamed",
             SemanticImpact::SymbolMoved => "symbol_moved",
             SemanticImpact::ImplementationChanged => "implementation_changed",
@@ -475,6 +491,16 @@ pub(crate) enum Postcondition {
         effects: Vec<Effect>,
         body: RawExpr,
     },
+    ExternalFunctionSourceMatches {
+        module: String,
+        name: String,
+        params: Vec<ParamSpec>,
+        return_type: String,
+        effects: Vec<Effect>,
+        abi: String,
+        link_name: String,
+        library: Option<String>,
+    },
     NamePointsToSymbol {
         module: String,
         name: String,
@@ -523,6 +549,9 @@ impl Postcondition {
         match self {
             Postcondition::RootExists { .. } => "root_exists",
             Postcondition::FunctionSourceMatches { .. } => "function_source_matches",
+            Postcondition::ExternalFunctionSourceMatches { .. } => {
+                "external_function_source_matches"
+            }
             Postcondition::NamePointsToSymbol { .. } => "name_points_to_symbol",
             Postcondition::NameAbsent { .. } => "name_absent",
             Postcondition::BodySourceMatches { .. } => "body_source_matches",
@@ -657,6 +686,11 @@ fn operation_summary_parts(op: &Operation) -> (String, SemanticImpact, Typecheck
             SemanticImpact::FunctionCreated,
             TypecheckImpact::Checked,
         ),
+        Operation::CreateExternalFunction { module, name, .. } => (
+            format!("{module}.{name}"),
+            SemanticImpact::ExternalFunctionCreated,
+            TypecheckImpact::Checked,
+        ),
         Operation::RenameSymbol {
             module,
             old_name,
@@ -767,7 +801,7 @@ fn operation_summary_parts(op: &Operation) -> (String, SemanticImpact, Typecheck
 
 fn fallback_build_impact(op: &Operation) -> BuildImpact {
     let (kind, recompile_symbols, relink, changed_symbols, reasons) = match op {
-        Operation::CreateFunction { .. } => (
+        Operation::CreateFunction { .. } | Operation::CreateExternalFunction { .. } => (
             BuildImpactKind::RecompileSymbols,
             vec![],
             true,
@@ -1099,7 +1133,8 @@ impl CodeDb {
 
     pub(crate) fn preconditions_for(&self, input_root: &str, op: &Operation) -> Vec<Precondition> {
         match op {
-            Operation::CreateFunction { module, name, .. } => vec![
+            Operation::CreateFunction { module, name, .. }
+            | Operation::CreateExternalFunction { module, name, .. } => vec![
                 Precondition::RootIsCurrent {
                     root: input_root.to_string(),
                 },
@@ -1313,6 +1348,31 @@ impl CodeDb {
                     return_type: return_type.clone(),
                     effects: effects.clone(),
                     body: body.clone(),
+                },
+            ],
+            Operation::CreateExternalFunction {
+                module,
+                name,
+                params,
+                return_type,
+                effects,
+                abi,
+                link_name,
+                library,
+                ..
+            } => vec![
+                Postcondition::RootExists {
+                    root: output_root.to_string(),
+                },
+                Postcondition::ExternalFunctionSourceMatches {
+                    module: module.clone(),
+                    name: name.clone(),
+                    params: params.clone(),
+                    return_type: return_type.clone(),
+                    effects: effects.clone(),
+                    abi: abi.clone(),
+                    link_name: link_name.clone(),
+                    library: library.clone(),
                 },
             ],
             Operation::RenameSymbol {
@@ -1632,6 +1692,30 @@ impl CodeDb {
                     &param_names,
                 )?)
             }
+            Postcondition::ExternalFunctionSourceMatches {
+                module,
+                name,
+                params,
+                return_type,
+                effects,
+                abi,
+                link_name,
+                library,
+            } => {
+                let Some(symbol) = symbol_for_name(root, module, name) else {
+                    return Ok(false);
+                };
+                self.external_function_source_matches(
+                    root,
+                    &symbol,
+                    params,
+                    return_type,
+                    effects,
+                    abi,
+                    link_name,
+                    library.as_deref(),
+                )
+            }
             Postcondition::NamePointsToSymbol {
                 module,
                 name,
@@ -1728,6 +1812,33 @@ impl CodeDb {
             && param_names(root, symbol) == expected_names)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn external_function_source_matches(
+        &self,
+        root: &ProgramRootPayload,
+        symbol: &str,
+        params: &[ParamSpec],
+        return_type: &str,
+        effects: &[Effect],
+        abi: &str,
+        link_name: &str,
+        library: Option<&str>,
+    ) -> Result<bool> {
+        let Some(entry) = self.root_symbol(root, symbol) else {
+            return Ok(false);
+        };
+        if !self.function_signature_source_matches(root, symbol, params, return_type, effects)? {
+            return Ok(false);
+        }
+        if !self.definition_is_external(&entry.definition)? {
+            return Ok(false);
+        }
+        let external = self.external_function_metadata(&entry.definition)?;
+        Ok(external.abi == abi
+            && external.link_name == link_name
+            && external.library.as_deref() == library)
+    }
+
     fn function_body_source_matches(
         &self,
         root: &ProgramRootPayload,
@@ -1770,6 +1881,29 @@ impl CodeDb {
                 return_type,
                 effects,
                 body,
+            ),
+            Operation::CreateExternalFunction {
+                module,
+                name,
+                birth_seed,
+                params,
+                return_type,
+                effects,
+                abi,
+                link_name,
+                library,
+            } => self.apply_create_external_function(
+                input_root,
+                parent_history_hash,
+                module,
+                name,
+                birth_seed,
+                params,
+                return_type,
+                effects,
+                abi,
+                link_name,
+                library.as_deref(),
             ),
             Operation::RenameSymbol {
                 module,
@@ -1952,6 +2086,76 @@ impl CodeDb {
         Ok(new_root)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_create_external_function(
+        &mut self,
+        input_root: &str,
+        parent_history_hash: Option<&str>,
+        module: &str,
+        name: &str,
+        birth_seed: &str,
+        params: &[ParamSpec],
+        return_type: &str,
+        effects: &[Effect],
+        abi: &str,
+        link_name: &str,
+        library: Option<&str>,
+    ) -> Result<String> {
+        validate_module_path("module", module)?;
+        validate_projection_identifier("function name", name)?;
+        validate_param_names(params)?;
+        let mut root = self.load_root(input_root)?;
+        if root
+            .names
+            .iter()
+            .any(|binding| binding.module == module && binding.display_name == name)
+        {
+            bail!("name already exists: {module}.{name}");
+        }
+
+        let symbol = self.put_symbol_birth(parent_history_hash, birth_seed)?;
+        let param_types = params
+            .iter()
+            .map(|param| self.resolve_type(&param.ty))
+            .collect::<Result<Vec<_>>>()?;
+        let return_type_hash = self.resolve_type(return_type)?;
+        let signature =
+            self.put_signature_with_effects(&param_types, &return_type_hash, effects)?;
+        let definition =
+            self.put_external_function(&symbol, &signature, abi, link_name, library)?;
+        let param_name_list = params
+            .iter()
+            .map(|param| param.name.clone())
+            .collect::<Vec<_>>();
+
+        root.symbols.push(RootSymbolPayload {
+            symbol: symbol.clone(),
+            definition,
+            signature: signature.clone(),
+        });
+        root.names.push(NameBinding {
+            module: module.to_string(),
+            display_name: name.to_string(),
+            symbol: symbol.clone(),
+            is_preferred: true,
+        });
+        root.param_names.push(ParamNames {
+            symbol,
+            names: param_name_list,
+        });
+        if module != MAIN_BRANCH
+            || root
+                .metadata
+                .contains_key(crate::model::ROOT_MODULES_METADATA_KEY)
+        {
+            synchronize_module_metadata(&mut root);
+        }
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)?;
+        Ok(new_root)
+    }
+
     pub(crate) fn apply_rename_symbol(
         &mut self,
         input_root: &str,
@@ -2061,6 +2265,9 @@ impl CodeDb {
         self.assert_name_points(&root, module, name, symbol)?;
         let idx = root_symbol_index(&root, symbol)?;
         let signature = root.symbols[idx].signature.clone();
+        if self.definition_is_external(&root.symbols[idx].definition)? {
+            bail!("cannot replace body for external function {module}.{name}");
+        }
         let (param_types, return_type) = self.signature_parts(&signature)?;
         let param_name_list = param_names(&root, symbol);
         let typed_body =
@@ -2095,8 +2302,6 @@ impl CodeDb {
         self.assert_name_points(&root, module, name, symbol)?;
         let idx = root_symbol_index(&root, symbol)?;
         let old_definition = root.symbols[idx].definition.clone();
-        let old_body_hash = self.function_body_hash(&old_definition)?;
-        let raw_body = self.typed_expr_to_raw_in_module(&old_body_hash, &root, module)?;
         let param_types = params
             .iter()
             .map(|param| self.resolve_type(&param.ty))
@@ -2108,6 +2313,26 @@ impl CodeDb {
             .iter()
             .map(|param| param.name.clone())
             .collect::<Vec<_>>();
+        if self.definition_is_external(&old_definition)? {
+            let external = self.external_function_metadata(&old_definition)?;
+            let definition = self.put_external_function(
+                symbol,
+                &signature,
+                &external.abi,
+                &external.link_name,
+                external.library.as_deref(),
+            )?;
+            root.symbols[idx].signature = signature;
+            root.symbols[idx].definition = definition;
+            upsert_param_names(&mut root, symbol, param_name_list);
+            let new_root = self.put_program_root(&root)?;
+            self.index_root(&new_root)?;
+            self.type_check_root(&new_root)
+                .context("new external signature invalidates existing root")?;
+            return Ok(new_root);
+        }
+        let old_body_hash = self.function_body_hash(&old_definition)?;
+        let raw_body = self.typed_expr_to_raw_in_module(&old_body_hash, &root, module)?;
         let typed_body =
             self.type_expr_in_module(module, &raw_body, &root, &param_name_list, &param_types)?;
         if typed_body.type_hash != return_type_hash {
@@ -2154,6 +2379,9 @@ impl CodeDb {
         let idx = root_symbol_index(&root, symbol)?;
         let old_signature = root.symbols[idx].signature.clone();
         let old_definition = root.symbols[idx].definition.clone();
+        if self.definition_is_external(&old_definition)? {
+            bail!("cannot add parameter to external function {module}.{name}");
+        }
         let old_body_hash = self.function_body_hash(&old_definition)?;
         let old_body = self.typed_expr_to_raw_in_module(&old_body_hash, &root, module)?;
         let (mut param_types, return_type) = self.signature_parts(&old_signature)?;

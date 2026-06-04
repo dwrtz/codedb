@@ -477,6 +477,9 @@ impl CodeDb {
             args: args.iter().map(TraceValue::from_value).collect(),
         });
 
+        if self.definition_is_external(&root_symbol.definition)? {
+            bail!("cannot trace external function {function_name}");
+        }
         let body = self.function_body_hash(&root_symbol.definition)?;
         let mut locals = Vec::new();
         let value = self.trace_expr(

@@ -26,7 +26,10 @@ use crate::store::{
     CodeDb, cache_key_for_input, canonical_json, extract_hash_strings, function_interface_metadata,
     hash_bytes, hash_object_canonical,
 };
-use crate::types::type_spec_from_payload;
+use crate::types::{
+    type_spec_from_payload, validate_external_abi_tag, validate_external_library_name,
+    validate_external_link_name,
+};
 use crate::{BYTES_DOMAIN, SCHEMA_VERSION};
 
 impl CodeDb {
@@ -222,6 +225,53 @@ impl CodeDb {
                     payload.get("typed_body_expr_hash"),
                     errors,
                 )?;
+            }
+            "ExternalFunction" => {
+                self.check_hash_ref(parent_hash, "symbol", payload.get("symbol"), errors)?;
+                self.check_hash_ref(
+                    parent_hash,
+                    "function_sig_hash",
+                    payload.get("function_sig_hash"),
+                    errors,
+                )?;
+                match payload.get("abi").and_then(JsonValue::as_str) {
+                    Some(abi) => {
+                        if let Err(err) = validate_external_abi_tag(abi) {
+                            errors.push(format!(
+                                "bad_external_function: {parent_hash} invalid abi: {err:#}"
+                            ));
+                        }
+                    }
+                    None => {
+                        errors.push(format!("bad_external_function: {parent_hash} missing abi"))
+                    }
+                }
+                match payload.get("link_name").and_then(JsonValue::as_str) {
+                    Some(link_name) => {
+                        if let Err(err) = validate_external_link_name(link_name) {
+                            errors.push(format!(
+                                "bad_external_function: {parent_hash} invalid link_name: {err:#}"
+                            ));
+                        }
+                    }
+                    None => errors.push(format!(
+                        "bad_external_function: {parent_hash} missing link_name"
+                    )),
+                }
+                if let Some(library) = payload.get("library") {
+                    match library.as_str() {
+                        Some(library) => {
+                            if let Err(err) = validate_external_library_name(library) {
+                                errors.push(format!(
+                                    "bad_external_function: {parent_hash} invalid library: {err:#}"
+                                ));
+                            }
+                        }
+                        None => errors.push(format!(
+                            "bad_external_function: {parent_hash} library must be string"
+                        )),
+                    }
+                }
             }
             "FunctionInterface" => {
                 self.check_hash_ref(
@@ -2147,7 +2197,7 @@ impl CodeDb {
                 return Ok(());
             };
             let expected_ir = self.build_lowered_function_ir(&root, entry)?;
-            let expected_relocation_targets = lowered_call_targets(&expected_ir);
+            let expected_relocation_targets = lowered_call_targets(&expected_ir)?;
             verify_object_relocations_match_dependencies(
                 errors,
                 cache_key,
@@ -2241,15 +2291,6 @@ impl CodeDb {
         {
             errors.push(format!("bad_link_plan: {cache_key} target mismatch"));
         }
-        if plan
-            .get("external_symbols")
-            .and_then(JsonValue::as_array)
-            .is_some_and(|symbols| !symbols.is_empty())
-        {
-            errors.push(format!(
-                "bad_link_plan: {cache_key} unexpected external symbols"
-            ));
-        }
         if plan.get("output_kind").and_then(JsonValue::as_str) != Some("executable") {
             errors.push(format!(
                 "bad_link_plan: {cache_key} missing or unsupported output kind"
@@ -2263,10 +2304,16 @@ impl CodeDb {
             .filter_map(|object| object.get("symbol_hash").and_then(JsonValue::as_str))
             .map(str::to_string)
             .collect::<BTreeSet<_>>();
+        let external_symbols = link_plan_external_symbols(plan);
+        let linked_symbols = object_symbols
+            .iter()
+            .cloned()
+            .chain(external_symbols.iter().cloned())
+            .collect::<BTreeSet<_>>();
         if let Some(entry_symbol) = plan.get("entry_symbol_hash").and_then(JsonValue::as_str) {
-            if !object_symbols.contains(entry_symbol) {
+            if !linked_symbols.contains(entry_symbol) {
                 errors.push(format!(
-                    "bad_link_plan: {cache_key} entry symbol is not backed by a linked object"
+                    "bad_link_plan: {cache_key} entry symbol is not linked"
                 ));
             }
         } else {
@@ -2335,6 +2382,53 @@ impl CodeDb {
                 )),
             }
         }
+        for external in plan
+            .get("external_symbols")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(symbol) = external.get("symbol_hash").and_then(JsonValue::as_str) else {
+                errors.push(format!(
+                    "bad_link_plan: {cache_key} external symbol missing symbol"
+                ));
+                continue;
+            };
+            if object_symbols.contains(symbol) {
+                errors.push(format!(
+                    "bad_link_plan: {cache_key} external symbol is also backed by an object"
+                ));
+            }
+            if let Some(abi) = external.get("abi").and_then(JsonValue::as_str) {
+                if let Err(err) = validate_external_abi_tag(abi) {
+                    errors.push(format!(
+                        "bad_link_plan: {cache_key} invalid external ABI: {err:#}"
+                    ));
+                }
+            } else {
+                errors.push(format!(
+                    "bad_link_plan: {cache_key} external symbol missing ABI"
+                ));
+            }
+            if let Some(link_name) = external.get("link_name").and_then(JsonValue::as_str) {
+                if let Err(err) = validate_external_link_name(link_name) {
+                    errors.push(format!(
+                        "bad_link_plan: {cache_key} invalid external link name: {err:#}"
+                    ));
+                }
+            } else {
+                errors.push(format!(
+                    "bad_link_plan: {cache_key} external symbol missing link_name"
+                ));
+            }
+            if let Some(library) = external.get("library").and_then(JsonValue::as_str)
+                && let Err(err) = validate_external_library_name(library)
+            {
+                errors.push(format!(
+                    "bad_link_plan: {cache_key} invalid external library: {err:#}"
+                ));
+            }
+        }
         let object_hashes = plan
             .get("objects")
             .and_then(JsonValue::as_array)
@@ -2388,6 +2482,7 @@ impl CodeDb {
                 if input.get("target_triple") != plan.get("target_triple")
                     || input.get("entry_symbol_hash") != plan.get("entry_symbol_hash")
                     || input.get("entry_abi_symbol") != plan.get("entry_abi_symbol")
+                    || input.get("external_symbols") != plan.get("external_symbols")
                     || input.get("export_map") != plan.get("export_map")
                     || input.get("output_kind") != plan.get("output_kind")
                     || input.get("link_options") != plan.get("link_options")
@@ -2507,18 +2602,35 @@ impl CodeDb {
         else {
             return Ok(false);
         };
-        if entry_abi_symbol != internal_abi_symbol(entry_symbol)? {
+        let root = self.load_root(root_hash)?;
+        let Some(entry) = self.root_symbol(&root, entry_symbol) else {
+            return Ok(false);
+        };
+        let expected_entry_abi = if self.definition_is_external(&entry.definition)? {
+            self.external_function_metadata(&entry.definition)?
+                .link_name
+        } else {
+            internal_abi_symbol(entry_symbol)?
+        };
+        if entry_abi_symbol != expected_entry_abi {
             return Ok(false);
         }
         let planned_symbols = link_plan_object_symbols(plan);
-        if planned_symbols.is_empty() {
-            return Ok(false);
-        }
-        if self.reachable_symbols(root_hash, entry_symbol)? != planned_symbols {
+        let planned_external_symbols = link_plan_external_symbols(plan);
+        let all_planned_symbols = planned_symbols
+            .iter()
+            .cloned()
+            .chain(planned_external_symbols.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        if self
+            .reachable_symbols(root_hash, entry_symbol)?
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            != all_planned_symbols
+        {
             return Ok(false);
         }
 
-        let root = self.load_root(root_hash)?;
         for object in plan
             .get("objects")
             .and_then(JsonValue::as_array)
@@ -2531,6 +2643,9 @@ impl CodeDb {
             let Some(entry) = self.root_symbol(&root, symbol) else {
                 return Ok(false);
             };
+            if self.definition_is_external(&entry.definition)? {
+                return Ok(false);
+            }
             let expected_internal_abi = internal_abi_symbol(symbol)?;
             if object.get("definition_hash").and_then(JsonValue::as_str)
                 != Some(entry.definition.as_str())
@@ -2550,6 +2665,33 @@ impl CodeDb {
             {
                 return Ok(false);
             }
+        }
+        let expected_external_symbols = planned_external_symbols
+            .iter()
+            .map(|symbol| {
+                let entry = self
+                    .root_symbol(&root, symbol)
+                    .ok_or_else(|| anyhow!("external symbol missing from root {symbol}"))?;
+                let metadata = self.external_function_metadata(&entry.definition)?;
+                let (param_type_hashes, return_type_hash) =
+                    self.signature_parts(&entry.signature)?;
+                Ok(json!({
+                    "symbol_hash": symbol,
+                    "definition_hash": &entry.definition,
+                    "signature_hash": &entry.signature,
+                    "param_type_hashes": param_type_hashes,
+                    "return_type_hash": return_type_hash,
+                    "effects": self.signature_effect_names(&entry.signature)?,
+                    "abi": metadata.abi,
+                    "link_name": metadata.link_name,
+                    "library": metadata.library,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if json_value_set(plan.get("external_symbols"))
+            != json_value_set(Some(&json!(expected_external_symbols)))
+        {
+            return Ok(false);
         }
 
         let linked_symbols = planned_symbols.into_iter().collect::<BTreeSet<_>>();
@@ -2865,7 +3007,7 @@ fn verify_object_relocations_match_dependencies(
     cache_key: &str,
     relocations: &[JsonValue],
     dependency_symbols: &[String],
-    expected_relocation_targets: &[String],
+    expected_relocation_targets: &[ExpectedRelocationTarget],
 ) {
     let expected_symbols = dependency_symbols.iter().cloned().collect::<BTreeSet<_>>();
     let actual_symbols = relocations
@@ -2888,12 +3030,20 @@ fn verify_object_relocations_match_dependencies(
             .and_then(JsonValue::as_str)
             .map(str::to_string)
     }));
-    let expected_target_counts = string_counts(expected_relocation_targets.iter().cloned());
+    let expected_target_counts = string_counts(
+        expected_relocation_targets
+            .iter()
+            .map(|target| target.symbol_hash.clone()),
+    );
     if actual_target_counts != expected_target_counts {
         errors.push(format!(
             "bad_object_artifact: {cache_key} relocations do not match lowered call sites"
         ));
     }
+    let expected_abi_by_symbol = expected_relocation_targets
+        .iter()
+        .map(|target| (target.symbol_hash.clone(), target.abi_symbol.clone()))
+        .collect::<BTreeMap<_, _>>();
 
     for relocation in relocations {
         let Some(target_symbol) = relocation
@@ -2902,14 +3052,11 @@ fn verify_object_relocations_match_dependencies(
         else {
             continue;
         };
-        let expected_abi_symbol = match internal_abi_symbol(target_symbol) {
-            Ok(symbol) => symbol,
-            Err(err) => {
-                errors.push(format!(
-                    "bad_object_artifact: {cache_key} relocation target symbol is invalid: {err:#}"
-                ));
-                continue;
-            }
+        let Some(expected_abi_symbol) = expected_abi_by_symbol.get(target_symbol) else {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} relocation target is not a lowered call site"
+            ));
+            continue;
         };
         if relocation
             .get("target_abi_symbol")
@@ -3097,25 +3244,47 @@ fn verify_object_debug_metadata_matches_lowered_ir(
     }
 }
 
-fn lowered_call_targets(ir: &LoweredFunctionIr) -> Vec<String> {
-    let mut targets = Vec::new();
-    collect_lowered_call_targets(&ir.operations, &mut targets);
-    targets
+#[derive(Debug, Clone)]
+struct ExpectedRelocationTarget {
+    symbol_hash: String,
+    abi_symbol: String,
 }
 
-fn collect_lowered_call_targets(operations: &[LoweredOp], targets: &mut Vec<String>) {
+fn lowered_call_targets(ir: &LoweredFunctionIr) -> Result<Vec<ExpectedRelocationTarget>> {
+    let mut targets = Vec::new();
+    collect_lowered_call_targets(&ir.operations, &mut targets)?;
+    Ok(targets)
+}
+
+fn collect_lowered_call_targets(
+    operations: &[LoweredOp],
+    targets: &mut Vec<ExpectedRelocationTarget>,
+) -> Result<()> {
     for op in operations {
         match op {
             LoweredOp::Call {
                 target_symbol_hash, ..
-            } => targets.push(target_symbol_hash.clone()),
+            } => {
+                let abi_symbol = match op {
+                    LoweredOp::Call {
+                        target_abi_symbol, ..
+                    } => target_abi_symbol
+                        .clone()
+                        .unwrap_or(internal_abi_symbol(target_symbol_hash)?),
+                    _ => unreachable!(),
+                };
+                targets.push(ExpectedRelocationTarget {
+                    symbol_hash: target_symbol_hash.clone(),
+                    abi_symbol,
+                });
+            }
             LoweredOp::If {
                 then_block,
                 else_block,
                 ..
             } => {
-                collect_lowered_call_targets(&then_block.operations, targets);
-                collect_lowered_call_targets(&else_block.operations, targets);
+                collect_lowered_call_targets(&then_block.operations, targets)?;
+                collect_lowered_call_targets(&else_block.operations, targets)?;
             }
             LoweredOp::Param { .. }
             | LoweredOp::ConstI64 { .. }
@@ -3126,6 +3295,7 @@ fn collect_lowered_call_targets(operations: &[LoweredOp], targets: &mut Vec<Stri
             | LoweredOp::Return { .. } => {}
         }
     }
+    Ok(())
 }
 
 fn string_counts(values: impl IntoIterator<Item = String>) -> BTreeMap<String, usize> {
@@ -3430,8 +3600,27 @@ fn json_string_vec(value: Option<&JsonValue>) -> Option<Vec<String>> {
     })?
 }
 
+fn json_value_set(value: Option<&JsonValue>) -> BTreeSet<String> {
+    value
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .map(canonical_json)
+        .collect()
+}
+
 fn link_plan_object_symbols(plan: &JsonValue) -> Vec<String> {
     plan.get("objects")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|object| object.get("symbol_hash").and_then(JsonValue::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn link_plan_external_symbols(plan: &JsonValue) -> BTreeSet<String> {
+    plan.get("external_symbols")
         .and_then(JsonValue::as_array)
         .into_iter()
         .flatten()

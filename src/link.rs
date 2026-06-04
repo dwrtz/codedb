@@ -57,6 +57,7 @@ struct PlannedLink {
     entry_abi_symbol: String,
     entry_effects: Vec<String>,
     objects: Vec<PlannedObject>,
+    external_symbols: Vec<PlannedExternalSymbol>,
     export_map: Vec<JsonValue>,
     link_options: JsonValue,
 }
@@ -71,6 +72,18 @@ struct PlannedObject {
     internal_abi_symbol: String,
     object_cache_key: String,
     object_key_input: CacheKeyInput,
+}
+
+struct PlannedExternalSymbol {
+    symbol_hash: String,
+    definition_hash: String,
+    signature_hash: String,
+    param_type_hashes: Vec<String>,
+    return_type_hash: String,
+    effects: Vec<String>,
+    abi: String,
+    link_name: String,
+    library: Option<String>,
 }
 
 impl PlannedLink {
@@ -95,6 +108,25 @@ impl PlannedLink {
                     "effects": &object.effects,
                     "internal_abi_symbol": &object.internal_abi_symbol,
                     "object_cache_key": &object.object_cache_key,
+                })
+            })
+            .collect()
+    }
+
+    fn external_symbol_entries(&self) -> Vec<JsonValue> {
+        self.external_symbols
+            .iter()
+            .map(|symbol| {
+                json!({
+                    "symbol_hash": &symbol.symbol_hash,
+                    "definition_hash": &symbol.definition_hash,
+                    "signature_hash": &symbol.signature_hash,
+                    "param_type_hashes": &symbol.param_type_hashes,
+                    "return_type_hash": &symbol.return_type_hash,
+                    "effects": &symbol.effects,
+                    "abi": &symbol.abi,
+                    "link_name": &symbol.link_name,
+                    "library": &symbol.library,
                 })
             })
             .collect()
@@ -150,7 +182,7 @@ impl CodeDb {
             "jobs": jobs,
             "objects": planned.object_job_entries(),
             "export_map": &planned.export_map,
-            "external_symbols": [],
+            "external_symbols": planned.external_symbol_entries(),
             "link_options": &planned.link_options,
         });
         Ok(format!("{}\n", canonical_json(&payload)))
@@ -344,7 +376,7 @@ impl CodeDb {
             "entry_abi_symbol": &planned.entry_abi_symbol,
             "objects": object_entries,
             "export_map": planned.export_map.clone(),
-            "external_symbols": [],
+            "external_symbols": planned.external_symbol_entries(),
             "output_kind": planned.input["output_kind"].clone(),
             "link_options": planned.link_options.clone(),
         });
@@ -428,9 +460,9 @@ impl CodeDb {
         target_triple: &str,
     ) -> Result<PlannedLink> {
         let symbols = self.reachable_symbols(root_hash, entry_symbol)?;
-        let linked_symbols = symbols.iter().cloned().collect::<BTreeSet<_>>();
         let backend_id = backend_id_for_target(target_triple)?;
         let mut objects = Vec::new();
+        let mut external_symbols = Vec::new();
         for symbol in symbols {
             let root_entry = self
                 .root_symbol(root, &symbol)
@@ -438,6 +470,21 @@ impl CodeDb {
             let (param_type_hashes, return_type_hash) =
                 self.signature_parts(&root_entry.signature)?;
             let effects = self.signature_effect_names(&root_entry.signature)?;
+            if self.definition_is_external(&root_entry.definition)? {
+                let external = self.external_function_metadata(&root_entry.definition)?;
+                external_symbols.push(PlannedExternalSymbol {
+                    symbol_hash: symbol.clone(),
+                    definition_hash: root_entry.definition.clone(),
+                    signature_hash: root_entry.signature.clone(),
+                    param_type_hashes,
+                    return_type_hash,
+                    effects,
+                    abi: external.abi,
+                    link_name: external.link_name,
+                    library: external.library,
+                });
+                continue;
+            }
             let mut dependency_interface_hashes = self
                 .dependencies_for_definition(root, &root_entry.definition)?
                 .into_iter()
@@ -475,9 +522,13 @@ impl CodeDb {
             });
         }
 
+        let linked_internal_symbols = objects
+            .iter()
+            .map(|object| object.symbol_hash.clone())
+            .collect::<BTreeSet<_>>();
         let export_map = export_map(root)?
             .into_iter()
-            .filter(|export| linked_symbols.contains(&export.symbol))
+            .filter(|export| linked_internal_symbols.contains(&export.symbol))
             .map(|export| {
                 json!({
                     "symbol_hash": export.symbol,
@@ -491,12 +542,34 @@ impl CodeDb {
             .iter()
             .map(|object| object.object_cache_key.clone())
             .collect::<Vec<_>>();
+        let external_symbol_entries = external_symbols
+            .iter()
+            .map(|symbol| {
+                json!({
+                    "symbol_hash": &symbol.symbol_hash,
+                    "definition_hash": &symbol.definition_hash,
+                    "signature_hash": &symbol.signature_hash,
+                    "param_type_hashes": &symbol.param_type_hashes,
+                    "return_type_hash": &symbol.return_type_hash,
+                    "effects": &symbol.effects,
+                    "abi": &symbol.abi,
+                    "link_name": &symbol.link_name,
+                    "library": &symbol.library,
+                })
+            })
+            .collect::<Vec<_>>();
+        let entry = root
+            .symbols
+            .iter()
+            .find(|entry| entry.symbol == entry_symbol)
+            .ok_or_else(|| anyhow!("entry symbol missing from root {entry_symbol}"))?;
         let input = json!({
             "schema": LINK_INPUT_SCHEMA,
             "target_triple": target_triple,
             "entry_symbol_hash": entry_symbol,
-            "entry_abi_symbol": internal_abi_symbol(entry_symbol)?,
+            "entry_abi_symbol": self.abi_symbol_for_entry(entry)?,
             "object_cache_keys": &object_cache_keys,
+            "external_symbols": &external_symbol_entries,
             "export_map": &export_map,
             "output_kind": "executable",
             "link_options": &link_options,
@@ -519,16 +592,10 @@ impl CodeDb {
             link_plan_key_input,
             target_triple: target_triple.to_string(),
             entry_symbol_hash: entry_symbol.to_string(),
-            entry_abi_symbol: internal_abi_symbol(entry_symbol)?,
-            entry_effects: self.signature_effect_names(
-                &root
-                    .symbols
-                    .iter()
-                    .find(|entry| entry.symbol == entry_symbol)
-                    .ok_or_else(|| anyhow!("entry symbol missing from root {entry_symbol}"))?
-                    .signature,
-            )?,
+            entry_abi_symbol: self.abi_symbol_for_entry(entry)?,
+            entry_effects: self.signature_effect_names(&entry.signature)?,
             objects,
+            external_symbols,
             export_map,
             link_options,
         })
@@ -550,6 +617,16 @@ impl CodeDb {
             cache_exists,
         )?;
         Ok(())
+    }
+
+    fn abi_symbol_for_entry(&self, entry: &crate::model::RootSymbolPayload) -> Result<String> {
+        if self.definition_is_external(&entry.definition)? {
+            Ok(self
+                .external_function_metadata(&entry.definition)?
+                .link_name)
+        } else {
+            internal_abi_symbol(&entry.symbol)
+        }
     }
 
     pub(crate) fn reachable_symbols(
@@ -682,6 +759,11 @@ fn link_with_cc(prepared: &PreparedLink) -> Result<Vec<u8>> {
     let mut command = Command::new("cc");
     for object in &object_paths {
         command.arg(object);
+    }
+    for library in external_libraries(&prepared.plan)? {
+        if library != "c" {
+            command.arg(format!("-l{library}"));
+        }
     }
     let output = command
         .arg(&harness)
@@ -824,6 +906,21 @@ fn export_wrapper_source(plan: &JsonValue) -> Result<String> {
         out.push('\n');
     }
     Ok(out)
+}
+
+fn external_libraries(plan: &JsonValue) -> Result<Vec<String>> {
+    let mut libraries = BTreeSet::new();
+    for external in plan
+        .get("external_symbols")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(library) = external.get("library").and_then(JsonValue::as_str) {
+            libraries.insert(library.to_string());
+        }
+    }
+    Ok(libraries.into_iter().collect())
 }
 
 fn plan_object_for_symbol<'a>(plan: &'a JsonValue, symbol: &str) -> Result<&'a JsonValue> {

@@ -866,18 +866,25 @@ External function object:
 
 ```json
 {
-  "schema": "codedb/external-function/v1",
-  "name": "puts",
-  "link_name": "puts",
+  "symbol": "sha256:symbol-birth",
+  "function_sig_hash": "sha256:function-signature",
   "abi": "c",
-  "params": ["sha256:type-ptr-i8"],
-  "return": "sha256:type-i32",
-  "effects": ["io", "ffi"],
-  "library": "libc"
+  "link_name": "puts",
+  "library": "c"
 }
 ```
 
-Link plans should include external symbols and libraries. Calls to external functions must pass through the type and effect system.
+The function signature object remains the source of parameter types, return type,
+ABI-internal signature hash identity, and effects. Initial projection syntax:
+
+```text
+extern fn host_value() -> i64 abi[c] effects[io, ffi] link_name "host_value" library "c"
+```
+
+The initial implementation supports the C ABI tag and the native scalar types
+already lowerable by v1 (`i64`, `bool`, and `unit`). Link plans include external
+symbols and libraries. Calls to external functions must pass through the type
+and effect system.
 
 ## 17. Visual graph explorer
 

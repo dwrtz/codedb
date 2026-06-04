@@ -1227,7 +1227,7 @@ fn verify_rejects_cached_link_plan_metadata_mismatch() {
 
     let stderr = run_failure(&["verify", db.to_str().unwrap()]);
     assert!(stderr.contains("bad_link_plan"));
-    assert!(stderr.contains("external symbols"));
+    assert!(stderr.contains("external symbol missing symbol"));
 }
 
 #[test]

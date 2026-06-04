@@ -30,7 +30,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::params;
 use serde_json::json;
 
-pub use expr::{FunctionSource, RawExpr, Value};
+pub use expr::{ExternalFunctionSource, FunctionSource, ProgramItem, RawExpr, Value};
 pub use store::CodeDb;
 pub use types::{Effect, ParamSpec};
 
@@ -85,20 +85,42 @@ impl CodeDb {
         self.ensure_initialized()?;
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let functions = parse_program(&source)?;
+        let items = parse_program(&source)?;
         let mut report = String::new();
 
-        for (idx, function) in functions.into_iter().enumerate() {
+        for (idx, item) in items.into_iter().enumerate() {
             let branch = self.branch(MAIN_BRANCH)?;
-            let birth_seed = format!("import:{}:{}:{}", function.module, function.name, idx);
-            let op = Operation::CreateFunction {
-                module: function.module,
-                name: function.name,
-                birth_seed,
-                params: function.params,
-                return_type: function.return_type,
-                effects: function.effects,
-                body: function.body,
+            let op = match item {
+                ProgramItem::Function(function) => {
+                    let birth_seed =
+                        format!("import:{}:{}:{}", function.module, function.name, idx);
+                    Operation::CreateFunction {
+                        module: function.module,
+                        name: function.name,
+                        birth_seed,
+                        params: function.params,
+                        return_type: function.return_type,
+                        effects: function.effects,
+                        body: function.body,
+                    }
+                }
+                ProgramItem::ExternalFunction(function) => {
+                    let birth_seed = format!(
+                        "import:extern:{}:{}:{}",
+                        function.module, function.name, idx
+                    );
+                    Operation::CreateExternalFunction {
+                        module: function.module,
+                        name: function.name,
+                        birth_seed,
+                        params: function.params,
+                        return_type: function.return_type,
+                        effects: function.effects,
+                        abi: function.abi,
+                        link_name: function.link_name,
+                        library: function.library,
+                    }
+                }
             };
             let outcome = self.apply_and_record(branch, op)?;
             report.push_str(&outcome.format_cli());
@@ -192,9 +214,14 @@ impl CodeDb {
                 .ok_or_else(|| anyhow!("root name points to missing symbol {symbol}"))?;
             let signature =
                 self.signature_source(&root_symbol.signature, &param_names(&root, &symbol))?;
+            let prefix = if self.definition_is_external(&root_symbol.definition)? {
+                "extern fn"
+            } else {
+                "fn"
+            };
             out.push_str(&format!(
-                "{}.{} {} {}\n",
-                binding.module, binding.display_name, symbol, signature
+                "{}.{} {} {} {}\n",
+                binding.module, binding.display_name, symbol, prefix, signature
             ));
         }
         Ok(out)
@@ -215,12 +242,24 @@ impl CodeDb {
                 .iter()
                 .find(|entry| entry.symbol == symbol)
                 .ok_or_else(|| anyhow!("root name points to missing symbol {symbol}"))?;
+            let external = if self.definition_is_external(&root_symbol.definition)? {
+                let metadata = self.external_function_metadata(&root_symbol.definition)?;
+                json!({
+                    "abi": metadata.abi,
+                    "link_name": metadata.link_name,
+                    "library": metadata.library,
+                })
+            } else {
+                json!(null)
+            };
             symbols.push(json!({
                 "module": binding.module,
                 "name": binding.display_name,
                 "symbol_hash": symbol,
                 "signature_hash": root_symbol.signature,
                 "definition_hash": root_symbol.definition,
+                "definition_kind": if external.is_null() { "function" } else { "external_function" },
+                "external": external,
                 "effects": self.signature_effect_names(&root_symbol.signature)?,
                 "signature": self.signature_source(&root_symbol.signature, &param_names(&root, &symbol))?,
             }));
@@ -246,7 +285,6 @@ impl CodeDb {
         let root_symbol = self
             .root_symbol(&root, &symbol)
             .ok_or_else(|| anyhow!("symbol missing from root {symbol}"))?;
-        let body_hash = self.function_body_hash(&root_symbol.definition)?;
         let deps = self.dependencies_for_symbol(&branch.root_hash, &symbol)?;
         let mut out = String::new();
         out.push_str(&format!("symbol {symbol}\n"));
@@ -261,7 +299,39 @@ impl CodeDb {
                 .join(",")
         ));
         out.push_str(&format!("definition {}\n", root_symbol.definition));
-        out.push_str(&format!("body {body_hash}\n"));
+        if self.definition_is_external(&root_symbol.definition)? {
+            let external = self.external_function_metadata(&root_symbol.definition)?;
+            out.push_str("definition_kind external_function\n");
+            out.push_str(&format!("external_abi {}\n", external.abi));
+            out.push_str(&format!("external_link_name {}\n", external.link_name));
+            out.push_str(&format!(
+                "external_library {}\n",
+                external.library.unwrap_or_else(|| "none".to_string())
+            ));
+            out.push_str(&format!(
+                "source {}\n",
+                self.render_function_source(&root, binding, root_symbol)?
+            ));
+        } else {
+            let body_hash = self.function_body_hash(&root_symbol.definition)?;
+            out.push_str("definition_kind function\n");
+            out.push_str(&format!("body {body_hash}\n"));
+            out.push_str(&format!(
+                "source fn {}{}\n",
+                binding.display_name,
+                self.signature_source(&root_symbol.signature, &param_names(&root, &symbol))?
+            ));
+            out.push_str(&format!(
+                "body_source {}\n",
+                self.expr_to_source_in_module(
+                    &body_hash,
+                    &root,
+                    &binding.module,
+                    &param_names(&root, &symbol),
+                    0
+                )?
+            ));
+        }
         out.push_str(&format!(
             "internal_abi_symbol {}\n",
             abi::internal_abi_symbol(&symbol)?
@@ -272,21 +342,6 @@ impl CodeDb {
         } else {
             out.push_str(&format!("exported_abi_symbols {}\n", exports.join(",")));
         }
-        out.push_str(&format!(
-            "source fn {}{}\n",
-            binding.display_name,
-            self.signature_source(&root_symbol.signature, &param_names(&root, &symbol))?
-        ));
-        out.push_str(&format!(
-            "body_source {}\n",
-            self.expr_to_source_in_module(
-                &body_hash,
-                &root,
-                &binding.module,
-                &param_names(&root, &symbol),
-                0
-            )?
-        ));
         if deps.is_empty() {
             out.push_str("dependencies none\n");
         } else {
@@ -316,7 +371,6 @@ impl CodeDb {
         let root_symbol = self
             .root_symbol(&root, &symbol)
             .ok_or_else(|| anyhow!("symbol missing from root {symbol}"))?;
-        let body_hash = self.function_body_hash(&root_symbol.definition)?;
         let deps = self.dependencies_for_symbol(&branch.root_hash, &symbol)?;
         let dependencies = deps
             .iter()
@@ -328,6 +382,29 @@ impl CodeDb {
             })
             .collect::<Result<Vec<_>>>()?;
         let local_param_names = param_names(&root, &symbol);
+        let external = if self.definition_is_external(&root_symbol.definition)? {
+            let metadata = self.external_function_metadata(&root_symbol.definition)?;
+            json!({
+                "abi": metadata.abi,
+                "link_name": metadata.link_name,
+                "library": metadata.library,
+            })
+        } else {
+            json!(null)
+        };
+        let (body_hash, body_source) = if external.is_null() {
+            let body_hash = self.function_body_hash(&root_symbol.definition)?;
+            let body_source = self.expr_to_source_in_module(
+                &body_hash,
+                &root,
+                &binding.module,
+                &local_param_names,
+                0,
+            )?;
+            (json!(body_hash), json!(body_source))
+        } else {
+            (json!(null), json!(null))
+        };
         let payload = json!({
             "branch": branch_name,
             "root_hash": branch.root_hash,
@@ -337,12 +414,15 @@ impl CodeDb {
             "name": binding.display_name,
             "signature_hash": root_symbol.signature,
             "definition_hash": root_symbol.definition,
+            "definition_kind": if external.is_null() { "function" } else { "external_function" },
             "body_hash": body_hash,
+            "external": external,
             "effects": self.signature_effect_names(&root_symbol.signature)?,
             "internal_abi_symbol": abi::internal_abi_symbol(&symbol)?,
             "exported_abi_symbols": abi::exported_abi_names(&root, &symbol),
             "signature": self.signature_source(&root_symbol.signature, &local_param_names)?,
-            "body_source": self.expr_to_source_in_module(&body_hash, &root, &binding.module, &local_param_names, 0)?,
+            "source": self.render_function_source(&root, binding, root_symbol)?,
+            "body_source": body_source,
             "dependencies": dependencies,
         });
         Ok(format!("{}\n", store::canonical_json(&payload)))

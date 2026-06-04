@@ -874,6 +874,7 @@ impl FunctionEmitter {
             LoweredOp::Call {
                 id,
                 target_symbol_hash,
+                target_abi_symbol,
                 args,
                 ..
             } => {
@@ -883,7 +884,9 @@ impl FunctionEmitter {
                 for (idx, arg) in args.iter().enumerate() {
                     self.mov_arg_reg_stack(idx, self.value_offset(arg)?)?;
                 }
-                let target_abi_symbol = internal_abi_symbol(target_symbol_hash)?;
+                let target_abi_symbol = target_abi_symbol
+                    .clone()
+                    .unwrap_or(internal_abi_symbol(target_symbol_hash)?);
                 let offset = self.text.len() + 1;
                 self.text.push(0xe8);
                 self.text.extend_from_slice(&[0, 0, 0, 0]);
@@ -1264,6 +1267,7 @@ impl Arm64Emitter {
             LoweredOp::Call {
                 id,
                 target_symbol_hash,
+                target_abi_symbol,
                 args,
                 ..
             } => {
@@ -1273,8 +1277,11 @@ impl Arm64Emitter {
                 for (idx, arg) in args.iter().enumerate() {
                     self.ldr_stack(idx as u8, self.value_offset(arg)?)?;
                 }
-                let target_abi_symbol =
-                    macho_symbol_name(&internal_abi_symbol(target_symbol_hash)?);
+                let target_abi_symbol = macho_symbol_name(
+                    &target_abi_symbol
+                        .clone()
+                        .unwrap_or(internal_abi_symbol(target_symbol_hash)?),
+                );
                 let offset = self.text.len();
                 self.emit_u32(0x94000000);
                 self.relocations.push(TextRelocation {

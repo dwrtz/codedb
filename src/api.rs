@@ -45,6 +45,23 @@ enum ApiOperation {
         #[serde(default, alias = "expect_root")]
         expect_root_hash: Option<String>,
     },
+    CreateExternalFunction {
+        #[serde(default = "default_module")]
+        module: String,
+        name: String,
+        #[serde(default)]
+        birth_seed: Option<String>,
+        params: Vec<ParamSpec>,
+        return_type: String,
+        #[serde(default)]
+        effects: Vec<Effect>,
+        abi: String,
+        link_name: String,
+        #[serde(default)]
+        library: Option<String>,
+        #[serde(default, alias = "expect_root")]
+        expect_root_hash: Option<String>,
+    },
     RenameSymbol {
         #[serde(default = "default_module")]
         module: String,
@@ -189,6 +206,9 @@ impl ApiOperation {
     fn expect_root_hash(&self) -> Option<&str> {
         match self {
             ApiOperation::CreateFunction {
+                expect_root_hash, ..
+            }
+            | ApiOperation::CreateExternalFunction {
                 expect_root_hash, ..
             }
             | ApiOperation::RenameSymbol {
@@ -513,6 +533,30 @@ impl CodeDb {
                 return_type: return_type.clone(),
                 effects: effects.clone(),
                 body: body.clone(),
+            }),
+            ApiOperation::CreateExternalFunction {
+                module,
+                name,
+                birth_seed,
+                params,
+                return_type,
+                effects,
+                abi,
+                link_name,
+                library,
+                ..
+            } => Ok(Operation::CreateExternalFunction {
+                module: module.clone(),
+                name: name.clone(),
+                birth_seed: birth_seed
+                    .clone()
+                    .unwrap_or_else(|| format!("json:extern:{module}:{name}")),
+                params: params.clone(),
+                return_type: return_type.clone(),
+                effects: effects.clone(),
+                abi: abi.clone(),
+                link_name: link_name.clone(),
+                library: library.clone(),
             }),
             ApiOperation::RenameSymbol {
                 module,

@@ -634,6 +634,16 @@ impl CodeDb {
                     reasons.insert("name");
                 }
             }
+            Operation::CreateExternalFunction { module, name, .. } => {
+                if self
+                    .resolve_name(&item.output_root, module, name)
+                    .is_ok_and(|created| created == symbol)
+                {
+                    reasons.insert("birth");
+                    reasons.insert("signature");
+                    reasons.insert("name");
+                }
+            }
             Operation::RenameSymbol {
                 symbol: changed, ..
             } => {

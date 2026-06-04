@@ -452,8 +452,17 @@ impl CodeDb {
         for entry in &root.symbols {
             let interface_metadata = function_interface_metadata(&entry.symbol, &entry.signature)?;
             let interface_input_hash = self.put_object("FunctionInterface", &interface_metadata)?;
-            let body_hash = self.function_body_hash(&entry.definition)?;
-            let direct_dependencies = self.dependencies_for_definition(&root, &entry.definition)?;
+            let is_external = self.definition_is_external(&entry.definition)?;
+            let body_hash = if is_external {
+                None
+            } else {
+                Some(self.function_body_hash(&entry.definition)?)
+            };
+            let direct_dependencies = if is_external {
+                BTreeSet::new()
+            } else {
+                self.dependencies_for_definition(&root, &entry.definition)?
+            };
             let mut direct_dependency_interface_hashes = Vec::new();
             for dependency in &direct_dependencies {
                 let Some(dependency_entry) = self.root_symbol(&root, dependency) else {
@@ -483,24 +492,26 @@ impl CodeDb {
                 ArtifactKind::InterfaceHash,
                 &interface_metadata,
             )?;
-            let implementation_metadata = json!({
-                "symbol_hash": entry.symbol,
-                "definition_hash": entry.definition,
-                "function_sig_hash": entry.signature,
-                "typed_body_expr_hash": body_hash,
-                "internal_abi_symbol": internal_abi_symbol(&entry.symbol)?,
-                "direct_dependency_symbols": direct_dependencies.iter().cloned().collect::<Vec<_>>(),
-                "direct_dependency_interface_hashes": direct_dependency_interface_hashes,
-                "semantic_lowering_version": crate::lowering::LOWERED_IR_SCHEMA,
-            });
-            let implementation_key = CacheKeyInput::new(
-                ArtifactKind::ImplementationHash,
-                &entry.definition,
-                "lowering",
-                "implementation",
-            )
-            .with_dependency_interface_hashes(direct_dependency_interface_hashes.clone());
-            self.write_cache_json_for_key(implementation_key, &implementation_metadata)?;
+            if let Some(body_hash) = body_hash {
+                let implementation_metadata = json!({
+                    "symbol_hash": entry.symbol,
+                    "definition_hash": entry.definition,
+                    "function_sig_hash": entry.signature,
+                    "typed_body_expr_hash": body_hash,
+                    "internal_abi_symbol": internal_abi_symbol(&entry.symbol)?,
+                    "direct_dependency_symbols": direct_dependencies.iter().cloned().collect::<Vec<_>>(),
+                    "direct_dependency_interface_hashes": direct_dependency_interface_hashes,
+                    "semantic_lowering_version": crate::lowering::LOWERED_IR_SCHEMA,
+                });
+                let implementation_key = CacheKeyInput::new(
+                    ArtifactKind::ImplementationHash,
+                    &entry.definition,
+                    "lowering",
+                    "implementation",
+                )
+                .with_dependency_interface_hashes(direct_dependency_interface_hashes.clone());
+                self.write_cache_json_for_key(implementation_key, &implementation_metadata)?;
+            }
         }
 
         for binding in &root.names {
@@ -528,7 +539,11 @@ impl CodeDb {
         }
 
         for entry in &root.symbols {
-            let deps = self.dependencies_for_definition(&root, &entry.definition)?;
+            let deps = if self.definition_is_external(&entry.definition)? {
+                BTreeSet::new()
+            } else {
+                self.dependencies_for_definition(&root, &entry.definition)?
+            };
             self.write_cache_json(
                 &entry.definition,
                 "analysis",
@@ -617,6 +632,9 @@ impl CodeDb {
     ) -> Result<Vec<String>> {
         let mut callers = Vec::new();
         for entry in &root.symbols {
+            if self.definition_is_external(&entry.definition)? {
+                continue;
+            }
             let deps = self.dependencies_for_definition(root, &entry.definition)?;
             if deps.contains(symbol) {
                 callers.push(entry.symbol.clone());

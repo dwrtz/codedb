@@ -121,7 +121,8 @@ stale writes instead of applying against a branch that has moved.
 
 `codedb apply <db> --json <file>` accepts an atomic structural
 `codedb/apply/v1` JSON document with operations such as `create_function`,
-`rename_symbol`, `move_symbol`, `replace_function_body`, `create_alias`, and `set_export`.
+`create_external_function`, `rename_symbol`, `move_symbol`,
+`replace_function_body`, `create_alias`, and `set_export`.
 Function bodies are structural expression JSON objects, so agents do not need
 to write projection text to mutate the database. The document `branch` field
 selects the branch to mutate and defaults to `main`. See

@@ -20,10 +20,11 @@ impl CodeDb {
             let entry = self
                 .root_symbol(&root, &binding.symbol)
                 .ok_or_else(|| anyhow!("root name points to missing symbol {}", binding.symbol))?;
+            let c_symbol_name = self.c_symbol_name_for_symbol(&root, &binding.symbol)?;
             out.push_str(&format!(
                 "{} {}({});\n",
                 self.c_return_type(&entry.signature)?,
-                c_symbol_name_for_binding(&binding.module, &binding.display_name),
+                c_symbol_name,
                 self.c_param_list(&root, &binding.symbol, &entry.signature)?
             ));
         }
@@ -32,6 +33,9 @@ impl CodeDb {
             let entry = self
                 .root_symbol(&root, &binding.symbol)
                 .ok_or_else(|| anyhow!("root name points to missing symbol {}", binding.symbol))?;
+            if self.definition_is_external(&entry.definition)? {
+                continue;
+            }
             let body = self.function_body_hash(&entry.definition)?;
             let params = param_names(&root, &binding.symbol);
             out.push_str(&format!(
@@ -303,6 +307,14 @@ impl CodeDb {
     }
 
     fn c_symbol_name_for_symbol(&self, root: &ProgramRootPayload, symbol: &str) -> Result<String> {
+        let entry = self
+            .root_symbol(root, symbol)
+            .ok_or_else(|| anyhow!("symbol missing from root {symbol}"))?;
+        if self.definition_is_external(&entry.definition)? {
+            return Ok(self
+                .external_function_metadata(&entry.definition)?
+                .link_name);
+        }
         let binding = self
             .preferred_binding(root, symbol)
             .ok_or_else(|| anyhow!("symbol has no display name {symbol}"))?;
