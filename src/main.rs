@@ -341,6 +341,11 @@ enum Command {
         #[command(subcommand)]
         command: BranchCommand,
     },
+    #[command(about = "Export and import semantic package bundles")]
+    Bundle {
+        #[command(subcommand)]
+        command: BundleCommand,
+    },
     #[command(about = "Preview or apply a conservative semantic branch merge")]
     Merge {
         #[command(subcommand)]
@@ -414,6 +419,25 @@ enum BranchCommand {
         branch_b: String,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BundleCommand {
+    Export {
+        db: PathBuf,
+        #[arg(long)]
+        root: String,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        include_artifacts: bool,
+    },
+    Import {
+        db: PathBuf,
+        file: PathBuf,
+        #[arg(long)]
+        import_artifacts: bool,
     },
 }
 
@@ -1090,6 +1114,36 @@ fn main() -> Result<()> {
             } => {
                 let codedb = codedb::CodeDb::open(db)?;
                 print!("{}", codedb.compare_branches(&branch_a, &branch_b, json)?);
+            }
+        },
+        Command::Bundle { command } => match command {
+            BundleCommand::Export {
+                db,
+                root,
+                out,
+                include_artifacts,
+            } => {
+                let codedb = codedb::CodeDb::open(db)?;
+                let bundle = codedb.export_bundle_root(&root, include_artifacts)?;
+                std::fs::write(&out, bundle.text)?;
+                println!("exported bundle {}", out.display());
+                println!("root {}", bundle.root_hash);
+                println!(
+                    "history {}",
+                    bundle.history_hash.unwrap_or_else(|| "none".to_string())
+                );
+                println!("package {}", bundle.package_hash);
+                println!("objects {}", bundle.object_count);
+                println!("migrations {}", bundle.migration_count);
+                println!("artifacts {}", bundle.artifact_count);
+            }
+            BundleCommand::Import {
+                db,
+                file,
+                import_artifacts,
+            } => {
+                let mut codedb = codedb::CodeDb::open(db)?;
+                print!("{}", codedb.import_bundle_file(&file, import_artifacts)?);
             }
         },
         Command::Merge { command } => match command {
