@@ -115,6 +115,7 @@ impl CodeDb {
             "FunctionSignature" => {
                 self.check_hash_array_refs(parent_hash, "params", payload.get("params"), errors)?;
                 self.check_hash_ref(parent_hash, "return", payload.get("return"), errors)?;
+                self.check_signature_effects(parent_hash, payload.get("effects"), errors)?;
             }
             "Expression" => {
                 self.check_hash_ref(parent_hash, "type", payload.get("type"), errors)?;
@@ -351,6 +352,42 @@ impl CodeDb {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn check_signature_effects(
+        &self,
+        parent_hash: &str,
+        value: Option<&JsonValue>,
+        errors: &mut Vec<String>,
+    ) -> Result<()> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        let Some(values) = value.as_array() else {
+            errors.push(format!(
+                "bad_signature_effects: {parent_hash} effects is not array"
+            ));
+            return Ok(());
+        };
+        let mut effects = Vec::new();
+        for effect in values {
+            let Some(effect) = effect.as_str() else {
+                errors.push(format!(
+                    "bad_signature_effects: {parent_hash} effect is not string"
+                ));
+                continue;
+            };
+            match crate::types::Effect::from_str(effect) {
+                Ok(effect) => effects.push(effect),
+                Err(_) => errors.push(format!(
+                    "bad_signature_effects: {parent_hash} unknown effect {effect}"
+                )),
+            }
+        }
+        if let Err(err) = crate::types::normalize_effects(&effects) {
+            errors.push(format!("bad_signature_effects: {parent_hash} {err:#}"));
         }
         Ok(())
     }

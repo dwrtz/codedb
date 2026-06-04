@@ -17,7 +17,7 @@ use crate::model::{
 };
 use crate::store::{CodeDb, canonical_json, hash_bytes};
 use crate::tests::{test_points_to_entry_symbol, validate_test_value_type};
-use crate::types::ParamSpec;
+use crate::types::{Effect, ParamSpec};
 use crate::{HISTORY_DOMAIN, MAIN_BRANCH, MIGRATION_DOMAIN};
 
 const HISTORY_EXPORT_SCHEMA: &str = "codedb/history-export/v1";
@@ -32,6 +32,8 @@ pub(crate) enum Operation {
         birth_seed: String,
         params: Vec<ParamSpec>,
         return_type: String,
+        #[serde(default)]
+        effects: Vec<Effect>,
         body: RawExpr,
     },
     RenameSymbol {
@@ -58,6 +60,8 @@ pub(crate) enum Operation {
         name: String,
         params: Vec<ParamSpec>,
         return_type: String,
+        #[serde(default)]
+        effects: Vec<Effect>,
     },
     AddParameter {
         module: String,
@@ -468,6 +472,7 @@ pub(crate) enum Postcondition {
         name: String,
         params: Vec<ParamSpec>,
         return_type: String,
+        effects: Vec<Effect>,
         body: RawExpr,
     },
     NamePointsToSymbol {
@@ -491,6 +496,7 @@ pub(crate) enum Postcondition {
         symbol: String,
         params: Vec<ParamSpec>,
         return_type: String,
+        effects: Vec<Effect>,
     },
     SymbolAbsent {
         symbol: String,
@@ -1293,6 +1299,7 @@ impl CodeDb {
                 name,
                 params,
                 return_type,
+                effects,
                 body,
                 ..
             } => vec![
@@ -1304,6 +1311,7 @@ impl CodeDb {
                     name: name.clone(),
                     params: params.clone(),
                     return_type: return_type.clone(),
+                    effects: effects.clone(),
                     body: body.clone(),
                 },
             ],
@@ -1367,6 +1375,7 @@ impl CodeDb {
                 name,
                 params,
                 return_type,
+                effects,
             } => vec![
                 Postcondition::RootExists {
                     root: output_root.to_string(),
@@ -1377,6 +1386,7 @@ impl CodeDb {
                     symbol: symbol.clone(),
                     params: params.clone(),
                     return_type: return_type.clone(),
+                    effects: effects.clone(),
                 },
             ],
             Operation::AddParameter {
@@ -1598,6 +1608,7 @@ impl CodeDb {
                 name,
                 params,
                 return_type,
+                effects,
                 body,
             } => {
                 let Some(symbol) = symbol_for_name(root, module, name) else {
@@ -1607,16 +1618,19 @@ impl CodeDb {
                     .iter()
                     .map(|param| param.name.clone())
                     .collect::<Vec<_>>();
-                Ok(
-                    self.function_signature_source_matches(root, &symbol, params, return_type)?
-                        && self.function_body_source_matches(
-                            root,
-                            module,
-                            &symbol,
-                            body,
-                            &param_names,
-                        )?,
-                )
+                Ok(self.function_signature_source_matches(
+                    root,
+                    &symbol,
+                    params,
+                    return_type,
+                    effects,
+                )? && self.function_body_source_matches(
+                    root,
+                    module,
+                    &symbol,
+                    body,
+                    &param_names,
+                )?)
             }
             Postcondition::NamePointsToSymbol {
                 module,
@@ -1650,11 +1664,12 @@ impl CodeDb {
                 symbol,
                 params,
                 return_type,
+                effects,
             } => {
                 if !name_points_to_symbol(root, module, name, symbol) {
                     return Ok(false);
                 }
-                self.function_signature_source_matches(root, symbol, params, return_type)
+                self.function_signature_source_matches(root, symbol, params, return_type, effects)
             }
             Postcondition::SymbolAbsent { symbol } => {
                 let test_refs_symbol = root
@@ -1690,6 +1705,7 @@ impl CodeDb {
         symbol: &str,
         params: &[ParamSpec],
         return_type: &str,
+        effects: &[Effect],
     ) -> Result<bool> {
         let Some(entry) = self.root_symbol(root, symbol) else {
             return Ok(false);
@@ -1700,12 +1716,15 @@ impl CodeDb {
             .map(|param| self.type_hash_for_source(&param.ty))
             .collect::<Result<Vec<_>>>()?;
         let expected_return_type = self.type_hash_for_source(return_type)?;
+        let expected_effects = crate::types::normalize_effects(effects)?;
+        let actual_effects = self.signature_effects(&entry.signature)?;
         let expected_names = params
             .iter()
             .map(|param| param.name.clone())
             .collect::<Vec<_>>();
         Ok(actual_params == expected_params
             && actual_return_type == expected_return_type
+            && actual_effects == expected_effects
             && param_names(root, symbol) == expected_names)
     }
 
@@ -1739,6 +1758,7 @@ impl CodeDb {
                 birth_seed,
                 params,
                 return_type,
+                effects,
                 body,
             } => self.apply_create_function(
                 input_root,
@@ -1748,6 +1768,7 @@ impl CodeDb {
                 birth_seed,
                 params,
                 return_type,
+                effects,
                 body,
             ),
             Operation::RenameSymbol {
@@ -1774,7 +1795,16 @@ impl CodeDb {
                 name,
                 params,
                 return_type,
-            } => self.apply_change_signature(input_root, module, symbol, name, params, return_type),
+                effects,
+            } => self.apply_change_signature(
+                input_root,
+                module,
+                symbol,
+                name,
+                params,
+                return_type,
+                effects,
+            ),
             Operation::AddParameter {
                 module,
                 symbol,
@@ -1856,6 +1886,7 @@ impl CodeDb {
         birth_seed: &str,
         params: &[ParamSpec],
         return_type: &str,
+        effects: &[Effect],
         body: &RawExpr,
     ) -> Result<String> {
         validate_module_path("module", module)?;
@@ -1876,7 +1907,8 @@ impl CodeDb {
             .map(|param| self.resolve_type(&param.ty))
             .collect::<Result<Vec<_>>>()?;
         let return_type_hash = self.resolve_type(return_type)?;
-        let signature = self.put_signature(&param_types, &return_type_hash)?;
+        let signature =
+            self.put_signature_with_effects(&param_types, &return_type_hash, effects)?;
         let param_name_list = params
             .iter()
             .map(|param| param.name.clone())
@@ -2056,6 +2088,7 @@ impl CodeDb {
         name: &str,
         params: &[ParamSpec],
         return_type: &str,
+        effects: &[Effect],
     ) -> Result<String> {
         validate_param_names(params)?;
         let mut root = self.load_root(input_root)?;
@@ -2069,7 +2102,8 @@ impl CodeDb {
             .map(|param| self.resolve_type(&param.ty))
             .collect::<Result<Vec<_>>>()?;
         let return_type_hash = self.resolve_type(return_type)?;
-        let signature = self.put_signature(&param_types, &return_type_hash)?;
+        let signature =
+            self.put_signature_with_effects(&param_types, &return_type_hash, effects)?;
         let param_name_list = params
             .iter()
             .map(|param| param.name.clone())
@@ -2123,6 +2157,7 @@ impl CodeDb {
         let old_body_hash = self.function_body_hash(&old_definition)?;
         let old_body = self.typed_expr_to_raw_in_module(&old_body_hash, &root, module)?;
         let (mut param_types, return_type) = self.signature_parts(&old_signature)?;
+        let effects = self.signature_effects(&old_signature)?;
         let mut param_name_list = param_names(&root, symbol);
         param_types.push(self.resolve_type(&param.ty)?);
         param_name_list.push(param.name.clone());
@@ -2138,7 +2173,7 @@ impl CodeDb {
             .collect::<Result<Vec<_>>>()?;
         validate_param_names(&params)?;
 
-        let signature = self.put_signature(&param_types, &return_type)?;
+        let signature = self.put_signature_with_effects(&param_types, &return_type, &effects)?;
         root.symbols[idx].signature = signature.clone();
         upsert_param_names(&mut root, symbol, param_name_list.clone());
 

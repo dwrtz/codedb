@@ -699,10 +699,21 @@ fn workspace_branch_compare(
 
 fn symbols_list(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
     let branch = branch_param(params)?;
-    let result = parse_json_payload(
+    let object = params_object(params)?;
+    let requested_effects = effects_filter_param(object)?;
+    let mut result = parse_json_payload(
         db.list_branch_json(&branch)
             .map_err(WorkspaceMethodError::method)?,
     )?;
+    if let Some(requested_effects) = requested_effects {
+        let symbols = result
+            .get_mut("symbols")
+            .and_then(JsonValue::as_array_mut)
+            .ok_or_else(|| {
+                WorkspaceMethodError::method(anyhow::anyhow!("symbols must be array"))
+            })?;
+        symbols.retain(|symbol| symbol_matches_effect_filter(symbol, &requested_effects));
+    }
     let snapshot = workspace_snapshot(db, &branch)?;
     Ok(WorkspaceMethodResult::new(result, snapshot))
 }
@@ -765,6 +776,8 @@ fn symbols_resolve(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMet
         "symbol_hash": symbol,
         "signature_hash": root_symbol.signature,
         "definition_hash": root_symbol.definition,
+        "effects": db.signature_effect_names(&root_symbol.signature)
+            .map_err(WorkspaceMethodError::method)?,
         "signature": db.signature_source(&root_symbol.signature, &local_param_names)
             .map_err(WorkspaceMethodError::method)?,
     });
@@ -1880,6 +1893,26 @@ fn optional_string_array(
         );
     }
     Ok(Some(out))
+}
+
+fn effects_filter_param(object: &JsonMap<String, JsonValue>) -> MethodResult<Option<Vec<String>>> {
+    if let Some(effect) = optional_str(object, "effect")? {
+        return Ok(Some(vec![effect.to_string()]));
+    }
+    optional_string_array(object, "effects")
+}
+
+fn symbol_matches_effect_filter(symbol: &JsonValue, requested_effects: &[String]) -> bool {
+    let effects = symbol
+        .get("effects")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    requested_effects
+        .iter()
+        .all(|effect| effects.contains(effect.as_str()))
 }
 
 fn required_str_any<'a>(

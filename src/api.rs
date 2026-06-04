@@ -9,7 +9,7 @@ use crate::expr::RawExpr;
 use crate::migrations::{MigrationStatus, Operation};
 use crate::model::{TestCategory, TestValue};
 use crate::store::{CodeDb, canonical_json};
-use crate::types::ParamSpec;
+use crate::types::{Effect, ParamSpec};
 
 const APPLY_SCHEMA: &str = "codedb/apply/v1";
 const APPLY_RESULT_SCHEMA: &str = "codedb/apply-result/v1";
@@ -39,6 +39,8 @@ enum ApiOperation {
         birth_seed: Option<String>,
         params: Vec<ParamSpec>,
         return_type: String,
+        #[serde(default)]
+        effects: Vec<Effect>,
         body: RawExpr,
         #[serde(default, alias = "expect_root")]
         expect_root_hash: Option<String>,
@@ -87,6 +89,8 @@ enum ApiOperation {
         name: String,
         params: Vec<ParamSpec>,
         return_type: String,
+        #[serde(default)]
+        effects: Vec<Effect>,
         #[serde(default, alias = "expect_root")]
         expect_root_hash: Option<String>,
     },
@@ -496,6 +500,7 @@ impl CodeDb {
                 birth_seed,
                 params,
                 return_type,
+                effects,
                 body,
                 ..
             } => Ok(Operation::CreateFunction {
@@ -506,6 +511,7 @@ impl CodeDb {
                     .unwrap_or_else(|| format!("json:{module}:{name}")),
                 params: params.clone(),
                 return_type: return_type.clone(),
+                effects: effects.clone(),
                 body: body.clone(),
             }),
             ApiOperation::RenameSymbol {
@@ -561,6 +567,7 @@ impl CodeDb {
                 name,
                 params,
                 return_type,
+                effects,
                 ..
             } => Ok(Operation::ChangeFunctionSignature {
                 module: module.clone(),
@@ -568,6 +575,7 @@ impl CodeDb {
                 name: name.clone(),
                 params: params.clone(),
                 return_type: return_type.clone(),
+                effects: effects.clone(),
             }),
             ApiOperation::AddParameter {
                 module,

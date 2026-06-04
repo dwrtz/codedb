@@ -11,7 +11,7 @@ use crate::model::{
     root_module_names,
 };
 use crate::store::CodeDb;
-use crate::types::{ParamSpec, TypeSpec};
+use crate::types::{Effect, ParamSpec, TypeSpec, normalize_effects, visible_effects};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -97,6 +97,8 @@ pub struct FunctionSource {
     pub name: String,
     pub params: Vec<ParamSpec>,
     pub return_type: String,
+    #[serde(default)]
+    pub effects: Vec<Effect>,
     pub body: RawExpr,
 }
 
@@ -559,6 +561,7 @@ impl CodeDb {
         param_names: &[String],
     ) -> Result<String> {
         let (params, return_type) = self.signature_parts(signature_hash)?;
+        let effects = self.signature_effects(signature_hash)?;
         let rendered_params = params
             .iter()
             .enumerate()
@@ -570,11 +573,20 @@ impl CodeDb {
                 Ok(format!("{name}: {}", self.type_name(ty)?))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(format!(
+        let mut source = format!(
             "({}) -> {}",
             rendered_params.join(", "),
             self.type_name(&return_type)?
-        ))
+        );
+        if !effects.is_empty() {
+            let rendered_effects = visible_effects(&effects)
+                .into_iter()
+                .map(|effect| effect.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            source.push_str(&format!(" effects[{rendered_effects}]"));
+        }
+        Ok(source)
     }
 
     pub(crate) fn expr_to_source(
@@ -1560,11 +1572,13 @@ pub(crate) fn parse_expr_source(source: &str) -> Result<RawExpr> {
     Ok(expr)
 }
 
-pub(crate) fn parse_signature_source(source: &str) -> Result<(Vec<ParamSpec>, String)> {
+pub(crate) fn parse_signature_source_with_effects(
+    source: &str,
+) -> Result<(Vec<ParamSpec>, String, Vec<Effect>)> {
     let wrapped = format!("fn __sig__{source} = 0");
     let mut parser = Parser::new(&wrapped)?;
     let function = parser.parse_function()?;
-    Ok((function.params, function.return_type))
+    Ok((function.params, function.return_type, function.effects))
 }
 
 struct Parser {
@@ -1618,6 +1632,11 @@ impl Parser {
         }
         self.expect_symbol("->")?;
         let return_type = self.parse_type_source()?;
+        let effects = if self.consume_ident_value("effects") {
+            self.parse_effect_list()?
+        } else {
+            Vec::new()
+        };
         self.expect_symbol("=")?;
         let body = self.parse_expr()?;
         Ok(FunctionSource {
@@ -1625,8 +1644,26 @@ impl Parser {
             name,
             params,
             return_type,
+            effects,
             body,
         })
+    }
+
+    fn parse_effect_list(&mut self) -> Result<Vec<Effect>> {
+        self.expect_symbol("[")?;
+        let mut effects = Vec::new();
+        if self.consume_symbol("]") {
+            bail!("effect list must not be empty");
+        }
+        loop {
+            let effect = Effect::from_str(&self.expect_ident()?)?;
+            effects.push(effect);
+            if self.consume_symbol("]") {
+                break;
+            }
+            self.expect_symbol(",")?;
+        }
+        normalize_effects(&effects)
     }
 
     fn parse_expr(&mut self) -> Result<RawExpr> {

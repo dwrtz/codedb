@@ -55,6 +55,7 @@ struct PlannedLink {
     target_triple: String,
     entry_symbol_hash: String,
     entry_abi_symbol: String,
+    entry_effects: Vec<String>,
     objects: Vec<PlannedObject>,
     export_map: Vec<JsonValue>,
     link_options: JsonValue,
@@ -66,6 +67,7 @@ struct PlannedObject {
     signature_hash: String,
     param_type_hashes: Vec<String>,
     return_type_hash: String,
+    effects: Vec<String>,
     internal_abi_symbol: String,
     object_cache_key: String,
     object_key_input: CacheKeyInput,
@@ -90,6 +92,7 @@ impl PlannedLink {
                     "signature_hash": &object.signature_hash,
                     "param_type_hashes": &object.param_type_hashes,
                     "return_type_hash": &object.return_type_hash,
+                    "effects": &object.effects,
                     "internal_abi_symbol": &object.internal_abi_symbol,
                     "object_cache_key": &object.object_cache_key,
                 })
@@ -139,6 +142,7 @@ impl CodeDb {
             "target_triple": &planned.target_triple,
             "entry_symbol_hash": &planned.entry_symbol_hash,
             "entry_abi_symbol": &planned.entry_abi_symbol,
+            "entry_effects": &planned.entry_effects,
             "link_plan_input_hash": &planned.input_hash,
             "link_plan_cache_key": &planned.link_plan_cache_key,
             "link_plan_hash": link_plan_hash,
@@ -433,6 +437,7 @@ impl CodeDb {
                 .ok_or_else(|| anyhow!("link plan symbol missing from root {symbol}"))?;
             let (param_type_hashes, return_type_hash) =
                 self.signature_parts(&root_entry.signature)?;
+            let effects = self.signature_effect_names(&root_entry.signature)?;
             let mut dependency_interface_hashes = self
                 .dependencies_for_definition(root, &root_entry.definition)?
                 .into_iter()
@@ -463,6 +468,7 @@ impl CodeDb {
                 signature_hash: root_entry.signature.clone(),
                 param_type_hashes,
                 return_type_hash,
+                effects,
                 internal_abi_symbol: internal_abi_symbol(&symbol)?,
                 object_cache_key,
                 object_key_input,
@@ -514,6 +520,14 @@ impl CodeDb {
             target_triple: target_triple.to_string(),
             entry_symbol_hash: entry_symbol.to_string(),
             entry_abi_symbol: internal_abi_symbol(entry_symbol)?,
+            entry_effects: self.signature_effect_names(
+                &root
+                    .symbols
+                    .iter()
+                    .find(|entry| entry.symbol == entry_symbol)
+                    .ok_or_else(|| anyhow!("entry symbol missing from root {entry_symbol}"))?
+                    .signature,
+            )?,
             objects,
             export_map,
             link_options,

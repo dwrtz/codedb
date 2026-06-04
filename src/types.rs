@@ -21,6 +21,45 @@ pub struct ParamSpec {
     pub ty: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Effect {
+    Pure,
+    Trap,
+    Io,
+    State,
+    Alloc,
+    Ffi,
+    Concurrent,
+}
+
+impl Effect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effect::Pure => "pure",
+            Effect::Trap => "trap",
+            Effect::Io => "io",
+            Effect::State => "state",
+            Effect::Alloc => "alloc",
+            Effect::Ffi => "ffi",
+            Effect::Concurrent => "concurrent",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "pure" => Ok(Effect::Pure),
+            "trap" => Ok(Effect::Trap),
+            "io" => Ok(Effect::Io),
+            "state" => Ok(Effect::State),
+            "alloc" => Ok(Effect::Alloc),
+            "ffi" => Ok(Effect::Ffi),
+            "concurrent" => Ok(Effect::Concurrent),
+            other => bail!("unknown effect {other}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LocalTypeBinding {
     name: String,
@@ -149,18 +188,29 @@ impl CodeDb {
         self.put_object("Type", &payload)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn put_signature(
         &mut self,
         param_types: &[String],
         return_type: &str,
     ) -> Result<String> {
+        self.put_signature_with_effects(param_types, return_type, &[])
+    }
+
+    pub(crate) fn put_signature_with_effects(
+        &mut self,
+        param_types: &[String],
+        return_type: &str,
+        effects: &[Effect],
+    ) -> Result<String> {
+        let effects = normalize_effects(effects)?;
         self.put_object(
             "FunctionSignature",
             &json!({
                 "params": param_types,
                 "return": return_type,
                 "abi": ABI_TAG,
-                "effects": [],
+                "effects": effect_names(&effects),
             }),
         )
     }
@@ -185,6 +235,32 @@ impl CodeDb {
             .ok_or_else(|| anyhow!("signature missing return {signature_hash}"))?
             .to_string();
         Ok((params, return_type))
+    }
+
+    pub(crate) fn signature_effects(&self, signature_hash: &str) -> Result<Vec<Effect>> {
+        let payload = self.get_payload(signature_hash)?;
+        let effects = match payload.get("effects") {
+            None => Vec::new(),
+            Some(JsonValue::Array(values)) => values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| anyhow!("signature effect must be string"))
+                        .and_then(Effect::from_str)
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Some(_) => bail!("signature effects must be an array {signature_hash}"),
+        };
+        normalize_effects(&effects)
+    }
+
+    pub(crate) fn signature_effect_names(&self, signature_hash: &str) -> Result<Vec<String>> {
+        let effects = self.signature_effects(signature_hash)?;
+        Ok(visible_effects(&effects)
+            .into_iter()
+            .map(|effect| effect.as_str().to_string())
+            .collect())
     }
 
     pub(crate) fn put_symbol_birth(
@@ -943,6 +1019,7 @@ impl CodeDb {
         let root = self.load_root(root_hash)?;
         for entry in &root.symbols {
             let (param_types, return_type) = self.signature_parts(&entry.signature)?;
+            self.signature_effects(&entry.signature)?;
             let body = self.function_body_hash(&entry.definition)?;
             let actual = self.verify_expr_type(&body, &root, &param_types)?;
             if actual != return_type {
@@ -961,8 +1038,37 @@ impl CodeDb {
                     definition_signature
                 );
             }
+            self.verify_function_effects(&root, entry)?;
         }
         self.validate_tests_for_root(root_hash, &root)?;
+        Ok(())
+    }
+
+    fn verify_function_effects(
+        &self,
+        root: &ProgramRootPayload,
+        entry: &crate::model::RootSymbolPayload,
+    ) -> Result<()> {
+        let declared = self
+            .signature_effects(&entry.signature)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let dependencies = self.dependencies_for_definition(root, &entry.definition)?;
+        for dependency in dependencies {
+            let Some(callee) = self.root_symbol(root, &dependency) else {
+                continue;
+            };
+            for effect in self.signature_effects(&callee.signature)? {
+                if !declared.contains(&effect) {
+                    bail!(
+                        "bad_effects: function {} calls {} with undeclared effect {}",
+                        self.symbol_display(root, &entry.symbol)?,
+                        self.symbol_display(root, &dependency)?,
+                        effect.as_str()
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1356,6 +1462,29 @@ pub(crate) fn type_hash_for(type_kind: &str) -> String {
         SCHEMA_VERSION,
         &canonical_json(&json!({ "type_kind": type_kind })),
     )
+}
+
+pub(crate) fn normalize_effects(effects: &[Effect]) -> Result<Vec<Effect>> {
+    let mut set = effects.iter().copied().collect::<BTreeSet<_>>();
+    if set.contains(&Effect::Pure) && set.len() > 1 {
+        bail!("pure effect cannot be combined with other effects");
+    }
+    if set.remove(&Effect::Pure) {
+        return Ok(Vec::new());
+    }
+    Ok(set.into_iter().collect())
+}
+
+pub(crate) fn visible_effects(effects: &[Effect]) -> Vec<Effect> {
+    if effects.is_empty() {
+        vec![Effect::Pure]
+    } else {
+        effects.to_vec()
+    }
+}
+
+pub(crate) fn effect_names(effects: &[Effect]) -> Vec<&'static str> {
+    effects.iter().map(|effect| effect.as_str()).collect()
 }
 
 impl TypeSpec {

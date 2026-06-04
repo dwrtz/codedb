@@ -32,10 +32,10 @@ use serde_json::json;
 
 pub use expr::{FunctionSource, RawExpr, Value};
 pub use store::CodeDb;
-pub use types::ParamSpec;
+pub use types::{Effect, ParamSpec};
 
 use backend::ArtifactKind;
-use expr::{parse_expr_source, parse_program, parse_signature_source};
+use expr::{parse_expr_source, parse_program, parse_signature_source_with_effects};
 use migrations::Operation;
 use model::{param_names, preferred_names, root_module_names};
 
@@ -97,6 +97,7 @@ impl CodeDb {
                 birth_seed,
                 params: function.params,
                 return_type: function.return_type,
+                effects: function.effects,
                 body: function.body,
             };
             let outcome = self.apply_and_record(branch, op)?;
@@ -220,6 +221,7 @@ impl CodeDb {
                 "symbol_hash": symbol,
                 "signature_hash": root_symbol.signature,
                 "definition_hash": root_symbol.definition,
+                "effects": self.signature_effect_names(&root_symbol.signature)?,
                 "signature": self.signature_source(&root_symbol.signature, &param_names(&root, &symbol))?,
             }));
         }
@@ -253,6 +255,11 @@ impl CodeDb {
             binding.module, binding.display_name
         ));
         out.push_str(&format!("signature {}\n", root_symbol.signature));
+        out.push_str(&format!(
+            "effects {}\n",
+            self.signature_effect_names(&root_symbol.signature)?
+                .join(",")
+        ));
         out.push_str(&format!("definition {}\n", root_symbol.definition));
         out.push_str(&format!("body {body_hash}\n"));
         out.push_str(&format!(
@@ -331,6 +338,7 @@ impl CodeDb {
             "signature_hash": root_symbol.signature,
             "definition_hash": root_symbol.definition,
             "body_hash": body_hash,
+            "effects": self.signature_effect_names(&root_symbol.signature)?,
             "internal_abi_symbol": abi::internal_abi_symbol(&symbol)?,
             "exported_abi_symbols": abi::exported_abi_names(&root, &symbol),
             "signature": self.signature_source(&root_symbol.signature, &local_param_names)?,
@@ -458,13 +466,14 @@ impl CodeDb {
         let branch = self.branch(MAIN_BRANCH)?;
         let operation_root = expected_root.unwrap_or(&branch.root_hash).to_string();
         let symbol = self.resolve_name(&operation_root, "main", name)?;
-        let (params, return_type) = parse_signature_source(signature)?;
+        let (params, return_type, effects) = parse_signature_source_with_effects(signature)?;
         let op = Operation::ChangeFunctionSignature {
             module: "main".to_string(),
             symbol,
             name: name.to_string(),
             params,
             return_type,
+            effects,
         };
         let outcome = self.apply_and_record_expected(branch, &operation_root, op)?;
         Ok(format_outcome(outcome, json))

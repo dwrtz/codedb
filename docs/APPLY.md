@@ -38,6 +38,7 @@ are rejected.
   "birth_seed": "stable-agent-seed",
   "params": [{ "name": "subtotal", "type": "i64" }],
   "return_type": "i64",
+  "effects": ["pure"],
   "body": { "kind": "literal_i64", "value": "1" }
 }
 ```
@@ -63,7 +64,8 @@ are rejected.
   "kind": "change_function_signature",
   "name": "tax",
   "params": [{ "name": "subtotal", "type": "i64" }],
-  "return_type": "i64"
+  "return_type": "i64",
+  "effects": ["io"]
 }
 ```
 
@@ -140,6 +142,36 @@ enum {none: unit, some: i64}
 Record fields and enum variants are projection-safe identifiers. Record and enum
 type objects are structural and content-addressed; they do not imply heap
 allocation or a managed runtime.
+
+## Effects
+
+Function signatures may declare effects:
+
+```text
+fn total(subtotal: i64) -> i64 = subtotal
+fn read_counter() -> i64 effects[io] = 41
+```
+
+Structural `create_function` and `change_function_signature` operations accept
+an optional `effects` array. Omitted effects and `["pure"]` are normalized to the
+default pure signature. Non-pure effects are part of the function signature hash.
+
+Initial effects:
+
+```text
+pure
+trap
+io
+state
+alloc
+ffi
+concurrent
+```
+
+`pure` cannot be combined with other effects. The current scaffold validates
+call propagation: a function that calls an `io`, `ffi`, or otherwise effectful
+function must declare those effects itself. Built-in arithmetic is still treated
+as pure in this phase.
 
 ## Expressions
 

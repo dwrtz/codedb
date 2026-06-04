@@ -296,11 +296,15 @@ impl CodeDb {
         binding: &RootTestBinding,
     ) -> Result<JsonValue> {
         let case = self.load_test_case(&binding.test)?;
+        let entry = self
+            .root_symbol(root, &case.entry_symbol)
+            .ok_or_else(|| anyhow!("test entry symbol missing from root: {}", case.entry_symbol))?;
         Ok(json!({
             "name": binding.name,
             "test_hash": binding.test,
             "entry_name": self.symbol_display(root, &case.entry_symbol)?,
             "entry_symbol": case.entry_symbol,
+            "entry_effects": self.signature_effect_names(&entry.signature)?,
             "category": case.category.as_str(),
             "args": case.args,
             "expected": case.expected,
@@ -427,6 +431,9 @@ impl CodeDb {
     ) -> Result<JsonValue> {
         let case = self.load_test_case(&binding.test)?;
         let entry_name = self.symbol_display(root, &case.entry_symbol)?;
+        let entry = self
+            .root_symbol(root, &case.entry_symbol)
+            .ok_or_else(|| anyhow!("test entry symbol missing from root: {}", case.entry_symbol))?;
         let expected = value_from_test_value(&case.expected)?;
         let args = case
             .args
@@ -467,6 +474,7 @@ impl CodeDb {
             "test_hash": binding.test,
             "entry_name": entry_name,
             "entry_symbol": case.entry_symbol,
+            "entry_effects": self.signature_effect_names(&entry.signature)?,
             "category": case.category.as_str(),
             "args": case.args,
             "expected": case.expected,
@@ -546,6 +554,11 @@ impl CodeDb {
         for binding in &new_root.tests {
             let case = self.load_test_case(&binding.test)?;
             let entry_name = self.symbol_display(&new_root, &case.entry_symbol)?;
+            let entry = self
+                .root_symbol(&new_root, &case.entry_symbol)
+                .ok_or_else(|| {
+                    anyhow!("test entry symbol missing from root: {}", case.entry_symbol)
+                })?;
             let reachable_symbols =
                 self.reachable_symbols_from_test_entry(new_root_hash, &case.entry_symbol)?;
             let mut reasons = Vec::new();
@@ -586,6 +599,7 @@ impl CodeDb {
                 "test_hash": binding.test,
                 "entry_name": entry_name,
                 "entry_symbol": case.entry_symbol,
+                "entry_effects": self.signature_effect_names(&entry.signature)?,
                 "category": case.category.as_str(),
                 "selected": is_selected,
                 "status": if is_selected { "selected" } else { "skipped" },
@@ -1039,6 +1053,8 @@ impl TestImpactClassification {
                 json!({
                     "symbol_hash": symbol,
                     "name": display_name_for_changed_symbol(db, old_root, new_root, symbol),
+                    "old_effects": signature_effects_for_changed_symbol(db, old_root, symbol),
+                    "new_effects": signature_effects_for_changed_symbol(db, new_root, symbol),
                     "categories": impact.categories(),
                     "reasons": impact.reasons_json(),
                 })
@@ -1131,6 +1147,18 @@ fn display_name_for_changed_symbol(
     db.symbol_display(new_root, symbol)
         .or_else(|_| db.symbol_display(old_root, symbol))
         .unwrap_or_else(|_| symbol.to_string())
+}
+
+fn signature_effects_for_changed_symbol(
+    db: &CodeDb,
+    root: &ProgramRootPayload,
+    symbol: &str,
+) -> Vec<String> {
+    root.symbols
+        .iter()
+        .find(|entry| entry.symbol == symbol)
+        .and_then(|entry| db.signature_effect_names(&entry.signature).ok())
+        .unwrap_or_default()
 }
 
 pub(crate) fn value_from_test_value(value: &TestValue) -> Result<Value> {

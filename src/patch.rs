@@ -1021,6 +1021,7 @@ impl CodeDb {
                 .unwrap_or_else(|| format!("semantic-patch:extract-function:{name}")),
             params: params.to_vec(),
             return_type,
+            effects: Vec::new(),
             body,
         }];
         let replacement = ExprReplacement::NewCall {
