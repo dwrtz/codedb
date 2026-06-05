@@ -1445,10 +1445,10 @@ impl FunctionEmitter {
             } => {
                 if self.type_passes_indirect(type_hash)? {
                     self.mov_rax_stack(self.value_offset(address)?);
+                    self.mov_stack_rax(self.value_offset(id)?);
                 } else {
-                    self.emit_load_addressed_value(type_hash, address)?;
+                    self.emit_load_addressed_value_to_stack(id, type_hash, address)?;
                 }
-                self.mov_stack_rax(self.value_offset(id)?);
             }
             LoweredOp::Store {
                 address,
@@ -1476,10 +1476,10 @@ impl FunctionEmitter {
             } => {
                 if self.type_passes_indirect(type_hash)? {
                     self.mov_rax_stack(self.value_offset(address)?);
+                    self.mov_stack_rax(self.value_offset(id)?);
                 } else {
-                    self.emit_load_addressed_value(type_hash, address)?;
+                    self.emit_load_addressed_value_to_stack(id, type_hash, address)?;
                 }
-                self.mov_stack_rax(self.value_offset(id)?);
             }
             LoweredOp::Drop { .. } | LoweredOp::BorrowDebug { .. } => {}
             LoweredOp::Return { .. } => {
@@ -1550,6 +1550,32 @@ impl FunctionEmitter {
         Ok(())
     }
 
+    fn emit_load_addressed_value_to_stack(
+        &mut self,
+        id: &str,
+        type_hash: &str,
+        address: &str,
+    ) -> Result<()> {
+        let value_offset = self.value_offset(id)?;
+        match self.type_size(type_hash)? {
+            0 | 1 | 8 => {
+                self.emit_load_addressed_value(type_hash, address)?;
+                self.mov_stack_rax(value_offset);
+            }
+            size @ 2..=7 => {
+                self.mov_rax_imm32(0);
+                self.mov_stack_rax(value_offset);
+                self.copy_memory_from_stack_pointer_to_stack(
+                    value_offset,
+                    self.value_offset(address)?,
+                    size,
+                )?;
+            }
+            size => bail!("native x86_64 backend cannot load scalar size {size}"),
+        }
+        Ok(())
+    }
+
     fn emit_store_addressed_value(
         &mut self,
         type_hash: &str,
@@ -1564,6 +1590,11 @@ impl FunctionEmitter {
                 self.mov_memb_rax_cl();
                 Ok(())
             }
+            size @ 2..=7 => self.copy_memory_from_stack_to_stack_pointer(
+                self.value_offset(address)?,
+                self.value_offset(value)?,
+                size,
+            ),
             8 => {
                 self.mov_rax_stack(self.value_offset(address)?);
                 self.mov_rcx_stack(self.value_offset(value)?);
@@ -1587,6 +1618,34 @@ impl FunctionEmitter {
         )
     }
 
+    fn copy_memory_from_stack_pointer_to_stack(
+        &mut self,
+        dest_stack_offset: i32,
+        source_pointer_offset: i32,
+        size_bytes: u64,
+    ) -> Result<()> {
+        if size_bytes == 0 {
+            return Ok(());
+        }
+        self.lea_rcx_stack(dest_stack_offset);
+        self.mov_rax_stack(source_pointer_offset);
+        self.copy_memory_from_rax_to_rcx(size_bytes)
+    }
+
+    fn copy_memory_from_stack_to_stack_pointer(
+        &mut self,
+        dest_pointer_offset: i32,
+        source_stack_offset: i32,
+        size_bytes: u64,
+    ) -> Result<()> {
+        if size_bytes == 0 {
+            return Ok(());
+        }
+        self.mov_rcx_stack(dest_pointer_offset);
+        self.lea_rax_stack(source_stack_offset);
+        self.copy_memory_from_rax_to_rcx(size_bytes)
+    }
+
     fn copy_memory_from_stack_pointers(
         &mut self,
         dest_pointer_offset: i32,
@@ -1598,6 +1657,10 @@ impl FunctionEmitter {
         }
         self.mov_rcx_stack(dest_pointer_offset);
         self.mov_rax_stack(source_pointer_offset);
+        self.copy_memory_from_rax_to_rcx(size_bytes)
+    }
+
+    fn copy_memory_from_rax_to_rcx(&mut self, size_bytes: u64) -> Result<()> {
         let mut offset = 0_u64;
         while offset + 8 <= size_bytes {
             let offset_i32 = i32::try_from(offset)?;
@@ -1716,6 +1779,11 @@ impl FunctionEmitter {
 
     fn lea_rax_stack(&mut self, offset: i32) {
         self.text.extend_from_slice(&[0x48, 0x8d, 0x85]);
+        self.push_i32(offset);
+    }
+
+    fn lea_rcx_stack(&mut self, offset: i32) {
+        self.text.extend_from_slice(&[0x48, 0x8d, 0x8d]);
         self.push_i32(offset);
     }
 
@@ -2126,10 +2194,10 @@ impl Arm64Emitter {
             } => {
                 if self.type_passes_indirect(type_hash)? {
                     self.ldr_stack(0, self.value_offset(address)?)?;
+                    self.str_stack(0, self.value_offset(id)?)?;
                 } else {
-                    self.emit_load_addressed_value(type_hash, address)?;
+                    self.emit_load_addressed_value_to_stack(id, type_hash, address)?;
                 }
-                self.str_stack(0, self.value_offset(id)?)?;
             }
             LoweredOp::Store {
                 address,
@@ -2157,10 +2225,10 @@ impl Arm64Emitter {
             } => {
                 if self.type_passes_indirect(type_hash)? {
                     self.ldr_stack(0, self.value_offset(address)?)?;
+                    self.str_stack(0, self.value_offset(id)?)?;
                 } else {
-                    self.emit_load_addressed_value(type_hash, address)?;
+                    self.emit_load_addressed_value_to_stack(id, type_hash, address)?;
                 }
-                self.str_stack(0, self.value_offset(id)?)?;
             }
             LoweredOp::Drop { .. } | LoweredOp::BorrowDebug { .. } => {}
             LoweredOp::Return { .. } => {
@@ -2231,6 +2299,32 @@ impl Arm64Emitter {
         Ok(())
     }
 
+    fn emit_load_addressed_value_to_stack(
+        &mut self,
+        id: &str,
+        type_hash: &str,
+        address: &str,
+    ) -> Result<()> {
+        let value_offset = self.value_offset(id)?;
+        match self.type_size(type_hash)? {
+            0 | 1 | 8 => {
+                self.emit_load_addressed_value(type_hash, address)?;
+                self.str_stack(0, value_offset)?;
+            }
+            size @ 2..=7 => {
+                self.mov_u64(0, 0);
+                self.str_stack(0, value_offset)?;
+                self.copy_memory_from_stack_pointer_to_stack(
+                    value_offset,
+                    self.value_offset(address)?,
+                    size,
+                )?;
+            }
+            size => bail!("native arm64 backend cannot load scalar size {size}"),
+        }
+        Ok(())
+    }
+
     fn emit_store_addressed_value(
         &mut self,
         type_hash: &str,
@@ -2245,6 +2339,11 @@ impl Arm64Emitter {
                 self.strb_reg_addr(0, 1)?;
                 Ok(())
             }
+            size @ 2..=7 => self.copy_memory_from_stack_to_stack_pointer(
+                self.value_offset(address)?,
+                self.value_offset(value)?,
+                size,
+            ),
             8 => {
                 self.ldr_stack(0, self.value_offset(value)?)?;
                 self.ldr_stack(1, self.value_offset(address)?)?;
@@ -2268,6 +2367,34 @@ impl Arm64Emitter {
         )
     }
 
+    fn copy_memory_from_stack_pointer_to_stack(
+        &mut self,
+        dest_stack_offset: u32,
+        source_pointer_offset: u32,
+        size_bytes: u64,
+    ) -> Result<()> {
+        if size_bytes == 0 {
+            return Ok(());
+        }
+        self.add_reg_sp_imm(1, dest_stack_offset)?;
+        self.ldr_stack(0, source_pointer_offset)?;
+        self.copy_memory_from_x0_to_x1(size_bytes)
+    }
+
+    fn copy_memory_from_stack_to_stack_pointer(
+        &mut self,
+        dest_pointer_offset: u32,
+        source_stack_offset: u32,
+        size_bytes: u64,
+    ) -> Result<()> {
+        if size_bytes == 0 {
+            return Ok(());
+        }
+        self.ldr_stack(1, dest_pointer_offset)?;
+        self.add_reg_sp_imm(0, source_stack_offset)?;
+        self.copy_memory_from_x0_to_x1(size_bytes)
+    }
+
     fn copy_memory_from_stack_pointers(
         &mut self,
         dest_pointer_offset: u32,
@@ -2279,6 +2406,10 @@ impl Arm64Emitter {
         }
         self.ldr_stack(1, dest_pointer_offset)?;
         self.ldr_stack(0, source_pointer_offset)?;
+        self.copy_memory_from_x0_to_x1(size_bytes)
+    }
+
+    fn copy_memory_from_x0_to_x1(&mut self, size_bytes: u64) -> Result<()> {
         let mut offset = 0_u64;
         while offset + 8 <= size_bytes {
             let offset_u32 = u32::try_from(offset)?;

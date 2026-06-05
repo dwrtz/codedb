@@ -1,6 +1,6 @@
 # SPEC_V2.md — CodeDB Native Semantic Programming Model
 
-Status: Draft 1.0  
+Status: Draft 1.0
 Scope: v2 design track built on the v1 semantic workspace
 
 ## 1. Thesis

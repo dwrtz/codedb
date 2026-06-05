@@ -769,8 +769,22 @@ impl CodeDb {
             &mut comparisons,
         )?;
         let export_wrappers = export_wrapper_source(&prepared.plan)?;
+        let return_abi = layout
+            .get("abi")
+            .and_then(|abi| abi.get("return"))
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("native record layout missing return ABI"))?;
+        let call = match return_abi {
+            "hidden_return_slot" => format!(
+                "void *{entry_abi_symbol}(void *out);\nstruct codedb_result {{ unsigned char bytes[{storage_bytes}]; }} __attribute__((aligned({align_bytes})));\nint main(void) {{\n  struct codedb_result out;\n  memset(&out, 0, sizeof(out));\n  {entry_abi_symbol}(&out);\n"
+            ),
+            "by_value" => format!(
+                "uint64_t {entry_abi_symbol}(void);\nstruct codedb_result {{ unsigned char bytes[{storage_bytes}]; }} __attribute__((aligned({align_bytes})));\nint main(void) {{\n  struct codedb_result out;\n  memset(&out, 0, sizeof(out));\n  uint64_t result = {entry_abi_symbol}();\n  memcpy(&out, &result, {size_bytes});\n"
+            ),
+            other => bail!("native record harness unsupported return ABI {other}"),
+        };
         Ok(format!(
-            "{export_wrappers}#include <stdint.h>\n#include <string.h>\nvoid *{entry_abi_symbol}(void *out);\nstruct codedb_result {{ unsigned char bytes[{storage_bytes}]; }} __attribute__((aligned({align_bytes})));\nint main(void) {{\n  struct codedb_result out;\n  memset(&out, 0, sizeof(out));\n  {entry_abi_symbol}(&out);\n{comparisons}  return 0;\n}}\n"
+            "{export_wrappers}#include <stdint.h>\n#include <string.h>\n{call}{comparisons}  return 0;\n}}\n"
         ))
     }
 

@@ -3376,11 +3376,21 @@ impl CodeDb {
             "call" => {
                 let (args, _, _) = self.call_region_context(root, &payload)?;
                 let mut added_call_loans = Vec::new();
+                let mut moved_call_owners = Vec::new();
                 for arg in args {
                     let pre_arg_state = state.clone();
+                    let transfer_owner = self.move_source_place_for_expr(
+                        root,
+                        &arg,
+                        param_types,
+                        &pre_arg_state.locals,
+                    )?;
                     self.verify_expr_borrows(root, &arg, param_types, state, ExprUse::Value)?;
                     let arg_loans =
                         self.collect_value_loans(root, &arg, param_types, &pre_arg_state)?;
+                    if let Some(owner) = transfer_owner {
+                        moved_call_owners.push(owner);
+                    }
                     for loan in arg_loans {
                         if state.active.contains(&loan) {
                             continue;
@@ -3390,7 +3400,12 @@ impl CodeDb {
                         added_call_loans.push(loan);
                     }
                 }
-                state.active.retain(|loan| !added_call_loans.contains(loan));
+                state.active.retain(|loan| {
+                    !added_call_loans.contains(loan)
+                        && !moved_call_owners
+                            .iter()
+                            .any(|owner| loan_owner_overlaps(loan, owner))
+                });
                 Ok(())
             }
             "binary" => {

@@ -266,6 +266,127 @@ fn main() -> i64 = 1
 }
 
 #[test]
+fn by_value_record_return_test_uses_layout_abi() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("tiny-record-test.sqlite");
+    let source = temp.path().join("tiny-record.cdb");
+    let apply = temp.path().join("tiny-record.apply.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Tiny {
+  only: i64
+}
+
+fn make_tiny() -> Tiny =
+  let tiny: Tiny = { only: 11 } in
+  tiny
+
+fn main() -> i64 = 1
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    std::fs::write(
+        &apply,
+        serde_json::to_string_pretty(&json!({
+            "schema": "codedb/apply/v1",
+            "operations": [
+                {
+                    "kind": "create_test",
+                    "name": "make_tiny_record",
+                    "entry": "make_tiny",
+                    "native_required": true,
+                    "expected": {
+                        "kind": "record",
+                        "fields": [
+                            { "name": "only", "value": { "kind": "i64", "value": "11" } }
+                        ]
+                    }
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let created = parse_json(&run(&["apply", path(&db), "--json", path(&apply)]));
+    assert_eq!(created["status"], "applied");
+
+    let report = parse_json(&run(&["test", path(&db), "--json"]));
+    if can_build_default_native_target() {
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["passed"], 1);
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+    } else {
+        assert_eq!(report["status"], "failed");
+        assert_eq!(report["unsupported"], 1);
+    }
+    run(&["verify", path(&db)]);
+}
+
+#[test]
+fn compact_record_sizes_compile_and_run_native() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("compact-record.sqlite");
+    let source = temp.path().join("compact-record.cdb");
+    let object_path = temp.path().join("make-flags.o");
+
+    std::fs::write(
+        &source,
+        r#"
+record Flags {
+  a: bool
+  b: bool
+}
+
+fn first(flags: Flags) -> bool = flags.a
+
+fn make_flags() -> Flags =
+  let flags: Flags = { a: true, b: false } in
+  flags
+
+fn main() -> bool = first(make_flags())
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "true");
+    run(&[
+        "emit-object",
+        path(&db),
+        "make_flags",
+        "--target",
+        codedb::DEFAULT_NATIVE_TARGET,
+        "--out",
+        path(&object_path),
+    ]);
+    run(&["verify", path(&db)]);
+
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "compact_record_native",
+            "--entry",
+            "main",
+            "--expect-bool",
+            "true",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+    }
+}
+
+#[test]
 fn region_parameterized_record_return_lowers_and_runs_native() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("region-record-return.sqlite");

@@ -1,6 +1,6 @@
 # PLAN_V2.md — CodeDB Native Semantic Programming Roadmap
 
-Status: Draft 1.0  
+Status: Draft 1.0
 Scope: implementation roadmap for the v2 native semantic programming track
 
 ## Direction
