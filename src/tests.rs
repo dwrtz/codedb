@@ -922,6 +922,9 @@ impl CodeDb {
             );
         }
         let Some(expected_exit) = expected_native_exit_code(expected) else {
+            if matches!(expected, Value::Record(_)) {
+                return self.native_record_agreement_result(branch_name, case, expected);
+            }
             return native_unavailable_result(
                 case,
                 "unsupported_feature",
@@ -1001,6 +1004,103 @@ impl CodeDb {
                         vec![native_diagnostic(
                             "native_mismatch",
                             "native result did not match expected value",
+                        )]
+                    },
+                })
+            }
+            Err(err) => native_result_base(
+                case,
+                "failed",
+                Some("native_execution_failed"),
+                Some(format!("failed to run native executable: {err}")),
+                vec![native_diagnostic(
+                    "native_execution_failed",
+                    &format!("failed to run native executable: {err}"),
+                )],
+            ),
+        }
+    }
+
+    fn native_record_agreement_result(
+        &mut self,
+        branch_name: &str,
+        case: &TestCasePayload,
+        expected: &Value,
+    ) -> JsonValue {
+        if !native_target_is_host_linkable(DEFAULT_NATIVE_TARGET) {
+            return native_unavailable_result(
+                case,
+                "backend_unavailable",
+                "default native target is not linkable on this host",
+            );
+        }
+        if !host_has_cc() {
+            return native_unavailable_result(
+                case,
+                "backend_unavailable",
+                "cc linker is not available",
+            );
+        }
+        let build = match self.build_native_test_harness_branch(
+            branch_name,
+            &case.entry_symbol,
+            expected,
+            DEFAULT_NATIVE_TARGET,
+        ) {
+            Ok(build) => build,
+            Err(err) => {
+                return native_unavailable_result(
+                    case,
+                    "unsupported_feature",
+                    &format!("native record build unavailable: {err:#}"),
+                );
+            }
+        };
+        let exe = native_test_executable_path(&build.artifact_hash);
+        if let Err(err) =
+            std::fs::write(&exe, &build.executable).and_then(|_| make_executable(&exe))
+        {
+            let _ = std::fs::remove_file(&exe);
+            return native_result_base(
+                case,
+                "failed",
+                Some("native_execution_failed"),
+                Some(format!("failed to materialize native executable: {err}")),
+                vec![native_diagnostic(
+                    "native_execution_failed",
+                    &format!("failed to materialize native executable: {err}"),
+                )],
+            );
+        }
+        let output = ProcessCommand::new(&exe).status();
+        let _ = std::fs::remove_file(&exe);
+        match output {
+            Ok(status) => {
+                let actual = status.code();
+                let passed = actual == Some(0);
+                json!({
+                    "schema": NATIVE_TEST_RESULT_SCHEMA,
+                    "status": if passed { "passed" } else { "native_mismatch" },
+                    "mode": case.mode.as_str(),
+                    "native_required": case.native_required,
+                    "target_triple": DEFAULT_NATIVE_TARGET,
+                    "reason_code": if passed { JsonValue::Null } else { JsonValue::String("native_mismatch".to_string()) },
+                    "reason": if passed { JsonValue::Null } else { JsonValue::String("native record result did not match expected value".to_string()) },
+                    "comparison": {
+                        "kind": "native_record_harness",
+                        "expected": &case.expected,
+                        "actual": if passed { json!(&case.expected) } else { JsonValue::Null },
+                        "actual_exit_code": actual,
+                    },
+                    "executable_cache_key": JsonValue::Null,
+                    "executable_artifact_hash": build.artifact_hash,
+                    "harness_kind": build.harness_kind,
+                    "diagnostics": if passed {
+                        Vec::<JsonValue>::new()
+                    } else {
+                        vec![native_diagnostic(
+                            "native_mismatch",
+                            "native record result did not match expected value",
                         )]
                     },
                 })

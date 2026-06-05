@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -9,13 +9,14 @@ use crate::abi::{export_map, internal_abi_symbol, validate_exported_abi_name};
 use crate::artifact::CacheKeyInput;
 use crate::backend::ArtifactKind;
 use crate::backend::native::{NativeObjectArtifact, backend_id_for_target};
+use crate::expr::Value;
 use crate::jobs::{ArtifactJobClaim, artifact_job_error, new_worker_id};
 use crate::model::ProgramRootPayload;
 use crate::store::{
     CodeDb, cache_key_for_input, canonical_json, function_interface_metadata, hash_bytes,
     hash_object_canonical,
 };
-use crate::types::type_hash_for;
+use crate::types::{TypeSpec, type_hash_for};
 use crate::{
     APPLE_ARM64_TARGET, BYTES_DOMAIN, DEFAULT_NATIVE_TARGET, LINUX_X86_64_TARGET, MAIN_BRANCH,
     SCHEMA_VERSION,
@@ -33,6 +34,12 @@ pub struct NativeBuild {
     pub artifact_hash: String,
 }
 
+pub(crate) struct NativeTestHarnessBuild {
+    pub(crate) executable: Vec<u8>,
+    pub(crate) artifact_hash: String,
+    pub(crate) harness_kind: String,
+}
+
 struct PreparedLink {
     root_hash: String,
     input_hash: String,
@@ -45,6 +52,11 @@ struct PreparedObject {
     artifact_hash: String,
     cache_key: String,
     bytes: Vec<u8>,
+}
+
+struct NativeRecordFieldLayout {
+    type_hash: String,
+    offset_bytes: u64,
 }
 
 struct PlannedLink {
@@ -281,6 +293,34 @@ impl CodeDb {
             executable,
             cache_key,
             artifact_hash,
+        })
+    }
+
+    pub(crate) fn build_native_test_harness_branch(
+        &mut self,
+        branch_name: &str,
+        entry_symbol: &str,
+        expected: &Value,
+        target_triple: &str,
+    ) -> Result<NativeTestHarnessBuild> {
+        self.ensure_initialized()?;
+        let branch = self.branch(branch_name)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let prepared =
+            self.prepare_link_plan(&branch.root_hash, &root, entry_symbol, target_triple)?;
+        let harness = self.native_test_harness_source(
+            &root,
+            &prepared,
+            entry_symbol,
+            expected,
+            target_triple,
+        )?;
+        let executable = link_with_cc_harness(&prepared, &harness)?;
+        let artifact_hash = hash_bytes(BYTES_DOMAIN, &executable);
+        Ok(NativeTestHarnessBuild {
+            executable,
+            artifact_hash,
+            harness_kind: "c-main-compare-record-return".to_string(),
         })
     }
 
@@ -676,6 +716,161 @@ impl CodeDb {
         }
         Ok(())
     }
+
+    fn native_test_harness_source(
+        &self,
+        root: &ProgramRootPayload,
+        prepared: &PreparedLink,
+        entry_symbol: &str,
+        expected: &Value,
+        target_triple: &str,
+    ) -> Result<String> {
+        let root_entry = self
+            .root_symbol(root, entry_symbol)
+            .ok_or_else(|| anyhow!("entry symbol missing from root {entry_symbol}"))?;
+        let (params, return_type_hash) = self.signature_parts(&root_entry.signature)?;
+        if !params.is_empty() {
+            bail!("native record harness entry must not take parameters");
+        }
+        if !matches!(expected, Value::Record(_)) {
+            bail!("native record harness requires a record expected value");
+        }
+        if !matches!(
+            self.type_spec_in_root(root, &return_type_hash)?,
+            TypeSpec::Record(_)
+        ) {
+            bail!("native record harness entry must return a record");
+        }
+
+        let layout = self
+            .compute_type_layout(root, &return_type_hash, target_triple)?
+            .metadata;
+        if layout.get("kind").and_then(JsonValue::as_str) != Some("record") {
+            bail!("native record harness expected record layout metadata");
+        }
+        let size_bytes = required_metadata_u64(&layout, "size_bytes")?;
+        let align_bytes = required_metadata_u64(&layout, "align_bytes")?;
+        let storage_bytes = size_bytes.max(1);
+        let entry_abi_symbol = prepared
+            .plan
+            .get("entry_abi_symbol")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("link plan missing entry ABI symbol"))?;
+        let mut comparisons = String::new();
+        let mut next_check = 1;
+        self.native_record_comparisons(
+            root,
+            &return_type_hash,
+            expected,
+            &layout,
+            0,
+            target_triple,
+            &mut next_check,
+            &mut comparisons,
+        )?;
+        let export_wrappers = export_wrapper_source(&prepared.plan)?;
+        Ok(format!(
+            "{export_wrappers}#include <stdint.h>\n#include <string.h>\nvoid *{entry_abi_symbol}(void *out);\nstruct codedb_result {{ unsigned char bytes[{storage_bytes}]; }} __attribute__((aligned({align_bytes})));\nint main(void) {{\n  struct codedb_result out;\n  memset(&out, 0, sizeof(out));\n  {entry_abi_symbol}(&out);\n{comparisons}  return 0;\n}}\n"
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn native_record_comparisons(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+        expected: &Value,
+        layout: &JsonValue,
+        base_offset: u64,
+        target_triple: &str,
+        next_check: &mut u32,
+        out: &mut String,
+    ) -> Result<()> {
+        let Value::Record(values) = expected else {
+            bail!("native record comparison expected record value");
+        };
+        let TypeSpec::Record(fields) = self.type_spec_in_root(root, type_hash)? else {
+            bail!("native record comparison expected record type");
+        };
+        if values.len() != fields.len() {
+            bail!(
+                "native record comparison expected {} fields, got {}",
+                fields.len(),
+                values.len()
+            );
+        }
+        let field_layouts = native_record_field_layouts(layout)?;
+        for field in fields {
+            let value = values
+                .get(&field.name)
+                .ok_or_else(|| anyhow!("native record comparison missing field {}", field.name))?;
+            let field_layout = field_layouts
+                .get(&field.name)
+                .ok_or_else(|| anyhow!("native record layout missing field {}", field.name))?;
+            if field_layout.type_hash != field.type_hash {
+                bail!("native record layout field {} type mismatch", field.name);
+            }
+            self.native_value_comparison(
+                root,
+                &field.type_hash,
+                value,
+                base_offset + field_layout.offset_bytes,
+                target_triple,
+                next_check,
+                out,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn native_value_comparison(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+        expected: &Value,
+        offset: u64,
+        target_triple: &str,
+        next_check: &mut u32,
+        out: &mut String,
+    ) -> Result<()> {
+        match (expected, self.type_spec_in_root(root, type_hash)?) {
+            (Value::I64(value), TypeSpec::Builtin(kind)) if kind == "I64" => {
+                let code = next_native_check_code(next_check);
+                out.push_str(&format!(
+                    "  {{ int64_t actual; memcpy(&actual, ((const unsigned char *)&out) + {offset}, sizeof(actual)); if (actual != {}) return {code}; }}\n",
+                    c_i64_literal(*value)
+                ));
+                Ok(())
+            }
+            (Value::Bool(value), TypeSpec::Builtin(kind)) if kind == "Bool" => {
+                let code = next_native_check_code(next_check);
+                let expected = u8::from(*value);
+                out.push_str(&format!(
+                    "  {{ uint8_t actual; memcpy(&actual, ((const unsigned char *)&out) + {offset}, sizeof(actual)); if (actual != {expected}) return {code}; }}\n"
+                ));
+                Ok(())
+            }
+            (Value::Unit, TypeSpec::Builtin(kind)) if kind == "Unit" => Ok(()),
+            (Value::Record(_), TypeSpec::Record(_)) => {
+                let layout = self
+                    .compute_type_layout(root, type_hash, target_triple)?
+                    .metadata;
+                self.native_record_comparisons(
+                    root,
+                    type_hash,
+                    expected,
+                    &layout,
+                    offset,
+                    target_triple,
+                    next_check,
+                    out,
+                )
+            }
+            _ => bail!(
+                "native record harness supports only record values containing i64, bool, unit, or nested records"
+            ),
+        }
+    }
 }
 
 fn prepared_object(object: NativeObjectArtifact) -> PreparedObject {
@@ -698,6 +893,52 @@ fn required_metadata_str<'a>(metadata: &'a JsonValue, key: &str) -> Result<&'a s
         .get(key)
         .and_then(JsonValue::as_str)
         .ok_or_else(|| anyhow!("native object metadata missing string {key}"))
+}
+
+fn required_metadata_u64(metadata: &JsonValue, key: &str) -> Result<u64> {
+    metadata
+        .get(key)
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| anyhow!("native metadata missing u64 {key}"))
+}
+
+fn native_record_field_layouts(
+    layout: &JsonValue,
+) -> Result<BTreeMap<String, NativeRecordFieldLayout>> {
+    if layout.get("kind").and_then(JsonValue::as_str) != Some("record") {
+        bail!("native record layout metadata must have kind record");
+    }
+    let mut fields = BTreeMap::new();
+    for field in layout
+        .get("fields")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| anyhow!("native record layout missing fields"))?
+    {
+        let name = field
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("native record layout field missing name"))?
+            .to_string();
+        let type_hash = field
+            .get("type_hash")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("native record layout field missing type_hash"))?
+            .to_string();
+        let offset_bytes = required_metadata_u64(field, "offset_bytes")?;
+        if fields
+            .insert(
+                name.clone(),
+                NativeRecordFieldLayout {
+                    type_hash,
+                    offset_bytes,
+                },
+            )
+            .is_some()
+        {
+            bail!("native record layout has duplicate field {name}");
+        }
+    }
+    Ok(fields)
 }
 
 fn json_metadata(artifact_json: &JsonValue) -> Result<JsonValue> {
@@ -731,6 +972,19 @@ fn executable_cache_key(prepared: &PreparedLink, linker_identity_hash: &str) -> 
 }
 
 fn link_with_cc(prepared: &PreparedLink) -> Result<Vec<u8>> {
+    let entry = prepared
+        .plan
+        .get("entry_abi_symbol")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| anyhow!("link plan missing entry ABI symbol"))?;
+    let export_wrappers = export_wrapper_source(&prepared.plan)?;
+    let harness_source = format!(
+        "{export_wrappers}long {entry}(void);\nint main(void) {{ return (int){entry}(); }}\n"
+    );
+    link_with_cc_harness(prepared, &harness_source)
+}
+
+fn link_with_cc_harness(prepared: &PreparedLink, harness_source: &str) -> Result<Vec<u8>> {
     let temp_dir = build_temp_dir(&prepared.plan_hash)?;
     std::fs::create_dir_all(&temp_dir)
         .with_context(|| format!("failed to create {}", temp_dir.display()))?;
@@ -741,20 +995,9 @@ fn link_with_cc(prepared: &PreparedLink) -> Result<Vec<u8>> {
             .with_context(|| format!("failed to write {}", path.display()))?;
         object_paths.push(path);
     }
-    let entry = prepared
-        .plan
-        .get("entry_abi_symbol")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| anyhow!("link plan missing entry ABI symbol"))?;
     let harness = temp_dir.join("codedb_main.c");
-    let export_wrappers = export_wrapper_source(&prepared.plan)?;
-    std::fs::write(
-        &harness,
-        format!(
-            "{export_wrappers}long {entry}(void);\nint main(void) {{ return (int){entry}(); }}\n"
-        ),
-    )
-    .with_context(|| format!("failed to write {}", harness.display()))?;
+    std::fs::write(&harness, harness_source)
+        .with_context(|| format!("failed to write {}", harness.display()))?;
     let executable = temp_dir.join("codedb_executable");
     let mut command = Command::new("cc");
     for object in &object_paths {
@@ -939,6 +1182,20 @@ fn native_harness_c_type(type_hash: &str) -> Result<&'static str> {
         Ok("void")
     } else {
         bail!("unsupported native harness type {type_hash}")
+    }
+}
+
+fn next_native_check_code(next_check: &mut u32) -> u32 {
+    let code = ((*next_check - 1) % 250) + 1;
+    *next_check += 1;
+    code
+}
+
+fn c_i64_literal(value: i64) -> String {
+    if value == i64::MIN {
+        "(-9223372036854775807LL - 1LL)".to_string()
+    } else {
+        format!("{value}LL")
     }
 }
 

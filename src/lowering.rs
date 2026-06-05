@@ -1975,15 +1975,37 @@ impl CodeDb {
                     })?;
                     let (expected_args, expected_return) =
                         self.signature_parts(&target.signature)?;
+                    let callee_regions = self
+                        .signature_region_params(&target.signature)?
+                        .into_iter()
+                        .map(|param| param.region)
+                        .collect::<BTreeSet<_>>();
+                    let mut region_substitutions = BTreeMap::new();
                     if args.len() != expected_args.len() {
                         bail!("lowered call arity mismatch for {target_symbol_hash}");
                     }
                     for (idx, arg) in args.iter().enumerate() {
                         let actual = value_type(values, arg)?;
-                        if !self.type_assignable_in_root(root, actual, &expected_args[idx])? {
+                        if !self.type_assignable_for_call_in_root(
+                            root,
+                            actual,
+                            &expected_args[idx],
+                            &callee_regions,
+                        )? {
                             bail!("lowered call argument {idx} type mismatch");
                         }
+                        self.infer_call_region_substitutions_for_types(
+                            root,
+                            actual,
+                            &expected_args[idx],
+                            &callee_regions,
+                            &mut region_substitutions,
+                        )?;
                     }
+                    let expected_return = self.substitute_type_regions_hash_for_verify(
+                        &expected_return,
+                        &region_substitutions,
+                    )?;
                     if type_hash != &expected_return {
                         bail!("lowered call return type mismatch");
                     }

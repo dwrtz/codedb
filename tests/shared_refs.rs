@@ -193,6 +193,69 @@ fn leak<'a>() -> &'a Line =
 }
 
 #[test]
+fn returning_reference_to_local_storage_through_call_is_rejected() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("leak-local-ref-through-call.sqlite");
+    let source = temp.path().join("leak-local-ref-through-call.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+fn id_ref<'a>(line: &'a Line) -> &'a Line = line
+
+fn leak<'a>() -> &'a Line =
+  let line: Line = { price_cents: 25, qty: 4 } in
+  id_ref(&'a line)
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_borrow"))
+        .stderr(predicate::str::contains(
+            "returns reference to local storage",
+        ));
+}
+
+#[test]
+fn region_coercion_between_unrelated_regions_is_rejected() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("region-coercion.sqlite");
+    let source = temp.path().join("region-coercion.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+fn coerce<'a, 'b>(line: &'a Line) -> &'b Line =
+  let widened: &'b Line = line in
+  widened
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("let binding expected"));
+}
+
+#[test]
 fn borrowed_field_and_polymorphic_call_returns_use_caller_region() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("borrowed-return.sqlite");

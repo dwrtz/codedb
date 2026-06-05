@@ -194,6 +194,7 @@ fn main() -> i64 = 1
                     "kind": "create_test",
                     "name": "make_pair_record",
                     "entry": "make_pair",
+                    "native_required": true,
                     "expected": {
                         "kind": "record",
                         "fields": [
@@ -212,9 +213,16 @@ fn main() -> i64 = 1
 
     let listed = parse_json(&run(&["test", path(&db), "--list", "--json"]));
     assert_eq!(listed["tests"][0]["expected"]["kind"], "record");
+    assert_eq!(listed["tests"][0]["native_required"], true);
     let report = parse_json(&run(&["test", path(&db), "--json"]));
-    assert_eq!(report["status"], "passed");
-    assert_eq!(report["passed"], 1);
+    if can_build_default_native_target() {
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["passed"], 1);
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+    } else {
+        assert_eq!(report["status"], "failed");
+        assert_eq!(report["unsupported"], 1);
+    }
     assert_eq!(report["tests"][0]["reference"]["status"], "passed");
     assert_eq!(
         report["tests"][0]["reference"]["actual"],
@@ -227,6 +235,61 @@ fn main() -> i64 = 1
         })
     );
     run(&["verify", path(&db)]);
+}
+
+#[test]
+fn region_parameterized_record_return_lowers_and_runs_native() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("region-record-return.sqlite");
+    let source = temp.path().join("region-record-return.cdb");
+    let ir_path = temp.path().join("main.ir.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+record LineView<'a> {
+  line: &'a Line
+}
+
+fn id_view<'a>(view: LineView<'a>) -> LineView<'a> = view
+
+fn main<'a>() -> i64 =
+  let line: Line = { price_cents: 25, qty: 4 } in
+  let view: LineView<'a> = { line: &'a line } in
+  let same: LineView<'a> = id_view(view) in
+  same.line.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "25");
+    run(&["emit-ir", path(&db), "main", "--out", path(&ir_path)]);
+    run(&["verify", path(&db)]);
+
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "region_record_return_native",
+            "--entry",
+            "main",
+            "--expect-i64",
+            "25",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+    }
 }
 
 fn can_build_default_native_target() -> bool {

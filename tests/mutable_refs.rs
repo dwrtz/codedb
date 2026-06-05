@@ -165,6 +165,72 @@ fn main<'a>() -> i64 =
 }
 
 #[test]
+fn compiler_rejects_two_mutable_borrows_in_one_call() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("duplicate-mut-borrow-call.sqlite");
+    let source = temp.path().join("duplicate-mut-borrow-call.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+fn use_two<'a>(first: &'a mut Line, second: &'a mut Line) -> i64 = 1
+
+fn main<'a>() -> i64 =
+  let line: Line = { price_cents: 25, qty: 4 } in
+  use_two(&'a mut line, &'a mut line)
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_borrow"))
+        .stderr(predicate::str::contains("exclusive loan conflict"));
+}
+
+#[test]
+fn mutable_reference_returned_from_call_keeps_loan_live() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("mut-call-return-loan.sqlite");
+    let source = temp.path().join("mut-call-return-loan.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+fn id_mut<'a>(line: &'a mut Line) -> &'a mut Line = line
+
+fn main<'a>() -> i64 =
+  let line: Line = { price_cents: 25, qty: 4 } in
+  let m: &'a mut Line = id_mut(&'a mut line) in
+  line.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_borrow"))
+        .stderr(predicate::str::contains("shared read"))
+        .stderr(predicate::str::contains("live mutable borrow"));
+}
+
+#[test]
 fn compiler_rejects_shared_read_while_mutable_loan_is_live() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("shared-read-during-mut.sqlite");

@@ -162,6 +162,7 @@ struct LoanPlace {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveLoan {
     kind: LoanKind,
+    region: String,
     place: LoanPlace,
     owner: Option<LoanPlace>,
 }
@@ -1086,17 +1087,17 @@ impl CodeDb {
         ) {
             (
                 TypeSpec::Reference {
+                    region: actual_region,
                     mutable: actual_mutable,
                     referent: actual_referent,
-                    ..
                 },
                 TypeSpec::Reference {
+                    region: expected_region,
                     mutable: expected_mutable,
                     referent: expected_referent,
-                    ..
                 },
             ) => {
-                if actual_mutable != expected_mutable {
+                if actual_region != expected_region || actual_mutable != expected_mutable {
                     return Ok(false);
                 }
                 self.type_assignable_in_root(root, &actual_referent, &expected_referent)
@@ -1116,6 +1117,72 @@ impl CodeDb {
                         root,
                         &actual_field.type_hash,
                         &expected_field.type_hash,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub(crate) fn type_assignable_for_call_in_root(
+        &self,
+        root: &ProgramRootPayload,
+        actual: &str,
+        expected: &str,
+        callee_regions: &BTreeSet<String>,
+    ) -> Result<bool> {
+        if actual == expected {
+            return Ok(true);
+        }
+        match (
+            self.type_spec_in_root(root, actual)?,
+            self.type_spec_in_root(root, expected)?,
+        ) {
+            (
+                TypeSpec::Reference {
+                    region: actual_region,
+                    mutable: actual_mutable,
+                    referent: actual_referent,
+                },
+                TypeSpec::Reference {
+                    region: expected_region,
+                    mutable: expected_mutable,
+                    referent: expected_referent,
+                },
+            ) => {
+                if actual_mutable != expected_mutable {
+                    return Ok(false);
+                }
+                if actual_region != expected_region && !callee_regions.contains(&expected_region) {
+                    return Ok(false);
+                }
+                self.type_assignable_for_call_in_root(
+                    root,
+                    &actual_referent,
+                    &expected_referent,
+                    callee_regions,
+                )
+            }
+            (TypeSpec::Record(actual_fields), TypeSpec::Record(expected_fields))
+            | (TypeSpec::Enum(actual_fields), TypeSpec::Enum(expected_fields)) => {
+                if actual_fields.len() != expected_fields.len() {
+                    return Ok(false);
+                }
+                for expected_field in expected_fields {
+                    let Some(actual_field) = actual_fields
+                        .iter()
+                        .find(|field| field.name == expected_field.name)
+                    else {
+                        return Ok(false);
+                    };
+                    if !self.type_assignable_for_call_in_root(
+                        root,
+                        &actual_field.type_hash,
+                        &expected_field.type_hash,
+                        callee_regions,
                     )? {
                         return Ok(false);
                     }
@@ -1235,6 +1302,25 @@ impl CodeDb {
             }
             _ => Ok(()),
         }
+    }
+
+    pub(crate) fn infer_call_region_substitutions_for_types(
+        &self,
+        root: &ProgramRootPayload,
+        actual: &str,
+        expected: &str,
+        callee_regions: &BTreeSet<String>,
+        substitutions: &mut BTreeMap<String, String>,
+    ) -> Result<()> {
+        self.infer_call_region_substitutions(root, actual, expected, callee_regions, substitutions)
+    }
+
+    pub(crate) fn substitute_type_regions_hash_for_verify(
+        &self,
+        type_hash: &str,
+        region_substitutions: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        self.substitute_type_regions_hash(type_hash, region_substitutions)
     }
 
     fn value_class_in_root(
@@ -2023,10 +2109,11 @@ impl CodeDb {
                         region_scope,
                         locals,
                     )?;
-                    if !self.type_assignable_in_root(
+                    if !self.type_assignable_for_call_in_root(
                         root,
                         &typed.type_hash,
                         &expected_params[idx],
+                        &callee_regions,
                     )? {
                         bail!(
                             "call arg {} for {name} expected {}, got {}",
@@ -2815,7 +2902,7 @@ impl CodeDb {
                     self.type_name(&actual)?
                 );
             }
-            if self.expr_escapes_local_borrow(&body, &mut Vec::new())? {
+            if self.expr_escapes_local_borrow(&root, &body, &mut Vec::new())? {
                 bail!(
                     "bad_borrow: function {} returns reference to local storage",
                     self.symbol_display(&root, &entry.symbol)?
@@ -2830,6 +2917,7 @@ impl CodeDb {
 
     fn expr_escapes_local_borrow(
         &self,
+        root: &ProgramRootPayload,
         expr_hash: &str,
         locals_with_local_borrows: &mut Vec<bool>,
     ) -> Result<bool> {
@@ -2866,10 +2954,10 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("let missing body"))?;
                 let value_has_local_borrow =
-                    self.expr_escapes_local_borrow(value_hash, locals_with_local_borrows)?;
+                    self.expr_escapes_local_borrow(root, value_hash, locals_with_local_borrows)?;
                 locals_with_local_borrows.push(value_has_local_borrow);
                 let body_result =
-                    self.expr_escapes_local_borrow(body_hash, locals_with_local_borrows);
+                    self.expr_escapes_local_borrow(root, body_hash, locals_with_local_borrows);
                 locals_with_local_borrows.pop();
                 body_result
             }
@@ -2884,7 +2972,11 @@ impl CodeDb {
                         .get("value")
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("record field missing value"))?;
-                    if self.expr_escapes_local_borrow(value_hash, locals_with_local_borrows)? {
+                    if self.expr_escapes_local_borrow(
+                        root,
+                        value_hash,
+                        locals_with_local_borrows,
+                    )? {
                         return Ok(true);
                     }
                 }
@@ -2895,14 +2987,14 @@ impl CodeDb {
                     .get("type")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("field_access missing type"))?;
-                if !self.expr_type_can_escape_borrow(declared_type)? {
+                if !self.expr_type_can_escape_borrow(root, declared_type)? {
                     return Ok(false);
                 }
                 let target = payload
                     .get("target")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("field_access missing target"))?;
-                self.expr_escapes_local_borrow(target, locals_with_local_borrows)
+                self.expr_escapes_local_borrow(root, target, locals_with_local_borrows)
             }
             "if" => {
                 let then_hash = payload
@@ -2914,8 +3006,12 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("if missing else"))?;
                 Ok(
-                    self.expr_escapes_local_borrow(then_hash, locals_with_local_borrows)?
-                        || self.expr_escapes_local_borrow(else_hash, locals_with_local_borrows)?,
+                    self.expr_escapes_local_borrow(root, then_hash, locals_with_local_borrows)?
+                        || self.expr_escapes_local_borrow(
+                            root,
+                            else_hash,
+                            locals_with_local_borrows,
+                        )?,
                 )
             }
             "case" => {
@@ -2936,7 +3032,7 @@ impl CodeDb {
                         locals_with_local_borrows.push(false);
                     }
                     let body_result =
-                        self.expr_escapes_local_borrow(body_hash, locals_with_local_borrows);
+                        self.expr_escapes_local_borrow(root, body_hash, locals_with_local_borrows);
                     if arm
                         .get("binding_name")
                         .is_some_and(|value| !value.is_null())
@@ -2949,16 +3045,37 @@ impl CodeDb {
                 }
                 Ok(false)
             }
-            "call" | "binary" | "unary" | "enum_construct" => Ok(false),
+            "call" => {
+                let (args, return_type, _) = self.call_region_context(root, &payload)?;
+                let return_regions = self.reference_regions_in_type(root, &return_type)?;
+                if return_regions.is_empty() {
+                    return Ok(false);
+                }
+                for arg in args {
+                    if !self.expr_escapes_local_borrow(root, &arg, locals_with_local_borrows)? {
+                        continue;
+                    }
+                    let arg_type = self.expr_declared_type(&arg)?;
+                    let arg_regions = self.reference_regions_in_type(root, &arg_type)?;
+                    if !arg_regions.is_disjoint(&return_regions) {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            "binary" | "unary" | "enum_construct" => Ok(false),
             other => bail!("unknown expression kind {other}"),
         }
     }
 
-    fn expr_type_can_escape_borrow(&self, type_hash: &str) -> Result<bool> {
-        Ok(matches!(
-            self.type_spec(type_hash)?,
-            TypeSpec::Reference { .. }
-        ))
+    fn expr_type_can_escape_borrow(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .value_class_in_root(root, type_hash)?
+            .contains_reference)
     }
 
     fn borrow_target_is_local_storage(&self, expr_hash: &str) -> Result<bool> {
@@ -2977,6 +3094,102 @@ impl CodeDb {
                 self.borrow_target_is_local_storage(target)
             }
             _ => Ok(false),
+        }
+    }
+
+    fn call_region_context(
+        &self,
+        root: &ProgramRootPayload,
+        payload: &JsonValue,
+    ) -> Result<(Vec<String>, String, BTreeMap<String, String>)> {
+        let symbol = payload
+            .get("symbol")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("call missing symbol"))?;
+        let callee = self
+            .root_symbol(root, symbol)
+            .ok_or_else(|| anyhow!("call target missing from root {symbol}"))?;
+        let (expected_params, return_type) = self.signature_parts(&callee.signature)?;
+        let args = payload
+            .get("args")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| anyhow!("call missing args"))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("call arg must be hash"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if args.len() != expected_params.len() {
+            bail!("call arity mismatch for {symbol}");
+        }
+        let callee_regions = self
+            .signature_region_params(&callee.signature)?
+            .into_iter()
+            .map(|param| param.region)
+            .collect::<BTreeSet<_>>();
+        let mut region_substitutions = BTreeMap::new();
+        for (idx, arg) in args.iter().enumerate() {
+            let actual = self.expr_declared_type(arg)?;
+            if !self.type_assignable_for_call_in_root(
+                root,
+                &actual,
+                &expected_params[idx],
+                &callee_regions,
+            )? {
+                bail!("call arg type mismatch for {symbol} at arg {idx}");
+            }
+            self.infer_call_region_substitutions(
+                root,
+                &actual,
+                &expected_params[idx],
+                &callee_regions,
+                &mut region_substitutions,
+            )?;
+        }
+        let return_type = self.substitute_type_regions_hash(&return_type, &region_substitutions)?;
+        Ok((args, return_type, region_substitutions))
+    }
+
+    fn reference_regions_in_type(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+    ) -> Result<BTreeSet<String>> {
+        let mut regions = BTreeSet::new();
+        self.collect_reference_regions_in_type(root, type_hash, &mut regions)?;
+        Ok(regions)
+    }
+
+    fn collect_reference_regions_in_type(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+        regions: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        match self.type_spec_in_root(root, type_hash)? {
+            TypeSpec::Builtin(_) => Ok(()),
+            TypeSpec::Named { .. } => Ok(()),
+            TypeSpec::Reference {
+                region, referent, ..
+            } => {
+                regions.insert(region);
+                self.collect_reference_regions_in_type(root, &referent, regions)
+            }
+            TypeSpec::RawPointer { pointee, .. } => {
+                self.collect_reference_regions_in_type(root, &pointee, regions)
+            }
+            TypeSpec::FixedArray { element, .. } => {
+                self.collect_reference_regions_in_type(root, &element, regions)
+            }
+            TypeSpec::Record(fields) | TypeSpec::Enum(fields) => {
+                for field in fields {
+                    self.collect_reference_regions_in_type(root, &field.type_hash, regions)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -3149,16 +3362,23 @@ impl CodeDb {
                 ExprUse::Value => self.verify_place_value_use(root, expr_hash, param_types, state),
             },
             "call" => {
-                for arg in payload
-                    .get("args")
-                    .and_then(JsonValue::as_array)
-                    .ok_or_else(|| anyhow!("call missing args"))?
-                {
-                    let arg = arg
-                        .as_str()
-                        .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                    self.verify_expr_borrows(root, arg, param_types, state, ExprUse::Value)?;
+                let (args, _, _) = self.call_region_context(root, &payload)?;
+                let mut added_call_loans = Vec::new();
+                for arg in args {
+                    let pre_arg_state = state.clone();
+                    self.verify_expr_borrows(root, &arg, param_types, state, ExprUse::Value)?;
+                    let arg_loans =
+                        self.collect_value_loans(root, &arg, param_types, &pre_arg_state)?;
+                    for loan in arg_loans {
+                        if state.active.contains(&loan) {
+                            continue;
+                        }
+                        self.check_loan_conflicts(&loan.kind, &loan.place, &state.active)?;
+                        state.active.push(loan.clone());
+                        added_call_loans.push(loan);
+                    }
                 }
+                state.active.retain(|loan| !added_call_loans.contains(loan));
                 Ok(())
             }
             "binary" => {
@@ -3421,6 +3641,11 @@ impl CodeDb {
                     .get("target")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow expression missing target"))?;
+                let region = payload
+                    .get("region")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow expression missing region"))?
+                    .to_string();
                 out.push(ActiveLoan {
                     kind: if payload.get("expr_kind").and_then(JsonValue::as_str)
                         == Some("borrow_mut")
@@ -3429,9 +3654,24 @@ impl CodeDb {
                     } else {
                         LoanKind::Shared
                     },
+                    region,
                     place: self.loan_place_for_expr(target, param_types, &state.locals)?,
                     owner: None,
                 });
+            }
+            "call" => {
+                let (args, return_type, _) = self.call_region_context(root, &payload)?;
+                let return_regions = self.reference_regions_in_type(root, &return_type)?;
+                if return_regions.is_empty() {
+                    return Ok(out);
+                }
+                for arg in args {
+                    out.extend(
+                        self.collect_value_loans(root, &arg, param_types, state)?
+                            .into_iter()
+                            .filter(|loan| return_regions.contains(&loan.region)),
+                    );
+                }
             }
             "record_literal" => {
                 for field in payload
@@ -3578,7 +3818,7 @@ impl CodeDb {
         }
     }
 
-    fn expr_declared_type(&self, expr_hash: &str) -> Result<String> {
+    pub(crate) fn expr_declared_type(&self, expr_hash: &str) -> Result<String> {
         self.get_payload(expr_hash)?
             .get("type")
             .and_then(JsonValue::as_str)
@@ -3858,7 +4098,12 @@ impl CodeDb {
                         allowed_regions,
                         locals,
                     )?;
-                    if !self.type_assignable_in_root(root, &arg_type, &expected_params[idx])? {
+                    if !self.type_assignable_for_call_in_root(
+                        root,
+                        &arg_type,
+                        &expected_params[idx],
+                        &callee_regions,
+                    )? {
                         bail!("call arg type mismatch for {symbol} at arg {idx}");
                     }
                     self.infer_call_region_substitutions(

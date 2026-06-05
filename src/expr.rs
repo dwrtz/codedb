@@ -1658,6 +1658,24 @@ impl CodeDb {
         )
     }
 
+    pub(crate) fn typed_expr_to_raw_in_module_with_regions_and_locals(
+        &self,
+        expr_hash: &str,
+        root: &ProgramRootPayload,
+        current_module: &str,
+        region_names: &BTreeMap<String, String>,
+        local_names: &[String],
+    ) -> Result<RawExpr> {
+        let mut local_names = local_names.to_vec();
+        self.typed_expr_to_raw_with_locals(
+            expr_hash,
+            root,
+            current_module,
+            region_names,
+            &mut local_names,
+        )
+    }
+
     fn typed_expr_to_raw_with_locals(
         &self,
         expr_hash: &str,

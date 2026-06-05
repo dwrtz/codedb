@@ -176,6 +176,102 @@ fn field_and_variant_renames_preserve_member_identity() {
 }
 
 #[test]
+fn field_rename_updates_existing_function_bodies() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("rename-used-field.sqlite");
+    let source = temp.path().join("rename-used-field.cdb");
+    let rename_field = temp.path().join("rename-field.json");
+    let projection = temp.path().join("renamed.projection.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+fn total(line: Line) -> i64 = line.price_cents * line.qty
+fn main() -> i64 = total({ price_cents: 25, qty: 4 })
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &rename_field,
+        r#"{ "kind": "rename_field", "type": "Line", "field": "price_cents", "new_name": "amount_cents" }"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "100");
+    run(&["apply", path(&db), "--json", path(&rename_field)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "100");
+    run(&["verify", path(&db)]);
+    run(&[
+        "export",
+        path(&db),
+        "--branch",
+        "main",
+        "--out",
+        path(&projection),
+    ]);
+    let exported = std::fs::read_to_string(&projection).unwrap();
+    assert!(exported.contains("amount_cents: i64"));
+    assert!(exported.contains("line.amount_cents * line.qty"));
+    assert!(exported.contains("total({amount_cents: 25, qty: 4})"));
+}
+
+#[test]
+fn variant_rename_updates_existing_function_bodies() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("rename-used-variant.sqlite");
+    let source = temp.path().join("rename-used-variant.cdb");
+    let rename_variant = temp.path().join("rename-variant.json");
+    let projection = temp.path().join("renamed-variant.projection.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+enum Discount {
+  none: unit
+  percent: i64
+}
+
+fn value(discount: Discount) -> i64 =
+  case discount of none => 0 | percent(amount) => amount
+
+fn main() -> i64 = value(Discount::percent(10))
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &rename_variant,
+        r#"{ "kind": "rename_variant", "type": "Discount", "variant": "percent", "new_name": "pct" }"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "10");
+    run(&["apply", path(&db), "--json", path(&rename_variant)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "10");
+    run(&["verify", path(&db)]);
+    run(&[
+        "export",
+        path(&db),
+        "--branch",
+        "main",
+        "--out",
+        path(&projection),
+    ]);
+    let exported = std::fs::read_to_string(&projection).unwrap();
+    assert!(exported.contains("pct: i64"));
+    assert!(exported.contains("pct(amount) => amount"));
+    assert!(exported.contains("value(Discount::pct(10))"));
+}
+
+#[test]
 fn verify_rejects_type_definition_with_invalid_region_reference() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("bad-region.sqlite");

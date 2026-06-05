@@ -8,7 +8,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::abi::validate_exported_abi_name;
 use crate::build_plan::{BuildImpact, BuildImpactKind, BuildImpactReason, projection_artifacts};
-use crate::expr::RawExpr;
+use crate::expr::{RawCaseArm, RawExpr, RawRecordField};
 use crate::model::{
     BranchState, ExportBinding, NameBinding, ParamNames, ProgramRootPayload, RootSymbolPayload,
     RootTestBinding, RootTypePayload, TestCasePayload, TestCategory, TestMode, TestValue,
@@ -19,7 +19,7 @@ use crate::store::{CodeDb, canonical_json, hash_bytes};
 use crate::tests::{test_points_to_entry_symbol, validate_test_value_for_type};
 use crate::types::{
     Effect, ParamSpec, RegionParamDef, TypeDefinition, TypeDefinitionKind, TypeMemberDef,
-    TypeMemberSpec,
+    TypeMemberSpec, TypeSpec,
 };
 use crate::{HISTORY_DOMAIN, MAIN_BRANCH, MIGRATION_DOMAIN};
 
@@ -752,6 +752,31 @@ impl Postcondition {
             Postcondition::ExportAbsent { .. } => "export_absent",
             Postcondition::TestNamePointsToTest { .. } => "test_name_points_to_test",
             Postcondition::TestAbsent { .. } => "test_absent",
+        }
+    }
+}
+
+enum MemberRename {
+    Field {
+        type_symbol: String,
+        member_symbol: String,
+        old_name: String,
+        new_name: String,
+    },
+    Variant {
+        type_symbol: String,
+        member_symbol: String,
+        old_name: String,
+        new_name: String,
+    },
+}
+
+impl MemberRename {
+    fn new_name(&self) -> &str {
+        match self {
+            MemberRename::Field { new_name, .. } | MemberRename::Variant { new_name, .. } => {
+                new_name
+            }
         }
     }
 }
@@ -3390,6 +3415,7 @@ impl CodeDb {
     ) -> Result<String> {
         validate_projection_identifier("record field", new_name)?;
         let mut root = self.load_root(input_root)?;
+        let old_root = root.clone();
         self.assert_type_name_points(&root, module, type_name, type_symbol)?;
         let definition = self.type_definition_for_symbol(&root, type_symbol)?;
         let TypeDefinition::Record {
@@ -3420,6 +3446,16 @@ impl CodeDb {
                 type_symbol: type_symbol.to_string(),
                 region_params,
                 fields,
+            },
+        )?;
+        self.rewrite_function_bodies_for_member_rename(
+            &old_root,
+            &mut root,
+            &MemberRename::Field {
+                type_symbol: type_symbol.to_string(),
+                member_symbol: field_symbol.to_string(),
+                old_name: old_name.to_string(),
+                new_name: new_name.to_string(),
             },
         )?;
         let new_root = self.put_program_root(&root)?;
@@ -3538,6 +3574,7 @@ impl CodeDb {
     ) -> Result<String> {
         validate_projection_identifier("enum variant", new_name)?;
         let mut root = self.load_root(input_root)?;
+        let old_root = root.clone();
         self.assert_type_name_points(&root, module, type_name, type_symbol)?;
         let definition = self.type_definition_for_symbol(&root, type_symbol)?;
         let TypeDefinition::Enum {
@@ -3568,6 +3605,16 @@ impl CodeDb {
                 type_symbol: type_symbol.to_string(),
                 region_params,
                 variants,
+            },
+        )?;
+        self.rewrite_function_bodies_for_member_rename(
+            &old_root,
+            &mut root,
+            &MemberRename::Variant {
+                type_symbol: type_symbol.to_string(),
+                member_symbol: variant_symbol.to_string(),
+                old_name: old_name.to_string(),
+                new_name: new_name.to_string(),
             },
         )?;
         let new_root = self.put_program_root(&root)?;
@@ -4441,6 +4488,562 @@ impl CodeDb {
             .root_type(root, type_symbol)
             .ok_or_else(|| anyhow!("type missing from root {type_symbol}"))?;
         self.type_definition(&entry.type_def)
+    }
+
+    fn rewrite_function_bodies_for_member_rename(
+        &mut self,
+        old_root: &ProgramRootPayload,
+        root: &mut ProgramRootPayload,
+        rename: &MemberRename,
+    ) -> Result<()> {
+        for idx in 0..root.symbols.len() {
+            let symbol = root.symbols[idx].symbol.clone();
+            let Some(old_entry) = old_root.symbols.iter().find(|entry| entry.symbol == symbol)
+            else {
+                continue;
+            };
+            if self.definition_is_external(&old_entry.definition)? {
+                continue;
+            }
+            let signature = root.symbols[idx].signature.clone();
+            let (param_types, return_type) = self.signature_parts(&signature)?;
+            let region_params = self.signature_region_params(&signature)?;
+            let region_scope = region_scope_from_params(&region_params);
+            let region_names = region_params
+                .iter()
+                .map(|param| (param.region.clone(), param.name.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let module = preferred_module_for_symbol(old_root, &symbol)?;
+            let body = self.function_body_hash(&old_entry.definition)?;
+            let mut local_names = Vec::new();
+            let raw_body = self.rewrite_typed_expr_for_member_rename(
+                old_root,
+                &module,
+                &region_names,
+                &mut local_names,
+                &body,
+                Some(&return_type),
+                rename,
+            )?;
+            let param_name_list = param_names(old_root, &symbol);
+            let typed_body = self.type_expr_in_module_with_regions(
+                &module,
+                &raw_body,
+                root,
+                &param_name_list,
+                &param_types,
+                &region_scope,
+            )?;
+            if typed_body.type_hash != return_type {
+                bail!(
+                    "renamed member rewrite changed function {} body type from {} to {}",
+                    self.symbol_display(old_root, &symbol)?,
+                    self.type_name(&return_type)?,
+                    self.type_name(&typed_body.type_hash)?
+                );
+            }
+            root.symbols[idx].definition =
+                self.put_function_def(&symbol, &signature, &typed_body.expr_hash)?;
+        }
+        Ok(())
+    }
+
+    fn rewrite_typed_expr_for_member_rename(
+        &self,
+        old_root: &ProgramRootPayload,
+        module: &str,
+        region_names: &BTreeMap<String, String>,
+        local_names: &mut Vec<String>,
+        expr_hash: &str,
+        expected_type: Option<&str>,
+        rename: &MemberRename,
+    ) -> Result<RawExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let expr_kind = payload
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?;
+        let mut raw = self.typed_expr_to_raw_in_module_with_regions_and_locals(
+            expr_hash,
+            old_root,
+            module,
+            region_names,
+            local_names,
+        )?;
+        match (&mut raw, expr_kind) {
+            (RawExpr::Call { args, .. }, "call") => {
+                let symbol = payload
+                    .get("symbol")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("call missing symbol"))?;
+                let callee = old_root
+                    .symbols
+                    .iter()
+                    .find(|entry| entry.symbol == symbol)
+                    .ok_or_else(|| anyhow!("call target missing from old root {symbol}"))?;
+                let (expected_params, _) = self.signature_parts(&callee.signature)?;
+                let arg_hashes = payload
+                    .get("args")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("call missing args"))?;
+                *args = arg_hashes
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, value)| {
+                        let arg = value
+                            .as_str()
+                            .ok_or_else(|| anyhow!("call arg must be hash"))?;
+                        self.rewrite_typed_expr_for_member_rename(
+                            old_root,
+                            module,
+                            region_names,
+                            local_names,
+                            arg,
+                            expected_params.get(idx).map(String::as_str),
+                            rename,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            (RawExpr::Binary { left, right, .. }, "binary") => {
+                *left = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "left",
+                    None,
+                    rename,
+                )?);
+                *right = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "right",
+                    None,
+                    rename,
+                )?);
+            }
+            (RawExpr::Unary { expr, .. }, "unary") => {
+                *expr = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "expr",
+                    None,
+                    rename,
+                )?);
+            }
+            (RawExpr::BorrowShared { target, .. }, "borrow_shared")
+            | (RawExpr::BorrowMut { target, .. }, "borrow_mut") => {
+                *target = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "target",
+                    None,
+                    rename,
+                )?);
+            }
+            (RawExpr::Assign { target, value }, "assign") => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("assign missing target"))?;
+                let target_type = self.expr_declared_type(target_hash)?;
+                *target = Box::new(self.rewrite_typed_expr_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    target_hash,
+                    None,
+                    rename,
+                )?);
+                *value = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "value",
+                    Some(&target_type),
+                    rename,
+                )?);
+            }
+            (
+                RawExpr::Let {
+                    name, value, body, ..
+                },
+                "let",
+            ) => {
+                let binding_type = payload
+                    .get("binding_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing binding_type"))?;
+                *value = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "value",
+                    Some(binding_type),
+                    rename,
+                )?);
+                local_names.push(name.clone());
+                let rewritten_body = self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "body",
+                    expected_type,
+                    rename,
+                );
+                local_names.pop();
+                *body = Box::new(rewritten_body?);
+            }
+            (
+                RawExpr::If {
+                    cond,
+                    then_expr,
+                    else_expr,
+                },
+                "if",
+            ) => {
+                *cond = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "cond",
+                    None,
+                    rename,
+                )?);
+                *then_expr = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "then",
+                    expected_type,
+                    rename,
+                )?);
+                *else_expr = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "else",
+                    expected_type,
+                    rename,
+                )?);
+            }
+            (RawExpr::Record { fields }, "record_literal") => {
+                let expected_fields =
+                    expected_type.and_then(|ty| self.record_fields_by_name(old_root, ty).ok());
+                let field_payloads = payload
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("record_literal missing fields"))?;
+                *fields = field_payloads
+                    .iter()
+                    .map(|field| {
+                        let old_name = field
+                            .get("name")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("record field missing name"))?;
+                        let value_hash = field
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("record field missing value"))?;
+                        let expected_field = expected_fields
+                            .as_ref()
+                            .and_then(|fields| fields.get(old_name));
+                        let name = if self.record_field_matches_rename(
+                            old_root,
+                            expected_type,
+                            old_name,
+                            rename,
+                        )? {
+                            rename.new_name().to_string()
+                        } else {
+                            old_name.to_string()
+                        };
+                        Ok(RawRecordField {
+                            name,
+                            value: self.rewrite_typed_expr_for_member_rename(
+                                old_root,
+                                module,
+                                region_names,
+                                local_names,
+                                value_hash,
+                                expected_field.map(String::as_str),
+                                rename,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            (RawExpr::FieldAccess { target, field }, "field_access") => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing target"))?;
+                let target_type = self.expr_declared_type(target_hash)?;
+                *target = Box::new(self.rewrite_typed_expr_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    target_hash,
+                    None,
+                    rename,
+                )?);
+                if self.record_field_matches_rename(old_root, Some(&target_type), field, rename)? {
+                    *field = rename.new_name().to_string();
+                }
+            }
+            (RawExpr::EnumConstruct { variant, value, .. }, "enum_construct") => {
+                let enum_type = payload
+                    .get("enum_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing enum_type"))?;
+                let old_variant = variant.clone();
+                let variant_type =
+                    self.enum_variant_type_in_root(old_root, enum_type, &old_variant)?;
+                if self.enum_variant_matches_rename(old_root, enum_type, &old_variant, rename)? {
+                    *variant = rename.new_name().to_string();
+                }
+                *value = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "value",
+                    Some(&variant_type),
+                    rename,
+                )?);
+            }
+            (RawExpr::Case { expr, arms }, "case") => {
+                let scrutinee_hash = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("case missing expr"))?;
+                let scrutinee_type = self.expr_declared_type(scrutinee_hash)?;
+                *expr = Box::new(self.rewrite_typed_expr_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    scrutinee_hash,
+                    None,
+                    rename,
+                )?);
+                let arm_payloads = payload
+                    .get("arms")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("case missing arms"))?;
+                let mut rewritten_arms = Vec::new();
+                for arm in arm_payloads {
+                    let old_variant = arm
+                        .get("variant")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("case arm missing variant"))?;
+                    let body_hash = arm
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("case arm missing body"))?;
+                    let variant = if self.enum_variant_matches_rename(
+                        old_root,
+                        &scrutinee_type,
+                        old_variant,
+                        rename,
+                    )? {
+                        rename.new_name().to_string()
+                    } else {
+                        old_variant.to_string()
+                    };
+                    let binding = arm
+                        .get("binding_name")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_string);
+                    if let Some(binding) = &binding {
+                        local_names.push(binding.clone());
+                    }
+                    let body = self.rewrite_typed_expr_for_member_rename(
+                        old_root,
+                        module,
+                        region_names,
+                        local_names,
+                        body_hash,
+                        expected_type,
+                        rename,
+                    );
+                    if binding.is_some() {
+                        local_names.pop();
+                    }
+                    rewritten_arms.push(RawCaseArm {
+                        variant,
+                        binding,
+                        body: body?,
+                    });
+                }
+                *arms = rewritten_arms;
+            }
+            _ => {}
+        }
+        Ok(raw)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rewrite_expr_child_for_member_rename(
+        &self,
+        old_root: &ProgramRootPayload,
+        module: &str,
+        region_names: &BTreeMap<String, String>,
+        local_names: &mut Vec<String>,
+        payload: &JsonValue,
+        key: &str,
+        expected_type: Option<&str>,
+        rename: &MemberRename,
+    ) -> Result<RawExpr> {
+        let child = payload
+            .get(key)
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing {key}"))?;
+        self.rewrite_typed_expr_for_member_rename(
+            old_root,
+            module,
+            region_names,
+            local_names,
+            child,
+            expected_type,
+            rename,
+        )
+    }
+
+    fn record_fields_by_name(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+    ) -> Result<BTreeMap<String, String>> {
+        let TypeSpec::Record(fields) = self.type_spec_in_root(root, type_hash)? else {
+            return Ok(BTreeMap::new());
+        };
+        Ok(fields
+            .into_iter()
+            .map(|field| (field.name, field.type_hash))
+            .collect())
+    }
+
+    fn record_field_matches_rename(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: Option<&str>,
+        field: &str,
+        rename: &MemberRename,
+    ) -> Result<bool> {
+        let MemberRename::Field {
+            type_symbol,
+            member_symbol,
+            old_name,
+            ..
+        } = rename
+        else {
+            return Ok(false);
+        };
+        if field != old_name {
+            return Ok(false);
+        }
+        let Some(type_hash) = type_hash else {
+            return Ok(false);
+        };
+        Ok(self.record_field_member_for_type(root, type_hash, field)?
+            == Some((type_symbol.clone(), member_symbol.clone())))
+    }
+
+    fn record_field_member_for_type(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+        field: &str,
+    ) -> Result<Option<(String, String)>> {
+        match self.type_spec(type_hash)? {
+            TypeSpec::Reference { referent, .. } => {
+                self.record_field_member_for_type(root, &referent, field)
+            }
+            TypeSpec::Named { type_symbol, .. } => {
+                let TypeDefinition::Record { fields, .. } =
+                    self.type_definition_for_symbol(root, &type_symbol)?
+                else {
+                    return Ok(None);
+                };
+                Ok(fields
+                    .into_iter()
+                    .find(|candidate| candidate.name == field)
+                    .map(|field| (type_symbol, field.member_symbol)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn enum_variant_matches_rename(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+        variant: &str,
+        rename: &MemberRename,
+    ) -> Result<bool> {
+        let MemberRename::Variant {
+            type_symbol,
+            member_symbol,
+            old_name,
+            ..
+        } = rename
+        else {
+            return Ok(false);
+        };
+        if variant != old_name {
+            return Ok(false);
+        }
+        Ok(self.enum_variant_member_for_type(root, type_hash, variant)?
+            == Some((type_symbol.clone(), member_symbol.clone())))
+    }
+
+    fn enum_variant_member_for_type(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+        variant: &str,
+    ) -> Result<Option<(String, String)>> {
+        match self.type_spec(type_hash)? {
+            TypeSpec::Named { type_symbol, .. } => {
+                let TypeDefinition::Enum { variants, .. } =
+                    self.type_definition_for_symbol(root, &type_symbol)?
+                else {
+                    return Ok(None);
+                };
+                Ok(variants
+                    .into_iter()
+                    .find(|candidate| candidate.name == variant)
+                    .map(|variant| (type_symbol, variant.member_symbol)))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn type_source_matches(
@@ -5331,6 +5934,15 @@ fn type_symbol_for_name(root: &ProgramRootPayload, module: &str, name: &str) -> 
         .iter()
         .find(|binding| binding.module == module && binding.display_name == name)
         .map(|binding| binding.type_symbol.clone())
+}
+
+fn preferred_module_for_symbol(root: &ProgramRootPayload, symbol: &str) -> Result<String> {
+    root.names
+        .iter()
+        .find(|binding| binding.symbol == symbol && binding.is_preferred)
+        .or_else(|| root.names.iter().find(|binding| binding.symbol == symbol))
+        .map(|binding| binding.module.clone())
+        .ok_or_else(|| anyhow!("symbol {symbol} has no name binding"))
 }
 
 fn export_points_to_symbol(root: &ProgramRootPayload, name: &str, symbol: &str) -> bool {
