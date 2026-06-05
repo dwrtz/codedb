@@ -150,6 +150,68 @@ fn main<'a>() -> i64 =
 }
 
 #[test]
+fn moving_mutable_reference_record_through_if_transfers_loan() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("mutable-record-if-move.sqlite");
+    let source = temp.path().join("mutable-record-if-move.cdb");
+    let ir_path = temp.path().join("main.ir.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+}
+
+record LineEditor<'a> {
+  line: &'a mut Line
+}
+
+fn main<'a>() -> i64 =
+  let line: Line = { price_cents: 25 } in
+  let editor: LineEditor<'a> = { line: &'a mut line } in
+  let moved: LineEditor<'a> =
+    (if true then editor else editor) in
+  moved.line.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "25");
+    run(&["verify", path(&db)]);
+    run(&["emit-ir", path(&db), "main", "--out", path(&ir_path)]);
+
+    let ir = read_json(&ir_path);
+    let ops = op_names(&ir);
+    assert!(ops.contains(&"if".to_string()));
+    assert!(
+        serde_json::to_string(&ir)
+            .unwrap()
+            .contains("\"op\":\"move\"")
+    );
+
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "mutable_record_if_move_native",
+            "--entry",
+            "main",
+            "--expect-i64",
+            "25",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+    }
+}
+
+#[test]
 fn moving_mutable_reference_record_into_call_ends_loan_after_return() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("call-consume-move.sqlite");
@@ -200,6 +262,37 @@ fn main<'a>() -> i64 =
         assert_eq!(report["status"], "passed");
         assert_eq!(report["tests"][0]["native"]["status"], "passed");
     }
+}
+
+#[test]
+fn enum_payload_cannot_return_local_borrow() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("enum-local-borrow.sqlite");
+    let source = temp.path().join("enum-local-borrow.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+}
+
+fn leak<'a>() -> enum { none: unit, some: &'a Line } =
+  let line: Line = { price_cents: 25 } in
+  enum { none: unit, some: &'a Line }::some(&'a line)
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_borrow"))
+        .stderr(predicate::str::contains(
+            "returns reference to local storage",
+        ));
 }
 
 #[test]

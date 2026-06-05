@@ -3179,6 +3179,12 @@ impl CodeDb {
                 )
             }
             "case" => {
+                let expr = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("case missing expr"))?;
+                let scrutinee_has_local_borrow =
+                    self.expr_escapes_local_borrow(root, expr, locals_with_local_borrows)?;
                 for arm in payload
                     .get("arms")
                     .and_then(JsonValue::as_array)
@@ -3193,7 +3199,7 @@ impl CodeDb {
                         .get("binding_name")
                         .is_some_and(|value| !value.is_null())
                     {
-                        locals_with_local_borrows.push(false);
+                        locals_with_local_borrows.push(scrutinee_has_local_borrow);
                     }
                     let body_result =
                         self.expr_escapes_local_borrow(root, body_hash, locals_with_local_borrows);
@@ -3227,7 +3233,14 @@ impl CodeDb {
                 }
                 Ok(false)
             }
-            "binary" | "unary" | "enum_construct" => Ok(false),
+            "enum_construct" => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing value"))?;
+                self.expr_escapes_local_borrow(root, value, locals_with_local_borrows)
+            }
+            "binary" | "unary" => Ok(false),
             other => bail!("unknown expression kind {other}"),
         }
     }
@@ -3543,7 +3556,7 @@ impl CodeDb {
                 let mut moved_call_owners = Vec::new();
                 for arg in args {
                     let pre_arg_state = state.clone();
-                    let transfer_owner = self.move_source_place_for_expr(
+                    let transfer_owners = self.move_source_places_for_expr(
                         root,
                         &arg,
                         param_types,
@@ -3553,12 +3566,12 @@ impl CodeDb {
                     let arg_loans =
                         self.collect_value_loans(root, &arg, param_types, &pre_arg_state)?;
                     self.check_loans_point_to_live_storage(&arg_loans, state)?;
-                    if let Some(owner) = transfer_owner {
-                        state
-                            .active
-                            .retain(|loan| !loan_owner_overlaps(loan, &owner));
-                        moved_call_owners.push(owner);
-                    }
+                    state.active.retain(|loan| {
+                        !transfer_owners
+                            .iter()
+                            .any(|owner| loan_owner_overlaps(loan, owner))
+                    });
+                    moved_call_owners.extend(transfer_owners);
                     added_call_loans
                         .extend(self.add_checked_value_loans(&mut state.active, &arg_loans)?);
                 }
@@ -3648,7 +3661,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("let missing body"))?;
                 let pre_value_state = state.clone();
                 self.verify_expr_borrows(root, value_hash, param_types, state, ExprUse::Value)?;
-                let transfer_owner = self.move_source_place_for_expr(
+                let transfer_owners = self.move_source_places_for_expr(
                     root,
                     value_hash,
                     param_types,
@@ -3668,11 +3681,11 @@ impl CodeDb {
                     &local_owner,
                 )?;
                 self.check_loans_point_to_live_storage(&value_loans, state)?;
-                if let Some(owner) = &transfer_owner {
-                    state
-                        .active
-                        .retain(|loan| !loan_owner_overlaps(loan, owner));
-                }
+                state.active.retain(|loan| {
+                    !transfer_owners
+                        .iter()
+                        .any(|owner| loan_owner_overlaps(loan, owner))
+                });
                 state.locals.push(local_id);
                 self.add_checked_value_loans(&mut state.active, &value_loans)?;
                 let body_result =
@@ -3787,6 +3800,30 @@ impl CodeDb {
                         let local_id = arm_state.next_local;
                         arm_state.next_local += 1;
                         arm_state.locals.push(local_id);
+                        let local_owner = LoanPlace {
+                            root: LoanRoot::Local(local_id),
+                            fields: Vec::new(),
+                        };
+                        let transfer_owners = self.move_source_places_for_expr(
+                            root,
+                            expr,
+                            param_types,
+                            &base_state.locals,
+                        )?;
+                        let value_loans = self.collect_value_loans_for_store(
+                            root,
+                            expr,
+                            param_types,
+                            &base_state,
+                            &local_owner,
+                        )?;
+                        self.check_loans_point_to_live_storage(&value_loans, &arm_state)?;
+                        arm_state.active.retain(|loan| {
+                            !transfer_owners
+                                .iter()
+                                .any(|owner| loan_owner_overlaps(loan, owner))
+                        });
+                        self.add_checked_value_loans(&mut arm_state.active, &value_loans)?;
                     }
                     if pushed {
                         let local_id = *arm_state
@@ -3908,7 +3945,7 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("let missing body"))?;
                 let mut nested_state = state.clone();
-                let transfer_owner = self.move_source_place_for_expr(
+                let transfer_owners = self.move_source_places_for_expr(
                     root,
                     value_hash,
                     param_types,
@@ -3927,11 +3964,11 @@ impl CodeDb {
                     &nested_state,
                     &local_owner,
                 )?;
-                if let Some(owner) = &transfer_owner {
-                    nested_state
-                        .active
-                        .retain(|loan| !loan_owner_overlaps(loan, owner));
-                }
+                nested_state.active.retain(|loan| {
+                    !transfer_owners
+                        .iter()
+                        .any(|owner| loan_owner_overlaps(loan, owner))
+                });
                 nested_state.locals.push(local_id);
                 nested_state.active.extend(value_loans);
                 let body_loans =
@@ -3952,6 +3989,67 @@ impl CodeDb {
                     self.collect_value_loans(root, then_hash, param_types, state)?,
                     self.collect_value_loans(root, else_hash, param_types, state)?,
                 ));
+            }
+            "enum_construct" => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing value"))?;
+                out.extend(self.collect_value_loans(root, value, param_types, state)?);
+            }
+            "case" => {
+                let expr = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("case missing expr"))?;
+                let base_state = state.clone();
+                for arm in payload
+                    .get("arms")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("case missing arms"))?
+                {
+                    let body = arm
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("case arm missing body"))?;
+                    let mut arm_state = base_state.clone();
+                    if arm
+                        .get("binding_name")
+                        .and_then(JsonValue::as_str)
+                        .is_some()
+                    {
+                        let local_id = arm_state.next_local;
+                        arm_state.next_local += 1;
+                        let local_owner = LoanPlace {
+                            root: LoanRoot::Local(local_id),
+                            fields: Vec::new(),
+                        };
+                        let transfer_owners = self.move_source_places_for_expr(
+                            root,
+                            expr,
+                            param_types,
+                            &arm_state.locals,
+                        )?;
+                        let value_loans = self.collect_value_loans_for_store(
+                            root,
+                            expr,
+                            param_types,
+                            &arm_state,
+                            &local_owner,
+                        )?;
+                        arm_state.active.retain(|loan| {
+                            !transfer_owners
+                                .iter()
+                                .any(|owner| loan_owner_overlaps(loan, owner))
+                        });
+                        arm_state.locals.push(local_id);
+                        arm_state.active.extend(value_loans);
+                    }
+                    let body_loans =
+                        self.collect_value_loans(root, body, param_types, &arm_state)?;
+                    self.check_loans_point_to_live_storage(&body_loans, state)?;
+                    out.extend(body_loans);
+                }
             }
             "param_ref" | "local_ref" | "field_access" => {
                 let type_hash = self.expr_declared_type(expr_hash)?;
@@ -4048,7 +4146,7 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("let missing body"))?;
                 let mut nested_state = state.clone();
-                let transfer_owner = self.move_source_place_for_expr(
+                let transfer_owners = self.move_source_places_for_expr(
                     root,
                     value_hash,
                     param_types,
@@ -4067,11 +4165,11 @@ impl CodeDb {
                     &nested_state,
                     &local_owner,
                 )?;
-                if let Some(owner) = &transfer_owner {
-                    nested_state
-                        .active
-                        .retain(|loan| !loan_owner_overlaps(loan, owner));
-                }
+                nested_state.active.retain(|loan| {
+                    !transfer_owners
+                        .iter()
+                        .any(|owner| loan_owner_overlaps(loan, owner))
+                });
                 nested_state.locals.push(local_id);
                 nested_state.active.extend(value_loans);
                 self.collect_value_loans_for_store(
@@ -4081,6 +4179,64 @@ impl CodeDb {
                     &nested_state,
                     target_owner,
                 )
+            }
+            "case" => {
+                let expr = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("case missing expr"))?;
+                let mut out = Vec::new();
+                for arm in payload
+                    .get("arms")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("case missing arms"))?
+                {
+                    let body = arm
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("case arm missing body"))?;
+                    let mut arm_state = state.clone();
+                    if arm
+                        .get("binding_name")
+                        .and_then(JsonValue::as_str)
+                        .is_some()
+                    {
+                        let local_id = arm_state.next_local;
+                        arm_state.next_local += 1;
+                        let local_owner = LoanPlace {
+                            root: LoanRoot::Local(local_id),
+                            fields: Vec::new(),
+                        };
+                        let transfer_owners = self.move_source_places_for_expr(
+                            root,
+                            expr,
+                            param_types,
+                            &arm_state.locals,
+                        )?;
+                        let value_loans = self.collect_value_loans_for_store(
+                            root,
+                            expr,
+                            param_types,
+                            &arm_state,
+                            &local_owner,
+                        )?;
+                        arm_state.active.retain(|loan| {
+                            !transfer_owners
+                                .iter()
+                                .any(|owner| loan_owner_overlaps(loan, owner))
+                        });
+                        arm_state.locals.push(local_id);
+                        arm_state.active.extend(value_loans);
+                    }
+                    out.extend(self.collect_value_loans_for_store(
+                        root,
+                        body,
+                        param_types,
+                        &arm_state,
+                        target_owner,
+                    )?);
+                }
+                Ok(out)
             }
             _ => {
                 let mut loans = self.collect_value_loans(root, expr_hash, param_types, state)?;
@@ -4148,26 +4304,26 @@ impl CodeDb {
         Ok(())
     }
 
-    fn move_source_place_for_expr(
+    fn move_source_places_for_expr(
         &self,
         root: &ProgramRootPayload,
         expr_hash: &str,
         param_types: &[String],
         locals: &[usize],
-    ) -> Result<Option<LoanPlace>> {
+    ) -> Result<Vec<LoanPlace>> {
         let payload = self.get_payload(expr_hash)?;
         match payload.get("expr_kind").and_then(JsonValue::as_str) {
             Some("param_ref" | "local_ref" | "field_access") => {
                 let type_hash = self.expr_declared_type(expr_hash)?;
                 let class = self.value_class_in_root(root, &type_hash)?;
                 if class.copy_kind == ValueCopyKind::MoveOnly {
-                    Ok(Some(self.loan_place_for_expr(
+                    Ok(vec![self.loan_place_for_expr(
                         expr_hash,
                         param_types,
                         locals,
-                    )?))
+                    )?])
                 } else {
-                    Ok(None)
+                    Ok(Vec::new())
                 }
             }
             Some("let") => {
@@ -4178,18 +4334,34 @@ impl CodeDb {
                 let mut nested_locals = locals.to_vec();
                 let synthetic_local = synthetic_let_local_id(&nested_locals);
                 nested_locals.push(synthetic_local);
-                let source =
-                    self.move_source_place_for_expr(root, body_hash, param_types, &nested_locals)?;
-                let Some(source) = source else {
-                    return Ok(None);
-                };
-                if matches!(source.root, LoanRoot::Local(id) if id == synthetic_local) {
-                    Ok(None)
-                } else {
-                    Ok(Some(source))
-                }
+                let mut sources =
+                    self.move_source_places_for_expr(root, body_hash, param_types, &nested_locals)?;
+                sources.retain(
+                    |source| !matches!(source.root, LoanRoot::Local(id) if id == synthetic_local),
+                );
+                Ok(sources)
             }
-            _ => Ok(None),
+            Some("if") => {
+                let then_hash = payload
+                    .get("then")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("if missing then"))?;
+                let else_hash = payload
+                    .get("else")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("if missing else"))?;
+                let mut sources =
+                    self.move_source_places_for_expr(root, then_hash, param_types, locals)?;
+                for source in
+                    self.move_source_places_for_expr(root, else_hash, param_types, locals)?
+                {
+                    if !sources.contains(&source) {
+                        sources.push(source);
+                    }
+                }
+                Ok(sources)
+            }
+            _ => Ok(Vec::new()),
         }
     }
 
