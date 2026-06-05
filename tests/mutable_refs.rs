@@ -267,6 +267,92 @@ fn main<'a>() -> i64 =
 }
 
 #[test]
+fn compiler_rejects_assignment_while_shared_loan_is_live() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("write-while-shared.sqlite");
+    let source = temp.path().join("write-while-shared.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+fn main<'a>() -> i64 effects[state] =
+  let line: Line = { price_cents: 25, qty: 4 } in
+  let shared: &'a Line = &'a line in
+  let changed: unit = line.price_cents = 30 in
+  shared.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_borrow"))
+        .stderr(predicate::str::contains("exclusive loan conflict"));
+}
+
+#[test]
+fn mutable_reference_assignment_updates_original_after_drop() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("mut-after-drop.sqlite");
+    let source = temp.path().join("mut-after-drop.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+record LineEditor<'a> {
+  line: &'a mut Line
+}
+
+fn main<'a>() -> i64 effects[state] =
+  let line: Line = { price_cents: 25, qty: 4 } in
+  let after: i64 =
+    let editor: LineEditor<'a> = { line: &'a mut line } in
+    let changed: unit = editor.line.price_cents = editor.line.price_cents + 75 in
+    0 in
+  line.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "100");
+    run(&["verify", path(&db)]);
+
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "mut_after_drop_native",
+            "--entry",
+            "main",
+            "--expect-i64",
+            "100",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+        assert_eq!(report["tests"][0]["reference"]["status"], "passed");
+    }
+}
+
+#[test]
 fn assignment_requires_state_effect() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("missing-state-effect.sqlite");

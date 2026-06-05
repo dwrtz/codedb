@@ -2941,7 +2941,7 @@ impl CodeDb {
                     .get("target")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow expression missing target"))?;
-                self.borrow_target_is_local_storage(target)
+                self.borrow_target_is_local_storage(root, target)
             }
             "assign" => Ok(false),
             "let" => {
@@ -3078,7 +3078,11 @@ impl CodeDb {
             .contains_reference)
     }
 
-    fn borrow_target_is_local_storage(&self, expr_hash: &str) -> Result<bool> {
+    fn borrow_target_is_local_storage(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+    ) -> Result<bool> {
         let payload = self.get_payload(expr_hash)?;
         let expr_kind = payload
             .get("expr_kind")
@@ -3091,7 +3095,15 @@ impl CodeDb {
                     .get("target")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("field_access missing target"))?;
-                self.borrow_target_is_local_storage(target)
+                let target_type = self.expr_declared_type(target)?;
+                if matches!(
+                    self.type_spec_in_root(root, &target_type)?,
+                    TypeSpec::Reference { .. }
+                ) {
+                    Ok(false)
+                } else {
+                    self.borrow_target_is_local_storage(root, target)
+                }
             }
             _ => Ok(false),
         }
@@ -3427,6 +3439,7 @@ impl CodeDb {
                 self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
                 let target_place = self.loan_place_for_expr(target, param_types, &state.locals)?;
                 self.check_place_not_moved(&target_place, state)?;
+                self.check_loan_conflicts(&LoanKind::Mutable, &target_place, &state.active)?;
                 self.verify_expr_borrows(root, value, param_types, state, ExprUse::Value)?;
                 Ok(())
             }

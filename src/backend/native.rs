@@ -317,7 +317,7 @@ impl CodeDb {
         target_triple: &str,
     ) -> Result<NativeObjectJobInput> {
         let root = self.load_root(root_hash)?;
-        let lowered = self.lower_symbol(root_hash, symbol)?;
+        let lowered = self.lower_symbol_for_target(root_hash, symbol, target_triple)?;
         let dependency_interface_hashes = self.dependency_interface_hashes(&root, &lowered.ir)?;
         let dependency_closure = self.dependency_closure_for_symbol(root_hash, symbol)?;
         let backend_id = backend_id_for_target(target_triple)?;

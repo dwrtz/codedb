@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::expr::{Value, eval_binary, eval_unary};
+use crate::expr::{Value, ValueCell, eval_binary, eval_unary, field_cell, value_cell};
 use crate::model::ProgramRootPayload;
 use crate::store::{CodeDb, canonical_json};
 use crate::{MAIN_BRANCH, parse_eval_arg};
@@ -77,13 +77,13 @@ impl TraceValue {
             Value::SharedRef(value) => TraceValue::Record {
                 fields: vec![TraceRecordField {
                     name: "ref".to_string(),
-                    value: TraceValue::from_value(value),
+                    value: TraceValue::from_value(&value.borrow()),
                 }],
             },
             Value::MutRef(value) => TraceValue::Record {
                 fields: vec![TraceRecordField {
                     name: "mut_ref".to_string(),
-                    value: TraceValue::from_value(value),
+                    value: TraceValue::from_value(&value.borrow()),
                 }],
             },
             Value::Record(fields) => TraceValue::Record {
@@ -91,13 +91,13 @@ impl TraceValue {
                     .iter()
                     .map(|(name, value)| TraceRecordField {
                         name: name.clone(),
-                        value: TraceValue::from_value(value),
+                        value: TraceValue::from_value(&value.borrow()),
                     })
                     .collect(),
             },
             Value::Enum { variant, value } => TraceValue::Enum {
                 variant: variant.clone(),
-                value: Box::new(TraceValue::from_value(value)),
+                value: Box::new(TraceValue::from_value(&value.borrow())),
             },
         }
     }
@@ -493,7 +493,7 @@ impl CodeDb {
             bail!("cannot trace external function {function_name}");
         }
         let body = self.function_body_hash(&root_symbol.definition)?;
-        let mut args = args;
+        let mut args = args.into_iter().map(value_cell).collect::<Vec<_>>();
         let mut locals = Vec::new();
         let value = self.trace_expr(
             state,
@@ -523,8 +523,8 @@ impl CodeDb {
         symbol_hash: &str,
         function_def_hash: &str,
         expr_hash: &str,
-        args: &mut Vec<Value>,
-        locals: &mut Vec<Value>,
+        args: &mut Vec<ValueCell>,
+        locals: &mut Vec<ValueCell>,
     ) -> Result<Value> {
         let payload = match self.get_payload(expr_hash) {
             Ok(payload) => payload,
@@ -626,7 +626,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("param_ref missing index"))
                     .and_then(|index| {
                         args.get(index as usize)
-                            .cloned()
+                            .map(|value| value.borrow().clone())
                             .ok_or_else(|| anyhow!("parameter index out of bounds: {index}"))
                     });
                 self.finish_current_expr(
@@ -645,7 +645,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("local_ref missing depth"))
                     .and_then(|depth| {
                         local_at_depth(locals, depth as usize)
-                            .cloned()
+                            .map(|value| value.borrow().clone())
                             .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))
                     });
                 self.finish_current_expr(
@@ -788,16 +788,8 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_shared missing target"))?;
                 let value = self
-                    .trace_expr(
-                        state,
-                        frame,
-                        symbol_hash,
-                        function_def_hash,
-                        target_hash,
-                        args,
-                        locals,
-                    )
-                    .map(|value| Value::SharedRef(Box::new(value)));
+                    .trace_place_cell(target_hash, args, locals)
+                    .map(Value::SharedRef);
                 self.finish_current_expr(
                     state,
                     frame,
@@ -813,16 +805,8 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_mut missing target"))?;
                 let value = self
-                    .trace_expr(
-                        state,
-                        frame,
-                        symbol_hash,
-                        function_def_hash,
-                        target_hash,
-                        args,
-                        locals,
-                    )
-                    .map(|value| Value::MutRef(Box::new(value)));
+                    .trace_place_cell(target_hash, args, locals)
+                    .map(Value::MutRef);
                 self.finish_current_expr(
                     state,
                     frame,
@@ -850,7 +834,9 @@ impl CodeDb {
                     args,
                     locals,
                 )?;
-                *self.trace_place_mut(target_hash, args, locals)? = value;
+                *self
+                    .trace_place_cell(target_hash, args, locals)?
+                    .borrow_mut() = value;
                 self.finish_current_expr(
                     state,
                     frame,
@@ -898,7 +884,7 @@ impl CodeDb {
                     type_hash: binding_type.clone(),
                     value: TraceValue::from_value(&value),
                 });
-                locals.push(value);
+                locals.push(value_cell(value));
                 let body = self.trace_expr(
                     state,
                     frame,
@@ -918,7 +904,7 @@ impl CodeDb {
                         expr_hash: expr_hash.to_string(),
                         name,
                         type_hash: binding_type,
-                        value: TraceValue::from_value(value),
+                        value: TraceValue::from_value(&value.borrow()),
                     });
                 }
                 let body = body?;
@@ -1003,7 +989,7 @@ impl CodeDb {
                         .ok_or_else(|| anyhow!("record field missing value"))?;
                     values.insert(
                         name,
-                        self.trace_expr(
+                        value_cell(self.trace_expr(
                             state,
                             frame,
                             symbol_hash,
@@ -1011,7 +997,7 @@ impl CodeDb {
                             value_hash,
                             args,
                             locals,
-                        )?,
+                        )?),
                     );
                 }
                 let value = Value::Record(values);
@@ -1019,44 +1005,9 @@ impl CodeDb {
                 Ok(value)
             }
             "field_access" => {
-                let target_hash = payload
-                    .get("target")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("field_access missing target"))?;
-                let field = payload
-                    .get("field")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("field_access missing field"))?;
-                let target = self.trace_expr(
-                    state,
-                    frame,
-                    symbol_hash,
-                    function_def_hash,
-                    target_hash,
-                    args,
-                    locals,
-                )?;
-                let value = match target {
-                    Value::Record(fields) => fields
-                        .get(field)
-                        .cloned()
-                        .ok_or_else(|| anyhow!("record value has no field {field}")),
-                    Value::SharedRef(value) => match value.as_ref() {
-                        Value::Record(fields) => fields
-                            .get(field)
-                            .cloned()
-                            .ok_or_else(|| anyhow!("record value has no field {field}")),
-                        other => bail!("field access target evaluated to non-record {other}"),
-                    },
-                    Value::MutRef(value) => match value.as_ref() {
-                        Value::Record(fields) => fields
-                            .get(field)
-                            .cloned()
-                            .ok_or_else(|| anyhow!("record value has no field {field}")),
-                        other => bail!("field access target evaluated to non-record {other}"),
-                    },
-                    other => bail!("field access target evaluated to non-record {other}"),
-                };
+                let value = self
+                    .trace_place_cell(expr_hash, args, locals)
+                    .map(|value| value.borrow().clone());
                 self.finish_current_expr(
                     state,
                     frame,
@@ -1087,7 +1038,7 @@ impl CodeDb {
                 )?;
                 let value = Value::Enum {
                     variant,
-                    value: Box::new(payload_value),
+                    value: value_cell(payload_value),
                 };
                 state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
                 Ok(value)
@@ -1126,7 +1077,7 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .is_some()
                 {
-                    locals.push(*value);
+                    locals.push(value);
                     let body = self.trace_expr(
                         state,
                         frame,
@@ -1214,12 +1165,12 @@ impl CodeDb {
         }
     }
 
-    fn trace_place_mut<'a>(
+    fn trace_place_cell(
         &self,
         expr_hash: &str,
-        args: &'a mut Vec<Value>,
-        locals: &'a mut Vec<Value>,
-    ) -> Result<&'a mut Value> {
+        args: &mut Vec<ValueCell>,
+        locals: &mut Vec<ValueCell>,
+    ) -> Result<ValueCell> {
         let payload = self.get_payload(expr_hash)?;
         match payload
             .get("expr_kind")
@@ -1233,6 +1184,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("param_ref missing index"))?
                     as usize;
                 args.get_mut(index)
+                    .cloned()
                     .ok_or_else(|| anyhow!("parameter index out of bounds: {index}"))
             }
             "local_ref" => {
@@ -1242,6 +1194,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("local_ref missing depth"))?
                     as usize;
                 local_at_depth_mut(locals, depth)
+                    .cloned()
                     .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))
             }
             "field_access" => {
@@ -1253,8 +1206,8 @@ impl CodeDb {
                     .get("field")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("field_access missing field"))?;
-                let target = self.trace_place_mut(target, args, locals)?;
-                field_value_mut(target, field)
+                let target = self.trace_place_cell(target, args, locals)?;
+                field_cell(&target, field)
             }
             other => bail!("expression kind {other} is not an assignable place"),
         }
@@ -1341,20 +1294,4 @@ fn local_at_depth_mut<T>(locals: &mut [T], depth: usize) -> Option<&mut T> {
         .len()
         .checked_sub(depth + 1)
         .and_then(|idx| locals.get_mut(idx))
-}
-
-fn field_value_mut<'a>(value: &'a mut Value, field: &str) -> Result<&'a mut Value> {
-    match value {
-        Value::Record(fields) => fields
-            .get_mut(field)
-            .ok_or_else(|| anyhow!("record value has no field {field}")),
-        Value::MutRef(value) => match value.as_mut() {
-            Value::Record(fields) => fields
-                .get_mut(field)
-                .ok_or_else(|| anyhow!("record value has no field {field}")),
-            other => bail!("field assignment target evaluated to non-record ref {other}"),
-        },
-        Value::SharedRef(_) => bail!("cannot assign through shared reference"),
-        other => bail!("field assignment target evaluated to non-record {other}"),
-    }
 }

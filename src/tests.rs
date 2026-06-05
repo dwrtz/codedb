@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value as JsonValue, json};
 
-use crate::expr::Value;
+use crate::expr::{Value, value_cell};
 use crate::migrations::Operation;
 use crate::model::{
     ProgramRootPayload, RootTestBinding, TEST_CASE_SCHEMA_V1, TEST_CASE_SCHEMA_V2, TestCasePayload,
@@ -1452,7 +1452,10 @@ pub(crate) fn value_from_test_value(value: &TestValue) -> Result<Value> {
             for field in fields {
                 validate_projection_identifier("record test field", &field.name)?;
                 if values
-                    .insert(field.name.clone(), value_from_test_value(&field.value)?)
+                    .insert(
+                        field.name.clone(),
+                        value_cell(value_from_test_value(&field.value)?),
+                    )
                     .is_some()
                 {
                     bail!("duplicate record test field {}", field.name);
@@ -1475,7 +1478,7 @@ pub(crate) fn test_value_from_value(value: &Value) -> TestValue {
                 .iter()
                 .map(|(name, value)| TestRecordField {
                     name: name.clone(),
-                    value: test_value_from_value(value),
+                    value: test_value_from_value(&value.borrow()),
                 })
                 .collect(),
         },
@@ -1522,7 +1525,7 @@ fn test_value_has_type(
                 let Some(value) = values.get(&field.name) else {
                     return Ok(false);
                 };
-                if !test_value_has_type(db, root, value, &field.type_hash)? {
+                if !test_value_has_type(db, root, &value.borrow(), &field.type_hash)? {
                     return Ok(false);
                 }
             }

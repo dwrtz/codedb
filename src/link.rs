@@ -813,7 +813,7 @@ impl CodeDb {
             self.native_value_comparison(
                 root,
                 &field.type_hash,
-                value,
+                &value.borrow(),
                 base_offset + field_layout.offset_bytes,
                 target_triple,
                 next_check,

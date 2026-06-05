@@ -294,6 +294,59 @@ fn main<'a>() -> i64 =
 }
 
 #[test]
+fn borrow_through_reference_parameter_can_return_field() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("borrow-through-ref-param.sqlite");
+    let source = temp.path().join("borrow-through-ref-param.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+record Holder {
+  line: Line
+}
+
+fn first_line<'a>(holder: &'a Holder) -> &'a Line =
+  &'a holder.line
+
+fn main<'a>() -> i64 =
+  let holder: Holder = { line: { price_cents: 25, qty: 4 } } in
+  let line: &'a Line = first_line(&'a holder) in
+  line.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "25");
+    run(&["verify", path(&db)]);
+
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "borrow_through_ref_param_native",
+            "--entry",
+            "main",
+            "--expect-i64",
+            "25",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+    }
+}
+
+#[test]
 fn verify_rejects_shared_borrow_region_outside_function_scope() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("bad-shared-borrow-region.sqlite");

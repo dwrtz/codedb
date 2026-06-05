@@ -32,6 +32,7 @@ fn records_compile_end_to_end_with_params_returns_references_and_native_tests() 
     let db = temp.path().join("native-records.sqlite");
     let source = temp.path().join("native-records.cdb");
     let main_ir_path = temp.path().join("main.ir.json");
+    let make_tiny_ir_path = temp.path().join("make-tiny.ir.json");
     let make_big_ir_path = temp.path().join("make-big.ir.json");
     let object_path = temp.path().join("make-big.o");
 
@@ -41,6 +42,10 @@ fn records_compile_end_to_end_with_params_returns_references_and_native_tests() 
 record Pair {
   left: i64
   right: i64
+}
+
+record Tiny {
+  only: i64
 }
 
 record Big {
@@ -65,6 +70,12 @@ fn make_pair() -> Pair =
   let pair: Pair = { left: 10, right: 7 } in
   pair
 
+fn sum_tiny(tiny: Tiny) -> i64 = tiny.only
+
+fn make_tiny() -> Tiny =
+  let tiny: Tiny = { only: 11 } in
+  tiny
+
 fn sum_big(big: Big) -> i64 = big.a + big.b + big.c + big.d
 
 fn make_big() -> Big =
@@ -79,16 +90,23 @@ fn refs_main<'a>() -> i64 =
   let view: LineView<'a> = { line: &'a line } in
   line_total(view)
 
-fn main() -> i64 = sum_pair({ left: 2, right: 3 }) + sum_pair(make_pair()) + sum_big(make_big()) + refs_main()
+fn main() -> i64 = sum_pair({ left: 2, right: 3 }) + sum_pair(make_pair()) + sum_tiny({ only: 6 }) + sum_tiny(make_tiny()) + sum_big(make_big()) + refs_main()
 "#,
     )
     .unwrap();
 
     run(&["init", path(&db)]);
     run(&["import", path(&db), path(&source)]);
-    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "132");
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "149");
 
     run(&["emit-ir", path(&db), "main", "--out", path(&main_ir_path)]);
+    run(&[
+        "emit-ir",
+        path(&db),
+        "make_tiny",
+        "--out",
+        path(&make_tiny_ir_path),
+    ]);
     run(&[
         "emit-ir",
         path(&db),
@@ -97,6 +115,7 @@ fn main() -> i64 = sum_pair({ left: 2, right: 3 }) + sum_pair(make_pair()) + sum
         path(&make_big_ir_path),
     ]);
     let main_ir = read_json(&main_ir_path);
+    let make_tiny_ir = read_json(&make_tiny_ir_path);
     let make_big_ir = read_json(&make_big_ir_path);
     assert!(
         main_ir["ir"]["operations"]
@@ -105,6 +124,15 @@ fn main() -> i64 = sum_pair({ left: 2, right: 3 }) + sum_pair(make_pair()) + sum
             .iter()
             .any(|op| op["op"] == "call" && op.get("return_address").is_some())
     );
+    let tiny_return_layout = make_tiny_ir["ir"]["type_layouts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|layout| layout["type_hash"] == make_tiny_ir["ir"]["return_type_hash"])
+        .unwrap();
+    assert_eq!(tiny_return_layout["kind"], "record");
+    assert_eq!(tiny_return_layout["abi"]["pass"], "by_value");
+    assert_eq!(tiny_return_layout["abi"]["return"], "by_value");
     let big_return_layout = make_big_ir["ir"]["type_layouts"]
         .as_array()
         .unwrap()
@@ -140,7 +168,7 @@ fn main() -> i64 = sum_pair({ left: 2, right: 3 }) + sum_pair(make_pair()) + sum
             "--entry",
             "main",
             "--expect-i64",
-            "132",
+            "149",
             "--native-required",
             "--json",
         ]));
@@ -154,7 +182,7 @@ fn main() -> i64 = sum_pair({ left: 2, right: 3 }) + sum_pair(make_pair()) + sum
         assert_eq!(report["tests"][0]["native"]["status"], "passed");
         assert_eq!(
             report["tests"][0]["native"]["comparison"]["actual"],
-            json!({"kind": "i64", "value": "132"})
+            json!({"kind": "i64", "value": "149"})
         );
     }
 }

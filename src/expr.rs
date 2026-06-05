@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display};
+use std::rc::Rc;
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -149,16 +151,51 @@ pub struct TypeDefinitionSource {
     pub definition: TypeDefinitionKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     I64(i64),
     Bool(bool),
     Unit,
-    SharedRef(Box<Value>),
-    MutRef(Box<Value>),
-    Record(BTreeMap<String, Value>),
-    Enum { variant: String, value: Box<Value> },
+    SharedRef(ValueCell),
+    MutRef(ValueCell),
+    Record(BTreeMap<String, ValueCell>),
+    Enum { variant: String, value: ValueCell },
 }
+
+pub type ValueCell = Rc<RefCell<Value>>;
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::I64(left), Value::I64(right)) => left == right,
+            (Value::Bool(left), Value::Bool(right)) => left == right,
+            (Value::Unit, Value::Unit) => true,
+            (Value::SharedRef(left), Value::SharedRef(right))
+            | (Value::MutRef(left), Value::MutRef(right)) => *left.borrow() == *right.borrow(),
+            (Value::Record(left), Value::Record(right)) => {
+                left.len() == right.len()
+                    && left.iter().all(|(name, left)| {
+                        right
+                            .get(name)
+                            .is_some_and(|right| *left.borrow() == *right.borrow())
+                    })
+            }
+            (
+                Value::Enum {
+                    variant: left_variant,
+                    value: left_value,
+                },
+                Value::Enum {
+                    variant: right_variant,
+                    value: right_value,
+                },
+            ) => left_variant == right_variant && *left_value.borrow() == *right_value.borrow(),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
 
 impl Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -166,20 +203,20 @@ impl Display for Value {
             Value::I64(value) => write!(f, "{value}"),
             Value::Bool(value) => write!(f, "{value}"),
             Value::Unit => write!(f, "()"),
-            Value::SharedRef(value) => write!(f, "&{value}"),
-            Value::MutRef(value) => write!(f, "&mut {value}"),
+            Value::SharedRef(value) => write!(f, "&{}", value.borrow()),
+            Value::MutRef(value) => write!(f, "&mut {}", value.borrow()),
             Value::Record(fields) => {
                 let rendered = fields
                     .iter()
-                    .map(|(name, value)| format!("{name}: {value}"))
+                    .map(|(name, value)| format!("{name}: {}", value.borrow()))
                     .collect::<Vec<_>>();
                 write!(f, "{{{}}}", rendered.join(", "))
             }
             Value::Enum { variant, value } => {
-                if matches!(value.as_ref(), Value::Unit) {
+                if matches!(*value.borrow(), Value::Unit) {
                     write!(f, "{variant}")
                 } else {
-                    write!(f, "{variant}({value})")
+                    write!(f, "{variant}({})", value.borrow())
                 }
             }
         }
@@ -232,7 +269,7 @@ impl CodeDb {
             );
         }
         let body = self.function_body_hash(&root_symbol.definition)?;
-        let mut args = args;
+        let mut args = args.into_iter().map(value_cell).collect::<Vec<_>>();
         self.eval_expr(root_hash, &body, &mut args)
     }
 
@@ -240,7 +277,7 @@ impl CodeDb {
         &self,
         root_hash: &str,
         expr_hash: &str,
-        args: &mut Vec<Value>,
+        args: &mut Vec<ValueCell>,
     ) -> Result<Value> {
         self.eval_expr_with_locals(root_hash, expr_hash, args, &mut Vec::new())
     }
@@ -262,7 +299,7 @@ impl CodeDb {
                     referent,
                     ..
                 },
-            ) => self.value_has_type(root, value, &referent),
+            ) => self.value_has_type(root, &value.borrow(), &referent),
             (
                 Value::MutRef(value),
                 TypeSpec::Reference {
@@ -270,7 +307,7 @@ impl CodeDb {
                     referent,
                     ..
                 },
-            ) => self.value_has_type(root, value, &referent),
+            ) => self.value_has_type(root, &value.borrow(), &referent),
             (Value::Record(values), TypeSpec::Record(fields)) => {
                 if values.len() != fields.len() {
                     return Ok(false);
@@ -279,7 +316,7 @@ impl CodeDb {
                     let Some(value) = values.get(&field.name) else {
                         return Ok(false);
                     };
-                    if !self.value_has_type(root, value, &field.type_hash)? {
+                    if !self.value_has_type(root, &value.borrow(), &field.type_hash)? {
                         return Ok(false);
                     }
                 }
@@ -290,7 +327,7 @@ impl CodeDb {
                 else {
                     return Ok(false);
                 };
-                self.value_has_type(root, value, &variant.type_hash)
+                self.value_has_type(root, &value.borrow(), &variant.type_hash)
             }
             _ => Ok(false),
         }
@@ -300,8 +337,8 @@ impl CodeDb {
         &self,
         root_hash: &str,
         expr_hash: &str,
-        args: &mut Vec<Value>,
-        locals: &mut Vec<Value>,
+        args: &mut Vec<ValueCell>,
+        locals: &mut Vec<ValueCell>,
     ) -> Result<Value> {
         let payload = self.get_payload(expr_hash)?;
         match payload
@@ -332,7 +369,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("param_ref missing index"))?
                     as usize;
                 args.get(index)
-                    .cloned()
+                    .map(|value| value.borrow().clone())
                     .ok_or_else(|| anyhow!("parameter index out of bounds: {index}"))
             }
             "local_ref" => {
@@ -342,7 +379,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("local_ref missing depth"))?
                     as usize;
                 local_at_depth(locals, depth)
-                    .cloned()
+                    .map(|value| value.borrow().clone())
                     .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))
             }
             "call" => {
@@ -397,24 +434,22 @@ impl CodeDb {
                     .get("target")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_shared missing target"))?;
-                Ok(Value::SharedRef(Box::new(self.eval_expr_with_locals(
-                    root_hash,
+                Ok(Value::SharedRef(self.eval_place_cell(
                     target_hash,
                     args,
                     locals,
-                )?)))
+                )?))
             }
             "borrow_mut" => {
                 let target_hash = payload
                     .get("target")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_mut missing target"))?;
-                Ok(Value::MutRef(Box::new(self.eval_expr_with_locals(
-                    root_hash,
+                Ok(Value::MutRef(self.eval_place_cell(
                     target_hash,
                     args,
                     locals,
-                )?)))
+                )?))
             }
             "assign" => {
                 let target_hash = payload
@@ -426,7 +461,9 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("assign missing value"))?;
                 let value = self.eval_expr_with_locals(root_hash, value_hash, args, locals)?;
-                *self.eval_place_mut(target_hash, args, locals)? = value;
+                *self
+                    .eval_place_cell(target_hash, args, locals)?
+                    .borrow_mut() = value;
                 Ok(Value::Unit)
             }
             "let" => {
@@ -439,7 +476,7 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("let missing body"))?;
                 let value = self.eval_expr_with_locals(root_hash, value_hash, args, locals)?;
-                locals.push(value);
+                locals.push(value_cell(value));
                 let body = self.eval_expr_with_locals(root_hash, body_hash, args, locals);
                 locals.pop();
                 body
@@ -485,42 +522,17 @@ impl CodeDb {
                         .ok_or_else(|| anyhow!("record field missing value"))?;
                     values.insert(
                         name,
-                        self.eval_expr_with_locals(root_hash, value_hash, args, locals)?,
+                        value_cell(
+                            self.eval_expr_with_locals(root_hash, value_hash, args, locals)?,
+                        ),
                     );
                 }
                 Ok(Value::Record(values))
             }
-            "field_access" => {
-                let target_hash = payload
-                    .get("target")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("field_access missing target"))?;
-                let field = payload
-                    .get("field")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("field_access missing field"))?;
-                match self.eval_expr_with_locals(root_hash, target_hash, args, locals)? {
-                    Value::Record(fields) => fields
-                        .get(field)
-                        .cloned()
-                        .ok_or_else(|| anyhow!("record value has no field {field}")),
-                    Value::SharedRef(value) => match value.as_ref() {
-                        Value::Record(fields) => fields
-                            .get(field)
-                            .cloned()
-                            .ok_or_else(|| anyhow!("record value has no field {field}")),
-                        other => bail!("field access target evaluated to non-record ref {other}"),
-                    },
-                    Value::MutRef(value) => match value.as_ref() {
-                        Value::Record(fields) => fields
-                            .get(field)
-                            .cloned()
-                            .ok_or_else(|| anyhow!("record value has no field {field}")),
-                        other => bail!("field access target evaluated to non-record ref {other}"),
-                    },
-                    other => bail!("field access target evaluated to non-record {other}"),
-                }
-            }
+            "field_access" => Ok(self
+                .eval_place_cell(expr_hash, args, locals)?
+                .borrow()
+                .clone()),
             "enum_construct" => {
                 let variant = payload
                     .get("variant")
@@ -533,7 +545,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("enum_construct missing value"))?;
                 Ok(Value::Enum {
                     variant,
-                    value: Box::new(
+                    value: value_cell(
                         self.eval_expr_with_locals(root_hash, value_hash, args, locals)?,
                     ),
                 })
@@ -564,7 +576,7 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .is_some()
                 {
-                    locals.push(*value);
+                    locals.push(value);
                     let result = self.eval_expr_with_locals(root_hash, body_hash, args, locals);
                     locals.pop();
                     result
@@ -576,12 +588,12 @@ impl CodeDb {
         }
     }
 
-    fn eval_place_mut<'a>(
+    fn eval_place_cell(
         &self,
         expr_hash: &str,
-        args: &'a mut Vec<Value>,
-        locals: &'a mut Vec<Value>,
-    ) -> Result<&'a mut Value> {
+        args: &mut Vec<ValueCell>,
+        locals: &mut Vec<ValueCell>,
+    ) -> Result<ValueCell> {
         let payload = self.get_payload(expr_hash)?;
         match payload
             .get("expr_kind")
@@ -595,6 +607,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("param_ref missing index"))?
                     as usize;
                 args.get_mut(index)
+                    .cloned()
                     .ok_or_else(|| anyhow!("parameter index out of bounds: {index}"))
             }
             "local_ref" => {
@@ -604,6 +617,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("local_ref missing depth"))?
                     as usize;
                 local_at_depth_mut(locals, depth)
+                    .cloned()
                     .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))
             }
             "field_access" => {
@@ -615,8 +629,8 @@ impl CodeDb {
                     .get("field")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("field_access missing field"))?;
-                let target = self.eval_place_mut(target, args, locals)?;
-                field_value_mut(target, field)
+                let target = self.eval_place_cell(target, args, locals)?;
+                field_cell(&target, field)
             }
             other => bail!("expression kind {other} is not an assignable place"),
         }
@@ -3144,18 +3158,17 @@ fn local_at_depth_mut<T>(locals: &mut [T], depth: usize) -> Option<&mut T> {
         .and_then(|idx| locals.get_mut(idx))
 }
 
-fn field_value_mut<'a>(value: &'a mut Value, field: &str) -> Result<&'a mut Value> {
-    match value {
+pub(crate) fn value_cell(value: Value) -> ValueCell {
+    Rc::new(RefCell::new(value))
+}
+
+pub(crate) fn field_cell(value: &ValueCell, field: &str) -> Result<ValueCell> {
+    match &*value.borrow() {
         Value::Record(fields) => fields
-            .get_mut(field)
+            .get(field)
+            .cloned()
             .ok_or_else(|| anyhow!("record value has no field {field}")),
-        Value::MutRef(value) => match value.as_mut() {
-            Value::Record(fields) => fields
-                .get_mut(field)
-                .ok_or_else(|| anyhow!("record value has no field {field}")),
-            other => bail!("field assignment target evaluated to non-record ref {other}"),
-        },
-        Value::SharedRef(_) => bail!("cannot assign through shared reference"),
-        other => bail!("field assignment target evaluated to non-record {other}"),
+        Value::SharedRef(referent) | Value::MutRef(referent) => field_cell(referent, field),
+        other => bail!("field access target evaluated to non-record {other}"),
     }
 }

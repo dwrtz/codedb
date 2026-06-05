@@ -16,7 +16,7 @@ pub(crate) const LOWERED_IR_SCHEMA: &str = "codedb/lowered-function-ir/v2";
 pub(crate) const LOWERED_DEBUG_MAP_SCHEMA: &str = "codedb/lowered-debug-map/v1";
 const LOWERED_IR_INSPECTION_SCHEMA: &str = "codedb/lowered-ir-inspection/v1";
 const LOWERING_BACKEND_ID: &str = "lowering-v1";
-const LOWERING_TARGET: &str = "target-independent-memory-ir-v1";
+pub(crate) const LOWERING_TARGET: &str = "target-independent-memory-ir-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LoweredFunctionIr {
@@ -303,8 +303,8 @@ struct LocalLoweredBinding {
     type_hash: String,
 }
 
-#[derive(Default)]
 struct LowerCtx {
+    target_triple: String,
     next_value: usize,
     next_local: usize,
     local_slots: Vec<LoweredLocalSlot>,
@@ -312,6 +312,20 @@ struct LowerCtx {
 }
 
 impl LowerCtx {
+    fn new(target_triple: &str) -> Self {
+        Self {
+            target_triple: target_triple.to_string(),
+            next_value: 0,
+            next_local: 0,
+            local_slots: Vec::new(),
+            debug_operations: Vec::new(),
+        }
+    }
+
+    fn target_triple(&self) -> &str {
+        &self.target_triple
+    }
+
     fn value(&mut self) -> String {
         let value = format!("v{}", self.next_value);
         self.next_value += 1;
@@ -389,6 +403,26 @@ impl CodeDb {
         self.lower_function_definition(&root, &entry)
     }
 
+    pub(crate) fn lower_symbol_for_target(
+        &self,
+        root_hash: &str,
+        symbol: &str,
+        target_triple: &str,
+    ) -> Result<LoweredFunctionArtifact> {
+        let root = self.load_root(root_hash)?;
+        let entry = self
+            .root_symbol(&root, symbol)
+            .cloned()
+            .ok_or_else(|| anyhow!("missing symbol {symbol}"))?;
+        let ir = self.build_lowered_function_ir(&root, &entry, target_triple)?;
+        self.verify_lowered_ir(&root, &ir, target_triple)?;
+        let ir_json = serde_json::to_value(&ir)?;
+        Ok(LoweredFunctionArtifact {
+            ir,
+            lowered_ir_hash: hash_lowered_ir_json(&ir_json),
+        })
+    }
+
     fn lower_function_definition(
         &mut self,
         root: &ProgramRootPayload,
@@ -406,8 +440,8 @@ impl CodeDb {
                 .as_ref()
                 .ok_or_else(|| anyhow!("lowered IR cache entry missing artifact_json"))?;
             let ir = lowered_ir_from_artifact_metadata(artifact_json)?;
-            self.verify_lowered_ir(root, &ir)?;
-            let expected = self.build_lowered_function_ir(root, entry)?;
+            self.verify_lowered_ir(root, &ir, DEFAULT_NATIVE_TARGET)?;
+            let expected = self.build_lowered_function_ir(root, entry, DEFAULT_NATIVE_TARGET)?;
             let ir_json = serde_json::to_value(&ir)?;
             let recomputed_hash = hash_lowered_ir_json(&ir_json);
             if ir != expected || recomputed_hash != cache_entry.artifact_hash {
@@ -419,8 +453,8 @@ impl CodeDb {
             });
         }
 
-        let ir = self.build_lowered_function_ir(root, entry)?;
-        self.verify_lowered_ir(root, &ir)?;
+        let ir = self.build_lowered_function_ir(root, entry, DEFAULT_NATIVE_TARGET)?;
+        self.verify_lowered_ir(root, &ir, DEFAULT_NATIVE_TARGET)?;
         self.write_lowered_ir_artifact(entry, ir)
     }
 
@@ -448,6 +482,7 @@ impl CodeDb {
         &self,
         root: &ProgramRootPayload,
         entry: &RootSymbolPayload,
+        target_triple: &str,
     ) -> Result<LoweredFunctionIr> {
         if !self.definition_is_internal_function(&entry.definition)? {
             bail!("lowering input is not a FunctionDef {}", entry.definition);
@@ -492,7 +527,7 @@ impl CodeDb {
             );
         }
 
-        let mut ctx = LowerCtx::default();
+        let mut ctx = LowerCtx::new(target_triple);
         let mut lowered = self.lower_expr(root, &body, &param_types, &mut ctx, &mut Vec::new())?;
         let local_slots = ctx.local_slots.clone();
         let debug_map = ctx.into_debug_map();
@@ -502,6 +537,7 @@ impl CodeDb {
         });
         let type_layouts = self.lowered_type_layouts(
             root,
+            target_triple,
             &param_types,
             &return_type,
             &local_slots,
@@ -638,23 +674,27 @@ impl CodeDb {
                 }
                 let id = ctx.value();
                 ctx.push_debug_op(expr_hash, "call", &id);
-                let return_address = if self.is_aggregate_ir_type(root, &type_hash)? {
-                    let slot_size =
-                        stack_slot_size_bytes(self.layout_size_bytes(root, &type_hash)?);
-                    let slot = ctx.local_slot(type_hash.clone(), slot_size);
-                    let address = ctx.value();
-                    ctx.push_debug_op(expr_hash, "addr_of_local", &address);
-                    operations.push(LoweredOp::AddrOfLocal {
-                        id: address.clone(),
-                        place: LoweredPlace::Local {
-                            slot,
-                            type_hash: type_hash.clone(),
-                        },
-                    });
-                    Some(address)
-                } else {
-                    None
-                };
+                let return_address =
+                    if self.type_returns_indirect(root, ctx.target_triple(), &type_hash)? {
+                        let slot_size = stack_slot_size_bytes(self.layout_size_bytes(
+                            root,
+                            ctx.target_triple(),
+                            &type_hash,
+                        )?);
+                        let slot = ctx.local_slot(type_hash.clone(), slot_size);
+                        let address = ctx.value();
+                        ctx.push_debug_op(expr_hash, "addr_of_local", &address);
+                        operations.push(LoweredOp::AddrOfLocal {
+                            id: address.clone(),
+                            place: LoweredPlace::Local {
+                                slot,
+                                type_hash: type_hash.clone(),
+                            },
+                        });
+                        Some(address)
+                    } else {
+                        None
+                    };
                 operations.push(LoweredOp::Call {
                     id: id.clone(),
                     target_symbol_hash,
@@ -745,7 +785,11 @@ impl CodeDb {
                     .get("body")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("let missing body"))?;
-                let slot_size = stack_slot_size_bytes(self.layout_size_bytes(root, &binding_type)?);
+                let slot_size = stack_slot_size_bytes(self.layout_size_bytes(
+                    root,
+                    ctx.target_triple(),
+                    &binding_type,
+                )?);
                 let slot = ctx.local_slot(binding_type.clone(), slot_size);
                 let address = ctx.value();
                 ctx.push_debug_op(expr_hash, "addr_of_local", &address);
@@ -771,7 +815,7 @@ impl CodeDb {
                         ctx,
                         locals,
                     )?);
-                } else if self.is_aggregate_ir_type(root, &binding_type)?
+                } else if self.type_passes_indirect(root, ctx.target_triple(), &binding_type)?
                     && self.expr_is_place(value_hash)?
                 {
                     operations.extend(self.lower_aggregate_place_init_to_address(
@@ -803,7 +847,7 @@ impl CodeDb {
                 locals.pop();
                 let body = body?;
                 operations.extend(body.operations);
-                if self.type_requires_drop_scaffold(root, &binding_type)? {
+                if self.type_requires_drop_scaffold(root, ctx.target_triple(), &binding_type)? {
                     operations.push(LoweredOp::Drop {
                         address,
                         type_hash: binding_type,
@@ -931,7 +975,11 @@ impl CodeDb {
                 })
             }
             "record_literal" => {
-                let slot_size = stack_slot_size_bytes(self.layout_size_bytes(root, &type_hash)?);
+                let slot_size = stack_slot_size_bytes(self.layout_size_bytes(
+                    root,
+                    ctx.target_triple(),
+                    &type_hash,
+                )?);
                 let slot = ctx.local_slot(type_hash.clone(), slot_size);
                 let address = ctx.value();
                 ctx.push_debug_op(expr_hash, "addr_of_local", &address);
@@ -951,11 +999,26 @@ impl CodeDb {
                     ctx,
                     locals,
                 )?);
-                Ok(LoweredExpr {
-                    operations,
-                    value: address,
-                    type_hash,
-                })
+                if self.type_passes_indirect(root, ctx.target_triple(), &type_hash)? {
+                    Ok(LoweredExpr {
+                        operations,
+                        value: address,
+                        type_hash,
+                    })
+                } else {
+                    let id = ctx.value();
+                    ctx.push_debug_op(expr_hash, "load", &id);
+                    operations.push(LoweredOp::Load {
+                        id: id.clone(),
+                        address,
+                        type_hash: type_hash.clone(),
+                    });
+                    Ok(LoweredExpr {
+                        operations,
+                        value: id,
+                        type_hash,
+                    })
+                }
             }
             "if" => {
                 let cond_hash = payload
@@ -1021,7 +1084,7 @@ impl CodeDb {
         locals: &mut Vec<LocalLoweredBinding>,
     ) -> Result<LoweredExpr> {
         let lowered = self.lower_place(root, expr_hash, param_types, ctx, locals)?;
-        if self.type_is_move_only(root, type_hash)? {
+        if self.type_is_move_only(root, ctx.target_triple(), type_hash)? {
             let id = ctx.value();
             ctx.push_debug_op(expr_hash, "move", &id);
             let mut operations = lowered.operations;
@@ -1036,7 +1099,8 @@ impl CodeDb {
                 type_hash: type_hash.to_string(),
             });
         }
-        if self.is_aggregate_ir_type(root, type_hash)? {
+        let passes_indirect = self.type_passes_indirect(root, ctx.target_triple(), type_hash)?;
+        if passes_indirect {
             let id = ctx.value();
             ctx.push_debug_op(expr_hash, "copy", &id);
             let mut operations = lowered.operations;
@@ -1048,6 +1112,28 @@ impl CodeDb {
             return Ok(LoweredExpr {
                 operations,
                 value: id,
+                type_hash: type_hash.to_string(),
+            });
+        }
+        if self.type_requires_copy_scaffold(root, ctx.target_triple(), type_hash)? {
+            let loaded_id = ctx.value();
+            ctx.push_debug_op(expr_hash, "load", &loaded_id);
+            let copy_id = ctx.value();
+            ctx.push_debug_op(expr_hash, "copy", &copy_id);
+            let mut operations = lowered.operations;
+            operations.push(LoweredOp::Load {
+                id: loaded_id.clone(),
+                address: lowered.address,
+                type_hash: type_hash.to_string(),
+            });
+            operations.push(LoweredOp::Copy {
+                id: copy_id.clone(),
+                value: loaded_id,
+                type_hash: type_hash.to_string(),
+            });
+            return Ok(LoweredExpr {
+                operations,
+                value: copy_id,
                 type_hash: type_hash.to_string(),
             });
         }
@@ -1136,7 +1222,11 @@ impl CodeDb {
                         place: LoweredPlace::Param {
                             slot,
                             type_hash: type_hash.clone(),
-                            indirect: self.is_aggregate_ir_type(root, &type_hash)?,
+                            indirect: self.type_passes_indirect(
+                                root,
+                                ctx.target_triple(),
+                                &type_hash,
+                            )?,
                         },
                     }],
                     address: id,
@@ -1215,6 +1305,11 @@ impl CodeDb {
                             type_hash: referent,
                         }
                     }
+                    _ if self.is_aggregate_ir_type(root, &target_type)?
+                        && self.expr_is_place(target_hash)? =>
+                    {
+                        self.lower_place(root, target_hash, param_types, ctx, locals)?
+                    }
                     _ if self.is_aggregate_ir_type(root, &target_type)? => {
                         let lowered_value =
                             self.lower_expr(root, target_hash, param_types, ctx, locals)?;
@@ -1226,7 +1321,8 @@ impl CodeDb {
                     }
                     _ => self.lower_place(root, target_hash, param_types, ctx, locals)?,
                 };
-                let field_info = self.lowered_record_field(root, &target.type_hash, field)?;
+                let field_info =
+                    self.lowered_record_field(root, ctx.target_triple(), &target.type_hash, field)?;
                 if field_info.type_hash != type_hash {
                     bail!("field_access type mismatch while lowering");
                 }
@@ -1283,7 +1379,8 @@ impl CodeDb {
                 .get("value")
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| anyhow!("record field missing value"))?;
-            let field_info = self.lowered_record_field(root, target_type, name)?;
+            let field_info =
+                self.lowered_record_field(root, ctx.target_triple(), target_type, name)?;
             let value = self.lower_expr(root, value_hash, param_types, ctx, locals)?;
             if !self.type_assignable_in_root(root, &value.type_hash, &field_info.type_hash)? {
                 bail!("record initializer field {name} type mismatch while lowering");
@@ -1335,7 +1432,7 @@ impl CodeDb {
         let source = self.lower_place(root, expr_hash, param_types, ctx, locals)?;
         let mut operations = source.operations;
         let scaffold_id = ctx.value();
-        if self.type_is_move_only(root, &source_type)? {
+        if self.type_is_move_only(root, ctx.target_triple(), &source_type)? {
             ctx.push_debug_op(expr_hash, "move", &scaffold_id);
             operations.push(LoweredOp::Move {
                 id: scaffold_id,
@@ -1352,8 +1449,12 @@ impl CodeDb {
         }
 
         for field in self.aggregate_record_fields(root, target_type)? {
-            let source_field_info =
-                self.lowered_record_field(root, &source.type_hash, &field.name)?;
+            let source_field_info = self.lowered_record_field(
+                root,
+                ctx.target_triple(),
+                &source.type_hash,
+                &field.name,
+            )?;
             if !self.type_assignable_in_root(
                 root,
                 &source_field_info.type_hash,
@@ -1387,7 +1488,8 @@ impl CodeDb {
                 type_hash: source_field_info.type_hash.clone(),
             });
 
-            let target_field_info = self.lowered_record_field(root, target_type, &field.name)?;
+            let target_field_info =
+                self.lowered_record_field(root, ctx.target_triple(), target_type, &field.name)?;
             let store_type_hash = if source_field_info.type_hash == target_field_info.type_hash {
                 target_field_info.type_hash.clone()
             } else {
@@ -1418,10 +1520,11 @@ impl CodeDb {
     fn lowered_record_field(
         &self,
         root: &ProgramRootPayload,
+        target_triple: &str,
         type_hash: &str,
         field: &str,
     ) -> Result<LoweredFieldInfo> {
-        let offset_bytes = self.layout_field_offset_bytes(root, type_hash, field)?;
+        let offset_bytes = self.layout_field_offset_bytes(root, target_triple, type_hash, field)?;
         let field_symbol = if let TypeSpec::Named { type_symbol, .. } = self.type_spec(type_hash)? {
             let entry = self
                 .root_type(root, &type_symbol)
@@ -1477,16 +1580,54 @@ impl CodeDb {
         ))
     }
 
-    fn layout_size_bytes(&self, root: &ProgramRootPayload, type_hash: &str) -> Result<u64> {
-        self.compute_type_layout(root, type_hash, DEFAULT_NATIVE_TARGET)?
+    fn layout_size_bytes(
+        &self,
+        root: &ProgramRootPayload,
+        target_triple: &str,
+        type_hash: &str,
+    ) -> Result<u64> {
+        self.compute_type_layout(root, type_hash, target_triple)?
             .metadata
             .get("size_bytes")
             .and_then(JsonValue::as_u64)
             .ok_or_else(|| anyhow!("type layout missing size_bytes for {type_hash}"))
     }
 
-    fn type_is_move_only(&self, root: &ProgramRootPayload, type_hash: &str) -> Result<bool> {
-        let layout = self.compute_type_layout(root, type_hash, DEFAULT_NATIVE_TARGET)?;
+    fn type_passes_indirect(
+        &self,
+        root: &ProgramRootPayload,
+        target_triple: &str,
+        type_hash: &str,
+    ) -> Result<bool> {
+        let layout = self.compute_type_layout(root, type_hash, target_triple)?;
+        let abi = layout
+            .metadata
+            .get("abi")
+            .ok_or_else(|| anyhow!("type layout missing abi for {type_hash}"))?;
+        Ok(required_layout_string(abi, "pass")? == "by_indirect")
+    }
+
+    fn type_returns_indirect(
+        &self,
+        root: &ProgramRootPayload,
+        target_triple: &str,
+        type_hash: &str,
+    ) -> Result<bool> {
+        let layout = self.compute_type_layout(root, type_hash, target_triple)?;
+        let abi = layout
+            .metadata
+            .get("abi")
+            .ok_or_else(|| anyhow!("type layout missing abi for {type_hash}"))?;
+        Ok(required_layout_string(abi, "return")? == "hidden_return_slot")
+    }
+
+    fn type_is_move_only(
+        &self,
+        root: &ProgramRootPayload,
+        target_triple: &str,
+        type_hash: &str,
+    ) -> Result<bool> {
+        let layout = self.compute_type_layout(root, type_hash, target_triple)?;
         match layout.metadata.get("copy_kind").and_then(JsonValue::as_str) {
             Some("copy") => Ok(false),
             Some("move_only") => Ok(true),
@@ -1495,12 +1636,34 @@ impl CodeDb {
         }
     }
 
+    fn type_requires_copy_scaffold(
+        &self,
+        root: &ProgramRootPayload,
+        target_triple: &str,
+        type_hash: &str,
+    ) -> Result<bool> {
+        let layout = self.compute_type_layout(root, type_hash, target_triple)?;
+        let copy_kind = match layout.metadata.get("copy_kind").and_then(JsonValue::as_str) {
+            Some("copy") => true,
+            Some("move_only") => false,
+            Some(other) => bail!("unknown copy_kind {other} for type {type_hash}"),
+            None => bail!("type layout missing copy_kind for {type_hash}"),
+        };
+        let contains_reference = layout
+            .metadata
+            .get("contains_reference")
+            .and_then(JsonValue::as_bool)
+            .ok_or_else(|| anyhow!("type layout missing contains_reference for {type_hash}"))?;
+        Ok(copy_kind && contains_reference)
+    }
+
     fn type_requires_drop_scaffold(
         &self,
         root: &ProgramRootPayload,
+        target_triple: &str,
         type_hash: &str,
     ) -> Result<bool> {
-        let layout = self.compute_type_layout(root, type_hash, DEFAULT_NATIVE_TARGET)?;
+        let layout = self.compute_type_layout(root, type_hash, target_triple)?;
         let move_only = match layout.metadata.get("copy_kind").and_then(JsonValue::as_str) {
             Some("copy") => false,
             Some("move_only") => true,
@@ -1524,10 +1687,11 @@ impl CodeDb {
     fn layout_field_offset_bytes(
         &self,
         root: &ProgramRootPayload,
+        target_triple: &str,
         type_hash: &str,
         field: &str,
     ) -> Result<u64> {
-        let layout = self.compute_type_layout(root, type_hash, DEFAULT_NATIVE_TARGET)?;
+        let layout = self.compute_type_layout(root, type_hash, target_triple)?;
         layout
             .metadata
             .get("fields")
@@ -1546,7 +1710,7 @@ impl CodeDb {
     ) -> Result<()> {
         let type_name = self.type_name(type_hash)?;
         match self.type_spec_in_root(root, type_hash)? {
-            TypeSpec::Builtin(_) | TypeSpec::Record(_) => Ok(()),
+            TypeSpec::Builtin(_) | TypeSpec::Record(_) | TypeSpec::Reference { .. } => Ok(()),
             _ => bail!("lowering v1 does not support aggregate return type {type_name}"),
         }
     }
@@ -1566,6 +1730,7 @@ impl CodeDb {
     fn lowered_type_layouts(
         &self,
         root: &ProgramRootPayload,
+        target_triple: &str,
         param_types: &[String],
         return_type: &str,
         local_slots: &[LoweredLocalSlot],
@@ -1580,7 +1745,7 @@ impl CodeDb {
         type_hashes
             .into_iter()
             .map(|type_hash| {
-                let layout = self.compute_type_layout(root, &type_hash, DEFAULT_NATIVE_TARGET)?;
+                let layout = self.compute_type_layout(root, &type_hash, target_triple)?;
                 let metadata = layout.metadata;
                 let abi = metadata
                     .get("abi")
@@ -1602,6 +1767,7 @@ impl CodeDb {
     pub(crate) fn verify_lowered_ir_against_index(
         &self,
         input_hash: &str,
+        target_triple: &str,
         ir: &LoweredFunctionIr,
     ) -> Result<()> {
         if ir.function_def_hash != input_hash {
@@ -1626,6 +1792,7 @@ impl CodeDb {
         }
 
         let mut last_error = None;
+        let layout_target = lowered_ir_layout_target(target_triple);
         for root_hash in root_hashes {
             let root = self.load_root(&root_hash)?;
             let Some(entry) = self.root_symbol(&root, &ir.symbol_hash) else {
@@ -1635,11 +1802,11 @@ impl CodeDb {
                 ));
                 continue;
             };
-            if let Err(err) = self.verify_lowered_ir(&root, ir) {
+            if let Err(err) = self.verify_lowered_ir(&root, ir, layout_target) {
                 last_error = Some(err);
                 continue;
             }
-            match self.build_lowered_function_ir(&root, entry) {
+            match self.build_lowered_function_ir(&root, entry, layout_target) {
                 Ok(expected) if &expected == ir => return Ok(()),
                 Ok(_) => {
                     last_error = Some(anyhow!(
@@ -1655,7 +1822,12 @@ impl CodeDb {
         bail!("lowered IR does not match any indexed root");
     }
 
-    fn verify_lowered_ir(&self, root: &ProgramRootPayload, ir: &LoweredFunctionIr) -> Result<()> {
+    fn verify_lowered_ir(
+        &self,
+        root: &ProgramRootPayload,
+        ir: &LoweredFunctionIr,
+        target_triple: &str,
+    ) -> Result<()> {
         self.verify_lowered_ir_shape(ir)?;
         let root_entry = self
             .root_symbol(root, &ir.symbol_hash)
@@ -1684,9 +1856,10 @@ impl CodeDb {
         {
             bail!("lowered IR return type mismatch");
         }
-        self.verify_lowered_operations(root, ir, &param_types, &return_type)?;
+        self.verify_lowered_operations(root, ir, target_triple, &param_types, &return_type)?;
         let expected_layouts = self.lowered_type_layouts(
             root,
+            target_triple,
             &param_types,
             &return_type,
             &ir.locals,
@@ -1851,6 +2024,7 @@ impl CodeDb {
         &self,
         root: &ProgramRootPayload,
         ir: &LoweredFunctionIr,
+        target_triple: &str,
         param_types: &[String],
         return_type: &str,
     ) -> Result<()> {
@@ -1863,6 +2037,7 @@ impl CodeDb {
         self.verify_value_ops(
             root,
             body_ops,
+            target_triple,
             param_types,
             &ir.locals,
             &mut values,
@@ -1889,6 +2064,7 @@ impl CodeDb {
         &self,
         root: &ProgramRootPayload,
         operations: &[LoweredOp],
+        target_triple: &str,
         param_types: &[String],
         local_slots: &[LoweredLocalSlot],
         values: &mut BTreeMap<String, String>,
@@ -2009,7 +2185,7 @@ impl CodeDb {
                     if type_hash != &expected_return {
                         bail!("lowered call return type mismatch");
                     }
-                    if self.is_aggregate_ir_type(root, type_hash)? {
+                    if self.type_returns_indirect(root, target_triple, type_hash)? {
                         let Some(return_address) = return_address else {
                             bail!("lowered aggregate call missing return address");
                         };
@@ -2031,7 +2207,7 @@ impl CodeDb {
                         bail!("lowered call ABI symbol does not match target definition");
                     }
                     insert_value(values, id, type_hash)?;
-                    if self.is_aggregate_ir_type(root, type_hash)? {
+                    if self.type_returns_indirect(root, target_triple, type_hash)? {
                         insert_address(addresses, id, type_hash)?;
                     }
                 }
@@ -2048,6 +2224,7 @@ impl CodeDb {
                     let then_type = self.verify_lowered_block(
                         root,
                         then_block,
+                        target_triple,
                         param_types,
                         local_slots,
                         values,
@@ -2056,6 +2233,7 @@ impl CodeDb {
                     let else_type = self.verify_lowered_block(
                         root,
                         else_block,
+                        target_triple,
                         param_types,
                         local_slots,
                         values,
@@ -2163,11 +2341,11 @@ impl CodeDb {
                     if expected != type_hash {
                         bail!("lowered addr_of_param slot {slot} type mismatch");
                     }
-                    if *indirect != self.is_aggregate_ir_type(root, type_hash)? {
+                    if *indirect != self.type_passes_indirect(root, target_triple, type_hash)? {
                         bail!("lowered addr_of_param indirect flag mismatch");
                     }
                     insert_address(addresses, id, type_hash)?;
-                    if self.is_aggregate_ir_type(root, type_hash)? {
+                    if self.type_passes_indirect(root, target_triple, type_hash)? {
                         insert_value(values, id, type_hash)?;
                     }
                 }
@@ -2202,7 +2380,8 @@ impl CodeDb {
                     if base_type != owner_type_hash {
                         bail!("lowered addr_of_field owner type mismatch");
                     }
-                    let field_info = self.lowered_record_field(root, owner_type_hash, field)?;
+                    let field_info =
+                        self.lowered_record_field(root, target_triple, owner_type_hash, field)?;
                     if field_info.type_hash != *type_hash
                         && !self.type_assignable_in_root(root, type_hash, &field_info.type_hash)?
                     {
@@ -2273,14 +2452,14 @@ impl CodeDb {
                     value,
                     type_hash,
                 } => {
-                    if self.type_is_move_only(root, type_hash)? {
+                    if self.type_is_move_only(root, target_triple, type_hash)? {
                         bail!("lowered copy requires a copy type");
                     }
                     if value_type(values, value)? != type_hash {
                         bail!("lowered copy type mismatch");
                     }
                     insert_value(values, id, type_hash)?;
-                    if self.is_aggregate_ir_type(root, type_hash)? {
+                    if self.type_passes_indirect(root, target_triple, type_hash)? {
                         insert_address(addresses, id, type_hash)?;
                     }
                 }
@@ -2289,19 +2468,19 @@ impl CodeDb {
                     address,
                     type_hash,
                 } => {
-                    if !self.type_is_move_only(root, type_hash)? {
+                    if !self.type_is_move_only(root, target_triple, type_hash)? {
                         bail!("lowered move requires a move-only type");
                     }
                     if address_type(addresses, address)? != type_hash {
                         bail!("lowered move type mismatch");
                     }
                     insert_value(values, id, type_hash)?;
-                    if self.is_aggregate_ir_type(root, type_hash)? {
+                    if self.type_passes_indirect(root, target_triple, type_hash)? {
                         insert_address(addresses, id, type_hash)?;
                     }
                 }
                 LoweredOp::Drop { address, type_hash } => {
-                    if !self.type_requires_drop_scaffold(root, type_hash)? {
+                    if !self.type_requires_drop_scaffold(root, target_triple, type_hash)? {
                         bail!("lowered drop requires a drop-relevant type");
                     }
                     if address_type(addresses, address)? != type_hash {
@@ -2335,6 +2514,7 @@ impl CodeDb {
         &self,
         root: &ProgramRootPayload,
         block: &LoweredBlock,
+        target_triple: &str,
         param_types: &[String],
         local_slots: &[LoweredLocalSlot],
         parent_values: &BTreeMap<String, String>,
@@ -2345,6 +2525,7 @@ impl CodeDb {
         self.verify_value_ops(
             root,
             &block.operations,
+            target_triple,
             param_types,
             local_slots,
             &mut values,
@@ -2364,6 +2545,14 @@ pub(crate) fn lowered_ir_from_artifact_metadata(
         .get("metadata")
         .ok_or_else(|| anyhow!("lowered IR artifact missing metadata"))?;
     Ok(serde_json::from_value(metadata.clone())?)
+}
+
+fn lowered_ir_layout_target(target_triple: &str) -> &str {
+    if target_triple == LOWERING_TARGET {
+        DEFAULT_NATIVE_TARGET
+    } else {
+        target_triple
+    }
 }
 
 fn hash_lowered_ir_json(value: &JsonValue) -> String {

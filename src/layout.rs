@@ -551,18 +551,22 @@ impl LayoutComputer<'_> {
             "contains_raw_pointer": class.contains_raw_pointer,
             "contains_box": class.contains_box,
             "contains_capability_handle": class.contains_capability_handle,
-            "abi": abi_metadata(kind),
+            "abi": abi_metadata(kind, size_bytes),
         })
     }
 }
 
-fn abi_metadata(kind: &str) -> JsonValue {
-    match kind {
-        "record" | "enum" | "fixed_array" => json!({
+fn abi_metadata(kind: &str, size_bytes: u64) -> JsonValue {
+    match (kind, size_bytes <= 8) {
+        ("record", true) => json!({
+            "pass": "by_value",
+            "return": "by_value",
+        }),
+        ("record" | "enum" | "fixed_array", _) => json!({
             "pass": "by_indirect",
             "return": "hidden_return_slot",
         }),
-        _ => json!({
+        (_, _) => json!({
             "pass": "by_value",
             "return": "by_value",
         }),

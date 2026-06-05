@@ -134,8 +134,8 @@ fn main() -> i64 = 1
     assert_eq!(line_view["align_bytes"], 8);
     assert_eq!(line_view["copy_kind"], "copy");
     assert_eq!(line_view["drop_kind"], "trivial");
-    assert_eq!(line_view["abi"]["pass"], "by_indirect");
-    assert_eq!(line_view["abi"]["return"], "hidden_return_slot");
+    assert_eq!(line_view["abi"]["pass"], "by_value");
+    assert_eq!(line_view["abi"]["return"], "by_value");
     assert_eq!(line_view["contains_reference"], true);
     assert_eq!(line_view["contains_mut_reference"], false);
     assert_eq!(line_view["fields"][0]["name"], "line");

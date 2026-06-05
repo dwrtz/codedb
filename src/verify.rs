@@ -1965,7 +1965,9 @@ impl CodeDb {
             {
                 match crate::lowering::lowered_ir_from_artifact_metadata(value) {
                     Ok(ir) => {
-                        if let Err(err) = self.verify_lowered_ir_against_index(&input_hash, &ir) {
+                        if let Err(err) =
+                            self.verify_lowered_ir_against_index(&input_hash, &target, &ir)
+                        {
                             errors.push(format!("bad_lowered_ir: {cache_key}: {err:#}"));
                         }
                     }
@@ -2660,7 +2662,8 @@ impl CodeDb {
                 ));
                 return Ok(());
             };
-            let expected_ir = self.build_lowered_function_ir(&root, entry)?;
+            let expected_ir =
+                self.build_lowered_function_ir(&root, entry, &key_input.target_triple)?;
             let expected_relocation_targets = lowered_call_targets(&expected_ir)?;
             verify_object_relocations_match_dependencies(
                 errors,
