@@ -47,6 +47,7 @@ struct NativeObjectJobInput {
     cache_key: String,
     ir: LoweredFunctionIr,
     dependency_interface_hashes: Vec<String>,
+    dependency_implementation_hashes: Vec<String>,
     dependency_closure: Vec<String>,
     target_triple: String,
 }
@@ -319,6 +320,8 @@ impl CodeDb {
         let root = self.load_root(root_hash)?;
         let lowered = self.lower_symbol_for_target(root_hash, symbol, target_triple)?;
         let dependency_interface_hashes = self.dependency_interface_hashes(&root, &lowered.ir)?;
+        let dependency_implementation_hashes =
+            self.native_object_type_dependency_hashes(&root, &lowered.ir, target_triple)?;
         let dependency_closure = self.dependency_closure_for_symbol(root_hash, symbol)?;
         let backend_id = backend_id_for_target(target_triple)?;
         let key_input = CacheKeyInput::new(
@@ -327,7 +330,8 @@ impl CodeDb {
             backend_id,
             target_triple,
         )
-        .with_dependency_interface_hashes(dependency_interface_hashes.clone());
+        .with_dependency_interface_hashes(dependency_interface_hashes.clone())
+        .with_dependency_implementation_hashes(dependency_implementation_hashes.clone());
         let object_cache_key = cache_key_for_input(&key_input)?;
 
         Ok(NativeObjectJobInput {
@@ -335,6 +339,7 @@ impl CodeDb {
             cache_key: object_cache_key,
             ir: lowered.ir,
             dependency_interface_hashes,
+            dependency_implementation_hashes,
             dependency_closure,
             target_triple: target_triple.to_string(),
         })
@@ -411,6 +416,7 @@ impl CodeDb {
         add_native_object_dependency_metadata(
             &mut metadata,
             &input.dependency_interface_hashes,
+            &input.dependency_implementation_hashes,
             &input.dependency_closure,
         )?;
         if metadata != original_metadata {
@@ -446,6 +452,22 @@ impl CodeDb {
             .collect()
     }
 
+    pub(crate) fn native_object_type_dependency_hashes(
+        &self,
+        root: &ProgramRootPayload,
+        ir: &LoweredFunctionIr,
+        target_triple: &str,
+    ) -> Result<Vec<String>> {
+        let mut dependencies = BTreeSet::new();
+        for layout in &ir.type_layouts {
+            dependencies.extend(
+                self.compute_type_layout(root, &layout.type_hash, target_triple)?
+                    .dependency_type_def_hashes,
+            );
+        }
+        Ok(dependencies.into_iter().collect())
+    }
+
     fn dependency_closure_for_symbol(&self, root_hash: &str, symbol: &str) -> Result<Vec<String>> {
         let mut seen = BTreeSet::new();
         self.collect_dependency_closure(root_hash, symbol, symbol, &mut seen)?;
@@ -474,6 +496,7 @@ impl CodeDb {
 fn add_native_object_dependency_metadata(
     metadata: &mut JsonValue,
     dependency_interface_hashes: &[String],
+    dependency_implementation_hashes: &[String],
     dependency_closure: &[String],
 ) -> Result<()> {
     let object = metadata
@@ -482,6 +505,10 @@ fn add_native_object_dependency_metadata(
     object.insert(
         "dependency_interface_hashes".to_string(),
         json!(dependency_interface_hashes),
+    );
+    object.insert(
+        "dependency_implementation_hashes".to_string(),
+        json!(dependency_implementation_hashes),
     );
     object.insert("dependency_closure".to_string(), json!(dependency_closure));
     Ok(())
@@ -501,6 +528,7 @@ fn compile_native_object_job(input: &NativeObjectJobInput) -> Result<NativeObjec
     add_native_object_dependency_metadata(
         &mut metadata,
         &input.dependency_interface_hashes,
+        &input.dependency_implementation_hashes,
         &input.dependency_closure,
     )?;
     Ok(NativeObjectCompileOutput {

@@ -3492,16 +3492,13 @@ impl CodeDb {
                         self.collect_value_loans(root, &arg, param_types, &pre_arg_state)?;
                     self.check_loans_point_to_live_storage(&arg_loans, state)?;
                     if let Some(owner) = transfer_owner {
+                        state
+                            .active
+                            .retain(|loan| !loan_owner_overlaps(loan, &owner));
                         moved_call_owners.push(owner);
                     }
-                    for loan in arg_loans {
-                        if state.active.contains(&loan) {
-                            continue;
-                        }
-                        self.check_loan_conflicts(&loan.kind, &loan.place, &state.active)?;
-                        state.active.push(loan.clone());
-                        added_call_loans.push(loan);
-                    }
+                    added_call_loans
+                        .extend(self.add_checked_value_loans(&mut state.active, &arg_loans)?);
                 }
                 state.active.retain(|loan| {
                     !added_call_loans.contains(loan)
@@ -3586,9 +3583,8 @@ impl CodeDb {
                         .active
                         .retain(|loan| !loan_owner_overlaps(loan, owner));
                 }
-                for loan in &value_loans {
-                    self.check_loan_conflicts(&loan.kind, &loan.place, &state.active)?;
-                }
+                let mut active_with_value_loans = state.active.clone();
+                self.add_checked_value_loans(&mut active_with_value_loans, &value_loans)?;
                 let local_id = state.next_local;
                 state.next_local += 1;
                 let local_owner = LoanPlace {
@@ -4040,6 +4036,23 @@ impl CodeDb {
             }
             other => bail!("borrow target {other} is not an addressable place"),
         }
+    }
+
+    fn add_checked_value_loans(
+        &self,
+        active: &mut Vec<ActiveLoan>,
+        loans: &[ActiveLoan],
+    ) -> Result<Vec<ActiveLoan>> {
+        let mut added = Vec::new();
+        for loan in loans {
+            self.check_loan_conflicts(&loan.kind, &loan.place, active)?;
+            if active.contains(loan) {
+                continue;
+            }
+            active.push(loan.clone());
+            added.push(loan.clone());
+        }
+        Ok(added)
     }
 
     fn check_loan_conflicts(

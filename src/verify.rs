@@ -2514,6 +2514,7 @@ impl CodeDb {
             "called_symbols",
             "relocations",
             "dependency_interface_hashes",
+            "dependency_implementation_hashes",
             "dependency_closure",
         ] {
             if metadata.get(field).and_then(JsonValue::as_array).is_none() {
@@ -2531,6 +2532,17 @@ impl CodeDb {
         {
             errors.push(format!(
                 "bad_object_artifact: {cache_key} dependency interface hashes mismatch"
+            ));
+        }
+        if json_string_set(metadata.get("dependency_implementation_hashes"))
+            != key_input
+                .dependency_implementation_hashes
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} dependency implementation hashes mismatch"
             ));
         }
         if metadata
@@ -2619,6 +2631,11 @@ impl CodeDb {
         else {
             return Ok(());
         };
+        let Some(metadata_dependency_implementations) =
+            json_string_vec(metadata.get("dependency_implementation_hashes"))
+        else {
+            return Ok(());
+        };
         let Some(metadata_dependency_closure) = json_string_vec(metadata.get("dependency_closure"))
         else {
             return Ok(());
@@ -2637,6 +2654,7 @@ impl CodeDb {
 
         let mut saw_dependency_match = false;
         let mut saw_interface_match = false;
+        let mut saw_implementation_match = false;
         for (root_hash, dependencies) in indexed_roots {
             if dependencies != called_symbols {
                 continue;
@@ -2653,10 +2671,6 @@ impl CodeDb {
                 continue;
             }
             saw_interface_match = true;
-            let expected_closure = self.verify_dependency_closure_for_symbol(&root_hash, symbol)?;
-            if expected_closure != metadata_dependency_closure {
-                continue;
-            }
             let Some(entry) = self.root_symbol(&root, symbol) else {
                 errors.push(format!(
                     "bad_object_artifact: {cache_key} symbol missing from indexed root {root_hash}"
@@ -2665,6 +2679,19 @@ impl CodeDb {
             };
             let expected_ir =
                 self.build_lowered_function_ir(&root, entry, &key_input.target_triple)?;
+            let expected_implementation_dependencies = self.lowered_ir_type_dependency_hashes(
+                &root,
+                &expected_ir,
+                &key_input.target_triple,
+            )?;
+            if expected_implementation_dependencies != metadata_dependency_implementations {
+                continue;
+            }
+            saw_implementation_match = true;
+            let expected_closure = self.verify_dependency_closure_for_symbol(&root_hash, symbol)?;
+            if expected_closure != metadata_dependency_closure {
+                continue;
+            }
             let expected_relocation_targets = lowered_call_targets(&expected_ir)?;
             verify_object_relocations_match_dependencies(
                 errors,
@@ -2700,12 +2727,32 @@ impl CodeDb {
             errors.push(format!(
                 "bad_object_artifact: {cache_key} dependency interface metadata does not match indexed root"
             ));
+        } else if !saw_implementation_match {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} dependency implementation metadata does not match indexed root"
+            ));
         } else {
             errors.push(format!(
                 "bad_object_artifact: {cache_key} dependency closure metadata does not match indexed root"
             ));
         }
         Ok(())
+    }
+
+    fn lowered_ir_type_dependency_hashes(
+        &self,
+        root: &ProgramRootPayload,
+        ir: &LoweredFunctionIr,
+        target_triple: &str,
+    ) -> Result<Vec<String>> {
+        let mut dependencies = BTreeSet::new();
+        for layout in &ir.type_layouts {
+            dependencies.extend(
+                self.compute_type_layout(root, &layout.type_hash, target_triple)?
+                    .dependency_type_def_hashes,
+            );
+        }
+        Ok(dependencies.into_iter().collect())
     }
 
     fn verify_dependency_closure_for_symbol(

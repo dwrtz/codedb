@@ -541,13 +541,17 @@ impl CodeDb {
                 .collect::<Result<Vec<_>>>()?;
             dependency_interface_hashes.sort();
             dependency_interface_hashes.dedup();
+            let lowered = self.build_lowered_function_ir(root, root_entry, target_triple)?;
+            let dependency_implementation_hashes =
+                self.native_object_type_dependency_hashes(root, &lowered, target_triple)?;
             let object_key_input = CacheKeyInput::new(
                 ArtifactKind::ObjectFile,
                 &root_entry.definition,
                 backend_id,
                 target_triple,
             )
-            .with_dependency_interface_hashes(dependency_interface_hashes);
+            .with_dependency_interface_hashes(dependency_interface_hashes)
+            .with_dependency_implementation_hashes(dependency_implementation_hashes);
             let object_cache_key = cache_key_for_input(&object_key_input)?;
             objects.push(PlannedObject {
                 symbol_hash: symbol.clone(),

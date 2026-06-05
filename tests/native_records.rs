@@ -2,6 +2,7 @@ use std::path::Path;
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
+use rusqlite::Connection;
 use serde_json::{Value as JsonValue, json};
 use tempfile::tempdir;
 
@@ -505,8 +506,104 @@ fn main<'a>() -> i64 =
     }
 }
 
+#[test]
+fn native_object_cache_key_changes_when_named_record_layout_changes() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("record-layout-object-cache.sqlite");
+    let source = temp.path().join("record-layout-object-cache.cdb");
+    let add_field = temp.path().join("add-field.json");
+    let object_path = temp.path().join("first.o");
+
+    std::fs::write(
+        &source,
+        r#"
+record Pair {
+  left: i64
+}
+
+fn first(pair: Pair) -> i64 = pair.left
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&[
+        "emit-object",
+        path(&db),
+        "first",
+        "--target",
+        codedb::DEFAULT_NATIVE_TARGET,
+        "--out",
+        path(&object_path),
+    ]);
+    let first_keys = object_cache_key_payloads(&db);
+    assert_eq!(first_keys.len(), 1);
+    let first_cache_key = first_keys[0].0.clone();
+    let first_dependencies = key_dependency_implementations(&first_keys[0].1);
+    assert!(!first_dependencies.is_empty());
+
+    std::fs::write(
+        &add_field,
+        r#"{ "kind": "add_field", "type": "Pair", "field": { "name": "right", "type": "i64" } }"#,
+    )
+    .unwrap();
+    run(&["apply", path(&db), "--json", path(&add_field)]);
+    run(&[
+        "emit-object",
+        path(&db),
+        "first",
+        "--target",
+        codedb::DEFAULT_NATIVE_TARGET,
+        "--out",
+        path(&object_path),
+    ]);
+
+    let object_keys = object_cache_key_payloads(&db);
+    assert_eq!(object_keys.len(), 2);
+    assert!(object_keys.iter().any(|(key, _)| key == &first_cache_key));
+    let second_key = object_keys
+        .iter()
+        .find(|(key, _)| key != &first_cache_key)
+        .expect("new object cache key after layout change");
+    let second_dependencies = key_dependency_implementations(&second_key.1);
+    assert!(!second_dependencies.is_empty());
+    assert_ne!(first_dependencies, second_dependencies);
+    run(&["verify", path(&db)]);
+}
+
 fn can_build_default_native_target() -> bool {
     let native_target = (std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64")
         || (std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64");
     native_target && StdCommand::new("cc").arg("--version").output().is_ok()
+}
+
+fn object_cache_key_payloads(db: &Path) -> Vec<(String, JsonValue)> {
+    let conn = Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT cache_key, cache_key_json
+             FROM compile_cache
+             WHERE artifact_kind = 'object_file'
+             ORDER BY cache_key",
+        )
+        .unwrap();
+    stmt.query_map([], |row| {
+        let cache_key: String = row.get(0)?;
+        let cache_key_json: String = row.get(1)?;
+        let payload: JsonValue = serde_json::from_str(&cache_key_json).unwrap();
+        Ok((cache_key, payload))
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+fn key_dependency_implementations(key_payload: &JsonValue) -> Vec<String> {
+    key_payload["dependency_implementation_hashes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_string())
+        .collect()
 }

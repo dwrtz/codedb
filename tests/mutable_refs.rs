@@ -197,6 +197,41 @@ fn main<'a>() -> i64 =
 }
 
 #[test]
+fn compiler_rejects_duplicate_mutable_borrows_inside_record_literal() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("duplicate-mut-borrow-record.sqlite");
+    let source = temp.path().join("duplicate-mut-borrow-record.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+}
+
+record DoubleEditor<'a> {
+  first: &'a mut Line
+  second: &'a mut Line
+}
+
+fn main<'a>() -> i64 =
+  let line: Line = { price_cents: 25 } in
+  let editor: DoubleEditor<'a> = { first: &'a mut line, second: &'a mut line } in
+  editor.first.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_borrow"))
+        .stderr(predicate::str::contains("exclusive loan conflict"));
+}
+
+#[test]
 fn mutable_reference_returned_from_call_keeps_loan_live() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("mut-call-return-loan.sqlite");

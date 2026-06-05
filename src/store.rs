@@ -1263,6 +1263,7 @@ mod tests {
                 "called_symbols": [],
                 "relocations": [],
                 "dependency_interface_hashes": [dep_interface],
+                "dependency_implementation_hashes": [],
                 "dependency_closure": [],
             }),
             b"\x7fELF",
