@@ -250,6 +250,68 @@ fn bundle_artifact_cache_is_optional_and_can_be_regenerated() {
 }
 
 #[test]
+fn bundle_artifact_cache_includes_type_layout_inputs_outside_root_closure() {
+    let temp = tempdir().unwrap();
+    let source_db = temp.path().join("source-layout-artifact.sqlite");
+    let imported_db = temp.path().join("imported-layout-artifact.sqlite");
+    let source = temp.path().join("layout-artifact.cdb");
+    let layout_path = temp.path().join("unused-layout.json");
+    let bundle = temp.path().join("layout-artifact.codedb.bundle");
+
+    std::fs::write(
+        &source,
+        r#"
+record Unused {
+  value: i64
+}
+
+fn main() -> i64 = 7
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&source_db)]);
+    run(&["import", path(&source_db), path(&source)]);
+    run(&[
+        "emit-type-layout",
+        path(&source_db),
+        "Unused",
+        "--out",
+        path(&layout_path),
+    ]);
+    assert_eq!(cache_row_count_by_kind(&source_db, "type_layout"), 1);
+    let source_branch = branch_state(&source_db);
+
+    run(&[
+        "bundle",
+        "export",
+        path(&source_db),
+        "--root",
+        &source_branch.0,
+        "--out",
+        path(&bundle),
+        "--include-artifacts",
+    ]);
+    assert!(cache_kinds_in_bundle(&bundle).contains(&"type_layout".to_string()));
+
+    run(&["init", path(&imported_db)]);
+    run(&[
+        "bundle",
+        "import",
+        path(&imported_db),
+        path(&bundle),
+        "--import-artifacts",
+    ]);
+    assert_eq!(branch_state(&imported_db), source_branch);
+    assert_eq!(cache_row_count_by_kind(&imported_db, "type_layout"), 1);
+    bin()
+        .args(["verify", path(&imported_db)])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+}
+
+#[test]
 fn bundle_import_rejects_tampered_bundle() {
     let temp = tempdir().unwrap();
     let source_db = temp.path().join("source-tamper.sqlite");

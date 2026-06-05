@@ -3908,13 +3908,18 @@ impl CodeDb {
                 out.extend(body_loans);
             }
             "if" => {
-                for key in ["then", "else"] {
-                    let child = payload
-                        .get(key)
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("if missing {key}"))?;
-                    out.extend(self.collect_value_loans(root, child, param_types, state)?);
-                }
+                let then_hash = payload
+                    .get("then")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("if missing then"))?;
+                let else_hash = payload
+                    .get("else")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("if missing else"))?;
+                out.extend(alternative_value_loans(
+                    self.collect_value_loans(root, then_hash, param_types, state)?,
+                    self.collect_value_loans(root, else_hash, param_types, state)?,
+                ));
             }
             "param_ref" | "local_ref" | "field_access" => {
                 let type_hash = self.expr_declared_type(expr_hash)?;
@@ -4840,6 +4845,22 @@ fn loan_owner_overlaps(loan: &ActiveLoan, owner: &LoanPlace) -> bool {
     loan.owner
         .as_ref()
         .is_some_and(|loan_owner| places_overlap(loan_owner, owner))
+}
+
+fn alternative_value_loans(left: Vec<ActiveLoan>, right: Vec<ActiveLoan>) -> Vec<ActiveLoan> {
+    let mut out = Vec::new();
+    for loan in left.iter().chain(right.iter()) {
+        let needed = loan_count(&left, loan).max(loan_count(&right, loan));
+        let existing = loan_count(&out, loan);
+        if existing < needed {
+            out.push(loan.clone());
+        }
+    }
+    out
+}
+
+fn loan_count(loans: &[ActiveLoan], needle: &ActiveLoan) -> usize {
+    loans.iter().filter(|loan| *loan == needle).count()
 }
 
 fn merge_branch_state(

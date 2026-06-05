@@ -510,61 +510,33 @@ impl CodeDb {
         root_object_hashes: &BTreeSet<String>,
     ) -> Result<Vec<BundleObject>> {
         let mut stmt = self.conn.prepare(
-            "SELECT hash, kind, schema_version, payload_json
-             FROM objects
-             WHERE kind IN ('FunctionInterface', 'LinkPlanInput')
-             ORDER BY hash",
+            "SELECT DISTINCT input_hash
+             FROM compile_cache
+             ORDER BY input_hash",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        let mut objects = Vec::new();
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut objects = BTreeMap::new();
         for row in rows {
-            let (hash, kind, schema_version, payload_json) = row?;
-            if root_object_hashes.contains(&hash) {
+            let input_hash = row?;
+            if root_object_hashes.contains(&input_hash) || !self.object_exists(&input_hash)? {
                 continue;
             }
-            let payload: JsonValue = serde_json::from_str(&payload_json)
-                .with_context(|| format!("artifact input object {hash} has invalid JSON"))?;
-            let canonical_payload = canonical_json(&payload);
-            if canonical_payload != payload_json {
-                bail!("corrupt_object: payload is not canonical {hash}");
+            let roots = BTreeSet::from([input_hash]);
+            let closure = self.bundle_object_closure(&roots)?;
+            if closure.iter().any(|object| {
+                !root_object_hashes.contains(&object.hash)
+                    && !artifact_input_object_kind_is_supported(object)
+            }) {
+                continue;
             }
-            let object = BundleObject {
-                schema: BUNDLE_OBJECT_SCHEMA.to_string(),
-                hash,
-                kind,
-                schema_version,
-                payload,
-            };
-            if self.bundle_artifact_input_object_belongs_to_root(&object, root_object_hashes)? {
-                objects.push(object);
+            for object in closure {
+                if root_object_hashes.contains(&object.hash) {
+                    continue;
+                }
+                objects.entry(object.hash.clone()).or_insert(object);
             }
         }
-        Ok(objects)
-    }
-
-    fn bundle_artifact_input_object_belongs_to_root(
-        &self,
-        object: &BundleObject,
-        root_object_hashes: &BTreeSet<String>,
-    ) -> Result<bool> {
-        if !artifact_input_object_kind_is_supported(object) {
-            return Ok(false);
-        }
-        let mut refs = Vec::new();
-        collect_bundle_object_refs(&object.kind, &object.payload, &mut refs);
-        for child_hash in refs {
-            if self.object_exists(&child_hash)? && !root_object_hashes.contains(&child_hash) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        Ok(objects.into_values().collect())
     }
 
     fn object_row(&self, hash: &str) -> Result<Option<(String, i64, String)>> {
@@ -1232,7 +1204,7 @@ fn expected_bundle_object_set(
                     key_input.input_hash
                 )
             })?;
-            validate_artifact_input_object(object, root_closure, objects_by_hash)?;
+            validate_artifact_input_object(object)?;
             expected.insert(key_input.input_hash);
         }
     }
@@ -1241,16 +1213,12 @@ fn expected_bundle_object_set(
         let object = objects_by_hash
             .get(hash)
             .ok_or_else(|| anyhow!("bad_bundle_closure: missing artifact input object {hash}"))?;
-        validate_artifact_input_object(object, root_closure, objects_by_hash)?;
+        validate_artifact_input_object(object)?;
     }
     Ok(expected_closure)
 }
 
-fn validate_artifact_input_object(
-    object: &BundleObject,
-    root_closure: &BTreeSet<String>,
-    objects_by_hash: &BTreeMap<String, BundleObject>,
-) -> Result<()> {
+fn validate_artifact_input_object(object: &BundleObject) -> Result<()> {
     if !artifact_input_object_kind_is_supported(object) {
         bail!(
             "bad_bundle_closure: artifact input object {} has unsupported kind {}",
@@ -1258,23 +1226,13 @@ fn validate_artifact_input_object(
             object.kind
         );
     }
-    let mut refs = Vec::new();
-    collect_bundle_object_refs(&object.kind, &object.payload, &mut refs);
-    for child_hash in refs {
-        if objects_by_hash.contains_key(&child_hash) && !root_closure.contains(&child_hash) {
-            bail!(
-                "bad_bundle_closure: artifact input object {} references non-root object {}",
-                object.hash,
-                child_hash
-            );
-        }
-    }
     Ok(())
 }
 
 fn artifact_input_object_kind_is_supported(object: &BundleObject) -> bool {
     match object.kind.as_str() {
         "FunctionInterface" => true,
+        "Type" => true,
         "LinkPlanInput" => {
             object.payload.get("schema").and_then(JsonValue::as_str) == Some("codedb/link-input/v1")
         }

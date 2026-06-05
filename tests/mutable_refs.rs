@@ -232,6 +232,54 @@ fn main<'a>() -> i64 =
 }
 
 #[test]
+fn conditional_same_mutable_borrow_is_one_live_loan() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("conditional-same-mut-borrow.sqlite");
+    let source = temp.path().join("conditional-same-mut-borrow.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+}
+
+fn main<'a>() -> i64 =
+  let line: Line = { price_cents: 25 } in
+  let m: &'a mut Line =
+    if true then &'a mut line else &'a mut line in
+  m.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "25");
+    run(&["verify", path(&db)]);
+
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "conditional_same_mut_borrow_native",
+            "--entry",
+            "main",
+            "--expect-i64",
+            "25",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["passed"], 1);
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+        assert_eq!(report["tests"][0]["reference"]["status"], "passed");
+    }
+}
+
+#[test]
 fn mutable_reference_returned_from_call_keeps_loan_live() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("mut-call-return-loan.sqlite");
