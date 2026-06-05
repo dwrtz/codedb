@@ -3,6 +3,7 @@ use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use rusqlite::Connection;
 use serde_json::{Value as JsonValue, json};
 use tempfile::tempdir;
 
@@ -191,6 +192,55 @@ fn leak<'a>() -> &'a Line =
         ));
 }
 
+#[test]
+fn verify_rejects_shared_borrow_region_outside_function_scope() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("bad-shared-borrow-region.sqlite");
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), "examples/v2/line_view_refs.cdb"]);
+    run(&["verify", path(&db)]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (borrow_hash, payload_json): (String, String) = conn
+        .query_row(
+            "SELECT hash, payload_json
+             FROM objects
+             WHERE kind = 'Expression' AND payload_json LIKE '%borrow_shared%'
+             ORDER BY hash LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut payload: JsonValue = serde_json::from_str(&payload_json).unwrap();
+    let original_region = payload["region"].as_str().unwrap().to_string();
+    let bogus_region: String = conn
+        .query_row(
+            "SELECT hash
+             FROM objects
+             WHERE kind = 'Type' AND hash != ?1
+             ORDER BY hash LIMIT 1",
+            [&original_region],
+            |row| row.get(0),
+        )
+        .unwrap();
+    payload["region"] = JsonValue::String(bogus_region);
+    let canonical = canonical_json(&payload);
+    conn.execute(
+        "UPDATE objects
+         SET payload_json = ?1, payload_size_bytes = ?2
+         WHERE hash = ?3",
+        (&canonical, canonical.len() as i64, borrow_hash),
+    )
+    .unwrap();
+
+    bin()
+        .args(["verify", path(&db)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid region reference"));
+}
+
 fn op_names(ir: &JsonValue) -> Vec<String> {
     ir["ir"]["operations"]
         .as_array()
@@ -204,4 +254,37 @@ fn can_build_default_native_target() -> bool {
     let native_target = (std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64")
         || (std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64");
     native_target && StdCommand::new("cc").arg("--version").output().is_ok()
+}
+
+fn canonical_json(value: &JsonValue) -> String {
+    match value {
+        JsonValue::Null => "null".to_string(),
+        JsonValue::Bool(value) => value.to_string(),
+        JsonValue::Number(value) => value.to_string(),
+        JsonValue::String(value) => serde_json::to_string(value).expect("string serialization"),
+        JsonValue::Array(values) => {
+            let inner = values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{inner}]")
+        }
+        JsonValue::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let inner = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).expect("key serialization"),
+                        canonical_json(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{inner}}}")
+        }
+    }
 }

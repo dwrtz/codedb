@@ -2215,7 +2215,7 @@ impl CodeDb {
                 continue;
             }
             let body = self.function_body_hash(&entry.definition)?;
-            let actual = self.verify_expr_type(&body, &root, &param_types)?;
+            let actual = self.verify_expr_type(&body, &root, &param_types, &allowed_regions)?;
             if actual != return_type {
                 bail!(
                     "bad_type: function {} returns {}, body is {}",
@@ -2494,8 +2494,15 @@ impl CodeDb {
         expr_hash: &str,
         root: &ProgramRootPayload,
         param_types: &[String],
+        allowed_regions: &BTreeSet<String>,
     ) -> Result<String> {
-        self.verify_expr_type_with_locals(expr_hash, root, param_types, &mut Vec::new())
+        self.verify_expr_type_with_locals(
+            expr_hash,
+            root,
+            param_types,
+            allowed_regions,
+            &mut Vec::new(),
+        )
     }
 
     fn verify_expr_type_with_locals(
@@ -2503,6 +2510,7 @@ impl CodeDb {
         expr_hash: &str,
         root: &ProgramRootPayload,
         param_types: &[String],
+        allowed_regions: &BTreeSet<String>,
         locals: &mut Vec<String>,
     ) -> Result<String> {
         if self.get_kind(expr_hash)? != "Expression" {
@@ -2563,8 +2571,13 @@ impl CodeDb {
                     let arg_hash = arg
                         .as_str()
                         .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                    let arg_type =
-                        self.verify_expr_type_with_locals(arg_hash, root, param_types, locals)?;
+                    let arg_type = self.verify_expr_type_with_locals(
+                        arg_hash,
+                        root,
+                        param_types,
+                        allowed_regions,
+                        locals,
+                    )?;
                     if !self.type_assignable_in_root(root, &arg_type, &expected_params[idx])? {
                         bail!("call arg type mismatch for {symbol} at arg {idx}");
                     }
@@ -2584,10 +2597,20 @@ impl CodeDb {
                     .get("right")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("binary missing right"))?;
-                let left =
-                    self.verify_expr_type_with_locals(left_hash, root, param_types, locals)?;
-                let right =
-                    self.verify_expr_type_with_locals(right_hash, root, param_types, locals)?;
+                let left = self.verify_expr_type_with_locals(
+                    left_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                let right = self.verify_expr_type_with_locals(
+                    right_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
                 let i64_hash = type_hash_for("I64");
                 let bool_hash = type_hash_for("Bool");
                 match op {
@@ -2621,8 +2644,13 @@ impl CodeDb {
                     .get("expr")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("unary missing expr"))?;
-                let child_type =
-                    self.verify_expr_type_with_locals(child, root, param_types, locals)?;
+                let child_type = self.verify_expr_type_with_locals(
+                    child,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
                 match op {
                     "-" => {
                         if child_type != type_hash_for("I64") {
@@ -2644,12 +2672,20 @@ impl CodeDb {
                     .get("target")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_shared missing target"))?;
-                let target_type =
-                    self.verify_expr_type_with_locals(target, root, param_types, locals)?;
+                let target_type = self.verify_expr_type_with_locals(
+                    target,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
                 let region = payload
                     .get("region")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_shared missing region"))?;
+                if !allowed_regions.contains(region) {
+                    bail!("invalid region reference {region}");
+                }
                 let referent_type = payload
                     .get("referent_type")
                     .and_then(JsonValue::as_str)
@@ -2682,14 +2718,24 @@ impl CodeDb {
                     .get("body")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("let missing body"))?;
-                let value_type =
-                    self.verify_expr_type_with_locals(value_hash, root, param_types, locals)?;
+                let value_type = self.verify_expr_type_with_locals(
+                    value_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
                 if !self.type_assignable_in_root(root, &value_type, &binding_type)? {
                     bail!("let binding type mismatch");
                 }
                 locals.push(binding_type);
-                let body_type =
-                    self.verify_expr_type_with_locals(body_hash, root, param_types, locals);
+                let body_type = self.verify_expr_type_with_locals(
+                    body_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                );
                 locals.pop();
                 body_type?
             }
@@ -2706,15 +2752,30 @@ impl CodeDb {
                     .get("else")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("if missing else"))?;
-                let cond_type =
-                    self.verify_expr_type_with_locals(cond, root, param_types, locals)?;
+                let cond_type = self.verify_expr_type_with_locals(
+                    cond,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
                 if cond_type != type_hash_for("Bool") {
                     bail!("if condition must be bool");
                 }
-                let then_type =
-                    self.verify_expr_type_with_locals(then_hash, root, param_types, locals)?;
-                let else_type =
-                    self.verify_expr_type_with_locals(else_hash, root, param_types, locals)?;
+                let then_type = self.verify_expr_type_with_locals(
+                    then_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                let else_type = self.verify_expr_type_with_locals(
+                    else_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
                 if then_type != else_type {
                     bail!("if branches must have the same type");
                 }
@@ -2741,8 +2802,13 @@ impl CodeDb {
                         .get("value")
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("record field missing value"))?;
-                    let field_type =
-                        self.verify_expr_type_with_locals(value_hash, root, param_types, locals)?;
+                    let field_type = self.verify_expr_type_with_locals(
+                        value_hash,
+                        root,
+                        param_types,
+                        allowed_regions,
+                        locals,
+                    )?;
                     if field.get("type").and_then(JsonValue::as_str) != Some(field_type.as_str()) {
                         bail!("record field type mismatch for {name}");
                     }
@@ -2763,8 +2829,13 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("field_access missing field"))?;
                 validate_projection_identifier("record field", field)?;
-                let target_type =
-                    self.verify_expr_type_with_locals(target_hash, root, param_types, locals)?;
+                let target_type = self.verify_expr_type_with_locals(
+                    target_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
                 self.field_access_type_in_root(root, &target_type, field)?
             }
             "enum_construct" => {
@@ -2785,8 +2856,13 @@ impl CodeDb {
                     .get("value")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("enum_construct missing value"))?;
-                let value_type =
-                    self.verify_expr_type_with_locals(value_hash, root, param_types, locals)?;
+                let value_type = self.verify_expr_type_with_locals(
+                    value_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
                 if value_type != variant_type {
                     bail!("enum variant payload type mismatch for {variant}");
                 }
@@ -2797,8 +2873,13 @@ impl CodeDb {
                     .get("expr")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("case missing expr"))?;
-                let scrutinee_type =
-                    self.verify_expr_type_with_locals(scrutinee_hash, root, param_types, locals)?;
+                let scrutinee_type = self.verify_expr_type_with_locals(
+                    scrutinee_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
                 let TypeSpec::Enum(variants) = self.type_spec_in_root(root, &scrutinee_type)?
                 else {
                     bail!("case scrutinee must be enum");
@@ -2834,8 +2915,13 @@ impl CodeDb {
                         .get("body")
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("case arm missing body"))?;
-                    let body_type =
-                        self.verify_expr_type_with_locals(body_hash, root, param_types, locals);
+                    let body_type = self.verify_expr_type_with_locals(
+                        body_hash,
+                        root,
+                        param_types,
+                        allowed_regions,
+                        locals,
+                    );
                     if binding.is_some() {
                         locals.pop();
                     }

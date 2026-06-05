@@ -441,12 +441,17 @@ impl CodeDb {
             );
         }
         let (param_types, return_type) = self.signature_parts(&entry.signature)?;
+        let allowed_regions = self
+            .signature_region_params(&entry.signature)?
+            .into_iter()
+            .map(|param| param.region)
+            .collect::<BTreeSet<_>>();
         for type_hash in &param_types {
             self.ensure_addressable_ir_type(root, type_hash)?;
         }
         self.ensure_lowerable_return_type(&return_type)?;
         let body = self.function_body_hash(&entry.definition)?;
-        let actual_return = self.verify_expr_type(&body, root, &param_types)?;
+        let actual_return = self.verify_expr_type(&body, root, &param_types, &allowed_regions)?;
         if actual_return != return_type {
             bail!(
                 "function body type {} does not match return type {}",
@@ -1239,7 +1244,17 @@ impl CodeDb {
         }
 
         let (param_types, return_type) = self.signature_parts(&ir.function_sig_hash)?;
-        let actual_return = self.verify_expr_type(&ir.typed_body_expr_hash, root, &param_types)?;
+        let allowed_regions = self
+            .signature_region_params(&ir.function_sig_hash)?
+            .into_iter()
+            .map(|param| param.region)
+            .collect::<BTreeSet<_>>();
+        let actual_return = self.verify_expr_type(
+            &ir.typed_body_expr_hash,
+            root,
+            &param_types,
+            &allowed_regions,
+        )?;
         if actual_return != return_type || actual_return != ir.return_type_hash {
             bail!("lowered IR return type mismatch");
         }
