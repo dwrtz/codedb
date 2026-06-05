@@ -777,7 +777,7 @@ fn link_plan_cache_key_distinguishes_semantic_objects_with_identical_bytes() {
         "change-signature",
         db.to_str().unwrap(),
         "id",
-        "(x: bool) -> bool",
+        "(x: i64) -> i64 effects[io]",
     ]);
     assert!(change.contains("build_impact recompile_dependents"));
 

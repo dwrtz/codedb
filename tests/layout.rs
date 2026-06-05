@@ -134,6 +134,8 @@ fn main() -> i64 = 1
     assert_eq!(line_view["align_bytes"], 8);
     assert_eq!(line_view["copy_kind"], "copy");
     assert_eq!(line_view["drop_kind"], "trivial");
+    assert_eq!(line_view["abi"]["pass"], "by_indirect");
+    assert_eq!(line_view["abi"]["return"], "hidden_return_slot");
     assert_eq!(line_view["contains_reference"], true);
     assert_eq!(line_view["contains_mut_reference"], false);
     assert_eq!(line_view["fields"][0]["name"], "line");
@@ -157,6 +159,8 @@ fn main() -> i64 = 1
     assert_eq!(batch["kind"], "record");
     assert_eq!(batch["size_bytes"], 40);
     assert_eq!(batch["align_bytes"], 8);
+    assert_eq!(batch["abi"]["pass"], "by_indirect");
+    assert_eq!(batch["abi"]["return"], "hidden_return_slot");
     assert_eq!(batch["fields"][0]["name"], "values");
     assert_eq!(batch["fields"][0]["offset_bytes"], 0);
     assert_eq!(batch["fields"][0]["size_bytes"], 32);
@@ -167,6 +171,8 @@ fn main() -> i64 = 1
     assert_eq!(discount["kind"], "enum");
     assert_eq!(discount["size_bytes"], 48);
     assert_eq!(discount["align_bytes"], 8);
+    assert_eq!(discount["abi"]["pass"], "by_indirect");
+    assert_eq!(discount["abi"]["return"], "hidden_return_slot");
     assert_eq!(discount["tag"]["offset_bytes"], 0);
     assert_eq!(discount["tag"]["size_bytes"], 8);
     assert_eq!(discount["payload_offset_bytes"], 8);
@@ -249,6 +255,46 @@ fn main() -> i64 = 1
         .stderr(predicate::str::contains("bad_type_layout"));
 }
 
+#[test]
+fn verify_recomputes_and_rejects_malformed_type_layout_abi_metadata() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("bad-layout-abi.sqlite");
+    let source = temp.path().join("line.cdb");
+    let layout_path = temp.path().join("line-layout.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+fn main() -> i64 = 1
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&[
+        "emit-type-layout",
+        path(&db),
+        "Line",
+        "--out",
+        path(&layout_path),
+    ]);
+    run(&["verify", path(&db)]);
+
+    corrupt_first_type_layout_abi(&db, "by_value", "by_value");
+
+    bin()
+        .args(["verify", path(&db)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_type_layout"));
+}
+
 fn read_json(path: &Path) -> JsonValue {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
@@ -268,6 +314,34 @@ fn corrupt_first_type_layout_size(db: &Path, size_bytes: u64) {
         .unwrap();
     let mut artifact: JsonValue = serde_json::from_str(&artifact_json).unwrap();
     artifact["metadata"]["size_bytes"] = JsonValue::from(size_bytes);
+    let metadata_hash = hash_bytes(
+        b"codedb/bytes/v1\0",
+        canonical_json(&artifact["metadata"]).as_bytes(),
+    );
+    artifact["metadata_hash"] = JsonValue::from(metadata_hash.clone());
+    conn.execute(
+        "UPDATE compile_cache SET artifact_hash = ?1, artifact_json = ?2 WHERE cache_key = ?3",
+        (metadata_hash, canonical_json(&artifact), cache_key),
+    )
+    .unwrap();
+}
+
+fn corrupt_first_type_layout_abi(db: &Path, pass: &str, return_: &str) {
+    let conn = Connection::open(db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json
+             FROM compile_cache
+             WHERE artifact_kind = 'type_layout'
+             ORDER BY created_at
+             LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut artifact: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    artifact["metadata"]["abi"]["pass"] = JsonValue::from(pass);
+    artifact["metadata"]["abi"]["return"] = JsonValue::from(return_);
     let metadata_hash = hash_bytes(
         b"codedb/bytes/v1\0",
         canonical_json(&artifact["metadata"]).as_bytes(),

@@ -29,6 +29,8 @@ pub(crate) struct LoweredFunctionIr {
     #[serde(default)]
     pub(crate) locals: Vec<LoweredLocalSlot>,
     pub(crate) return_type_hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) type_layouts: Vec<LoweredTypeLayout>,
     pub(crate) operations: Vec<LoweredOp>,
     #[serde(default)]
     pub(crate) debug_map: LoweredDebugMap,
@@ -49,6 +51,22 @@ pub(crate) struct LoweredLocalSlot {
         skip_serializing_if = "is_default_slot_size"
     )]
     pub(crate) size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LoweredTypeLayout {
+    pub(crate) type_hash: String,
+    pub(crate) kind: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) align_bytes: u64,
+    pub(crate) abi: LoweredTypeAbi,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LoweredTypeAbi {
+    pub(crate) pass: String,
+    #[serde(rename = "return")]
+    pub(crate) return_: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +186,8 @@ pub(crate) enum LoweredOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_abi_symbol: Option<String>,
         args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        return_address: Option<String>,
         type_hash: String,
     },
     If {
@@ -461,10 +481,10 @@ impl CodeDb {
         for type_hash in &param_types {
             self.ensure_addressable_ir_type(root, type_hash)?;
         }
-        self.ensure_lowerable_return_type(&return_type)?;
+        self.ensure_lowerable_return_type(root, &return_type)?;
         let body = self.function_body_hash(&entry.definition)?;
         let actual_return = self.verify_expr_type(&body, root, &param_types, &allowed_regions)?;
-        if actual_return != return_type {
+        if !self.type_assignable_in_root(root, &actual_return, &return_type)? {
             bail!(
                 "function body type {} does not match return type {}",
                 actual_return,
@@ -480,6 +500,13 @@ impl CodeDb {
             value: lowered.value,
             type_hash: return_type.clone(),
         });
+        let type_layouts = self.lowered_type_layouts(
+            root,
+            &param_types,
+            &return_type,
+            &local_slots,
+            &lowered.operations,
+        )?;
 
         Ok(LoweredFunctionIr {
             schema: LOWERED_IR_SCHEMA.to_string(),
@@ -497,6 +524,7 @@ impl CodeDb {
                 .collect(),
             locals: local_slots,
             return_type_hash: return_type,
+            type_layouts,
             operations: lowered.operations,
             debug_map,
         })
@@ -610,11 +638,29 @@ impl CodeDb {
                 }
                 let id = ctx.value();
                 ctx.push_debug_op(expr_hash, "call", &id);
+                let return_address = if self.is_aggregate_ir_type(root, &type_hash)? {
+                    let slot_size =
+                        stack_slot_size_bytes(self.layout_size_bytes(root, &type_hash)?);
+                    let slot = ctx.local_slot(type_hash.clone(), slot_size);
+                    let address = ctx.value();
+                    ctx.push_debug_op(expr_hash, "addr_of_local", &address);
+                    operations.push(LoweredOp::AddrOfLocal {
+                        id: address.clone(),
+                        place: LoweredPlace::Local {
+                            slot,
+                            type_hash: type_hash.clone(),
+                        },
+                    });
+                    Some(address)
+                } else {
+                    None
+                };
                 operations.push(LoweredOp::Call {
                     id: id.clone(),
                     target_symbol_hash,
                     target_abi_symbol,
                     args: arg_values,
+                    return_address,
                     type_hash: type_hash.clone(),
                 });
                 Ok(LoweredExpr {
@@ -885,7 +931,31 @@ impl CodeDb {
                 })
             }
             "record_literal" => {
-                bail!("lowering v1 supports record literals only as typed let initializers")
+                let slot_size = stack_slot_size_bytes(self.layout_size_bytes(root, &type_hash)?);
+                let slot = ctx.local_slot(type_hash.clone(), slot_size);
+                let address = ctx.value();
+                ctx.push_debug_op(expr_hash, "addr_of_local", &address);
+                let mut operations = vec![LoweredOp::AddrOfLocal {
+                    id: address.clone(),
+                    place: LoweredPlace::Local {
+                        slot,
+                        type_hash: type_hash.clone(),
+                    },
+                }];
+                operations.extend(self.lower_record_init_to_address(
+                    root,
+                    expr_hash,
+                    &type_hash,
+                    &address,
+                    param_types,
+                    ctx,
+                    locals,
+                )?);
+                Ok(LoweredExpr {
+                    operations,
+                    value: address,
+                    type_hash,
+                })
             }
             "if" => {
                 let cond_hash = payload
@@ -1143,6 +1213,15 @@ impl CodeDb {
                             operations,
                             address: id,
                             type_hash: referent,
+                        }
+                    }
+                    _ if self.is_aggregate_ir_type(root, &target_type)? => {
+                        let lowered_value =
+                            self.lower_expr(root, target_hash, param_types, ctx, locals)?;
+                        LoweredAddress {
+                            operations: lowered_value.operations,
+                            address: lowered_value.value,
+                            type_hash: lowered_value.type_hash,
                         }
                     }
                     _ => self.lower_place(root, target_hash, param_types, ctx, locals)?,
@@ -1463,10 +1542,14 @@ impl CodeDb {
             .ok_or_else(|| anyhow!("type layout missing offset for field {field}"))
     }
 
-    fn ensure_lowerable_return_type(&self, type_hash: &str) -> Result<()> {
+    fn ensure_lowerable_return_type(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+    ) -> Result<()> {
         let type_name = self.type_name(type_hash)?;
-        match type_name.as_str() {
-            "i64" | "bool" | "unit" => Ok(()),
+        match self.type_spec_in_root(root, type_hash)? {
+            TypeSpec::Builtin(_) | TypeSpec::Record(_) => Ok(()),
             _ => bail!("lowering v1 does not support aggregate return type {type_name}"),
         }
     }
@@ -1481,6 +1564,42 @@ impl CodeDb {
             self.type_spec_in_root(root, type_hash)?,
             TypeSpec::Record(_) | TypeSpec::Enum(_) | TypeSpec::FixedArray { .. }
         ))
+    }
+
+    fn lowered_type_layouts(
+        &self,
+        root: &ProgramRootPayload,
+        param_types: &[String],
+        return_type: &str,
+        local_slots: &[LoweredLocalSlot],
+        operations: &[LoweredOp],
+    ) -> Result<Vec<LoweredTypeLayout>> {
+        let mut type_hashes = BTreeSet::new();
+        type_hashes.extend(param_types.iter().cloned());
+        type_hashes.insert(return_type.to_string());
+        type_hashes.extend(local_slots.iter().map(|local| local.type_hash.clone()));
+        collect_op_type_hashes(operations, &mut type_hashes);
+
+        type_hashes
+            .into_iter()
+            .map(|type_hash| {
+                let layout = self.compute_type_layout(root, &type_hash, DEFAULT_NATIVE_TARGET)?;
+                let metadata = layout.metadata;
+                let abi = metadata
+                    .get("abi")
+                    .ok_or_else(|| anyhow!("type layout missing abi for {type_hash}"))?;
+                Ok(LoweredTypeLayout {
+                    type_hash,
+                    kind: required_layout_string(&metadata, "kind")?,
+                    size_bytes: required_layout_u64(&metadata, "size_bytes")?,
+                    align_bytes: required_layout_u64(&metadata, "align_bytes")?,
+                    abi: LoweredTypeAbi {
+                        pass: required_layout_string(abi, "pass")?,
+                        return_: required_layout_string(abi, "return")?,
+                    },
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn verify_lowered_ir_against_index(
@@ -1563,10 +1682,23 @@ impl CodeDb {
             &param_types,
             &allowed_regions,
         )?;
-        if actual_return != return_type || actual_return != ir.return_type_hash {
+        if !self.type_assignable_in_root(root, &actual_return, &return_type)?
+            || ir.return_type_hash != return_type
+        {
             bail!("lowered IR return type mismatch");
         }
-        self.verify_lowered_operations(root, ir, &param_types, &return_type)
+        self.verify_lowered_operations(root, ir, &param_types, &return_type)?;
+        let expected_layouts = self.lowered_type_layouts(
+            root,
+            &param_types,
+            &return_type,
+            &ir.locals,
+            &ir.operations,
+        )?;
+        if ir.type_layouts != expected_layouts {
+            bail!("lowered IR type layout metadata mismatch");
+        }
+        Ok(())
     }
 
     fn verify_lowered_ir_shape(&self, ir: &LoweredFunctionIr) -> Result<()> {
@@ -1621,6 +1753,26 @@ impl CodeDb {
             self.type_spec(&local.type_hash)?;
             if local.size_bytes == 0 {
                 bail!("lowered IR local slot {slot} has zero size");
+            }
+        }
+        let mut seen_layouts = BTreeSet::new();
+        for layout in &ir.type_layouts {
+            if !seen_layouts.insert(layout.type_hash.clone()) {
+                bail!("duplicate lowered type layout {}", layout.type_hash);
+            }
+            if !is_hash(&layout.type_hash) {
+                bail!("lowered type layout hash is not a hash");
+            }
+            self.type_spec(&layout.type_hash)?;
+            if layout.size_bytes == 0 && layout.kind != "scalar" {
+                bail!("lowered non-scalar type layout has zero size");
+            }
+            if layout.align_bytes == 0 {
+                bail!("lowered type layout alignment is zero");
+            }
+            match (layout.abi.pass.as_str(), layout.abi.return_.as_str()) {
+                ("by_value", "by_value") | ("by_indirect", "hidden_return_slot") => {}
+                _ => bail!("lowered type layout has unsupported ABI classification"),
             }
         }
         if ir.operations.is_empty() {
@@ -1727,7 +1879,7 @@ impl CodeDb {
                 let actual = values
                     .get(value)
                     .ok_or_else(|| anyhow!("lowered return references unknown value {value}"))?;
-                if actual != type_hash {
+                if !self.type_assignable_in_root(root, actual, type_hash)? {
                     bail!("lowered return value type mismatch");
                 }
                 Ok(())
@@ -1815,6 +1967,7 @@ impl CodeDb {
                     target_symbol_hash,
                     target_abi_symbol,
                     args,
+                    return_address,
                     type_hash,
                 } => {
                     if !is_hash(target_symbol_hash) {
@@ -1837,6 +1990,16 @@ impl CodeDb {
                     if type_hash != &expected_return {
                         bail!("lowered call return type mismatch");
                     }
+                    if self.is_aggregate_ir_type(root, type_hash)? {
+                        let Some(return_address) = return_address else {
+                            bail!("lowered aggregate call missing return address");
+                        };
+                        if address_type(addresses, return_address)? != type_hash {
+                            bail!("lowered aggregate call return address type mismatch");
+                        }
+                    } else if return_address.is_some() {
+                        bail!("lowered scalar call must not have return address");
+                    }
                     let expected_abi_symbol = if self.definition_is_external(&target.definition)? {
                         Some(
                             self.external_function_metadata(&target.definition)?
@@ -1849,6 +2012,9 @@ impl CodeDb {
                         bail!("lowered call ABI symbol does not match target definition");
                     }
                     insert_value(values, id, type_hash)?;
+                    if self.is_aggregate_ir_type(root, type_hash)? {
+                        insert_address(addresses, id, type_hash)?;
+                    }
                 }
                 LoweredOp::If {
                     id,
@@ -2079,7 +2245,7 @@ impl CodeDb {
                     if address_type(addresses, address)? != type_hash {
                         bail!("lowered store address type mismatch");
                     }
-                    if value_type(values, value)? != type_hash {
+                    if !self.type_assignable_in_root(root, value_type(values, value)?, type_hash)? {
                         bail!("lowered store value type mismatch");
                     }
                 }
@@ -2095,6 +2261,9 @@ impl CodeDb {
                         bail!("lowered copy type mismatch");
                     }
                     insert_value(values, id, type_hash)?;
+                    if self.is_aggregate_ir_type(root, type_hash)? {
+                        insert_address(addresses, id, type_hash)?;
+                    }
                 }
                 LoweredOp::Move {
                     id,
@@ -2108,6 +2277,9 @@ impl CodeDb {
                         bail!("lowered move type mismatch");
                     }
                     insert_value(values, id, type_hash)?;
+                    if self.is_aggregate_ir_type(root, type_hash)? {
+                        insert_address(addresses, id, type_hash)?;
+                    }
                 }
                 LoweredOp::Drop { address, type_hash } => {
                     if !self.type_requires_drop_scaffold(root, type_hash)? {
@@ -2470,6 +2642,92 @@ fn collect_lowered_value_debug_infos(
         }
     }
     Ok(())
+}
+
+fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) {
+    for op in operations {
+        match op {
+            LoweredOp::Param { type_hash, .. }
+            | LoweredOp::ConstI64 { type_hash, .. }
+            | LoweredOp::ConstBool { type_hash, .. }
+            | LoweredOp::ConstUnit { type_hash, .. }
+            | LoweredOp::Unary { type_hash, .. }
+            | LoweredOp::Binary { type_hash, .. }
+            | LoweredOp::Call { type_hash, .. }
+            | LoweredOp::If { type_hash, .. }
+            | LoweredOp::BorrowShared { type_hash, .. }
+            | LoweredOp::BorrowMut { type_hash, .. }
+            | LoweredOp::Load { type_hash, .. }
+            | LoweredOp::Store { type_hash, .. }
+            | LoweredOp::Copy { type_hash, .. }
+            | LoweredOp::Move { type_hash, .. }
+            | LoweredOp::Drop { type_hash, .. }
+            | LoweredOp::BorrowDebug { type_hash, .. }
+            | LoweredOp::Return { type_hash, .. } => {
+                out.insert(type_hash.clone());
+            }
+            LoweredOp::DerefShared {
+                referent_type_hash, ..
+            }
+            | LoweredOp::DerefMut {
+                referent_type_hash, ..
+            } => {
+                out.insert(referent_type_hash.clone());
+            }
+            LoweredOp::AddrOfParam { place, .. }
+            | LoweredOp::AddrOfLocal { place, .. }
+            | LoweredOp::AddrOfField { place, .. }
+            | LoweredOp::AddrOfIndex { place, .. } => collect_place_type_hashes(place, out),
+        }
+        if let LoweredOp::If {
+            then_block,
+            else_block,
+            ..
+        } = op
+        {
+            collect_op_type_hashes(&then_block.operations, out);
+            collect_op_type_hashes(&else_block.operations, out);
+        }
+    }
+}
+
+fn collect_place_type_hashes(place: &LoweredPlace, out: &mut BTreeSet<String>) {
+    match place {
+        LoweredPlace::Param { type_hash, .. } | LoweredPlace::Local { type_hash, .. } => {
+            out.insert(type_hash.clone());
+        }
+        LoweredPlace::Field {
+            owner_type_hash,
+            type_hash,
+            ..
+        } => {
+            out.insert(owner_type_hash.clone());
+            out.insert(type_hash.clone());
+        }
+        LoweredPlace::Index {
+            element_type_hash,
+            type_hash,
+            ..
+        } => {
+            out.insert(element_type_hash.clone());
+            out.insert(type_hash.clone());
+        }
+    }
+}
+
+fn required_layout_string(metadata: &JsonValue, key: &str) -> Result<String> {
+    metadata
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("type layout missing string {key}"))
+}
+
+fn required_layout_u64(metadata: &JsonValue, key: &str) -> Result<u64> {
+    metadata
+        .get(key)
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| anyhow!("type layout missing integer {key}"))
 }
 
 fn is_hash(value: &str) -> bool {

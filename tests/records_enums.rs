@@ -57,19 +57,11 @@ fn main() -> i64 = add_tax({ amount: 100, tax: 20 })
     assert_eq!(run(&["eval", path(&rebuilt), "main"]).trim(), "120");
     run(&["verify", path(&rebuilt)]);
 
-    bin()
-        .args([
-            "emit-ir",
-            path(&db),
-            "main",
-            "--out",
-            path(&temp.path().join("main.ir.json")),
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "lowering v1 supports record literals only as typed let initializers",
-        ));
+    let main_ir = temp.path().join("main.ir.json");
+    run(&["emit-ir", path(&db), "main", "--out", path(&main_ir)]);
+    let lowered = std::fs::read_to_string(&main_ir).unwrap();
+    assert!(lowered.contains("\"record\""));
+    assert!(lowered.contains("\"by_indirect\""));
 }
 
 #[test]

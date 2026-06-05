@@ -12,7 +12,7 @@ use crate::backend::{ArtifactKind, ObjectBackend, ObjectBackendArtifact, ObjectB
 use crate::jobs::{ArtifactJobClaim, artifact_job_error, new_worker_id};
 use crate::lowering::{
     LoweredBlock, LoweredDebugOp, LoweredFunctionIr, LoweredLocalSlot, LoweredOp, LoweredParamSlot,
-    LoweredPlace, lowered_op_value_id, lowered_value_debug_ops,
+    LoweredPlace, LoweredTypeLayout, lowered_op_value_id, lowered_value_debug_ops,
 };
 use crate::model::ProgramRootPayload;
 use crate::store::{
@@ -579,14 +579,29 @@ fn validate_native_ir(ir: &LoweredFunctionIr) -> Result<()> {
     let i64_type = type_hash_for("I64");
     let bool_type = type_hash_for("Bool");
     let unit_type = type_hash_for("Unit");
-    if ir.return_type_hash != i64_type
-        && ir.return_type_hash != bool_type
-        && ir.return_type_hash != unit_type
-    {
-        bail!("native object backend v0 supports only i64, bool, and unit returns");
-    }
-    if ir.params.len() > 6 {
+    let type_layouts = native_type_layouts(ir)?;
+    native_supported_type(
+        &type_layouts,
+        &ir.return_type_hash,
+        &i64_type,
+        &bool_type,
+        &unit_type,
+    )?;
+    let hidden_return_count = usize::from(native_returns_indirect(
+        &type_layouts,
+        &ir.return_type_hash,
+    )?);
+    if ir.params.len() + hidden_return_count > 6 {
         bail!("native object backend v0 supports at most 6 parameters");
+    }
+    for param in &ir.params {
+        native_supported_type(
+            &type_layouts,
+            &param.type_hash,
+            &i64_type,
+            &bool_type,
+            &unit_type,
+        )?;
     }
     for local in &ir.locals {
         if local.size_bytes == 0 || !local.size_bytes.is_multiple_of(8) {
@@ -602,6 +617,7 @@ fn validate_native_ir(ir: &LoweredFunctionIr) -> Result<()> {
         &i64_type,
         &bool_type,
         &unit_type,
+        &type_layouts,
         &mut values,
         &mut addresses,
     )
@@ -614,6 +630,7 @@ fn validate_native_ops(
     i64_type: &str,
     bool_type: &str,
     unit_type: &str,
+    type_layouts: &BTreeMap<String, LoweredTypeLayout>,
     values: &mut BTreeMap<String, String>,
     addresses: &mut BTreeMap<String, String>,
 ) -> Result<()> {
@@ -628,9 +645,7 @@ fn validate_native_ops(
             | LoweredOp::Call { type_hash, .. }
             | LoweredOp::If { type_hash, .. }
             | LoweredOp::Return { type_hash, .. } => {
-                if !is_native_scalar_type(type_hash, i64_type, bool_type, unit_type) {
-                    bail!("native object backend v0 supports only i64, bool, and unit values");
-                }
+                native_supported_type(type_layouts, type_hash, i64_type, bool_type, unit_type)?;
             }
             LoweredOp::BorrowShared { .. }
             | LoweredOp::BorrowMut { .. }
@@ -674,7 +689,7 @@ fn validate_native_ops(
                 let _ = type_hash;
             }
         }
-        validate_native_op_flow(op, params, locals, values, addresses)?;
+        validate_native_op_flow(op, params, locals, type_layouts, values, addresses)?;
         if let LoweredOp::If {
             then_block,
             else_block,
@@ -690,6 +705,7 @@ fn validate_native_ops(
                 i64_type,
                 bool_type,
                 unit_type,
+                type_layouts,
                 &mut then_values,
                 &mut then_addresses,
             )?;
@@ -702,6 +718,7 @@ fn validate_native_ops(
                 i64_type,
                 bool_type,
                 unit_type,
+                type_layouts,
                 &mut else_values,
                 &mut else_addresses,
             )?;
@@ -710,19 +727,28 @@ fn validate_native_ops(
     Ok(())
 }
 
-fn is_native_scalar_type(
+fn native_supported_type(
+    type_layouts: &BTreeMap<String, LoweredTypeLayout>,
     type_hash: &str,
     i64_type: &str,
     bool_type: &str,
     unit_type: &str,
-) -> bool {
-    type_hash == i64_type || type_hash == bool_type || type_hash == unit_type
+) -> Result<()> {
+    if type_hash == i64_type || type_hash == bool_type || type_hash == unit_type {
+        return Ok(());
+    }
+    let layout = native_type_layout(type_layouts, type_hash)?;
+    match layout.kind.as_str() {
+        "record" | "reference" | "raw_pointer" => Ok(()),
+        other => bail!("native object backend v0 does not support native values of {other} type"),
+    }
 }
 
 fn validate_native_op_flow(
     op: &LoweredOp,
     params: &[LoweredParamSlot],
     locals: &[LoweredLocalSlot],
+    type_layouts: &BTreeMap<String, LoweredTypeLayout>,
     values: &mut BTreeMap<String, String>,
     addresses: &mut BTreeMap<String, String>,
 ) -> Result<()> {
@@ -768,11 +794,23 @@ fn validate_native_op_flow(
         LoweredOp::Call {
             id,
             args,
+            return_address,
             type_hash,
             ..
         } => {
             for arg in args {
                 native_value_type(values, arg)?;
+            }
+            if native_returns_indirect(type_layouts, type_hash)? {
+                let Some(return_address) = return_address else {
+                    bail!("native object backend saw aggregate call without return address");
+                };
+                if native_address_type(addresses, return_address)? != type_hash {
+                    bail!("native object backend saw aggregate call return address mismatch");
+                }
+                native_insert_address(addresses, id, type_hash)?;
+            } else if return_address.is_some() {
+                bail!("native object backend saw scalar call with return address");
             }
             native_insert_value(values, id, type_hash)?;
         }
@@ -895,6 +933,9 @@ fn validate_native_op_flow(
                 bail!("native object backend saw copy type mismatch");
             }
             native_insert_value(values, id, type_hash)?;
+            if native_passes_indirect(type_layouts, type_hash)? {
+                native_insert_address(addresses, id, type_hash)?;
+            }
         }
         LoweredOp::Move {
             id,
@@ -905,6 +946,9 @@ fn validate_native_op_flow(
                 bail!("native object backend saw move type mismatch");
             }
             native_insert_value(values, id, type_hash)?;
+            if native_passes_indirect(type_layouts, type_hash)? {
+                native_insert_address(addresses, id, type_hash)?;
+            }
         }
         LoweredOp::Drop { address, type_hash }
         | LoweredOp::BorrowDebug {
@@ -966,6 +1010,46 @@ fn native_address_type<'a>(
         .ok_or_else(|| anyhow!("unknown native lowered address id {id}"))
 }
 
+fn native_type_layouts(ir: &LoweredFunctionIr) -> Result<BTreeMap<String, LoweredTypeLayout>> {
+    let mut layouts = BTreeMap::new();
+    for layout in &ir.type_layouts {
+        if layouts
+            .insert(layout.type_hash.clone(), layout.clone())
+            .is_some()
+        {
+            bail!("duplicate native type layout {}", layout.type_hash);
+        }
+    }
+    Ok(layouts)
+}
+
+fn native_type_layout<'a>(
+    layouts: &'a BTreeMap<String, LoweredTypeLayout>,
+    type_hash: &str,
+) -> Result<&'a LoweredTypeLayout> {
+    layouts
+        .get(type_hash)
+        .ok_or_else(|| anyhow!("native object backend missing type layout for {type_hash}"))
+}
+
+fn native_type_size(layouts: &BTreeMap<String, LoweredTypeLayout>, type_hash: &str) -> Result<u64> {
+    Ok(native_type_layout(layouts, type_hash)?.size_bytes)
+}
+
+fn native_passes_indirect(
+    layouts: &BTreeMap<String, LoweredTypeLayout>,
+    type_hash: &str,
+) -> Result<bool> {
+    Ok(native_type_layout(layouts, type_hash)?.abi.pass == "by_indirect")
+}
+
+fn native_returns_indirect(
+    layouts: &BTreeMap<String, LoweredTypeLayout>,
+    type_hash: &str,
+) -> Result<bool> {
+    Ok(native_type_layout(layouts, type_hash)?.abi.return_ == "hidden_return_slot")
+}
+
 fn native_debug_metadata(compiled: &CompiledFunction) -> JsonValue {
     json!({
         "schema": NATIVE_DEBUG_METADATA_SCHEMA,
@@ -1018,6 +1102,7 @@ struct TextRelocation {
 
 #[derive(Debug)]
 struct StackLayout {
+    hidden_return_offset: Option<i32>,
     param_offsets: Vec<i32>,
     local_offsets: BTreeMap<usize, i32>,
     value_offsets: BTreeMap<String, i32>,
@@ -1028,9 +1113,11 @@ fn compile_x86_64_function(
     ir: &LoweredFunctionIr,
     function_symbol: &str,
 ) -> Result<CompiledFunction> {
+    let type_layouts = native_type_layouts(ir)?;
     let layout = StackLayout::new(ir)?;
     let mut emitter = FunctionEmitter {
         layout,
+        type_layouts,
         text: Vec::new(),
         relocations: Vec::new(),
         debug_ops: lowered_value_debug_ops(ir)?,
@@ -1047,7 +1134,9 @@ fn compile_x86_64_function(
     emitter.emit_ops(body)?;
     match last {
         LoweredOp::Return { value, type_hash } => {
-            if type_hash != &type_hash_for("Unit") {
+            if emitter.type_returns_indirect(type_hash)? {
+                emitter.emit_aggregate_return(value, type_hash)?;
+            } else if type_hash != &type_hash_for("Unit") {
                 let offset = emitter.value_offset(value)?;
                 emitter.mov_rax_stack(offset);
             }
@@ -1069,10 +1158,15 @@ fn compile_x86_64_function(
 
 impl StackLayout {
     fn new(ir: &LoweredFunctionIr) -> Result<Self> {
+        let type_layouts = native_type_layouts(ir)?;
+        let hidden_return_count = usize::from(native_returns_indirect(
+            &type_layouts,
+            &ir.return_type_hash,
+        )?);
         let mut ids = Vec::new();
         collect_value_ids(&ir.operations, &mut ids)?;
         let mut value_offsets = BTreeMap::new();
-        let mut next_offset = ir.params.len() as i32 * 8;
+        let mut next_offset = (ir.params.len() + hidden_return_count) as i32 * 8;
         let mut local_offsets = BTreeMap::new();
         for local in &ir.locals {
             if local.slot != local_offsets.len() {
@@ -1089,8 +1183,9 @@ impl StackLayout {
             value_offsets.insert(id, offset);
             next_offset += 8;
         }
+        let hidden_return_offset = (hidden_return_count == 1).then_some(-8);
         let param_offsets = (0..ir.params.len())
-            .map(|idx| -8 * (idx as i32 + 1))
+            .map(|idx| -8 * ((idx + hidden_return_count) as i32 + 1))
             .collect::<Vec<_>>();
         let raw_size = next_offset;
         let stack_size = if raw_size == 0 {
@@ -1099,6 +1194,7 @@ impl StackLayout {
             ((raw_size + 15) / 16) * 16
         };
         Ok(Self {
+            hidden_return_offset,
             param_offsets,
             local_offsets,
             value_offsets,
@@ -1166,6 +1262,7 @@ fn push_value_id(ids: &mut Vec<String>, seen: &mut BTreeSet<String>, id: &str) -
 
 struct FunctionEmitter {
     layout: StackLayout,
+    type_layouts: BTreeMap<String, LoweredTypeLayout>,
     text: Vec<u8>,
     relocations: Vec<TextRelocation>,
     debug_ops: BTreeMap<String, LoweredDebugOp>,
@@ -1187,8 +1284,12 @@ impl FunctionEmitter {
                 self.push_i32(self.layout.stack_size);
             }
         }
+        let arg_shift = usize::from(self.layout.hidden_return_offset.is_some());
+        if let Some(offset) = self.layout.hidden_return_offset {
+            self.mov_stack_arg_reg(offset, 0)?;
+        }
         for slot in 0..param_count {
-            self.mov_stack_arg_reg(self.layout.param_offsets[slot], slot)?;
+            self.mov_stack_arg_reg(self.layout.param_offsets[slot], slot + arg_shift)?;
         }
         Ok(())
     }
@@ -1252,13 +1353,18 @@ impl FunctionEmitter {
                 target_symbol_hash,
                 target_abi_symbol,
                 args,
+                return_address,
                 ..
             } => {
-                if args.len() > 6 {
+                let arg_shift = usize::from(return_address.is_some());
+                if args.len() + arg_shift > 6 {
                     bail!("native object backend v0 supports at most 6 call arguments");
                 }
+                if let Some(return_address) = return_address {
+                    self.mov_arg_reg_stack(0, self.value_offset(return_address)?)?;
+                }
                 for (idx, arg) in args.iter().enumerate() {
-                    self.mov_arg_reg_stack(idx, self.value_offset(arg)?)?;
+                    self.mov_arg_reg_stack(idx + arg_shift, self.value_offset(arg)?)?;
                 }
                 let target_abi_symbol = target_abi_symbol
                     .clone()
@@ -1271,6 +1377,9 @@ impl FunctionEmitter {
                     target_symbol_hash: target_symbol_hash.clone(),
                     target_abi_symbol,
                 });
+                if let Some(return_address) = return_address {
+                    self.mov_rax_stack(self.value_offset(return_address)?);
+                }
                 self.mov_stack_rax(self.value_offset(id)?);
             }
             LoweredOp::If {
@@ -1332,20 +1441,25 @@ impl FunctionEmitter {
             LoweredOp::Load {
                 id,
                 address,
-                type_hash: _,
+                type_hash,
             } => {
-                self.mov_rax_stack(self.value_offset(address)?);
-                self.mov_rax_mem_rax();
+                if self.type_passes_indirect(type_hash)? {
+                    self.mov_rax_stack(self.value_offset(address)?);
+                } else {
+                    self.emit_load_addressed_value(type_hash, address)?;
+                }
                 self.mov_stack_rax(self.value_offset(id)?);
             }
             LoweredOp::Store {
                 address,
                 value,
-                type_hash: _,
+                type_hash,
             } => {
-                self.mov_rax_stack(self.value_offset(address)?);
-                self.mov_rcx_stack(self.value_offset(value)?);
-                self.mov_mem_rax_rcx();
+                if self.type_passes_indirect(type_hash)? {
+                    self.copy_memory_from_value_to_address(address, value, type_hash)?;
+                } else {
+                    self.emit_store_addressed_value(type_hash, address, value)?;
+                }
             }
             LoweredOp::Copy {
                 id,
@@ -1358,10 +1472,13 @@ impl FunctionEmitter {
             LoweredOp::Move {
                 id,
                 address,
-                type_hash: _,
+                type_hash,
             } => {
-                self.mov_rax_stack(self.value_offset(address)?);
-                self.mov_rax_mem_rax();
+                if self.type_passes_indirect(type_hash)? {
+                    self.mov_rax_stack(self.value_offset(address)?);
+                } else {
+                    self.emit_load_addressed_value(type_hash, address)?;
+                }
                 self.mov_stack_rax(self.value_offset(id)?);
             }
             LoweredOp::Drop { .. } | LoweredOp::BorrowDebug { .. } => {}
@@ -1393,6 +1510,107 @@ impl FunctionEmitter {
             text_offset_start: start as u64,
             text_offset_end: end as u64,
         });
+        Ok(())
+    }
+
+    fn type_size(&self, type_hash: &str) -> Result<u64> {
+        native_type_size(&self.type_layouts, type_hash)
+    }
+
+    fn type_passes_indirect(&self, type_hash: &str) -> Result<bool> {
+        native_passes_indirect(&self.type_layouts, type_hash)
+    }
+
+    fn type_returns_indirect(&self, type_hash: &str) -> Result<bool> {
+        native_returns_indirect(&self.type_layouts, type_hash)
+    }
+
+    fn emit_aggregate_return(&mut self, value: &str, type_hash: &str) -> Result<()> {
+        let hidden = self
+            .layout
+            .hidden_return_offset
+            .ok_or_else(|| anyhow!("aggregate return missing hidden return slot"))?;
+        self.copy_memory_from_stack_pointers(
+            hidden,
+            self.value_offset(value)?,
+            self.type_size(type_hash)?,
+        )?;
+        self.mov_rax_stack(hidden);
+        Ok(())
+    }
+
+    fn emit_load_addressed_value(&mut self, type_hash: &str, address: &str) -> Result<()> {
+        self.mov_rax_stack(self.value_offset(address)?);
+        match self.type_size(type_hash)? {
+            0 => self.mov_rax_imm32(0),
+            1 => self.movzx_rax_memb_rax(),
+            8 => self.mov_rax_mem_rax(),
+            size => bail!("native x86_64 backend cannot load scalar size {size}"),
+        }
+        Ok(())
+    }
+
+    fn emit_store_addressed_value(
+        &mut self,
+        type_hash: &str,
+        address: &str,
+        value: &str,
+    ) -> Result<()> {
+        match self.type_size(type_hash)? {
+            0 => Ok(()),
+            1 => {
+                self.mov_rax_stack(self.value_offset(address)?);
+                self.mov_rcx_stack(self.value_offset(value)?);
+                self.mov_memb_rax_cl();
+                Ok(())
+            }
+            8 => {
+                self.mov_rax_stack(self.value_offset(address)?);
+                self.mov_rcx_stack(self.value_offset(value)?);
+                self.mov_mem_rax_rcx();
+                Ok(())
+            }
+            size => bail!("native x86_64 backend cannot store scalar size {size}"),
+        }
+    }
+
+    fn copy_memory_from_value_to_address(
+        &mut self,
+        address: &str,
+        value: &str,
+        type_hash: &str,
+    ) -> Result<()> {
+        self.copy_memory_from_stack_pointers(
+            self.value_offset(address)?,
+            self.value_offset(value)?,
+            self.type_size(type_hash)?,
+        )
+    }
+
+    fn copy_memory_from_stack_pointers(
+        &mut self,
+        dest_pointer_offset: i32,
+        source_pointer_offset: i32,
+        size_bytes: u64,
+    ) -> Result<()> {
+        if size_bytes == 0 {
+            return Ok(());
+        }
+        self.mov_rcx_stack(dest_pointer_offset);
+        self.mov_rax_stack(source_pointer_offset);
+        let mut offset = 0_u64;
+        while offset + 8 <= size_bytes {
+            let offset_i32 = i32::try_from(offset)?;
+            self.mov_rdx_mem_rax_disp(offset_i32);
+            self.mov_mem_rcx_disp_rdx(offset_i32);
+            offset += 8;
+        }
+        while offset < size_bytes {
+            let offset_i32 = i32::try_from(offset)?;
+            self.movzx_rdx_memb_rax_disp(offset_i32);
+            self.mov_memb_rcx_disp_dl(offset_i32);
+            offset += 1;
+        }
         Ok(())
     }
 
@@ -1505,6 +1723,10 @@ impl FunctionEmitter {
         self.text.extend_from_slice(&[0x48, 0x8b, 0x00]);
     }
 
+    fn movzx_rax_memb_rax(&mut self) {
+        self.text.extend_from_slice(&[0x0f, 0xb6, 0x00]);
+    }
+
     fn add_rax_imm32(&mut self, value: i32) {
         if value == 0 {
             return;
@@ -1520,6 +1742,30 @@ impl FunctionEmitter {
 
     fn mov_mem_rax_rcx(&mut self) {
         self.text.extend_from_slice(&[0x48, 0x89, 0x08]);
+    }
+
+    fn mov_memb_rax_cl(&mut self) {
+        self.text.extend_from_slice(&[0x88, 0x08]);
+    }
+
+    fn mov_rdx_mem_rax_disp(&mut self, offset: i32) {
+        self.text.extend_from_slice(&[0x48, 0x8b, 0x90]);
+        self.push_i32(offset);
+    }
+
+    fn mov_mem_rcx_disp_rdx(&mut self, offset: i32) {
+        self.text.extend_from_slice(&[0x48, 0x89, 0x91]);
+        self.push_i32(offset);
+    }
+
+    fn movzx_rdx_memb_rax_disp(&mut self, offset: i32) {
+        self.text.extend_from_slice(&[0x0f, 0xb6, 0x90]);
+        self.push_i32(offset);
+    }
+
+    fn mov_memb_rcx_disp_dl(&mut self, offset: i32) {
+        self.text.extend_from_slice(&[0x88, 0x91]);
+        self.push_i32(offset);
     }
 
     fn mov_stack_rax(&mut self, offset: i32) {
@@ -1593,6 +1839,7 @@ impl FunctionEmitter {
 
 #[derive(Debug)]
 struct Arm64StackLayout {
+    hidden_return_offset: Option<u32>,
     param_offsets: Vec<u32>,
     local_offsets: BTreeMap<usize, u32>,
     value_offsets: BTreeMap<String, u32>,
@@ -1603,9 +1850,11 @@ fn compile_arm64_function(
     ir: &LoweredFunctionIr,
     function_symbol: &str,
 ) -> Result<CompiledFunction> {
+    let type_layouts = native_type_layouts(ir)?;
     let layout = Arm64StackLayout::new(ir)?;
     let mut emitter = Arm64Emitter {
         layout,
+        type_layouts,
         text: Vec::new(),
         relocations: Vec::new(),
         debug_ops: lowered_value_debug_ops(ir)?,
@@ -1622,7 +1871,9 @@ fn compile_arm64_function(
     emitter.emit_ops(body)?;
     match last {
         LoweredOp::Return { value, type_hash } => {
-            if type_hash != &type_hash_for("Unit") {
+            if emitter.type_returns_indirect(type_hash)? {
+                emitter.emit_aggregate_return(value, type_hash)?;
+            } else if type_hash != &type_hash_for("Unit") {
                 let offset = emitter.value_offset(value)?;
                 emitter.ldr_stack(0, offset)?;
             }
@@ -1644,10 +1895,15 @@ fn compile_arm64_function(
 
 impl Arm64StackLayout {
     fn new(ir: &LoweredFunctionIr) -> Result<Self> {
+        let type_layouts = native_type_layouts(ir)?;
+        let hidden_return_count = usize::from(native_returns_indirect(
+            &type_layouts,
+            &ir.return_type_hash,
+        )?);
         let mut ids = Vec::new();
         collect_value_ids(&ir.operations, &mut ids)?;
         let mut value_offsets = BTreeMap::new();
-        let mut next_offset = ir.params.len() as u32 * 8;
+        let mut next_offset = (ir.params.len() + hidden_return_count) as u32 * 8;
         let mut local_offsets = BTreeMap::new();
         for local in &ir.locals {
             if local.slot != local_offsets.len() {
@@ -1664,8 +1920,9 @@ impl Arm64StackLayout {
             value_offsets.insert(id, offset);
             next_offset += 8;
         }
+        let hidden_return_offset = (hidden_return_count == 1).then_some(0);
         let param_offsets = (0..ir.params.len())
-            .map(|idx| 8 * idx as u32)
+            .map(|idx| 8 * (idx + hidden_return_count) as u32)
             .collect::<Vec<_>>();
         let raw_size = next_offset;
         let stack_size = if raw_size == 0 {
@@ -1677,6 +1934,7 @@ impl Arm64StackLayout {
             bail!("native arm64 backend v0 stack frame is too large");
         }
         Ok(Self {
+            hidden_return_offset,
             param_offsets,
             local_offsets,
             value_offsets,
@@ -1687,6 +1945,7 @@ impl Arm64StackLayout {
 
 struct Arm64Emitter {
     layout: Arm64StackLayout,
+    type_layouts: BTreeMap<String, LoweredTypeLayout>,
     text: Vec<u8>,
     relocations: Vec<TextRelocation>,
     debug_ops: BTreeMap<String, LoweredDebugOp>,
@@ -1702,8 +1961,12 @@ impl Arm64Emitter {
         if self.layout.stack_size > 0 {
             self.sub_sp_imm(self.layout.stack_size)?;
         }
+        let arg_shift = usize::from(self.layout.hidden_return_offset.is_some());
+        if let Some(offset) = self.layout.hidden_return_offset {
+            self.str_stack(0, offset)?;
+        }
         for slot in 0..param_count {
-            self.str_stack(slot as u8, self.layout.param_offsets[slot])?;
+            self.str_stack((slot + arg_shift) as u8, self.layout.param_offsets[slot])?;
         }
         Ok(())
     }
@@ -1770,13 +2033,18 @@ impl Arm64Emitter {
                 target_symbol_hash,
                 target_abi_symbol,
                 args,
+                return_address,
                 ..
             } => {
-                if args.len() > 8 {
-                    bail!("native arm64 backend v0 supports at most 8 call arguments");
+                let arg_shift = usize::from(return_address.is_some());
+                if args.len() + arg_shift > 8 {
+                    bail!("native arm64 backend v0 supports at most 8 machine call arguments");
+                }
+                if let Some(return_address) = return_address {
+                    self.ldr_stack(0, self.value_offset(return_address)?)?;
                 }
                 for (idx, arg) in args.iter().enumerate() {
-                    self.ldr_stack(idx as u8, self.value_offset(arg)?)?;
+                    self.ldr_stack((idx + arg_shift) as u8, self.value_offset(arg)?)?;
                 }
                 let target_abi_symbol = macho_symbol_name(
                     &target_abi_symbol
@@ -1790,6 +2058,9 @@ impl Arm64Emitter {
                     target_symbol_hash: target_symbol_hash.clone(),
                     target_abi_symbol,
                 });
+                if let Some(return_address) = return_address {
+                    self.ldr_stack(0, self.value_offset(return_address)?)?;
+                }
                 self.str_stack(0, self.value_offset(id)?)?;
             }
             LoweredOp::If {
@@ -1851,20 +2122,25 @@ impl Arm64Emitter {
             LoweredOp::Load {
                 id,
                 address,
-                type_hash: _,
+                type_hash,
             } => {
-                self.ldr_stack(0, self.value_offset(address)?)?;
-                self.ldr_reg_addr(0, 0)?;
+                if self.type_passes_indirect(type_hash)? {
+                    self.ldr_stack(0, self.value_offset(address)?)?;
+                } else {
+                    self.emit_load_addressed_value(type_hash, address)?;
+                }
                 self.str_stack(0, self.value_offset(id)?)?;
             }
             LoweredOp::Store {
                 address,
                 value,
-                type_hash: _,
+                type_hash,
             } => {
-                self.ldr_stack(0, self.value_offset(value)?)?;
-                self.ldr_stack(1, self.value_offset(address)?)?;
-                self.str_reg_addr(0, 1)?;
+                if self.type_passes_indirect(type_hash)? {
+                    self.copy_memory_from_value_to_address(address, value, type_hash)?;
+                } else {
+                    self.emit_store_addressed_value(type_hash, address, value)?;
+                }
             }
             LoweredOp::Copy {
                 id,
@@ -1877,10 +2153,13 @@ impl Arm64Emitter {
             LoweredOp::Move {
                 id,
                 address,
-                type_hash: _,
+                type_hash,
             } => {
-                self.ldr_stack(0, self.value_offset(address)?)?;
-                self.ldr_reg_addr(0, 0)?;
+                if self.type_passes_indirect(type_hash)? {
+                    self.ldr_stack(0, self.value_offset(address)?)?;
+                } else {
+                    self.emit_load_addressed_value(type_hash, address)?;
+                }
                 self.str_stack(0, self.value_offset(id)?)?;
             }
             LoweredOp::Drop { .. } | LoweredOp::BorrowDebug { .. } => {}
@@ -1912,6 +2191,107 @@ impl Arm64Emitter {
             text_offset_start: start as u64,
             text_offset_end: end as u64,
         });
+        Ok(())
+    }
+
+    fn type_size(&self, type_hash: &str) -> Result<u64> {
+        native_type_size(&self.type_layouts, type_hash)
+    }
+
+    fn type_passes_indirect(&self, type_hash: &str) -> Result<bool> {
+        native_passes_indirect(&self.type_layouts, type_hash)
+    }
+
+    fn type_returns_indirect(&self, type_hash: &str) -> Result<bool> {
+        native_returns_indirect(&self.type_layouts, type_hash)
+    }
+
+    fn emit_aggregate_return(&mut self, value: &str, type_hash: &str) -> Result<()> {
+        let hidden = self
+            .layout
+            .hidden_return_offset
+            .ok_or_else(|| anyhow!("aggregate return missing hidden return slot"))?;
+        self.copy_memory_from_stack_pointers(
+            hidden,
+            self.value_offset(value)?,
+            self.type_size(type_hash)?,
+        )?;
+        self.ldr_stack(0, hidden)?;
+        Ok(())
+    }
+
+    fn emit_load_addressed_value(&mut self, type_hash: &str, address: &str) -> Result<()> {
+        self.ldr_stack(0, self.value_offset(address)?)?;
+        match self.type_size(type_hash)? {
+            0 => self.mov_u64(0, 0),
+            1 => self.ldrb_reg_addr(0, 0)?,
+            8 => self.ldr_reg_addr(0, 0)?,
+            size => bail!("native arm64 backend cannot load scalar size {size}"),
+        }
+        Ok(())
+    }
+
+    fn emit_store_addressed_value(
+        &mut self,
+        type_hash: &str,
+        address: &str,
+        value: &str,
+    ) -> Result<()> {
+        match self.type_size(type_hash)? {
+            0 => Ok(()),
+            1 => {
+                self.ldr_stack(0, self.value_offset(value)?)?;
+                self.ldr_stack(1, self.value_offset(address)?)?;
+                self.strb_reg_addr(0, 1)?;
+                Ok(())
+            }
+            8 => {
+                self.ldr_stack(0, self.value_offset(value)?)?;
+                self.ldr_stack(1, self.value_offset(address)?)?;
+                self.str_reg_addr(0, 1)?;
+                Ok(())
+            }
+            size => bail!("native arm64 backend cannot store scalar size {size}"),
+        }
+    }
+
+    fn copy_memory_from_value_to_address(
+        &mut self,
+        address: &str,
+        value: &str,
+        type_hash: &str,
+    ) -> Result<()> {
+        self.copy_memory_from_stack_pointers(
+            self.value_offset(address)?,
+            self.value_offset(value)?,
+            self.type_size(type_hash)?,
+        )
+    }
+
+    fn copy_memory_from_stack_pointers(
+        &mut self,
+        dest_pointer_offset: u32,
+        source_pointer_offset: u32,
+        size_bytes: u64,
+    ) -> Result<()> {
+        if size_bytes == 0 {
+            return Ok(());
+        }
+        self.ldr_stack(1, dest_pointer_offset)?;
+        self.ldr_stack(0, source_pointer_offset)?;
+        let mut offset = 0_u64;
+        while offset + 8 <= size_bytes {
+            let offset_u32 = u32::try_from(offset)?;
+            self.ldr_reg_addr_offset(2, 0, offset_u32)?;
+            self.str_reg_addr_offset(2, 1, offset_u32)?;
+            offset += 8;
+        }
+        while offset < size_bytes {
+            let offset_u32 = u32::try_from(offset)?;
+            self.ldrb_reg_addr_offset(2, 0, offset_u32)?;
+            self.strb_reg_addr_offset(2, 1, offset_u32)?;
+            offset += 1;
+        }
         Ok(())
     }
 
@@ -2054,6 +2434,30 @@ impl Arm64Emitter {
         self.reg_mem_op(0xf9000000, reg, base_reg)
     }
 
+    fn ldrb_reg_addr(&mut self, reg: u8, base_reg: u8) -> Result<()> {
+        self.reg_byte_mem_op(0x39400000, reg, base_reg)
+    }
+
+    fn strb_reg_addr(&mut self, reg: u8, base_reg: u8) -> Result<()> {
+        self.reg_byte_mem_op(0x39000000, reg, base_reg)
+    }
+
+    fn ldr_reg_addr_offset(&mut self, reg: u8, base_reg: u8, offset: u32) -> Result<()> {
+        self.reg_mem_op_offset(0xf9400000, reg, base_reg, offset)
+    }
+
+    fn str_reg_addr_offset(&mut self, reg: u8, base_reg: u8, offset: u32) -> Result<()> {
+        self.reg_mem_op_offset(0xf9000000, reg, base_reg, offset)
+    }
+
+    fn ldrb_reg_addr_offset(&mut self, reg: u8, base_reg: u8, offset: u32) -> Result<()> {
+        self.reg_byte_mem_op_offset(0x39400000, reg, base_reg, offset)
+    }
+
+    fn strb_reg_addr_offset(&mut self, reg: u8, base_reg: u8, offset: u32) -> Result<()> {
+        self.reg_byte_mem_op_offset(0x39000000, reg, base_reg, offset)
+    }
+
     fn stack_mem_op(&mut self, base: u32, reg: u8, offset: u32) -> Result<()> {
         if reg > 30 {
             bail!("invalid arm64 general register x{reg}");
@@ -2066,10 +2470,38 @@ impl Arm64Emitter {
     }
 
     fn reg_mem_op(&mut self, base: u32, reg: u8, base_reg: u8) -> Result<()> {
+        self.reg_mem_op_offset(base, reg, base_reg, 0)
+    }
+
+    fn reg_mem_op_offset(&mut self, base: u32, reg: u8, base_reg: u8, offset: u32) -> Result<()> {
         if reg > 30 || base_reg > 30 {
             bail!("invalid arm64 general register");
         }
-        self.emit_u32(base | (u32::from(base_reg) << 5) | u32::from(reg));
+        if !offset.is_multiple_of(8) || offset / 8 > 4095 {
+            bail!("arm64 address offset cannot be encoded");
+        }
+        self.emit_u32(base | ((offset / 8) << 10) | (u32::from(base_reg) << 5) | u32::from(reg));
+        Ok(())
+    }
+
+    fn reg_byte_mem_op(&mut self, base: u32, reg: u8, base_reg: u8) -> Result<()> {
+        self.reg_byte_mem_op_offset(base, reg, base_reg, 0)
+    }
+
+    fn reg_byte_mem_op_offset(
+        &mut self,
+        base: u32,
+        reg: u8,
+        base_reg: u8,
+        offset: u32,
+    ) -> Result<()> {
+        if reg > 30 || base_reg > 30 {
+            bail!("invalid arm64 general register");
+        }
+        if offset > 4095 {
+            bail!("arm64 byte address offset cannot be encoded");
+        }
+        self.emit_u32(base | (offset << 10) | (u32::from(base_reg) << 5) | u32::from(reg));
         Ok(())
     }
 
