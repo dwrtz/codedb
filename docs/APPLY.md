@@ -238,7 +238,7 @@ record Money {
 }
 
 record LineView<'a> {
-  line: Money
+  line: &'a Money
 }
 
 enum Discount {
@@ -248,9 +248,16 @@ enum Discount {
 ```
 
 Region parameters are declared on named type definitions and are represented by
-stable region identities. Reference types are reserved for the later v2
-reference phases; phase 3 validates region parameters and named type region
-arguments without introducing reference semantics.
+stable region identities. Shared and mutable references use those region
+identities in both projection text and structural operation payloads:
+
+```text
+&'a Money
+&'a mut Money
+raw_ptr<Money>
+raw_mut_ptr<Money>
+array<i64, 4>
+```
 
 ## Effects
 
@@ -279,8 +286,9 @@ concurrent
 
 `pure` cannot be combined with other effects. The current scaffold validates
 call propagation: a function that calls an `io`, `ffi`, or otherwise effectful
-function must declare those effects itself. Built-in arithmetic is still treated
-as pure in this phase.
+function must declare those effects itself. Assignment requires the `state`
+effect, including when the assignment is nested inside another expression.
+Built-in arithmetic is still treated as pure in this phase.
 
 ## External Functions
 
@@ -326,6 +334,9 @@ Bodies use structural `RawExpr` JSON:
 { "kind": "call", "name": "tax", "args": [] }
 { "kind": "binary", "op": "+", "left": {}, "right": {} }
 { "kind": "unary", "op": "!", "expr": {} }
+{ "kind": "borrow_shared", "region": "a", "target": {} }
+{ "kind": "borrow_mut", "region": "a", "target": {} }
+{ "kind": "assign", "target": {}, "value": {} }
 { "kind": "let", "name": "x", "type": "i64", "value": {}, "body": {} }
 { "kind": "if", "cond": {}, "then": {}, "else": {} }
 { "kind": "record", "fields": [{ "name": "amount", "value": {} }] }
@@ -346,6 +357,9 @@ Projection syntax supports the same surface:
 ```text
 {amount: 100, tax: 20}
 order.amount
+&'a order
+&'a mut order
+order.amount = 120
 enum {none: unit, some: i64}::some(41)
 case maybe_value() of none => 0 | some(x) => x + 1
 ```

@@ -4156,7 +4156,20 @@ impl CodeDb {
                     false
                 }
                 "assign" => true,
-                "call" => false,
+                "call" => {
+                    let mut required = false;
+                    for arg in payload
+                        .get("args")
+                        .and_then(JsonValue::as_array)
+                        .ok_or_else(|| anyhow!("call missing args"))?
+                    {
+                        let arg = arg
+                            .as_str()
+                            .ok_or_else(|| anyhow!("call arg must be hash"))?;
+                        required |= self.expr_requires_state(arg)?;
+                    }
+                    required
+                }
                 "binary" => {
                     self.expr_child_requires_state(&payload, "left")?
                         || self.expr_child_requires_state(&payload, "right")?

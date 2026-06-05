@@ -424,6 +424,38 @@ fn main<'a>() -> i64 =
 }
 
 #[test]
+fn assignment_inside_call_argument_requires_state_effect() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("missing-state-effect-in-call.sqlite");
+    let source = temp.path().join("missing-state-effect-in-call.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+fn sink(changed: unit) -> i64 = 0
+
+fn main() -> i64 =
+  let line: Line = { price_cents: 25, qty: 4 } in
+  sink(line.price_cents = 99)
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_effects"))
+        .stderr(predicate::str::contains("undeclared effect state"));
+}
+
+#[test]
 fn verify_rejects_mutable_borrow_region_outside_function_scope() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("bad-mut-borrow-region.sqlite");
