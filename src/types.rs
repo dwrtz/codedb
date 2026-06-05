@@ -11,7 +11,7 @@ use crate::model::{
     validate_projection_identifier,
 };
 use crate::store::{CodeDb, canonical_json, hash_object_canonical};
-use crate::{ABI_TAG, MAIN_BRANCH, SCHEMA_VERSION};
+use crate::{ABI_TAG, DEFAULT_NATIVE_TARGET, MAIN_BRANCH, SCHEMA_VERSION};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -163,6 +163,41 @@ struct LoanPlace {
 struct ActiveLoan {
     kind: LoanKind,
     place: LoanPlace,
+    owner: Option<LoanPlace>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueCopyKind {
+    Copy,
+    MoveOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueDropKind {
+    Trivial,
+    NeedsDrop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValueClass {
+    copy_kind: ValueCopyKind,
+    drop_kind: ValueDropKind,
+    contains_reference: bool,
+    contains_mut_reference: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MoveBorrowState {
+    locals: Vec<usize>,
+    active: Vec<ActiveLoan>,
+    moved: Vec<LoanPlace>,
+    next_local: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExprUse {
+    Value,
+    Place,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -872,6 +907,42 @@ impl CodeDb {
             }
             _ => Ok(false),
         }
+    }
+
+    fn value_class_in_root(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+    ) -> Result<ValueClass> {
+        let layout = self.compute_type_layout(root, type_hash, DEFAULT_NATIVE_TARGET)?;
+        let copy_kind = match layout.metadata.get("copy_kind").and_then(JsonValue::as_str) {
+            Some("copy") => ValueCopyKind::Copy,
+            Some("move_only") => ValueCopyKind::MoveOnly,
+            Some(other) => bail!("unknown copy_kind {other} for type {type_hash}"),
+            None => bail!("type layout missing copy_kind for {type_hash}"),
+        };
+        let drop_kind = match layout.metadata.get("drop_kind").and_then(JsonValue::as_str) {
+            Some("trivial") => ValueDropKind::Trivial,
+            Some("needs_drop") => ValueDropKind::NeedsDrop,
+            Some(other) => bail!("unknown drop_kind {other} for type {type_hash}"),
+            None => bail!("type layout missing drop_kind for {type_hash}"),
+        };
+        Ok(ValueClass {
+            copy_kind,
+            drop_kind,
+            contains_reference: layout
+                .metadata
+                .get("contains_reference")
+                .and_then(JsonValue::as_bool)
+                .ok_or_else(|| anyhow!("type layout missing contains_reference for {type_hash}"))?,
+            contains_mut_reference: layout
+                .metadata
+                .get("contains_mut_reference")
+                .and_then(JsonValue::as_bool)
+                .ok_or_else(|| {
+                    anyhow!("type layout missing contains_mut_reference for {type_hash}")
+                })?,
+        })
     }
 
     #[allow(dead_code)]
@@ -2694,24 +2765,20 @@ impl CodeDb {
         param_types: &[String],
     ) -> Result<()> {
         let body = self.function_body_hash(&entry.definition)?;
-        let mut locals = Vec::new();
-        let mut active = Vec::new();
-        let mut next_local = 0usize;
-        self.verify_expr_borrows(
-            root,
-            &body,
-            param_types,
-            &mut locals,
-            &mut active,
-            &mut next_local,
-        )
-        .with_context(|| {
-            format!(
-                "bad_borrow: function {} violates borrow rules",
-                self.symbol_display(root, &entry.symbol)
-                    .unwrap_or(entry.symbol.clone())
-            )
-        })
+        let mut state = MoveBorrowState {
+            locals: Vec::new(),
+            active: Vec::new(),
+            moved: Vec::new(),
+            next_local: 0,
+        };
+        self.verify_expr_borrows(root, &body, param_types, &mut state, ExprUse::Value)
+            .with_context(|| {
+                format!(
+                    "bad_borrow: function {} violates borrow rules",
+                    self.symbol_display(root, &entry.symbol)
+                        .unwrap_or(entry.symbol.clone())
+                )
+            })
     }
 
     fn verify_expr_borrows(
@@ -2719,9 +2786,8 @@ impl CodeDb {
         root: &ProgramRootPayload,
         expr_hash: &str,
         param_types: &[String],
-        locals: &mut Vec<usize>,
-        active: &mut Vec<ActiveLoan>,
-        next_local: &mut usize,
+        state: &mut MoveBorrowState,
+        expr_use: ExprUse,
     ) -> Result<()> {
         let payload = self.get_payload(expr_hash)?;
         match payload
@@ -2730,10 +2796,13 @@ impl CodeDb {
             .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
         {
             "literal_i64" | "literal_bool" | "literal_unit" => Ok(()),
-            "param_ref" | "local_ref" => {
-                let place = self.loan_place_for_expr(expr_hash, param_types, locals)?;
-                self.check_shared_read_conflicts(&place, active)
-            }
+            "param_ref" | "local_ref" => match expr_use {
+                ExprUse::Place => {
+                    let place = self.loan_place_for_expr(expr_hash, param_types, &state.locals)?;
+                    self.check_place_not_moved(&place, state)
+                }
+                ExprUse::Value => self.verify_place_value_use(root, expr_hash, param_types, state),
+            },
             "call" => {
                 for arg in payload
                     .get("args")
@@ -2743,7 +2812,7 @@ impl CodeDb {
                     let arg = arg
                         .as_str()
                         .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                    self.verify_expr_borrows(root, arg, param_types, locals, active, next_local)?;
+                    self.verify_expr_borrows(root, arg, param_types, state, ExprUse::Value)?;
                 }
                 Ok(())
             }
@@ -2753,7 +2822,7 @@ impl CodeDb {
                         .get(key)
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("binary missing {key}"))?;
-                    self.verify_expr_borrows(root, child, param_types, locals, active, next_local)?;
+                    self.verify_expr_borrows(root, child, param_types, state, ExprUse::Value)?;
                 }
                 Ok(())
             }
@@ -2762,7 +2831,7 @@ impl CodeDb {
                     .get("expr")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("unary missing expr"))?;
-                self.verify_expr_borrows(root, child, param_types, locals, active, next_local)
+                self.verify_expr_borrows(root, child, param_types, state, ExprUse::Value)
             }
             "borrow_shared" | "borrow_mut" => {
                 let target = payload
@@ -2775,18 +2844,25 @@ impl CodeDb {
                     } else {
                         LoanKind::Shared
                     };
-                let place = self.loan_place_for_expr(target, param_types, locals)?;
-                self.check_loan_conflicts(&kind, &place, active)?;
+                self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
+                let place = self.loan_place_for_expr(target, param_types, &state.locals)?;
+                self.check_place_not_moved(&place, state)?;
+                self.check_loan_conflicts(&kind, &place, &state.active)?;
                 Ok(())
             }
             "assign" => {
-                for key in ["target", "value"] {
-                    let child = payload
-                        .get(key)
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("assign missing {key}"))?;
-                    self.verify_expr_borrows(root, child, param_types, locals, active, next_local)?;
-                }
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("assign missing target"))?;
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("assign missing value"))?;
+                self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
+                let target_place = self.loan_place_for_expr(target, param_types, &state.locals)?;
+                self.check_place_not_moved(&target_place, state)?;
+                self.verify_expr_borrows(root, value, param_types, state, ExprUse::Value)?;
                 Ok(())
             }
             "let" => {
@@ -2798,44 +2874,72 @@ impl CodeDb {
                     .get("body")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("let missing body"))?;
-                self.verify_expr_borrows(
-                    root,
-                    value_hash,
-                    param_types,
-                    locals,
-                    active,
-                    next_local,
-                )?;
-                let mut value_loans = Vec::new();
-                self.collect_value_loans(value_hash, param_types, locals, &mut value_loans)?;
-                for loan in &value_loans {
-                    self.check_loan_conflicts(&loan.kind, &loan.place, active)?;
+                self.verify_expr_borrows(root, value_hash, param_types, state, ExprUse::Value)?;
+                let transfer_owner =
+                    self.move_source_place_for_expr(root, value_hash, param_types, &state.locals)?;
+                let mut value_loans =
+                    self.collect_value_loans(root, value_hash, param_types, state)?;
+                if let Some(owner) = &transfer_owner {
+                    state
+                        .active
+                        .retain(|loan| !loan_owner_overlaps(loan, owner));
                 }
-                let local_id = *next_local;
-                *next_local += 1;
-                locals.push(local_id);
-                let active_len = active.len();
-                active.extend(value_loans);
-                let body_result = self.verify_expr_borrows(
-                    root,
-                    body_hash,
-                    param_types,
-                    locals,
-                    active,
-                    next_local,
-                );
-                active.truncate(active_len);
-                locals.pop();
+                for loan in &value_loans {
+                    self.check_loan_conflicts(&loan.kind, &loan.place, &state.active)?;
+                }
+                let local_id = state.next_local;
+                state.next_local += 1;
+                let local_owner = LoanPlace {
+                    root: LoanRoot::Local(local_id),
+                    fields: Vec::new(),
+                };
+                for loan in &mut value_loans {
+                    loan.owner = Some(local_owner.clone());
+                }
+                state.locals.push(local_id);
+                state.active.extend(value_loans);
+                let body_result =
+                    self.verify_expr_borrows(root, body_hash, param_types, state, ExprUse::Value);
+                state
+                    .active
+                    .retain(|loan| !loan_owner_overlaps(loan, &local_owner));
+                state
+                    .moved
+                    .retain(|place| !matches!(place.root, LoanRoot::Local(id) if id == local_id));
+                state.locals.pop();
                 body_result
             }
             "if" => {
-                for key in ["cond", "then", "else"] {
-                    let child = payload
-                        .get(key)
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("if missing {key}"))?;
-                    self.verify_expr_borrows(root, child, param_types, locals, active, next_local)?;
-                }
+                let cond = payload
+                    .get("cond")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("if missing cond"))?;
+                self.verify_expr_borrows(root, cond, param_types, state, ExprUse::Value)?;
+                let then_hash = payload
+                    .get("then")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("if missing then"))?;
+                let else_hash = payload
+                    .get("else")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("if missing else"))?;
+                let mut then_state = state.clone();
+                let mut else_state = state.clone();
+                self.verify_expr_borrows(
+                    root,
+                    then_hash,
+                    param_types,
+                    &mut then_state,
+                    ExprUse::Value,
+                )?;
+                self.verify_expr_borrows(
+                    root,
+                    else_hash,
+                    param_types,
+                    &mut else_state,
+                    ExprUse::Value,
+                )?;
+                merge_branch_state(state, then_state, else_state);
                 Ok(())
             }
             "record_literal" => {
@@ -2848,7 +2952,7 @@ impl CodeDb {
                         .get("value")
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("record field missing value"))?;
-                    self.verify_expr_borrows(root, child, param_types, locals, active, next_local)?;
+                    self.verify_expr_borrows(root, child, param_types, state, ExprUse::Value)?;
                 }
                 Ok(())
             }
@@ -2857,23 +2961,32 @@ impl CodeDb {
                     .get("target")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("field_access missing target"))?;
-                self.verify_expr_borrows(root, target, param_types, locals, active, next_local)?;
-                let place = self.loan_place_for_expr(expr_hash, param_types, locals)?;
-                self.check_shared_read_conflicts(&place, active)
+                self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
+                let place = self.loan_place_for_expr(expr_hash, param_types, &state.locals)?;
+                self.check_place_not_moved(&place, state)?;
+                match expr_use {
+                    ExprUse::Place => Ok(()),
+                    ExprUse::Value => {
+                        self.check_shared_read_conflicts(&place, &state.active)?;
+                        self.verify_place_value_use(root, expr_hash, param_types, state)
+                    }
+                }
             }
             "enum_construct" => {
                 let value = payload
                     .get("value")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("enum_construct missing value"))?;
-                self.verify_expr_borrows(root, value, param_types, locals, active, next_local)
+                self.verify_expr_borrows(root, value, param_types, state, ExprUse::Value)
             }
             "case" => {
                 let expr = payload
                     .get("expr")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("case missing expr"))?;
-                self.verify_expr_borrows(root, expr, param_types, locals, active, next_local)?;
+                self.verify_expr_borrows(root, expr, param_types, state, ExprUse::Value)?;
+                let base_state = state.clone();
+                let mut merged: Option<MoveBorrowState> = None;
                 for arm in payload
                     .get("arms")
                     .and_then(JsonValue::as_array)
@@ -2887,23 +3000,51 @@ impl CodeDb {
                         .get("binding_name")
                         .and_then(JsonValue::as_str)
                         .is_some();
+                    let mut arm_state = base_state.clone();
                     if pushed {
-                        let local_id = *next_local;
-                        *next_local += 1;
-                        locals.push(local_id);
+                        let local_id = arm_state.next_local;
+                        arm_state.next_local += 1;
+                        arm_state.locals.push(local_id);
                     }
-                    let result = self.verify_expr_borrows(
-                        root,
-                        body,
-                        param_types,
-                        locals,
-                        active,
-                        next_local,
-                    );
                     if pushed {
-                        locals.pop();
+                        let local_id = *arm_state
+                            .locals
+                            .last()
+                            .ok_or_else(|| anyhow!("case binding local missing"))?;
+                        self.verify_expr_borrows(
+                            root,
+                            body,
+                            param_types,
+                            &mut arm_state,
+                            ExprUse::Value,
+                        )?;
+                        let local_owner = LoanPlace {
+                            root: LoanRoot::Local(local_id),
+                            fields: Vec::new(),
+                        };
+                        arm_state
+                            .active
+                            .retain(|loan| !loan_owner_overlaps(loan, &local_owner));
+                        arm_state.moved.retain(
+                            |place| !matches!(place.root, LoanRoot::Local(id) if id == local_id),
+                        );
+                        arm_state.locals.pop();
+                    } else {
+                        self.verify_expr_borrows(
+                            root,
+                            body,
+                            param_types,
+                            &mut arm_state,
+                            ExprUse::Value,
+                        )?;
                     }
-                    result?;
+                    merged = Some(match merged {
+                        Some(previous) => merged_branch_states(previous, arm_state),
+                        None => arm_state,
+                    });
+                }
+                if let Some(merged) = merged {
+                    *state = merged;
                 }
                 Ok(())
             }
@@ -2913,11 +3054,12 @@ impl CodeDb {
 
     fn collect_value_loans(
         &self,
+        root: &ProgramRootPayload,
         expr_hash: &str,
         param_types: &[String],
-        locals: &[usize],
-        out: &mut Vec<ActiveLoan>,
-    ) -> Result<()> {
+        state: &MoveBorrowState,
+    ) -> Result<Vec<ActiveLoan>> {
+        let mut out = Vec::new();
         let payload = self.get_payload(expr_hash)?;
         match payload
             .get("expr_kind")
@@ -2937,9 +3079,9 @@ impl CodeDb {
                     } else {
                         LoanKind::Shared
                     },
-                    place: self.loan_place_for_expr(target, param_types, locals)?,
+                    place: self.loan_place_for_expr(target, param_types, &state.locals)?,
+                    owner: None,
                 });
-                Ok(())
             }
             "record_literal" => {
                 for field in payload
@@ -2951,9 +3093,8 @@ impl CodeDb {
                         .get("value")
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("record field missing value"))?;
-                    self.collect_value_loans(value, param_types, locals, out)?;
+                    out.extend(self.collect_value_loans(root, value, param_types, state)?);
                 }
-                Ok(())
             }
             "if" => {
                 for key in ["then", "else"] {
@@ -2961,12 +3102,91 @@ impl CodeDb {
                         .get(key)
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("if missing {key}"))?;
-                    self.collect_value_loans(child, param_types, locals, out)?;
+                    out.extend(self.collect_value_loans(root, child, param_types, state)?);
                 }
-                Ok(())
             }
-            _ => Ok(()),
+            "param_ref" | "local_ref" | "field_access" => {
+                let type_hash = self.expr_declared_type(expr_hash)?;
+                let class = self.value_class_in_root(root, &type_hash)?;
+                if class.contains_reference {
+                    let owner = self.loan_place_for_expr(expr_hash, param_types, &state.locals)?;
+                    out.extend(
+                        state
+                            .active
+                            .iter()
+                            .filter(|loan| loan_owner_overlaps(loan, &owner))
+                            .cloned(),
+                    );
+                }
+            }
+            _ => {}
         }
+        Ok(out)
+    }
+
+    fn verify_place_value_use(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        param_types: &[String],
+        state: &mut MoveBorrowState,
+    ) -> Result<()> {
+        let place = self.loan_place_for_expr(expr_hash, param_types, &state.locals)?;
+        self.check_place_not_moved(&place, state)?;
+        self.check_shared_read_conflicts(&place, &state.active)?;
+        let type_hash = self.expr_declared_type(expr_hash)?;
+        let class = self.value_class_in_root(root, &type_hash)?;
+        if class.copy_kind == ValueCopyKind::MoveOnly {
+            state.moved.push(place);
+        }
+        Ok(())
+    }
+
+    fn move_source_place_for_expr(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        param_types: &[String],
+        locals: &[usize],
+    ) -> Result<Option<LoanPlace>> {
+        let payload = self.get_payload(expr_hash)?;
+        match payload.get("expr_kind").and_then(JsonValue::as_str) {
+            Some("param_ref" | "local_ref" | "field_access") => {
+                let type_hash = self.expr_declared_type(expr_hash)?;
+                let class = self.value_class_in_root(root, &type_hash)?;
+                if class.copy_kind == ValueCopyKind::MoveOnly {
+                    Ok(Some(self.loan_place_for_expr(
+                        expr_hash,
+                        param_types,
+                        locals,
+                    )?))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn expr_declared_type(&self, expr_hash: &str) -> Result<String> {
+        self.get_payload(expr_hash)?
+            .get("type")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("expression missing type {expr_hash}"))
+    }
+
+    fn check_place_not_moved(&self, place: &LoanPlace, state: &MoveBorrowState) -> Result<()> {
+        for moved in &state.moved {
+            if places_overlap(place, moved) {
+                bail!(
+                    "bad_move: use after move of {:?}; attempted to use {:?}",
+                    moved,
+                    place
+                );
+            }
+        }
+        Ok(())
     }
 
     fn loan_place_for_expr(
@@ -3713,6 +3933,35 @@ fn local_usize_at_depth(locals: &[usize], depth: usize) -> Option<usize> {
         .checked_sub(depth + 1)
         .and_then(|idx| locals.get(idx))
         .copied()
+}
+
+fn loan_owner_overlaps(loan: &ActiveLoan, owner: &LoanPlace) -> bool {
+    loan.owner
+        .as_ref()
+        .is_some_and(|loan_owner| places_overlap(loan_owner, owner))
+}
+
+fn merge_branch_state(
+    state: &mut MoveBorrowState,
+    then_state: MoveBorrowState,
+    else_state: MoveBorrowState,
+) {
+    *state = merged_branch_states(then_state, else_state);
+}
+
+fn merged_branch_states(mut left: MoveBorrowState, right: MoveBorrowState) -> MoveBorrowState {
+    left.next_local = left.next_local.max(right.next_local);
+    for loan in right.active {
+        if !left.active.contains(&loan) {
+            left.active.push(loan);
+        }
+    }
+    for moved in right.moved {
+        if !left.moved.contains(&moved) {
+            left.moved.push(moved);
+        }
+    }
+    left
 }
 
 fn places_overlap(left: &LoanPlace, right: &LoanPlace) -> bool {

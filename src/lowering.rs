@@ -569,50 +569,10 @@ impl CodeDb {
                 })
             }
             "param_ref" => {
-                let lowered = self.lower_place(root, expr_hash, param_types, ctx, locals)?;
-                if self.is_aggregate_ir_type(root, &type_hash)? {
-                    return Ok(LoweredExpr {
-                        operations: lowered.operations,
-                        value: lowered.address,
-                        type_hash,
-                    });
-                }
-                let id = ctx.value();
-                ctx.push_debug_op(expr_hash, "load", &id);
-                let mut operations = lowered.operations;
-                operations.push(LoweredOp::Load {
-                    id: id.clone(),
-                    address: lowered.address,
-                    type_hash: type_hash.clone(),
-                });
-                Ok(LoweredExpr {
-                    operations,
-                    value: id,
-                    type_hash,
-                })
+                self.lower_place_value(root, expr_hash, &type_hash, param_types, ctx, locals)
             }
             "local_ref" => {
-                let lowered = self.lower_place(root, expr_hash, param_types, ctx, locals)?;
-                if self.is_aggregate_ir_type(root, &type_hash)? {
-                    return Ok(LoweredExpr {
-                        operations: lowered.operations,
-                        value: lowered.address,
-                        type_hash,
-                    });
-                }
-                let id = ctx.value();
-                ctx.push_debug_op(expr_hash, "load", &id);
-                let mut operations = lowered.operations;
-                operations.push(LoweredOp::Load {
-                    id: id.clone(),
-                    address: lowered.address,
-                    type_hash: type_hash.clone(),
-                });
-                Ok(LoweredExpr {
-                    operations,
-                    value: id,
-                    type_hash,
-                })
+                self.lower_place_value(root, expr_hash, &type_hash, param_types, ctx, locals)
             }
             "call" => {
                 let target_symbol_hash = payload
@@ -765,6 +725,18 @@ impl CodeDb {
                         ctx,
                         locals,
                     )?);
+                } else if self.is_aggregate_ir_type(root, &binding_type)?
+                    && self.expr_is_place(value_hash)?
+                {
+                    operations.extend(self.lower_aggregate_place_init_to_address(
+                        root,
+                        value_hash,
+                        &binding_type,
+                        &address,
+                        param_types,
+                        ctx,
+                        locals,
+                    )?);
                 } else {
                     let value = self.lower_expr(root, value_hash, param_types, ctx, locals)?;
                     if !self.type_assignable_in_root(root, &value.type_hash, &binding_type)? {
@@ -779,12 +751,18 @@ impl CodeDb {
                 }
                 locals.push(LocalLoweredBinding {
                     slot,
-                    type_hash: binding_type,
+                    type_hash: binding_type.clone(),
                 });
                 let body = self.lower_expr(root, body_hash, param_types, ctx, locals);
                 locals.pop();
                 let body = body?;
                 operations.extend(body.operations);
+                if self.type_requires_drop_scaffold(root, &binding_type)? {
+                    operations.push(LoweredOp::Drop {
+                        address,
+                        type_hash: binding_type,
+                    });
+                }
                 Ok(LoweredExpr {
                     operations,
                     value: body.value,
@@ -954,6 +932,86 @@ impl CodeDb {
                 })
             }
             "field_access" => {
+                self.lower_place_value(root, expr_hash, &type_hash, param_types, ctx, locals)
+            }
+            "enum_construct" | "case" => {
+                bail!("lowering v1 does not support aggregate expression kind {expr_kind}")
+            }
+            other => bail!("unknown expression kind {other}"),
+        }
+    }
+
+    fn lower_place_value(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let lowered = self.lower_place(root, expr_hash, param_types, ctx, locals)?;
+        if self.type_is_move_only(root, type_hash)? {
+            let id = ctx.value();
+            ctx.push_debug_op(expr_hash, "move", &id);
+            let mut operations = lowered.operations;
+            operations.push(LoweredOp::Move {
+                id: id.clone(),
+                address: lowered.address,
+                type_hash: type_hash.to_string(),
+            });
+            return Ok(LoweredExpr {
+                operations,
+                value: id,
+                type_hash: type_hash.to_string(),
+            });
+        }
+        if self.is_aggregate_ir_type(root, type_hash)? {
+            let id = ctx.value();
+            ctx.push_debug_op(expr_hash, "copy", &id);
+            let mut operations = lowered.operations;
+            operations.push(LoweredOp::Copy {
+                id: id.clone(),
+                value: lowered.address,
+                type_hash: type_hash.to_string(),
+            });
+            return Ok(LoweredExpr {
+                operations,
+                value: id,
+                type_hash: type_hash.to_string(),
+            });
+        }
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "load", &id);
+        let mut operations = lowered.operations;
+        operations.push(LoweredOp::Load {
+            id: id.clone(),
+            address: lowered.address,
+            type_hash: type_hash.to_string(),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash.to_string(),
+        })
+    }
+
+    fn lower_reference_value_for_place(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        match self.type_spec(type_hash)? {
+            TypeSpec::Reference { .. } => {}
+            _ => bail!("place reference lowering requires reference type"),
+        }
+        let payload = self.get_payload(expr_hash)?;
+        match payload.get("expr_kind").and_then(JsonValue::as_str) {
+            Some("param_ref" | "local_ref" | "field_access") => {
                 let lowered = self.lower_place(root, expr_hash, param_types, ctx, locals)?;
                 let id = ctx.value();
                 ctx.push_debug_op(expr_hash, "load", &id);
@@ -961,18 +1019,15 @@ impl CodeDb {
                 operations.push(LoweredOp::Load {
                     id: id.clone(),
                     address: lowered.address,
-                    type_hash: type_hash.clone(),
+                    type_hash: type_hash.to_string(),
                 });
                 Ok(LoweredExpr {
                     operations,
                     value: id,
-                    type_hash,
+                    type_hash: type_hash.to_string(),
                 })
             }
-            "enum_construct" | "case" => {
-                bail!("lowering v1 does not support aggregate expression kind {expr_kind}")
-            }
-            other => bail!("unknown expression kind {other}"),
+            _ => self.lower_expr(root, expr_hash, param_types, ctx, locals),
         }
     }
 
@@ -1059,8 +1114,14 @@ impl CodeDb {
                     TypeSpec::Reference {
                         mutable, referent, ..
                     } => {
-                        let lowered_ref =
-                            self.lower_expr(root, target_hash, param_types, ctx, locals)?;
+                        let lowered_ref = self.lower_reference_value_for_place(
+                            root,
+                            target_hash,
+                            &target_type,
+                            param_types,
+                            ctx,
+                            locals,
+                        )?;
                         let id = ctx.value();
                         let debug_kind = if mutable { "deref_mut" } else { "deref_shared" };
                         ctx.push_debug_op(expr_hash, debug_kind, &id);
@@ -1176,6 +1237,105 @@ impl CodeDb {
         Ok(operations)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn lower_aggregate_place_init_to_address(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        target_type: &str,
+        target_address: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<Vec<LoweredOp>> {
+        let source_payload = self.get_payload(expr_hash)?;
+        let source_type = expr_type(&source_payload, expr_hash)?;
+        if !self.type_assignable_in_root(root, &source_type, target_type)? {
+            bail!("aggregate initializer type mismatch while lowering");
+        }
+        let source = self.lower_place(root, expr_hash, param_types, ctx, locals)?;
+        let mut operations = source.operations;
+        let scaffold_id = ctx.value();
+        if self.type_is_move_only(root, &source_type)? {
+            ctx.push_debug_op(expr_hash, "move", &scaffold_id);
+            operations.push(LoweredOp::Move {
+                id: scaffold_id,
+                address: source.address.clone(),
+                type_hash: source_type.clone(),
+            });
+        } else {
+            ctx.push_debug_op(expr_hash, "copy", &scaffold_id);
+            operations.push(LoweredOp::Copy {
+                id: scaffold_id,
+                value: source.address.clone(),
+                type_hash: source_type.clone(),
+            });
+        }
+
+        for field in self.aggregate_record_fields(root, target_type)? {
+            let source_field_info =
+                self.lowered_record_field(root, &source.type_hash, &field.name)?;
+            if !self.type_assignable_in_root(
+                root,
+                &source_field_info.type_hash,
+                &field.type_hash,
+            )? {
+                bail!(
+                    "aggregate initializer field {} type mismatch while lowering",
+                    field.name
+                );
+            }
+
+            let source_field_address = ctx.value();
+            ctx.push_debug_op(expr_hash, "addr_of_field", &source_field_address);
+            operations.push(LoweredOp::AddrOfField {
+                id: source_field_address.clone(),
+                place: LoweredPlace::Field {
+                    base: source.address.clone(),
+                    field: field.name.clone(),
+                    field_symbol: source_field_info.field_symbol,
+                    owner_type_hash: source.type_hash.clone(),
+                    offset_bytes: source_field_info.offset_bytes,
+                    type_hash: source_field_info.type_hash.clone(),
+                },
+            });
+
+            let field_value = ctx.value();
+            ctx.push_debug_op(expr_hash, "load", &field_value);
+            operations.push(LoweredOp::Load {
+                id: field_value.clone(),
+                address: source_field_address,
+                type_hash: source_field_info.type_hash.clone(),
+            });
+
+            let target_field_info = self.lowered_record_field(root, target_type, &field.name)?;
+            let store_type_hash = if source_field_info.type_hash == target_field_info.type_hash {
+                target_field_info.type_hash.clone()
+            } else {
+                source_field_info.type_hash.clone()
+            };
+            let target_field_address = ctx.value();
+            ctx.push_debug_op(expr_hash, "addr_of_field", &target_field_address);
+            operations.push(LoweredOp::AddrOfField {
+                id: target_field_address.clone(),
+                place: LoweredPlace::Field {
+                    base: target_address.to_string(),
+                    field: field.name,
+                    field_symbol: target_field_info.field_symbol,
+                    owner_type_hash: target_type.to_string(),
+                    offset_bytes: target_field_info.offset_bytes,
+                    type_hash: store_type_hash.clone(),
+                },
+            });
+            operations.push(LoweredOp::Store {
+                address: target_field_address,
+                value: field_value,
+                type_hash: store_type_hash,
+            });
+        }
+        Ok(operations)
+    }
+
     fn lowered_record_field(
         &self,
         root: &ProgramRootPayload,
@@ -1219,12 +1379,70 @@ impl CodeDb {
         }
     }
 
+    fn aggregate_record_fields(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+    ) -> Result<Vec<crate::types::TypeFieldSpec>> {
+        match self.type_spec_in_root(root, type_hash)? {
+            TypeSpec::Record(fields) => Ok(fields),
+            other => bail!(
+                "aggregate place initializer requires record type, got {}",
+                other.to_source(self)?
+            ),
+        }
+    }
+
+    fn expr_is_place(&self, expr_hash: &str) -> Result<bool> {
+        let payload = self.get_payload(expr_hash)?;
+        Ok(matches!(
+            payload.get("expr_kind").and_then(JsonValue::as_str),
+            Some("param_ref" | "local_ref" | "field_access")
+        ))
+    }
+
     fn layout_size_bytes(&self, root: &ProgramRootPayload, type_hash: &str) -> Result<u64> {
         self.compute_type_layout(root, type_hash, DEFAULT_NATIVE_TARGET)?
             .metadata
             .get("size_bytes")
             .and_then(JsonValue::as_u64)
             .ok_or_else(|| anyhow!("type layout missing size_bytes for {type_hash}"))
+    }
+
+    fn type_is_move_only(&self, root: &ProgramRootPayload, type_hash: &str) -> Result<bool> {
+        let layout = self.compute_type_layout(root, type_hash, DEFAULT_NATIVE_TARGET)?;
+        match layout.metadata.get("copy_kind").and_then(JsonValue::as_str) {
+            Some("copy") => Ok(false),
+            Some("move_only") => Ok(true),
+            Some(other) => bail!("unknown copy_kind {other} for type {type_hash}"),
+            None => bail!("type layout missing copy_kind for {type_hash}"),
+        }
+    }
+
+    fn type_requires_drop_scaffold(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+    ) -> Result<bool> {
+        let layout = self.compute_type_layout(root, type_hash, DEFAULT_NATIVE_TARGET)?;
+        let move_only = match layout.metadata.get("copy_kind").and_then(JsonValue::as_str) {
+            Some("copy") => false,
+            Some("move_only") => true,
+            Some(other) => bail!("unknown copy_kind {other} for type {type_hash}"),
+            None => bail!("type layout missing copy_kind for {type_hash}"),
+        };
+        let needs_drop = match layout.metadata.get("drop_kind").and_then(JsonValue::as_str) {
+            Some("trivial") => false,
+            Some("needs_drop") => true,
+            Some(other) => bail!("unknown drop_kind {other} for type {type_hash}"),
+            None => bail!("type layout missing drop_kind for {type_hash}"),
+        };
+        let contains_reference = layout
+            .metadata
+            .get("contains_reference")
+            .and_then(JsonValue::as_bool)
+            .ok_or_else(|| anyhow!("type layout missing contains_reference for {type_hash}"))?;
+        Ok(move_only || needs_drop || contains_reference)
     }
 
     fn layout_field_offset_bytes(
@@ -1870,6 +2088,9 @@ impl CodeDb {
                     value,
                     type_hash,
                 } => {
+                    if self.type_is_move_only(root, type_hash)? {
+                        bail!("lowered copy requires a copy type");
+                    }
                     if value_type(values, value)? != type_hash {
                         bail!("lowered copy type mismatch");
                     }
@@ -1880,12 +2101,18 @@ impl CodeDb {
                     address,
                     type_hash,
                 } => {
+                    if !self.type_is_move_only(root, type_hash)? {
+                        bail!("lowered move requires a move-only type");
+                    }
                     if address_type(addresses, address)? != type_hash {
                         bail!("lowered move type mismatch");
                     }
                     insert_value(values, id, type_hash)?;
                 }
                 LoweredOp::Drop { address, type_hash } => {
+                    if !self.type_requires_drop_scaffold(root, type_hash)? {
+                        bail!("lowered drop requires a drop-relevant type");
+                    }
                     if address_type(addresses, address)? != type_hash {
                         bail!("lowered drop type mismatch");
                     }

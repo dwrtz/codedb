@@ -477,6 +477,14 @@ verify validates exclusive mutable loans
 
 Goal: make records with references and owned fields safe to move, copy, and drop.
 
+Status: implemented. Copy/move/drop classification is recomputed from v2
+layout metadata during semantic verification and lowered IR verification.
+Shared-reference records remain Copy and duplicate their carried loans when
+copied. Mutable-reference records are move-only; moving one transfers its loan
+to the new owner, using the old owner is rejected as `bad_move`, and lexical
+drop/end-of-scope removes the carried loan. Lowering now emits explicit
+`copy`, `move`, and `drop` scaffolding for these cases.
+
 Deliverables:
 
 ```text
