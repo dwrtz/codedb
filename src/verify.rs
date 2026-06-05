@@ -1444,6 +1444,7 @@ impl CodeDb {
             .names
             .iter()
             .map(|binding| binding.module.clone())
+            .chain(root.type_names.iter().map(|binding| binding.module.clone()))
             .collect::<BTreeSet<_>>();
         let mut metadata_modules = BTreeSet::new();
         for entry in entries {

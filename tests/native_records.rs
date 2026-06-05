@@ -266,6 +266,70 @@ fn main() -> i64 = 1
 }
 
 #[test]
+fn direct_record_literal_return_compiles_and_runs_native() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("direct-record-return.sqlite");
+    let source = temp.path().join("direct-record-return.cdb");
+    let apply = temp.path().join("direct-record-return.apply.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Pair {
+  left: i64
+  right: i64
+}
+
+fn make_pair() -> Pair = { left: 10, right: 7 }
+
+fn main() -> i64 =
+  let pair: Pair = make_pair() in
+  pair.left + pair.right
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "17");
+    std::fs::write(
+        &apply,
+        serde_json::to_string_pretty(&json!({
+            "schema": "codedb/apply/v1",
+            "operations": [
+                {
+                    "kind": "create_test",
+                    "name": "direct_record_return",
+                    "entry": "make_pair",
+                    "native_required": true,
+                    "expected": {
+                        "kind": "record",
+                        "fields": [
+                            { "name": "left", "value": { "kind": "i64", "value": "10" } },
+                            { "name": "right", "value": { "kind": "i64", "value": "7" } }
+                        ]
+                    }
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let created = parse_json(&run(&["apply", path(&db), "--json", path(&apply)]));
+    assert_eq!(created["status"], "applied");
+
+    let report = parse_json(&run(&["test", path(&db), "--json"]));
+    if can_build_default_native_target() {
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+    } else {
+        assert_eq!(report["status"], "failed");
+        assert_eq!(report["unsupported"], 1);
+    }
+    run(&["verify", path(&db)]);
+}
+
+#[test]
 fn by_value_record_return_test_uses_layout_abi() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("tiny-record-test.sqlite");

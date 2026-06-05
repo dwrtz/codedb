@@ -837,6 +837,7 @@ impl CodeDb {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn native_value_comparison(
         &self,
         root: &ProgramRootPayload,

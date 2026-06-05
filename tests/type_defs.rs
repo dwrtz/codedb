@@ -176,6 +176,120 @@ fn field_and_variant_renames_preserve_member_identity() {
 }
 
 #[test]
+fn type_move_add_and_remove_operations_update_type_definitions() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("type-ops.sqlite");
+    let create = temp.path().join("create-types.json");
+    let add_field = temp.path().join("add-field.json");
+    let add_variant = temp.path().join("add-variant.json");
+    let move_type = temp.path().join("move-type.json");
+    let remove_field = temp.path().join("remove-field.json");
+    let remove_variant = temp.path().join("remove-variant.json");
+
+    run(&["init", path(&db)]);
+    std::fs::write(
+        &create,
+        r#"
+{
+  "schema": "codedb/apply/v1",
+  "operations": [
+    {
+      "kind": "create_type",
+      "name": "Line",
+      "birth_seed": "line-type",
+      "definition": {
+        "kind": "record",
+        "fields": [
+          { "name": "price_cents", "type": "i64" }
+        ]
+      }
+    },
+    {
+      "kind": "create_type",
+      "name": "Discount",
+      "birth_seed": "discount-type",
+      "definition": {
+        "kind": "enum",
+        "variants": [
+          { "name": "none", "type": "unit" }
+        ]
+      }
+    }
+  ]
+}
+"#,
+    )
+    .unwrap();
+    run(&["apply", path(&db), "--json", path(&create)]);
+
+    std::fs::write(
+        &add_field,
+        r#"{ "kind": "add_field", "type": "Line", "field": { "name": "qty", "type": "i64" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &add_variant,
+        r#"{ "kind": "add_variant", "type": "Discount", "variant": { "name": "fixed", "type": "i64" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &move_type,
+        r#"{ "kind": "move_type", "name": "Line", "new_module": "billing" }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &remove_field,
+        r#"{ "kind": "remove_field", "module": "billing", "type": "Line", "field": "qty" }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &remove_variant,
+        r#"{ "kind": "remove_variant", "type": "Discount", "variant": "fixed" }"#,
+    )
+    .unwrap();
+
+    run(&["apply", path(&db), "--json", path(&add_field)]);
+    run(&["apply", path(&db), "--json", path(&add_variant)]);
+    run(&["apply", path(&db), "--json", path(&move_type)]);
+    let moved = list_json(&db);
+    let line = type_by_name(&moved, "Line");
+    assert_eq!(line["module"], "billing");
+    assert!(
+        line["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| { field["name"].as_str() == Some("qty") })
+    );
+    assert!(
+        type_by_name(&moved, "Discount")["variants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|variant| variant["name"].as_str() == Some("fixed"))
+    );
+
+    run(&["apply", path(&db), "--json", path(&remove_field)]);
+    run(&["apply", path(&db), "--json", path(&remove_variant)]);
+    run(&["verify", path(&db)]);
+    let after = list_json(&db);
+    assert!(
+        !type_by_name(&after, "Line")["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field["name"].as_str() == Some("qty"))
+    );
+    assert!(
+        !type_by_name(&after, "Discount")["variants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|variant| variant["name"].as_str() == Some("fixed"))
+    );
+}
+
+#[test]
 fn renamed_types_and_members_round_trip_projection_with_stable_identities() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("renamed-identities.sqlite");
@@ -421,7 +535,9 @@ fn member_symbol(type_entry: &JsonValue, member_key: &str, name: &str) -> String
         .to_string()
 }
 
-fn type_identity_summary(listing: &JsonValue) -> Vec<(String, String, Vec<(String, String)>)> {
+type TypeIdentitySummary = Vec<(String, String, Vec<(String, String)>)>;
+
+fn type_identity_summary(listing: &JsonValue) -> TypeIdentitySummary {
     listing["types"]
         .as_array()
         .unwrap()

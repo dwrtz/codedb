@@ -1140,6 +1140,7 @@ impl CodeDb {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn expr_to_source_with_locals(
         &self,
         expr_hash: &str,

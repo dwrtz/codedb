@@ -2613,6 +2613,7 @@ impl CodeDb {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn function_signature_source_matches(
         &self,
         root: &ProgramRootPayload,
@@ -3070,7 +3071,7 @@ impl CodeDb {
             &param_types,
             &region_scope,
         )?;
-        if typed_body.type_hash != return_type_hash {
+        if !self.type_assignable_in_root(&root, &typed_body.type_hash, &return_type_hash)? {
             bail!(
                 "function {module}.{name} body type {} does not match return type {}",
                 self.type_name(&typed_body.type_hash)?,
@@ -3798,7 +3799,7 @@ impl CodeDb {
             &param_types,
             &region_scope,
         )?;
-        if typed_body.type_hash != return_type {
+        if !self.type_assignable_in_root(&root, &typed_body.type_hash, &return_type)? {
             bail!(
                 "replacement body type {} does not match return type {}",
                 self.type_name(&typed_body.type_hash)?,
@@ -3889,7 +3890,7 @@ impl CodeDb {
             &param_types,
             &region_scope,
         )?;
-        if typed_body.type_hash != return_type_hash {
+        if !self.type_assignable_in_root(&root, &typed_body.type_hash, &return_type_hash)? {
             bail!(
                 "body type {} does not match new return type {}",
                 self.type_name(&typed_body.type_hash)?,
@@ -3999,7 +4000,7 @@ impl CodeDb {
             &param_types,
             &region_scope,
         )?;
-        if typed_body.type_hash != return_type {
+        if !self.type_assignable_in_root(&root, &typed_body.type_hash, &return_type)? {
             bail!(
                 "body type {} does not match new return type {}",
                 self.type_name(&typed_body.type_hash)?,
@@ -4053,7 +4054,11 @@ impl CodeDb {
                     &caller_param_types,
                     &caller_region_scope,
                 )?;
-                if typed_caller.type_hash != caller_return_type {
+                if !self.type_assignable_in_root(
+                    &root,
+                    &typed_caller.type_hash,
+                    &caller_return_type,
+                )? {
                     bail!(
                         "caller body type {} does not match return type {}",
                         self.type_name(&typed_caller.type_hash)?,
@@ -4600,7 +4605,7 @@ impl CodeDb {
                 &param_types,
                 &region_scope,
             )?;
-            if typed_body.type_hash != return_type {
+            if !self.type_assignable_in_root(root, &typed_body.type_hash, &return_type)? {
                 bail!(
                     "renamed member rewrite changed function {} body type from {} to {}",
                     self.symbol_display(old_root, &symbol)?,
@@ -4614,6 +4619,7 @@ impl CodeDb {
         Ok(())
     }
 
+    #[allow(clippy::replace_box, clippy::too_many_arguments)]
     fn rewrite_typed_expr_for_member_rename(
         &self,
         old_root: &ProgramRootPayload,

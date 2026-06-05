@@ -278,6 +278,11 @@ existing function-only programs still work
 
 Goal: compute deterministic native layouts for v2 types.
 
+Status: implemented. V2 type layouts now compute deterministic scalar, record,
+enum, reference, raw pointer, and fixed-array metadata with target-specific
+size/alignment, ABI classification, copy/move/drop scaffold classification,
+layout cache keys, and verification that recomputes cached layout artifacts.
+
 Deliverables:
 
 ```text

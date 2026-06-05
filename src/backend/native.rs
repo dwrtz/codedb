@@ -623,6 +623,7 @@ fn validate_native_ir(ir: &LoweredFunctionIr) -> Result<()> {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_native_ops(
     operations: &[LoweredOp],
     params: &[LoweredParamSlot],
@@ -959,7 +960,8 @@ fn validate_native_op_flow(
             }
         }
         LoweredOp::Return { value, type_hash } => {
-            if native_value_type(values, value)? != type_hash {
+            let actual = native_value_type(values, value)?;
+            if actual != type_hash && !native_layout_compatible(type_layouts, actual, type_hash)? {
                 bail!("native object backend saw return type mismatch");
             }
         }
@@ -1048,6 +1050,22 @@ fn native_returns_indirect(
     type_hash: &str,
 ) -> Result<bool> {
     Ok(native_type_layout(layouts, type_hash)?.abi.return_ == "hidden_return_slot")
+}
+
+fn native_layout_compatible(
+    layouts: &BTreeMap<String, LoweredTypeLayout>,
+    actual: &str,
+    expected: &str,
+) -> Result<bool> {
+    if actual == expected {
+        return Ok(true);
+    }
+    let actual = native_type_layout(layouts, actual)?;
+    let expected = native_type_layout(layouts, expected)?;
+    Ok(actual.kind == expected.kind
+        && actual.size_bytes == expected.size_bytes
+        && actual.align_bytes == expected.align_bytes
+        && actual.abi == expected.abi)
 }
 
 fn native_debug_metadata(compiled: &CompiledFunction) -> JsonValue {

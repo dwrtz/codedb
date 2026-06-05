@@ -283,18 +283,32 @@ impl LayoutComputer<'_> {
                 self.dependency_type_def_hashes
                     .insert(entry.type_def.clone());
                 match definition {
-                    TypeDefinition::Record { fields, .. } => self.layout_record(
-                        type_hash,
-                        Some(type_symbol),
-                        Some(entry.type_def.clone()),
-                        record_members(fields),
-                    ),
-                    TypeDefinition::Enum { variants, .. } => self.layout_enum(
-                        type_hash,
-                        Some(type_symbol),
-                        Some(entry.type_def.clone()),
-                        enum_members(variants),
-                    ),
+                    TypeDefinition::Record { fields, .. } => {
+                        let TypeSpec::Record(expanded_fields) =
+                            self.db.type_spec_in_root(self.root, type_hash)?
+                        else {
+                            bail!("named record did not expand to record layout members");
+                        };
+                        self.layout_record(
+                            type_hash,
+                            Some(type_symbol),
+                            Some(entry.type_def.clone()),
+                            record_members(fields, expanded_fields)?,
+                        )
+                    }
+                    TypeDefinition::Enum { variants, .. } => {
+                        let TypeSpec::Enum(expanded_variants) =
+                            self.db.type_spec_in_root(self.root, type_hash)?
+                        else {
+                            bail!("named enum did not expand to enum layout members");
+                        };
+                        self.layout_enum(
+                            type_hash,
+                            Some(type_symbol),
+                            Some(entry.type_def.clone()),
+                            enum_members(variants, expanded_variants)?,
+                        )
+                    }
                 }
             }
             TypeSpec::Reference {
@@ -573,24 +587,44 @@ fn abi_metadata(kind: &str, size_bytes: u64) -> JsonValue {
     }
 }
 
-fn record_members(fields: Vec<TypeMemberDef>) -> Vec<LayoutMember> {
-    fields
-        .into_iter()
-        .map(|field| LayoutMember {
-            symbol: Some(field.member_symbol),
-            name: field.name,
-            type_hash: field.type_hash,
-        })
-        .collect()
+fn record_members(
+    fields: Vec<TypeMemberDef>,
+    expanded_fields: Vec<TypeFieldSpec>,
+) -> Result<Vec<LayoutMember>> {
+    members_with_expanded_types("record field", fields, expanded_fields)
 }
 
-fn enum_members(variants: Vec<TypeMemberDef>) -> Vec<LayoutMember> {
-    variants
+fn enum_members(
+    variants: Vec<TypeMemberDef>,
+    expanded_variants: Vec<TypeFieldSpec>,
+) -> Result<Vec<LayoutMember>> {
+    members_with_expanded_types("enum variant", variants, expanded_variants)
+}
+
+fn members_with_expanded_types(
+    label: &str,
+    members: Vec<TypeMemberDef>,
+    expanded: Vec<TypeFieldSpec>,
+) -> Result<Vec<LayoutMember>> {
+    if members.len() != expanded.len() {
+        bail!("{label} expansion changed member count");
+    }
+    members
         .into_iter()
-        .map(|variant| LayoutMember {
-            symbol: Some(variant.member_symbol),
-            name: variant.name,
-            type_hash: variant.type_hash,
+        .zip(expanded)
+        .map(|(member, expanded)| {
+            if member.name != expanded.name {
+                bail!(
+                    "{label} expansion order mismatch: expected {}, got {}",
+                    member.name,
+                    expanded.name
+                );
+            }
+            Ok(LayoutMember {
+                symbol: Some(member.member_symbol),
+                name: member.name,
+                type_hash: expanded.type_hash,
+            })
         })
         .collect()
 }
@@ -629,4 +663,64 @@ fn align_up(value: u64, align: u64) -> Result<u64> {
         .checked_add(addend)
         .ok_or_else(|| anyhow!("layout alignment overflows"))?;
     Ok((rounded / align) * align)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    use crate::DEFAULT_NATIVE_TARGET;
+    use crate::model::resolve_function_name_in_root;
+    use tempfile::tempdir;
+
+    #[test]
+    fn named_record_layout_fields_use_instantiated_region_args() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("layout-regions.sqlite");
+        let source_path = temp.path().join("layout-regions.cdb");
+        fs::write(
+            &source_path,
+            r#"
+record Line {
+  price_cents: i64
+}
+
+record LineView<'view> {
+  line: &'view Line
+}
+
+fn id_view<'call>(view: LineView<'call>) -> LineView<'call> = view
+"#,
+        )
+        .unwrap();
+
+        let mut db = CodeDb::open(&db_path).unwrap();
+        db.init().unwrap();
+        db.import_file(&source_path).unwrap();
+
+        let branch = db.branch(MAIN_BRANCH).unwrap();
+        let root = db.load_root(&branch.root_hash).unwrap();
+        let symbol = resolve_function_name_in_root(&root, MAIN_BRANCH, "id_view").unwrap();
+        let entry = db.root_symbol(&root, &symbol).unwrap();
+        let (_, return_type) = db.signature_parts(&entry.signature).unwrap();
+        let function_region = db.signature_region_params(&entry.signature).unwrap()[0]
+            .region
+            .clone();
+
+        let layout = db
+            .compute_type_layout(&root, &return_type, DEFAULT_NATIVE_TARGET)
+            .unwrap()
+            .metadata;
+        let layout_field_type = layout["fields"][0]["type_hash"].as_str().unwrap();
+        let TypeSpec::Record(fields) = db.type_spec_in_root(&root, &return_type).unwrap() else {
+            panic!("return type should expand to a record");
+        };
+        assert_eq!(layout_field_type, fields[0].type_hash);
+
+        let TypeSpec::Reference { region, .. } = db.type_spec(layout_field_type).unwrap() else {
+            panic!("layout field should be a reference");
+        };
+        assert_eq!(region, function_region);
+    }
 }

@@ -2060,6 +2060,7 @@ impl CodeDb {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn verify_value_ops(
         &self,
         root: &ProgramRootPayload,
@@ -2510,6 +2511,7 @@ impl CodeDb {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn verify_lowered_block(
         &self,
         root: &ProgramRootPayload,

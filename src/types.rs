@@ -617,6 +617,7 @@ impl CodeDb {
         type_hash_for_spec(&parsed)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn type_hash_for_source_in_root(
         &self,
         current_module: &str,
@@ -722,6 +723,7 @@ impl CodeDb {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn type_name_in_root(
         &self,
         root: &ProgramRootPayload,
@@ -2018,6 +2020,7 @@ impl CodeDb {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn type_expr_with_locals(
         &mut self,
         current_module: &str,
@@ -2993,7 +2996,7 @@ impl CodeDb {
             }
             let body = self.function_body_hash(&entry.definition)?;
             let actual = self.verify_expr_type(&body, &root, &param_types, &allowed_regions)?;
-            if actual != return_type {
+            if !self.type_assignable_in_root(&root, &actual, &return_type)? {
                 bail!(
                     "bad_type: function {} returns {}, body is {}",
                     self.symbol_display(&root, &entry.symbol)?,
