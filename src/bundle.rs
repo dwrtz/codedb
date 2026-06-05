@@ -1351,6 +1351,16 @@ fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<St
                     push_hash_ref(payload.get("right"), refs);
                 }
                 Some("unary") => push_hash_ref(payload.get("expr"), refs),
+                Some("borrow_shared" | "borrow_mut") => {
+                    push_hash_ref(payload.get("target"), refs);
+                    push_hash_ref(payload.get("region"), refs);
+                    push_hash_ref(payload.get("referent_type"), refs);
+                }
+                Some("assign") => {
+                    push_hash_ref(payload.get("target"), refs);
+                    push_hash_ref(payload.get("value"), refs);
+                    push_hash_ref(payload.get("target_type"), refs);
+                }
                 Some("let") => {
                     push_hash_ref(payload.get("binding_type"), refs);
                     push_hash_ref(payload.get("value"), refs);

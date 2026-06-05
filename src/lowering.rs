@@ -184,7 +184,19 @@ pub(crate) enum LoweredOp {
         referent_type_hash: String,
         type_hash: String,
     },
+    BorrowMut {
+        id: String,
+        address: String,
+        region: String,
+        referent_type_hash: String,
+        type_hash: String,
+    },
     DerefShared {
+        id: String,
+        reference: String,
+        referent_type_hash: String,
+    },
+    DerefMut {
         id: String,
         reference: String,
         referent_type_hash: String,
@@ -820,6 +832,80 @@ impl CodeDb {
                     type_hash,
                 })
             }
+            "borrow_mut" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_mut missing target"))?;
+                let region = payload
+                    .get("region")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_mut missing region"))?
+                    .to_string();
+                let referent_type_hash = payload
+                    .get("referent_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_mut missing referent_type"))?
+                    .to_string();
+                let target = self.lower_place(root, target_hash, param_types, ctx, locals)?;
+                if target.type_hash != referent_type_hash {
+                    bail!("borrow_mut referent type mismatch while lowering");
+                }
+                let id = ctx.value();
+                ctx.push_debug_op(expr_hash, "borrow_mut", &id);
+                let mut operations = target.operations;
+                operations.push(LoweredOp::BorrowDebug {
+                    address: target.address.clone(),
+                    mutable: true,
+                    region: Some(region.clone()),
+                    type_hash: referent_type_hash.clone(),
+                });
+                operations.push(LoweredOp::BorrowMut {
+                    id: id.clone(),
+                    address: target.address,
+                    region,
+                    referent_type_hash,
+                    type_hash: type_hash.clone(),
+                });
+                Ok(LoweredExpr {
+                    operations,
+                    value: id,
+                    type_hash,
+                })
+            }
+            "assign" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("assign missing target"))?;
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("assign missing value"))?;
+                let target = self.lower_place(root, target_hash, param_types, ctx, locals)?;
+                let value = self.lower_expr(root, value_hash, param_types, ctx, locals)?;
+                if !self.type_assignable_in_root(root, &value.type_hash, &target.type_hash)? {
+                    bail!("assignment type mismatch while lowering");
+                }
+                let id = ctx.value();
+                ctx.push_debug_op(expr_hash, "const_unit", &id);
+                let mut operations = target.operations;
+                operations.extend(value.operations);
+                operations.push(LoweredOp::Store {
+                    address: target.address,
+                    value: value.value,
+                    type_hash: target.type_hash,
+                });
+                operations.push(LoweredOp::ConstUnit {
+                    id: id.clone(),
+                    type_hash: type_hash.clone(),
+                });
+                Ok(LoweredExpr {
+                    operations,
+                    value: id,
+                    type_hash,
+                })
+            }
             "record_literal" => {
                 bail!("lowering v1 supports record literals only as typed let initializers")
             }
@@ -971,28 +1057,32 @@ impl CodeDb {
                 let target_type = expr_type(&target_payload, target_hash)?;
                 let target = match self.type_spec(&target_type)? {
                     TypeSpec::Reference {
-                        mutable: false,
-                        referent,
-                        ..
+                        mutable, referent, ..
                     } => {
                         let lowered_ref =
                             self.lower_expr(root, target_hash, param_types, ctx, locals)?;
                         let id = ctx.value();
-                        ctx.push_debug_op(expr_hash, "deref_shared", &id);
+                        let debug_kind = if mutable { "deref_mut" } else { "deref_shared" };
+                        ctx.push_debug_op(expr_hash, debug_kind, &id);
                         let mut operations = lowered_ref.operations;
-                        operations.push(LoweredOp::DerefShared {
-                            id: id.clone(),
-                            reference: lowered_ref.value,
-                            referent_type_hash: referent.clone(),
-                        });
+                        if mutable {
+                            operations.push(LoweredOp::DerefMut {
+                                id: id.clone(),
+                                reference: lowered_ref.value,
+                                referent_type_hash: referent.clone(),
+                            });
+                        } else {
+                            operations.push(LoweredOp::DerefShared {
+                                id: id.clone(),
+                                reference: lowered_ref.value,
+                                referent_type_hash: referent.clone(),
+                            });
+                        }
                         LoweredAddress {
                             operations,
                             address: id,
                             type_hash: referent,
                         }
-                    }
-                    TypeSpec::Reference { mutable: true, .. } => {
-                        bail!("mutable reference field access is reserved for phase 7")
                     }
                     _ => self.lower_place(root, target_hash, param_types, ctx, locals)?,
                 };
@@ -1596,6 +1686,29 @@ impl CodeDb {
                     }
                     insert_value(values, id, type_hash)?;
                 }
+                LoweredOp::BorrowMut {
+                    id,
+                    address,
+                    region,
+                    referent_type_hash,
+                    type_hash,
+                } => {
+                    if !is_hash(region) {
+                        bail!("lowered borrow_mut region is not a hash");
+                    }
+                    if address_type(addresses, address)? != referent_type_hash {
+                        bail!("lowered borrow_mut referent type mismatch");
+                    }
+                    match self.type_spec(type_hash)? {
+                        TypeSpec::Reference {
+                            region: actual_region,
+                            mutable: true,
+                            referent,
+                        } if actual_region == *region && referent == *referent_type_hash => {}
+                        _ => bail!("lowered borrow_mut type mismatch"),
+                    }
+                    insert_value(values, id, type_hash)?;
+                }
                 LoweredOp::DerefShared {
                     id,
                     reference,
@@ -1608,6 +1721,24 @@ impl CodeDb {
                             ..
                         } if referent == *referent_type_hash => {}
                         _ => bail!("lowered deref_shared requires shared reference value"),
+                    }
+                    insert_address(addresses, id, referent_type_hash)?;
+                    if self.is_aggregate_ir_type(root, referent_type_hash)? {
+                        insert_value(values, id, referent_type_hash)?;
+                    }
+                }
+                LoweredOp::DerefMut {
+                    id,
+                    reference,
+                    referent_type_hash,
+                } => {
+                    match self.type_spec(value_type(values, reference)?)? {
+                        TypeSpec::Reference {
+                            mutable: true,
+                            referent,
+                            ..
+                        } if referent == *referent_type_hash => {}
+                        _ => bail!("lowered deref_mut requires mutable reference value"),
                     }
                     insert_address(addresses, id, referent_type_hash)?;
                     if self.is_aggregate_ir_type(root, referent_type_hash)? {
@@ -2003,7 +2134,9 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::Call { id, .. }
         | LoweredOp::If { id, .. }
         | LoweredOp::BorrowShared { id, .. }
+        | LoweredOp::BorrowMut { id, .. }
         | LoweredOp::DerefShared { id, .. }
+        | LoweredOp::DerefMut { id, .. }
         | LoweredOp::AddrOfParam { id, .. }
         | LoweredOp::AddrOfLocal { id, .. }
         | LoweredOp::AddrOfField { id, .. }
@@ -2029,7 +2162,9 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::Call { .. } => "call",
         LoweredOp::If { .. } => "if",
         LoweredOp::BorrowShared { .. } => "borrow_shared",
+        LoweredOp::BorrowMut { .. } => "borrow_mut",
         LoweredOp::DerefShared { .. } => "deref_shared",
+        LoweredOp::DerefMut { .. } => "deref_mut",
         LoweredOp::AddrOfParam { .. } => "addr_of_param",
         LoweredOp::AddrOfLocal { .. } => "addr_of_local",
         LoweredOp::AddrOfField { .. } => "addr_of_field",

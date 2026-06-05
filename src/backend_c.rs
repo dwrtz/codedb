@@ -292,7 +292,8 @@ impl CodeDb {
                     self.c_expr_with_locals(else_hash, root, local_params, locals, 0)?
                 )
             }
-            "record_literal" | "field_access" | "enum_construct" | "case" => {
+            "borrow_shared" | "borrow_mut" | "assign" | "record_literal" | "field_access"
+            | "enum_construct" | "case" => {
                 bail!(
                     "C projection v0 does not support {other}",
                     other = payload

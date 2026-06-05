@@ -427,6 +427,13 @@ trace maps dereference and field read to semantic place
 
 Goal: support exclusive mutable references and assignment through semantic places.
 
+Status: implemented. Mutable references now have projection syntax and typed
+`borrow_mut` expressions, assignment expressions returning `unit`, exclusive
+loan verification, state-effect enforcement, mutable-reference record fields,
+move-only layout classification, trace support, memory-aware IR lowering through
+`borrow_mut`/`deref_mut`/`store`, and native pointer store codegen for the
+`mutable_cursor.cdb` acceptance program.
+
 Deliverables:
 
 ```text

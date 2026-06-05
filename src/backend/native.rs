@@ -557,7 +557,9 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::Unary { .. }
             | LoweredOp::Binary { .. }
             | LoweredOp::BorrowShared { .. }
+            | LoweredOp::BorrowMut { .. }
             | LoweredOp::DerefShared { .. }
+            | LoweredOp::DerefMut { .. }
             | LoweredOp::AddrOfParam { .. }
             | LoweredOp::AddrOfLocal { .. }
             | LoweredOp::AddrOfField { .. }
@@ -630,7 +632,10 @@ fn validate_native_ops(
                     bail!("native object backend v0 supports only i64, bool, and unit values");
                 }
             }
-            LoweredOp::BorrowShared { .. } | LoweredOp::DerefShared { .. } => {}
+            LoweredOp::BorrowShared { .. }
+            | LoweredOp::BorrowMut { .. }
+            | LoweredOp::DerefShared { .. }
+            | LoweredOp::DerefMut { .. } => {}
             LoweredOp::AddrOfParam { place, .. } => {
                 let LoweredPlace::Param {
                     slot, type_hash, ..
@@ -786,13 +791,25 @@ fn validate_native_op_flow(
             referent_type_hash,
             type_hash,
             ..
+        }
+        | LoweredOp::BorrowMut {
+            id,
+            address,
+            referent_type_hash,
+            type_hash,
+            ..
         } => {
             if native_address_type(addresses, address)? != referent_type_hash {
-                bail!("native object backend saw borrow_shared referent mismatch");
+                bail!("native object backend saw borrow referent mismatch");
             }
             native_insert_value(values, id, type_hash)?;
         }
         LoweredOp::DerefShared {
+            id,
+            reference,
+            referent_type_hash,
+        }
+        | LoweredOp::DerefMut {
             id,
             reference,
             referent_type_hash,
@@ -1110,7 +1127,9 @@ fn collect_value_ids_inner(
             | LoweredOp::Binary { id, .. }
             | LoweredOp::Call { id, .. }
             | LoweredOp::BorrowShared { id, .. }
+            | LoweredOp::BorrowMut { id, .. }
             | LoweredOp::DerefShared { id, .. }
+            | LoweredOp::DerefMut { id, .. }
             | LoweredOp::AddrOfParam { id, .. }
             | LoweredOp::AddrOfLocal { id, .. }
             | LoweredOp::AddrOfField { id, .. }
@@ -1263,11 +1282,13 @@ impl FunctionEmitter {
             } => {
                 self.emit_if(id, cond, then_block, else_block)?;
             }
-            LoweredOp::BorrowShared { id, address, .. } => {
+            LoweredOp::BorrowShared { id, address, .. }
+            | LoweredOp::BorrowMut { id, address, .. } => {
                 self.mov_rax_stack(self.value_offset(address)?);
                 self.mov_stack_rax(self.value_offset(id)?);
             }
-            LoweredOp::DerefShared { id, reference, .. } => {
+            LoweredOp::DerefShared { id, reference, .. }
+            | LoweredOp::DerefMut { id, reference, .. } => {
                 self.mov_rax_stack(self.value_offset(reference)?);
                 self.mov_stack_rax(self.value_offset(id)?);
             }
@@ -1780,11 +1801,13 @@ impl Arm64Emitter {
             } => {
                 self.emit_if(id, cond, then_block, else_block)?;
             }
-            LoweredOp::BorrowShared { id, address, .. } => {
+            LoweredOp::BorrowShared { id, address, .. }
+            | LoweredOp::BorrowMut { id, address, .. } => {
                 self.ldr_stack(0, self.value_offset(address)?)?;
                 self.str_stack(0, self.value_offset(id)?)?;
             }
-            LoweredOp::DerefShared { id, reference, .. } => {
+            LoweredOp::DerefShared { id, reference, .. }
+            | LoweredOp::DerefMut { id, reference, .. } => {
                 self.ldr_stack(0, self.value_offset(reference)?)?;
                 self.str_stack(0, self.value_offset(id)?)?;
             }

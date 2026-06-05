@@ -473,6 +473,7 @@ fn reserved_projection_identifier(name: &str) -> bool {
             | "let"
             | "in"
             | "module"
+            | "mut"
             | "of"
             | "record"
             | "true"

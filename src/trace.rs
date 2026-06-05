@@ -80,6 +80,12 @@ impl TraceValue {
                     value: TraceValue::from_value(value),
                 }],
             },
+            Value::MutRef(value) => TraceValue::Record {
+                fields: vec![TraceRecordField {
+                    name: "mut_ref".to_string(),
+                    value: TraceValue::from_value(value),
+                }],
+            },
             Value::Record(fields) => TraceValue::Record {
                 fields: fields
                     .iter()
@@ -487,6 +493,7 @@ impl CodeDb {
             bail!("cannot trace external function {function_name}");
         }
         let body = self.function_body_hash(&root_symbol.definition)?;
+        let mut args = args;
         let mut locals = Vec::new();
         let value = self.trace_expr(
             state,
@@ -494,7 +501,7 @@ impl CodeDb {
             symbol,
             &root_symbol.definition,
             &body,
-            &args,
+            &mut args,
             &mut locals,
         )?;
         state.events.push(TraceEvent::ExitFunction {
@@ -516,7 +523,7 @@ impl CodeDb {
         symbol_hash: &str,
         function_def_hash: &str,
         expr_hash: &str,
-        args: &[Value],
+        args: &mut Vec<Value>,
         locals: &mut Vec<Value>,
     ) -> Result<Value> {
         let payload = match self.get_payload(expr_hash) {
@@ -800,6 +807,59 @@ impl CodeDb {
                     value,
                 )
             }
+            "borrow_mut" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_mut missing target"))?;
+                let value = self
+                    .trace_expr(
+                        state,
+                        frame,
+                        symbol_hash,
+                        function_def_hash,
+                        target_hash,
+                        args,
+                        locals,
+                    )
+                    .map(|value| Value::MutRef(Box::new(value)));
+                self.finish_current_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    expr_hash,
+                    value,
+                )
+            }
+            "assign" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("assign missing target"))?;
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("assign missing value"))?;
+                let value = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    value_hash,
+                    args,
+                    locals,
+                )?;
+                *self.trace_place_mut(target_hash, args, locals)? = value;
+                self.finish_current_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    expr_hash,
+                    Ok(Value::Unit),
+                )
+            }
             "let" => {
                 let name = payload
                     .get("binding_name")
@@ -988,6 +1048,13 @@ impl CodeDb {
                             .ok_or_else(|| anyhow!("record value has no field {field}")),
                         other => bail!("field access target evaluated to non-record {other}"),
                     },
+                    Value::MutRef(value) => match value.as_ref() {
+                        Value::Record(fields) => fields
+                            .get(field)
+                            .cloned()
+                            .ok_or_else(|| anyhow!("record value has no field {field}")),
+                        other => bail!("field access target evaluated to non-record {other}"),
+                    },
                     other => bail!("field access target evaluated to non-record {other}"),
                 };
                 self.finish_current_expr(
@@ -1146,6 +1213,52 @@ impl CodeDb {
             }
         }
     }
+
+    fn trace_place_mut<'a>(
+        &self,
+        expr_hash: &str,
+        args: &'a mut Vec<Value>,
+        locals: &'a mut Vec<Value>,
+    ) -> Result<&'a mut Value> {
+        let payload = self.get_payload(expr_hash)?;
+        match payload
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
+        {
+            "param_ref" => {
+                let index = payload
+                    .get("index")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("param_ref missing index"))?
+                    as usize;
+                args.get_mut(index)
+                    .ok_or_else(|| anyhow!("parameter index out of bounds: {index}"))
+            }
+            "local_ref" => {
+                let depth = payload
+                    .get("depth")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
+                    as usize;
+                local_at_depth_mut(locals, depth)
+                    .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))
+            }
+            "field_access" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing target"))?;
+                let field = payload
+                    .get("field")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing field"))?;
+                let target = self.trace_place_mut(target, args, locals)?;
+                field_value_mut(target, field)
+            }
+            other => bail!("expression kind {other} is not an assignable place"),
+        }
+    }
 }
 
 fn trace_report(
@@ -1221,4 +1334,27 @@ fn local_at_depth<T>(locals: &[T], depth: usize) -> Option<&T> {
         .len()
         .checked_sub(depth + 1)
         .and_then(|idx| locals.get(idx))
+}
+
+fn local_at_depth_mut<T>(locals: &mut [T], depth: usize) -> Option<&mut T> {
+    locals
+        .len()
+        .checked_sub(depth + 1)
+        .and_then(|idx| locals.get_mut(idx))
+}
+
+fn field_value_mut<'a>(value: &'a mut Value, field: &str) -> Result<&'a mut Value> {
+    match value {
+        Value::Record(fields) => fields
+            .get_mut(field)
+            .ok_or_else(|| anyhow!("record value has no field {field}")),
+        Value::MutRef(value) => match value.as_mut() {
+            Value::Record(fields) => fields
+                .get_mut(field)
+                .ok_or_else(|| anyhow!("record value has no field {field}")),
+            other => bail!("field assignment target evaluated to non-record ref {other}"),
+        },
+        Value::SharedRef(_) => bail!("cannot assign through shared reference"),
+        other => bail!("field assignment target evaluated to non-record {other}"),
+    }
 }

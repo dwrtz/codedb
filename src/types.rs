@@ -142,6 +142,30 @@ struct LocalTypeBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum LoanKind {
+    Shared,
+    Mutable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoanRoot {
+    Param(usize),
+    Local(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoanPlace {
+    root: LoanRoot,
+    fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveLoan {
+    kind: LoanKind,
+    place: LoanPlace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TypeFieldSpec {
     pub(crate) name: String,
     pub(crate) type_hash: String,
@@ -788,13 +812,8 @@ impl CodeDb {
         field: &str,
     ) -> Result<String> {
         match self.type_spec(type_hash)? {
-            TypeSpec::Reference {
-                mutable: false,
-                referent,
-                ..
-            } => self.record_field_type_in_root(root, &referent, field),
-            TypeSpec::Reference { mutable: true, .. } => {
-                bail!("mutable reference field access is reserved for phase 7")
+            TypeSpec::Reference { referent, .. } => {
+                self.record_field_type_in_root(root, &referent, field)
             }
             _ => self.record_field_type_in_root(root, type_hash, field),
         }
@@ -1747,6 +1766,9 @@ impl CodeDb {
                     region_scope,
                     locals,
                 )?;
+                if !self.typed_expr_is_place(&target.expr_hash)? {
+                    bail!("shared borrow target must be an addressable place");
+                }
                 let (region_name, region_hash) = match region {
                     Some(name) => (
                         name.clone(),
@@ -1780,6 +1802,120 @@ impl CodeDb {
                         "region": region_hash,
                         "region_name": region_name,
                         "referent_type": target.type_hash,
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
+            RawExpr::BorrowMut { region, target } => {
+                let target = self.type_expr_with_locals(
+                    current_module,
+                    target,
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                if !self.typed_expr_is_place(&target.expr_hash)? {
+                    bail!("mutable borrow target must be an addressable place");
+                }
+                let (region_name, region_hash) = match region {
+                    Some(name) => (
+                        name.clone(),
+                        region_scope
+                            .get(name)
+                            .cloned()
+                            .ok_or_else(|| anyhow!("unknown region parameter '{name}"))?,
+                    ),
+                    None if region_scope.len() == 1 => {
+                        let (name, hash) = region_scope
+                            .iter()
+                            .next()
+                            .expect("region_scope length was checked");
+                        (name.clone(), hash.clone())
+                    }
+                    None => bail!(
+                        "mutable borrow requires an explicit region when the function has {} region parameters",
+                        region_scope.len()
+                    ),
+                };
+                let type_hash = self.put_structural_type(TypeSpec::Reference {
+                    region: region_hash.clone(),
+                    mutable: true,
+                    referent: target.type_hash.clone(),
+                })?;
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "borrow_mut",
+                        "target": target.expr_hash,
+                        "region": region_hash,
+                        "region_name": region_name,
+                        "referent_type": target.type_hash,
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
+            RawExpr::Assign { target, value } => {
+                let target = self.type_expr_with_locals(
+                    current_module,
+                    target,
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                if !self.typed_expr_is_assignable_place(root, &target.expr_hash)? {
+                    bail!("assignment target must be a mutable semantic place");
+                }
+                let value = self.type_expr_with_locals(
+                    current_module,
+                    value,
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                if !self.type_assignable_in_root(root, &value.type_hash, &target.type_hash)? {
+                    require_type(
+                        &value.type_hash,
+                        &target.type_hash,
+                        "assignment value",
+                        self,
+                    )?;
+                }
+                let type_hash = type_hash_for("Unit");
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "assign",
+                        "target": target.expr_hash,
+                        "value": value.expr_hash,
+                        "target_type": target.type_hash,
                         "type": type_hash,
                     }),
                 )?;
@@ -2178,6 +2314,45 @@ impl CodeDb {
         })
     }
 
+    fn typed_expr_is_place(&self, expr_hash: &str) -> Result<bool> {
+        let payload = self.get_payload(expr_hash)?;
+        Ok(matches!(
+            payload.get("expr_kind").and_then(JsonValue::as_str),
+            Some("param_ref" | "local_ref" | "field_access")
+        ))
+    }
+
+    fn typed_expr_is_assignable_place(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+    ) -> Result<bool> {
+        let payload = self.get_payload(expr_hash)?;
+        match payload
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
+        {
+            "param_ref" | "local_ref" => Ok(true),
+            "field_access" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing target"))?;
+                let target_payload = self.get_payload(target_hash)?;
+                let target_type = target_payload
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access target missing type"))?;
+                match self.type_spec_in_root(root, target_type)? {
+                    TypeSpec::Reference { mutable, .. } => Ok(mutable),
+                    _ => self.typed_expr_is_assignable_place(root, target_hash),
+                }
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub(crate) fn type_check_root(&self, root_hash: &str) -> Result<()> {
         let root = self.load_root(root_hash)?;
         self.validate_root_type_definitions(&root)?;
@@ -2230,6 +2405,7 @@ impl CodeDb {
                     self.symbol_display(&root, &entry.symbol)?
                 );
             }
+            self.verify_function_borrows(&root, entry, &param_types)?;
             self.verify_function_effects(&root, entry)?;
         }
         self.validate_tests_for_root(root_hash, &root)?;
@@ -2256,13 +2432,14 @@ impl CodeDb {
                     as usize;
                 Ok(local_bool_at_depth(locals_with_local_borrows, depth).unwrap_or(false))
             }
-            "borrow_shared" => {
+            "borrow_shared" | "borrow_mut" => {
                 let target = payload
                     .get("target")
                     .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("borrow_shared missing target"))?;
+                    .ok_or_else(|| anyhow!("borrow expression missing target"))?;
                 self.borrow_target_is_local_storage(target)
             }
+            "assign" => Ok(false),
             "let" => {
                 let value_hash = payload
                     .get("value")
@@ -2298,6 +2475,13 @@ impl CodeDb {
                 Ok(false)
             }
             "field_access" => {
+                let declared_type = payload
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing type"))?;
+                if !self.expr_type_can_escape_borrow(declared_type)? {
+                    return Ok(false);
+                }
                 let target = payload
                     .get("target")
                     .and_then(JsonValue::as_str)
@@ -2352,6 +2536,13 @@ impl CodeDb {
             "call" | "binary" | "unary" | "enum_construct" => Ok(false),
             other => bail!("unknown expression kind {other}"),
         }
+    }
+
+    fn expr_type_can_escape_borrow(&self, type_hash: &str) -> Result<bool> {
+        Ok(matches!(
+            self.type_spec(type_hash)?,
+            TypeSpec::Reference { .. }
+        ))
     }
 
     fn borrow_target_is_local_storage(&self, expr_hash: &str) -> Result<bool> {
@@ -2470,6 +2661,13 @@ impl CodeDb {
             .signature_effects(&entry.signature)?
             .into_iter()
             .collect::<BTreeSet<_>>();
+        let body = self.function_body_hash(&entry.definition)?;
+        if self.expr_requires_state(&body)? && !declared.contains(&Effect::State) {
+            bail!(
+                "bad_effects: function {} requires undeclared effect state",
+                self.symbol_display(root, &entry.symbol)?
+            );
+        }
         let dependencies = self.dependencies_for_definition(root, &entry.definition)?;
         for dependency in dependencies {
             let Some(callee) = self.root_symbol(root, &dependency) else {
@@ -2487,6 +2685,452 @@ impl CodeDb {
             }
         }
         Ok(())
+    }
+
+    fn verify_function_borrows(
+        &self,
+        root: &ProgramRootPayload,
+        entry: &crate::model::RootSymbolPayload,
+        param_types: &[String],
+    ) -> Result<()> {
+        let body = self.function_body_hash(&entry.definition)?;
+        let mut locals = Vec::new();
+        let mut active = Vec::new();
+        let mut next_local = 0usize;
+        self.verify_expr_borrows(
+            root,
+            &body,
+            param_types,
+            &mut locals,
+            &mut active,
+            &mut next_local,
+        )
+        .with_context(|| {
+            format!(
+                "bad_borrow: function {} violates borrow rules",
+                self.symbol_display(root, &entry.symbol)
+                    .unwrap_or(entry.symbol.clone())
+            )
+        })
+    }
+
+    fn verify_expr_borrows(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        param_types: &[String],
+        locals: &mut Vec<usize>,
+        active: &mut Vec<ActiveLoan>,
+        next_local: &mut usize,
+    ) -> Result<()> {
+        let payload = self.get_payload(expr_hash)?;
+        match payload
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
+        {
+            "literal_i64" | "literal_bool" | "literal_unit" => Ok(()),
+            "param_ref" | "local_ref" => {
+                let place = self.loan_place_for_expr(expr_hash, param_types, locals)?;
+                self.check_shared_read_conflicts(&place, active)
+            }
+            "call" => {
+                for arg in payload
+                    .get("args")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("call missing args"))?
+                {
+                    let arg = arg
+                        .as_str()
+                        .ok_or_else(|| anyhow!("call arg must be hash"))?;
+                    self.verify_expr_borrows(root, arg, param_types, locals, active, next_local)?;
+                }
+                Ok(())
+            }
+            "binary" => {
+                for key in ["left", "right"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("binary missing {key}"))?;
+                    self.verify_expr_borrows(root, child, param_types, locals, active, next_local)?;
+                }
+                Ok(())
+            }
+            "unary" => {
+                let child = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unary missing expr"))?;
+                self.verify_expr_borrows(root, child, param_types, locals, active, next_local)
+            }
+            "borrow_shared" | "borrow_mut" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow expression missing target"))?;
+                let kind =
+                    if payload.get("expr_kind").and_then(JsonValue::as_str) == Some("borrow_mut") {
+                        LoanKind::Mutable
+                    } else {
+                        LoanKind::Shared
+                    };
+                let place = self.loan_place_for_expr(target, param_types, locals)?;
+                self.check_loan_conflicts(&kind, &place, active)?;
+                Ok(())
+            }
+            "assign" => {
+                for key in ["target", "value"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("assign missing {key}"))?;
+                    self.verify_expr_borrows(root, child, param_types, locals, active, next_local)?;
+                }
+                Ok(())
+            }
+            "let" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing value"))?;
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing body"))?;
+                self.verify_expr_borrows(
+                    root,
+                    value_hash,
+                    param_types,
+                    locals,
+                    active,
+                    next_local,
+                )?;
+                let mut value_loans = Vec::new();
+                self.collect_value_loans(value_hash, param_types, locals, &mut value_loans)?;
+                for loan in &value_loans {
+                    self.check_loan_conflicts(&loan.kind, &loan.place, active)?;
+                }
+                let local_id = *next_local;
+                *next_local += 1;
+                locals.push(local_id);
+                let active_len = active.len();
+                active.extend(value_loans);
+                let body_result = self.verify_expr_borrows(
+                    root,
+                    body_hash,
+                    param_types,
+                    locals,
+                    active,
+                    next_local,
+                );
+                active.truncate(active_len);
+                locals.pop();
+                body_result
+            }
+            "if" => {
+                for key in ["cond", "then", "else"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("if missing {key}"))?;
+                    self.verify_expr_borrows(root, child, param_types, locals, active, next_local)?;
+                }
+                Ok(())
+            }
+            "record_literal" => {
+                for field in payload
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("record_literal missing fields"))?
+                {
+                    let child = field
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("record field missing value"))?;
+                    self.verify_expr_borrows(root, child, param_types, locals, active, next_local)?;
+                }
+                Ok(())
+            }
+            "field_access" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing target"))?;
+                self.verify_expr_borrows(root, target, param_types, locals, active, next_local)?;
+                let place = self.loan_place_for_expr(expr_hash, param_types, locals)?;
+                self.check_shared_read_conflicts(&place, active)
+            }
+            "enum_construct" => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing value"))?;
+                self.verify_expr_borrows(root, value, param_types, locals, active, next_local)
+            }
+            "case" => {
+                let expr = payload
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("case missing expr"))?;
+                self.verify_expr_borrows(root, expr, param_types, locals, active, next_local)?;
+                for arm in payload
+                    .get("arms")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("case missing arms"))?
+                {
+                    let body = arm
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("case arm missing body"))?;
+                    let pushed = arm
+                        .get("binding_name")
+                        .and_then(JsonValue::as_str)
+                        .is_some();
+                    if pushed {
+                        let local_id = *next_local;
+                        *next_local += 1;
+                        locals.push(local_id);
+                    }
+                    let result = self.verify_expr_borrows(
+                        root,
+                        body,
+                        param_types,
+                        locals,
+                        active,
+                        next_local,
+                    );
+                    if pushed {
+                        locals.pop();
+                    }
+                    result?;
+                }
+                Ok(())
+            }
+            other => bail!("unknown expression kind {other}"),
+        }
+    }
+
+    fn collect_value_loans(
+        &self,
+        expr_hash: &str,
+        param_types: &[String],
+        locals: &[usize],
+        out: &mut Vec<ActiveLoan>,
+    ) -> Result<()> {
+        let payload = self.get_payload(expr_hash)?;
+        match payload
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
+        {
+            "borrow_shared" | "borrow_mut" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow expression missing target"))?;
+                out.push(ActiveLoan {
+                    kind: if payload.get("expr_kind").and_then(JsonValue::as_str)
+                        == Some("borrow_mut")
+                    {
+                        LoanKind::Mutable
+                    } else {
+                        LoanKind::Shared
+                    },
+                    place: self.loan_place_for_expr(target, param_types, locals)?,
+                });
+                Ok(())
+            }
+            "record_literal" => {
+                for field in payload
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("record_literal missing fields"))?
+                {
+                    let value = field
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("record field missing value"))?;
+                    self.collect_value_loans(value, param_types, locals, out)?;
+                }
+                Ok(())
+            }
+            "if" => {
+                for key in ["then", "else"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("if missing {key}"))?;
+                    self.collect_value_loans(child, param_types, locals, out)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn loan_place_for_expr(
+        &self,
+        expr_hash: &str,
+        param_types: &[String],
+        locals: &[usize],
+    ) -> Result<LoanPlace> {
+        let _ = param_types;
+        let payload = self.get_payload(expr_hash)?;
+        match payload
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
+        {
+            "param_ref" => {
+                let index = payload
+                    .get("index")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("param_ref missing index"))?
+                    as usize;
+                Ok(LoanPlace {
+                    root: LoanRoot::Param(index),
+                    fields: Vec::new(),
+                })
+            }
+            "local_ref" => {
+                let depth = payload
+                    .get("depth")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
+                    as usize;
+                let local_id = local_usize_at_depth(locals, depth)
+                    .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))?;
+                Ok(LoanPlace {
+                    root: LoanRoot::Local(local_id),
+                    fields: Vec::new(),
+                })
+            }
+            "field_access" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing target"))?;
+                let field = payload
+                    .get("field")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing field"))?;
+                let mut place = self.loan_place_for_expr(target, param_types, locals)?;
+                place.fields.push(field.to_string());
+                Ok(place)
+            }
+            other => bail!("borrow target {other} is not an addressable place"),
+        }
+    }
+
+    fn check_loan_conflicts(
+        &self,
+        kind: &LoanKind,
+        place: &LoanPlace,
+        active: &[ActiveLoan],
+    ) -> Result<()> {
+        for loan in active {
+            if places_overlap(place, &loan.place)
+                && (*kind == LoanKind::Mutable || loan.kind == LoanKind::Mutable)
+            {
+                bail!(
+                    "exclusive loan conflict: {:?} borrow of {:?} conflicts with live {:?} borrow of {:?}",
+                    kind,
+                    place,
+                    loan.kind,
+                    loan.place
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn check_shared_read_conflicts(&self, place: &LoanPlace, active: &[ActiveLoan]) -> Result<()> {
+        for loan in active {
+            if loan.kind == LoanKind::Mutable && places_overlap(place, &loan.place) {
+                bail!(
+                    "shared read of {:?} conflicts with live mutable borrow of {:?}",
+                    place,
+                    loan.place
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn expr_requires_state(&self, expr_hash: &str) -> Result<bool> {
+        let payload = self.get_payload(expr_hash)?;
+        Ok(
+            match payload
+                .get("expr_kind")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
+            {
+                "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" | "local_ref" => {
+                    false
+                }
+                "assign" => true,
+                "call" => false,
+                "binary" => {
+                    self.expr_child_requires_state(&payload, "left")?
+                        || self.expr_child_requires_state(&payload, "right")?
+                }
+                "unary" => self.expr_child_requires_state(&payload, "expr")?,
+                "borrow_shared" | "borrow_mut" => {
+                    self.expr_child_requires_state(&payload, "target")?
+                }
+                "let" => {
+                    self.expr_child_requires_state(&payload, "value")?
+                        || self.expr_child_requires_state(&payload, "body")?
+                }
+                "if" => {
+                    self.expr_child_requires_state(&payload, "cond")?
+                        || self.expr_child_requires_state(&payload, "then")?
+                        || self.expr_child_requires_state(&payload, "else")?
+                }
+                "record_literal" => {
+                    let mut required = false;
+                    for field in payload
+                        .get("fields")
+                        .and_then(JsonValue::as_array)
+                        .ok_or_else(|| anyhow!("record_literal missing fields"))?
+                    {
+                        let value = field
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("record field missing value"))?;
+                        required |= self.expr_requires_state(value)?;
+                    }
+                    required
+                }
+                "field_access" => self.expr_child_requires_state(&payload, "target")?,
+                "enum_construct" => self.expr_child_requires_state(&payload, "value")?,
+                "case" => {
+                    let mut required = self.expr_child_requires_state(&payload, "expr")?;
+                    for arm in payload
+                        .get("arms")
+                        .and_then(JsonValue::as_array)
+                        .ok_or_else(|| anyhow!("case missing arms"))?
+                    {
+                        let body = arm
+                            .get("body")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("case arm missing body"))?;
+                        required |= self.expr_requires_state(body)?;
+                    }
+                    required
+                }
+                other => bail!("unknown expression kind {other}"),
+            },
+        )
+    }
+
+    fn expr_child_requires_state(&self, payload: &JsonValue, key: &str) -> Result<bool> {
+        let child = payload
+            .get(key)
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing {key}"))?;
+        self.expr_requires_state(child)
     }
 
     pub(crate) fn verify_expr_type(
@@ -2698,6 +3342,77 @@ impl CodeDb {
                     mutable: false,
                     referent: target_type,
                 })?
+            }
+            "borrow_mut" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_mut missing target"))?;
+                let target_type = self.verify_expr_type_with_locals(
+                    target,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                let region = payload
+                    .get("region")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_mut missing region"))?;
+                if !allowed_regions.contains(region) {
+                    bail!("invalid region reference {region}");
+                }
+                let referent_type = payload
+                    .get("referent_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_mut missing referent_type"))?;
+                if referent_type != target_type {
+                    bail!("borrow_mut referent type mismatch");
+                }
+                if !self.typed_expr_is_place(target)? {
+                    bail!("borrow_mut target must be an addressable place");
+                }
+                hash_for_type_spec(&TypeSpec::Reference {
+                    region: region.to_string(),
+                    mutable: true,
+                    referent: target_type,
+                })?
+            }
+            "assign" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("assign missing target"))?;
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("assign missing value"))?;
+                let target_type = self.verify_expr_type_with_locals(
+                    target,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                let value_type = self.verify_expr_type_with_locals(
+                    value,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if payload.get("target_type").and_then(JsonValue::as_str)
+                    != Some(target_type.as_str())
+                {
+                    bail!("assign target_type mismatch");
+                }
+                if !self.typed_expr_is_assignable_place(root, target)? {
+                    bail!("assign target must be a mutable semantic place");
+                }
+                if !self.type_assignable_in_root(root, &value_type, &target_type)? {
+                    bail!("assign value type mismatch");
+                }
+                type_hash_for("Unit")
             }
             "let" => {
                 let binding_type = payload
@@ -2990,6 +3705,29 @@ fn local_bool_at_depth(locals: &[bool], depth: usize) -> Option<bool> {
         .checked_sub(depth + 1)
         .and_then(|idx| locals.get(idx))
         .copied()
+}
+
+fn local_usize_at_depth(locals: &[usize], depth: usize) -> Option<usize> {
+    locals
+        .len()
+        .checked_sub(depth + 1)
+        .and_then(|idx| locals.get(idx))
+        .copied()
+}
+
+fn places_overlap(left: &LoanPlace, right: &LoanPlace) -> bool {
+    if left.root != right.root {
+        return false;
+    }
+    fields_prefix(&left.fields, &right.fields) || fields_prefix(&right.fields, &left.fields)
+}
+
+fn fields_prefix(prefix: &[String], value: &[String]) -> bool {
+    prefix.len() <= value.len()
+        && prefix
+            .iter()
+            .zip(value.iter())
+            .all(|(left, right)| left == right)
 }
 
 pub(crate) fn type_hash_for(type_kind: &str) -> String {

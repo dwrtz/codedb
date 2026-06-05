@@ -226,13 +226,23 @@ impl CodeDb {
                     Some("unary") => {
                         self.check_hash_ref(parent_hash, "expr", payload.get("expr"), errors)?;
                     }
-                    Some("borrow_shared") => {
+                    Some("borrow_shared" | "borrow_mut") => {
                         self.check_hash_ref(parent_hash, "target", payload.get("target"), errors)?;
                         self.check_hash_ref(parent_hash, "region", payload.get("region"), errors)?;
                         self.check_hash_ref(
                             parent_hash,
                             "referent_type",
                             payload.get("referent_type"),
+                            errors,
+                        )?;
+                    }
+                    Some("assign") => {
+                        self.check_hash_ref(parent_hash, "target", payload.get("target"), errors)?;
+                        self.check_hash_ref(parent_hash, "value", payload.get("value"), errors)?;
+                        self.check_hash_ref(
+                            parent_hash,
+                            "target_type",
+                            payload.get("target_type"),
                             errors,
                         )?;
                     }
@@ -3751,7 +3761,9 @@ fn collect_lowered_call_targets(
             | LoweredOp::AddrOfField { .. }
             | LoweredOp::AddrOfIndex { .. }
             | LoweredOp::BorrowShared { .. }
+            | LoweredOp::BorrowMut { .. }
             | LoweredOp::DerefShared { .. }
+            | LoweredOp::DerefMut { .. }
             | LoweredOp::Load { .. }
             | LoweredOp::Store { .. }
             | LoweredOp::Copy { .. }

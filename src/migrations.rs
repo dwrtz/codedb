@@ -818,6 +818,14 @@ fn append_default_arg_to_calls(expr: &RawExpr, target_name: &str, default: &RawE
             region: region.clone(),
             target: Box::new(append_default_arg_to_calls(target, target_name, default)),
         },
+        RawExpr::BorrowMut { region, target } => RawExpr::BorrowMut {
+            region: region.clone(),
+            target: Box::new(append_default_arg_to_calls(target, target_name, default)),
+        },
+        RawExpr::Assign { target, value } => RawExpr::Assign {
+            target: Box::new(append_default_arg_to_calls(target, target_name, default)),
+            value: Box::new(append_default_arg_to_calls(value, target_name, default)),
+        },
         RawExpr::Let {
             name,
             ty,
@@ -5480,6 +5488,26 @@ fn normalize_param_refs_scoped(
             region: region.clone(),
             target: Box::new(normalize_param_refs_scoped(
                 target,
+                local_params,
+                local_bindings,
+            )),
+        },
+        RawExpr::BorrowMut { region, target } => RawExpr::BorrowMut {
+            region: region.clone(),
+            target: Box::new(normalize_param_refs_scoped(
+                target,
+                local_params,
+                local_bindings,
+            )),
+        },
+        RawExpr::Assign { target, value } => RawExpr::Assign {
+            target: Box::new(normalize_param_refs_scoped(
+                target,
+                local_params,
+                local_bindings,
+            )),
+            value: Box::new(normalize_param_refs_scoped(
+                value,
                 local_params,
                 local_bindings,
             )),

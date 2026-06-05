@@ -50,6 +50,15 @@ pub enum RawExpr {
         region: Option<String>,
         target: Box<RawExpr>,
     },
+    BorrowMut {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
+        target: Box<RawExpr>,
+    },
+    Assign {
+        target: Box<RawExpr>,
+        value: Box<RawExpr>,
+    },
     Let {
         name: String,
         #[serde(rename = "type")]
@@ -146,6 +155,7 @@ pub enum Value {
     Bool(bool),
     Unit,
     SharedRef(Box<Value>),
+    MutRef(Box<Value>),
     Record(BTreeMap<String, Value>),
     Enum { variant: String, value: Box<Value> },
 }
@@ -157,6 +167,7 @@ impl Display for Value {
             Value::Bool(value) => write!(f, "{value}"),
             Value::Unit => write!(f, "()"),
             Value::SharedRef(value) => write!(f, "&{value}"),
+            Value::MutRef(value) => write!(f, "&mut {value}"),
             Value::Record(fields) => {
                 let rendered = fields
                     .iter()
@@ -221,14 +232,15 @@ impl CodeDb {
             );
         }
         let body = self.function_body_hash(&root_symbol.definition)?;
-        self.eval_expr(root_hash, &body, &args)
+        let mut args = args;
+        self.eval_expr(root_hash, &body, &mut args)
     }
 
     pub(crate) fn eval_expr(
         &self,
         root_hash: &str,
         expr_hash: &str,
-        args: &[Value],
+        args: &mut Vec<Value>,
     ) -> Result<Value> {
         self.eval_expr_with_locals(root_hash, expr_hash, args, &mut Vec::new())
     }
@@ -247,6 +259,14 @@ impl CodeDb {
                 Value::SharedRef(value),
                 TypeSpec::Reference {
                     mutable: false,
+                    referent,
+                    ..
+                },
+            ) => self.value_has_type(root, value, &referent),
+            (
+                Value::MutRef(value),
+                TypeSpec::Reference {
+                    mutable: true,
                     referent,
                     ..
                 },
@@ -280,7 +300,7 @@ impl CodeDb {
         &self,
         root_hash: &str,
         expr_hash: &str,
-        args: &[Value],
+        args: &mut Vec<Value>,
         locals: &mut Vec<Value>,
     ) -> Result<Value> {
         let payload = self.get_payload(expr_hash)?;
@@ -384,6 +404,31 @@ impl CodeDb {
                     locals,
                 )?)))
             }
+            "borrow_mut" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_mut missing target"))?;
+                Ok(Value::MutRef(Box::new(self.eval_expr_with_locals(
+                    root_hash,
+                    target_hash,
+                    args,
+                    locals,
+                )?)))
+            }
+            "assign" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("assign missing target"))?;
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("assign missing value"))?;
+                let value = self.eval_expr_with_locals(root_hash, value_hash, args, locals)?;
+                *self.eval_place_mut(target_hash, args, locals)? = value;
+                Ok(Value::Unit)
+            }
             "let" => {
                 let value_hash = payload
                     .get("value")
@@ -466,6 +511,13 @@ impl CodeDb {
                             .ok_or_else(|| anyhow!("record value has no field {field}")),
                         other => bail!("field access target evaluated to non-record ref {other}"),
                     },
+                    Value::MutRef(value) => match value.as_ref() {
+                        Value::Record(fields) => fields
+                            .get(field)
+                            .cloned()
+                            .ok_or_else(|| anyhow!("record value has no field {field}")),
+                        other => bail!("field access target evaluated to non-record ref {other}"),
+                    },
                     other => bail!("field access target evaluated to non-record {other}"),
                 }
             }
@@ -521,6 +573,52 @@ impl CodeDb {
                 }
             }
             other => bail!("unknown expression kind {other}"),
+        }
+    }
+
+    fn eval_place_mut<'a>(
+        &self,
+        expr_hash: &str,
+        args: &'a mut Vec<Value>,
+        locals: &'a mut Vec<Value>,
+    ) -> Result<&'a mut Value> {
+        let payload = self.get_payload(expr_hash)?;
+        match payload
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
+        {
+            "param_ref" => {
+                let index = payload
+                    .get("index")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("param_ref missing index"))?
+                    as usize;
+                args.get_mut(index)
+                    .ok_or_else(|| anyhow!("parameter index out of bounds: {index}"))
+            }
+            "local_ref" => {
+                let depth = payload
+                    .get("depth")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
+                    as usize;
+                local_at_depth_mut(locals, depth)
+                    .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))
+            }
+            "field_access" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing target"))?;
+                let field = payload
+                    .get("field")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing field"))?;
+                let target = self.eval_place_mut(target, args, locals)?;
+                field_value_mut(target, field)
+            }
+            other => bail!("expression kind {other} is not an assignable place"),
         }
     }
 
@@ -1182,6 +1280,67 @@ impl CodeDb {
                     expr
                 }
             }
+            "borrow_mut" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_mut missing target"))?;
+                let region = payload.get("region_name").and_then(JsonValue::as_str);
+                let rendered_target = self.expr_to_source_with_locals(
+                    target,
+                    root,
+                    current_module,
+                    local_params,
+                    region_names,
+                    local_names,
+                    unary_precedence(),
+                )?;
+                let expr = match region {
+                    Some(region) => format!("&'{region} mut {rendered_target}"),
+                    None => format!("&mut {rendered_target}"),
+                };
+                if unary_precedence() < parent_prec {
+                    format!("({expr})")
+                } else {
+                    expr
+                }
+            }
+            "assign" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("assign missing target"))?;
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("assign missing value"))?;
+                let expr = format!(
+                    "{} = {}",
+                    self.expr_to_source_with_locals(
+                        target,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        assignment_precedence() + 1,
+                    )?,
+                    self.expr_to_source_with_locals(
+                        value,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        assignment_precedence(),
+                    )?
+                );
+                if assignment_precedence() < parent_prec {
+                    format!("({expr})")
+                } else {
+                    expr
+                }
+            }
             "let" => {
                 let name = payload
                     .get("binding_name")
@@ -1642,6 +1801,50 @@ impl CodeDb {
                     )?,
                 ),
             }),
+            "borrow_mut" => Ok(RawExpr::BorrowMut {
+                region: payload
+                    .get("region_name")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string),
+                target: Box::new(
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("target")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("borrow_mut missing target"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ),
+            }),
+            "assign" => Ok(RawExpr::Assign {
+                target: Box::new(
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("target")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("assign missing target"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ),
+                value: Box::new(
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("assign missing value"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ),
+            }),
             "let" => {
                 let name = payload
                     .get("binding_name")
@@ -1900,6 +2103,10 @@ pub(crate) fn unary_precedence() -> u8 {
     7
 }
 
+fn assignment_precedence() -> u8 {
+    1
+}
+
 fn field_access_precedence() -> u8 {
     8
 }
@@ -2064,12 +2271,21 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("unary missing expr"))?;
                 self.collect_expr_deps(root, child, deps)?;
             }
-            "borrow_shared" => {
+            "borrow_shared" | "borrow_mut" => {
                 let child = payload
                     .get("target")
                     .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("borrow_shared missing target"))?;
+                    .ok_or_else(|| anyhow!("borrow expression missing target"))?;
                 self.collect_expr_deps(root, child, deps)?;
+            }
+            "assign" => {
+                for key in ["target", "value"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("assign missing {key}"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
             }
             "let" => {
                 for key in ["value", "body"] {
@@ -2471,7 +2687,20 @@ impl Parser {
                 arms,
             })
         } else {
-            self.parse_binary_prec(1)
+            self.parse_assignment()
+        }
+    }
+
+    fn parse_assignment(&mut self) -> Result<RawExpr> {
+        let target = self.parse_binary_prec(1)?;
+        if self.consume_symbol("=") {
+            let value = self.parse_expr()?;
+            Ok(RawExpr::Assign {
+                target: Box::new(target),
+                value: Box::new(value),
+            })
+        } else {
+            Ok(target)
         }
     }
 
@@ -2514,10 +2743,17 @@ impl Parser {
                 } else {
                     None
                 };
-                Ok(RawExpr::BorrowShared {
-                    region,
-                    target: Box::new(self.parse_unary()?),
-                })
+                if self.consume_ident_value("mut") {
+                    Ok(RawExpr::BorrowMut {
+                        region,
+                        target: Box::new(self.parse_unary()?),
+                    })
+                } else {
+                    Ok(RawExpr::BorrowShared {
+                        region,
+                        target: Box::new(self.parse_unary()?),
+                    })
+                }
             }
             _ => self.parse_primary(),
         }
@@ -2881,4 +3117,27 @@ fn local_at_depth<T>(locals: &[T], depth: usize) -> Option<&T> {
         .len()
         .checked_sub(depth + 1)
         .and_then(|idx| locals.get(idx))
+}
+
+fn local_at_depth_mut<T>(locals: &mut [T], depth: usize) -> Option<&mut T> {
+    locals
+        .len()
+        .checked_sub(depth + 1)
+        .and_then(|idx| locals.get_mut(idx))
+}
+
+fn field_value_mut<'a>(value: &'a mut Value, field: &str) -> Result<&'a mut Value> {
+    match value {
+        Value::Record(fields) => fields
+            .get_mut(field)
+            .ok_or_else(|| anyhow!("record value has no field {field}")),
+        Value::MutRef(value) => match value.as_mut() {
+            Value::Record(fields) => fields
+                .get_mut(field)
+                .ok_or_else(|| anyhow!("record value has no field {field}")),
+            other => bail!("field assignment target evaluated to non-record ref {other}"),
+        },
+        Value::SharedRef(_) => bail!("cannot assign through shared reference"),
+        other => bail!("field assignment target evaluated to non-record {other}"),
+    }
 }

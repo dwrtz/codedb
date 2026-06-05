@@ -1,0 +1,14 @@
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+record LineEditor<'a> {
+  line: &'a mut Line
+}
+
+fn main<'a>() -> i64 effects[state] =
+  let line: Line = { price_cents: 25, qty: 4 } in
+  let editor: LineEditor<'a> = { line: &'a mut line } in
+  let changed: unit = editor.line.price_cents = editor.line.price_cents + 75 in
+  editor.line.price_cents

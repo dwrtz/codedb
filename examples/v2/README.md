@@ -1,6 +1,6 @@
 # examples/v2 - Native Acceptance Programs
 
-Status: Phase 1 index
+Status: v2 acceptance fixture index
 
 V2 acceptance programs prove that CodeDB features compile from semantic objects
 to native artifacts. These examples are native-required gates: the reference
@@ -26,6 +26,5 @@ Each acceptance program should eventually include:
 - verify fixture;
 - replay/export/import fixture.
 
-No `.cdb` program fixtures are added in Phase 1. Later phases add them when the
-corresponding semantic objects, verification, lowering, and native backends are
-available.
+Implemented fixtures are added as their corresponding semantic objects,
+verification, lowering, and native backends become available.

@@ -2520,6 +2520,14 @@ fn substitute_param_refs(expr: &RawExpr, args: &[RawExpr]) -> Result<RawExpr> {
             region: region.clone(),
             target: Box::new(substitute_param_refs(target, args)?),
         },
+        RawExpr::BorrowMut { region, target } => RawExpr::BorrowMut {
+            region: region.clone(),
+            target: Box::new(substitute_param_refs(target, args)?),
+        },
+        RawExpr::Assign { target, value } => RawExpr::Assign {
+            target: Box::new(substitute_param_refs(target, args)?),
+            value: Box::new(substitute_param_refs(value, args)?),
+        },
         RawExpr::Let {
             name,
             ty,
@@ -2607,6 +2615,11 @@ fn collect_free_param_names(
         RawExpr::Unary { expr, .. } => collect_free_param_names(expr, bound_locals, names),
         RawExpr::BorrowShared { target, .. } => {
             collect_free_param_names(target, bound_locals, names)
+        }
+        RawExpr::BorrowMut { target, .. } => collect_free_param_names(target, bound_locals, names),
+        RawExpr::Assign { target, value } => {
+            collect_free_param_names(target, bound_locals, names);
+            collect_free_param_names(value, bound_locals, names);
         }
         RawExpr::Let {
             name, value, body, ..
@@ -2706,6 +2719,26 @@ fn alpha_rename_let_bindings_with_scope(
             region: region.clone(),
             target: Box::new(alpha_rename_let_bindings_with_scope(
                 target,
+                used_names,
+                renamed_locals,
+            )),
+        },
+        RawExpr::BorrowMut { region, target } => RawExpr::BorrowMut {
+            region: region.clone(),
+            target: Box::new(alpha_rename_let_bindings_with_scope(
+                target,
+                used_names,
+                renamed_locals,
+            )),
+        },
+        RawExpr::Assign { target, value } => RawExpr::Assign {
+            target: Box::new(alpha_rename_let_bindings_with_scope(
+                target,
+                used_names,
+                renamed_locals,
+            )),
+            value: Box::new(alpha_rename_let_bindings_with_scope(
+                value,
                 used_names,
                 renamed_locals,
             )),
