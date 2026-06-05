@@ -2874,11 +2874,16 @@ impl CodeDb {
                     .get("body")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("let missing body"))?;
+                let pre_value_state = state.clone();
                 self.verify_expr_borrows(root, value_hash, param_types, state, ExprUse::Value)?;
-                let transfer_owner =
-                    self.move_source_place_for_expr(root, value_hash, param_types, &state.locals)?;
+                let transfer_owner = self.move_source_place_for_expr(
+                    root,
+                    value_hash,
+                    param_types,
+                    &pre_value_state.locals,
+                )?;
                 let mut value_loans =
-                    self.collect_value_loans(root, value_hash, param_types, state)?;
+                    self.collect_value_loans(root, value_hash, param_types, &pre_value_state)?;
                 if let Some(owner) = &transfer_owner {
                     state
                         .active
@@ -3096,6 +3101,47 @@ impl CodeDb {
                     out.extend(self.collect_value_loans(root, value, param_types, state)?);
                 }
             }
+            "let" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing value"))?;
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing body"))?;
+                let mut nested_state = state.clone();
+                let transfer_owner = self.move_source_place_for_expr(
+                    root,
+                    value_hash,
+                    param_types,
+                    &nested_state.locals,
+                )?;
+                let mut value_loans =
+                    self.collect_value_loans(root, value_hash, param_types, &nested_state)?;
+                if let Some(owner) = &transfer_owner {
+                    nested_state
+                        .active
+                        .retain(|loan| !loan_owner_overlaps(loan, owner));
+                }
+                let local_id = nested_state.next_local;
+                nested_state.next_local += 1;
+                let local_owner = LoanPlace {
+                    root: LoanRoot::Local(local_id),
+                    fields: Vec::new(),
+                };
+                for loan in &mut value_loans {
+                    loan.owner = Some(local_owner.clone());
+                }
+                nested_state.locals.push(local_id);
+                nested_state.active.extend(value_loans);
+                out.extend(self.collect_value_loans(
+                    root,
+                    body_hash,
+                    param_types,
+                    &nested_state,
+                )?);
+            }
             "if" => {
                 for key in ["then", "else"] {
                     let child = payload
@@ -3162,6 +3208,25 @@ impl CodeDb {
                     )?))
                 } else {
                     Ok(None)
+                }
+            }
+            Some("let") => {
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing body"))?;
+                let mut nested_locals = locals.to_vec();
+                let synthetic_local = synthetic_let_local_id(&nested_locals);
+                nested_locals.push(synthetic_local);
+                let source =
+                    self.move_source_place_for_expr(root, body_hash, param_types, &nested_locals)?;
+                let Some(source) = source else {
+                    return Ok(None);
+                };
+                if matches!(source.root, LoanRoot::Local(id) if id == synthetic_local) {
+                    Ok(None)
+                } else {
+                    Ok(Some(source))
                 }
             }
             _ => Ok(None),
@@ -3933,6 +3998,10 @@ fn local_usize_at_depth(locals: &[usize], depth: usize) -> Option<usize> {
         .checked_sub(depth + 1)
         .and_then(|idx| locals.get(idx))
         .copied()
+}
+
+fn synthetic_let_local_id(locals: &[usize]) -> usize {
+    usize::MAX - locals.len()
 }
 
 fn loan_owner_overlaps(loan: &ActiveLoan, owner: &LoanPlace) -> bool {

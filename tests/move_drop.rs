@@ -185,6 +185,86 @@ fn main<'a>() -> i64 =
         .stderr(predicate::str::contains("use after move"));
 }
 
+#[test]
+fn moving_mutable_reference_record_out_of_inner_let_keeps_loan_live() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("inner-let-move-loan.sqlite");
+    let source = temp.path().join("inner-let-move-loan.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+record LineEditor<'a> {
+  line: &'a mut Line
+}
+
+fn main<'a>() -> i64 =
+  let line: Line = { price_cents: 25, qty: 4 } in
+  let moved: LineEditor<'a> =
+    (let editor: LineEditor<'a> = { line: &'a mut line } in
+     editor) in
+  line.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_borrow"))
+        .stderr(predicate::str::contains("shared read"))
+        .stderr(predicate::str::contains("live mutable borrow"));
+}
+
+#[test]
+fn moving_outer_mutable_reference_record_through_inner_let_transfers_loan() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("outer-move-through-inner-let.sqlite");
+    let source = temp.path().join("outer-move-through-inner-let.cdb");
+    let ir_path = temp.path().join("main.ir.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+record LineEditor<'a> {
+  line: &'a mut Line
+}
+
+fn main<'a>() -> i64 =
+  let line: Line = { price_cents: 25, qty: 4 } in
+  let editor: LineEditor<'a> = { line: &'a mut line } in
+  let moved: LineEditor<'a> =
+    (let marker: i64 = 1 in
+     editor) in
+  moved.line.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "25");
+    run(&["verify", path(&db)]);
+    run(&["emit-ir", path(&db), "main", "--out", path(&ir_path)]);
+
+    let ir = read_json(&ir_path);
+    let ops = op_names(&ir);
+    assert!(ops.contains(&"move".to_string()));
+    assert!(ops.contains(&"drop".to_string()));
+}
+
 fn op_names(ir: &JsonValue) -> Vec<String> {
     ir["ir"]["operations"]
         .as_array()
