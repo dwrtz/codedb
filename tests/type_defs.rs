@@ -460,6 +460,79 @@ fn main() -> i64 = value(Discount::percent(10))
 }
 
 #[test]
+fn distinct_named_records_with_same_shape_are_not_assignable() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("nominal-records.sqlite");
+    let source = temp.path().join("nominal-records.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Cents {
+  value: i64
+}
+
+record Quantity {
+  value: i64
+}
+
+fn use_cents(c: Cents) -> i64 = c.value
+
+fn main() -> i64 =
+  let q: Quantity = { value: 7 } in
+  use_cents(q)
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "call arg 0 for use_cents expected",
+        ))
+        .stderr(predicate::str::contains("got type<"));
+}
+
+#[test]
+fn distinct_named_enums_with_same_shape_are_not_assignable() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("nominal-enums.sqlite");
+    let source = temp.path().join("nominal-enums.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+enum PrimaryDiscount {
+  none: unit
+  percent: i64
+}
+
+enum SecondaryDiscount {
+  none: unit
+  percent: i64
+}
+
+fn value(discount: PrimaryDiscount) -> i64 =
+  case discount of none => 0 | percent(amount) => amount
+
+fn main() -> i64 = value(SecondaryDiscount::percent(10))
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("call arg 0 for value expected"))
+        .stderr(predicate::str::contains("got type<"));
+}
+
+#[test]
 fn verify_rejects_type_definition_with_invalid_region_reference() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("bad-region.sqlite");

@@ -1182,6 +1182,11 @@ impl CodeDb {
         if actual == expected {
             return Ok(true);
         }
+        if let Some(assignable) =
+            same_named_type_assignable(&self.type_spec(actual)?, &self.type_spec(expected)?)
+        {
+            return Ok(assignable);
+        }
         match (
             self.type_spec_in_root(root, actual)?,
             self.type_spec_in_root(root, expected)?,
@@ -1237,6 +1242,13 @@ impl CodeDb {
     ) -> Result<bool> {
         if actual == expected {
             return Ok(true);
+        }
+        if let Some(assignable) = same_named_type_assignable_for_call(
+            &self.type_spec(actual)?,
+            &self.type_spec(expected)?,
+            callee_regions,
+        ) {
+            return Ok(assignable);
         }
         match (
             self.type_spec_in_root(root, actual)?,
@@ -1303,6 +1315,14 @@ impl CodeDb {
         substitutions: &mut BTreeMap<String, String>,
     ) -> Result<()> {
         if actual == expected {
+            return Ok(());
+        }
+        if self.infer_named_type_region_substitutions(
+            actual,
+            expected,
+            callee_regions,
+            substitutions,
+        )? {
             return Ok(());
         }
         match (
@@ -1403,6 +1423,40 @@ impl CodeDb {
             }
             _ => Ok(()),
         }
+    }
+
+    fn infer_named_type_region_substitutions(
+        &self,
+        actual: &str,
+        expected: &str,
+        callee_regions: &BTreeSet<String>,
+        substitutions: &mut BTreeMap<String, String>,
+    ) -> Result<bool> {
+        let (
+            TypeSpec::Named {
+                type_symbol: actual_symbol,
+                region_args: actual_args,
+            },
+            TypeSpec::Named {
+                type_symbol: expected_symbol,
+                region_args: expected_args,
+            },
+        ) = (self.type_spec(actual)?, self.type_spec(expected)?)
+        else {
+            return Ok(false);
+        };
+        if actual_symbol != expected_symbol || actual_args.len() != expected_args.len() {
+            return Ok(true);
+        }
+        for (actual_region, expected_region) in actual_args.into_iter().zip(expected_args) {
+            record_call_region_substitution(
+                expected_region,
+                actual_region,
+                callee_regions,
+                substitutions,
+            )?;
+        }
+        Ok(true)
     }
 
     pub(crate) fn infer_call_region_substitutions_for_types(
@@ -4811,6 +4865,54 @@ fn fields_prefix(prefix: &[String], value: &[String]) -> bool {
             .iter()
             .zip(value.iter())
             .all(|(left, right)| left == right)
+}
+
+fn same_named_type_assignable(actual: &TypeSpec, expected: &TypeSpec) -> Option<bool> {
+    let (
+        TypeSpec::Named {
+            type_symbol: actual_symbol,
+            region_args: actual_args,
+        },
+        TypeSpec::Named {
+            type_symbol: expected_symbol,
+            region_args: expected_args,
+        },
+    ) = (actual, expected)
+    else {
+        return None;
+    };
+    Some(actual_symbol == expected_symbol && actual_args == expected_args)
+}
+
+fn same_named_type_assignable_for_call(
+    actual: &TypeSpec,
+    expected: &TypeSpec,
+    callee_regions: &BTreeSet<String>,
+) -> Option<bool> {
+    let (
+        TypeSpec::Named {
+            type_symbol: actual_symbol,
+            region_args: actual_args,
+        },
+        TypeSpec::Named {
+            type_symbol: expected_symbol,
+            region_args: expected_args,
+        },
+    ) = (actual, expected)
+    else {
+        return None;
+    };
+    if actual_symbol != expected_symbol || actual_args.len() != expected_args.len() {
+        return Some(false);
+    }
+    Some(
+        actual_args
+            .iter()
+            .zip(expected_args)
+            .all(|(actual_region, expected_region)| {
+                actual_region == expected_region || callee_regions.contains(expected_region)
+            }),
+    )
 }
 
 fn record_call_region_substitution(
