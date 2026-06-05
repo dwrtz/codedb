@@ -1042,6 +1042,89 @@ fn event_view(event_index: usize, event: &TraceEvent) -> DebugEventView {
             args: None,
             message: None,
         },
+        TraceEvent::BorrowShared {
+            frame,
+            symbol_hash,
+            function_def_hash,
+            expr_hash,
+            place,
+            region,
+            referent_type_hash,
+            type_hash,
+            ..
+        } => DebugEventView {
+            event_index,
+            event: "borrow_shared".to_string(),
+            frame: Some(*frame),
+            symbol_hash: Some(symbol_hash.clone()),
+            function_name: None,
+            function_def_hash: Some(function_def_hash.clone()),
+            expr_hash: Some(expr_hash.clone()),
+            expr_kind: None,
+            type_hash: Some(type_hash.clone()),
+            callee_symbol_hash: None,
+            callee_name: None,
+            value: None,
+            args: None,
+            message: Some(format!(
+                "place {:?} region {region} referent {referent_type_hash}",
+                place
+            )),
+        },
+        TraceEvent::BorrowMut {
+            frame,
+            symbol_hash,
+            function_def_hash,
+            expr_hash,
+            place,
+            region,
+            referent_type_hash,
+            type_hash,
+            ..
+        } => DebugEventView {
+            event_index,
+            event: "borrow_mut".to_string(),
+            frame: Some(*frame),
+            symbol_hash: Some(symbol_hash.clone()),
+            function_name: None,
+            function_def_hash: Some(function_def_hash.clone()),
+            expr_hash: Some(expr_hash.clone()),
+            expr_kind: None,
+            type_hash: Some(type_hash.clone()),
+            callee_symbol_hash: None,
+            callee_name: None,
+            value: None,
+            args: None,
+            message: Some(format!(
+                "place {:?} region {region} referent {referent_type_hash}",
+                place
+            )),
+        },
+        TraceEvent::FieldAccess {
+            frame,
+            symbol_hash,
+            function_def_hash,
+            expr_hash,
+            place,
+            field,
+            type_hash,
+            ..
+        } => DebugEventView {
+            event_index,
+            event: "field_access".to_string(),
+            frame: Some(*frame),
+            symbol_hash: Some(symbol_hash.clone()),
+            function_name: None,
+            function_def_hash: Some(function_def_hash.clone()),
+            expr_hash: Some(expr_hash.clone()),
+            expr_kind: None,
+            type_hash: Some(type_hash.clone()),
+            callee_symbol_hash: None,
+            callee_name: None,
+            value: None,
+            args: None,
+            message: Some(format!("field {field} place {:?}", place)),
+        },
         TraceEvent::Value {
             frame,
             symbol_hash,
@@ -1199,6 +1282,9 @@ fn event_frame(event: &TraceEvent) -> Option<usize> {
         TraceEvent::EnterFunction { frame, .. }
         | TraceEvent::ExitFunction { frame, .. }
         | TraceEvent::EvalExpr { frame, .. }
+        | TraceEvent::BorrowShared { frame, .. }
+        | TraceEvent::BorrowMut { frame, .. }
+        | TraceEvent::FieldAccess { frame, .. }
         | TraceEvent::Value { frame, .. }
         | TraceEvent::Call { frame, .. }
         | TraceEvent::BranchDecision { frame, .. }
@@ -1211,6 +1297,9 @@ fn event_frame(event: &TraceEvent) -> Option<usize> {
 fn event_expr_hash(event: &TraceEvent) -> Option<&str> {
     match event {
         TraceEvent::EvalExpr { expr_hash, .. }
+        | TraceEvent::BorrowShared { expr_hash, .. }
+        | TraceEvent::BorrowMut { expr_hash, .. }
+        | TraceEvent::FieldAccess { expr_hash, .. }
         | TraceEvent::Value { expr_hash, .. }
         | TraceEvent::Call { expr_hash, .. }
         | TraceEvent::BranchDecision { expr_hash, .. }

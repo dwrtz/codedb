@@ -529,6 +529,13 @@ impl CodeDb {
 
         let mut ctx = LowerCtx::new(target_triple);
         let mut lowered = self.lower_expr(root, &body, &param_types, &mut ctx, &mut Vec::new())?;
+        lowered.operations.extend(self.lower_param_drop_scaffolds(
+            root,
+            target_triple,
+            &param_types,
+            &body,
+            &mut ctx,
+        )?);
         let local_slots = ctx.local_slots.clone();
         let debug_map = ctx.into_debug_map();
         lowered.operations.push(LoweredOp::Return {
@@ -1072,6 +1079,37 @@ impl CodeDb {
             }
             other => bail!("unknown expression kind {other}"),
         }
+    }
+
+    fn lower_param_drop_scaffolds(
+        &self,
+        root: &ProgramRootPayload,
+        target_triple: &str,
+        param_types: &[String],
+        debug_expr_hash: &str,
+        ctx: &mut LowerCtx,
+    ) -> Result<Vec<LoweredOp>> {
+        let mut operations = Vec::new();
+        for (slot, type_hash) in param_types.iter().enumerate() {
+            if !self.type_requires_drop_scaffold(root, target_triple, type_hash)? {
+                continue;
+            }
+            let address = ctx.value();
+            ctx.push_debug_op(debug_expr_hash, "addr_of_param", &address);
+            operations.push(LoweredOp::AddrOfParam {
+                id: address.clone(),
+                place: LoweredPlace::Param {
+                    slot,
+                    type_hash: type_hash.clone(),
+                    indirect: self.type_passes_indirect(root, target_triple, type_hash)?,
+                },
+            });
+            operations.push(LoweredOp::Drop {
+                address,
+                type_hash: type_hash.clone(),
+            });
+        }
+        Ok(operations)
     }
 
     fn lower_place_value(

@@ -436,6 +436,126 @@ fn main<'a>() -> i64 effects[state] =
 }
 
 #[test]
+fn assigning_mutable_reference_field_keeps_new_loan_exclusive() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("mut-field-reassign-exclusive.sqlite");
+    let source = temp.path().join("mut-field-reassign-exclusive.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+}
+
+record LineEditor<'a> {
+  line: &'a mut Line
+}
+
+fn main<'a>() -> i64 effects[state] =
+  let first: Line = { price_cents: 1 } in
+  let second: Line = { price_cents: 2 } in
+  let editor: LineEditor<'a> = { line: &'a mut first } in
+  let changed: unit = editor.line = &'a mut second in
+  let duplicate: LineEditor<'a> = { line: &'a mut second } in
+  let write_a: unit = editor.line.price_cents = 10 in
+  let write_b: unit = duplicate.line.price_cents = 20 in
+  0
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_borrow"))
+        .stderr(predicate::str::contains("exclusive loan conflict"));
+}
+
+#[test]
+fn assigning_mutable_reference_field_releases_old_loan() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("mut-field-reassign-release.sqlite");
+    let source = temp.path().join("mut-field-reassign-release.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+}
+
+record LineEditor<'a> {
+  line: &'a mut Line
+}
+
+fn main<'a>() -> i64 effects[state] =
+  let first: Line = { price_cents: 1 } in
+  let second: Line = { price_cents: 2 } in
+  let editor: LineEditor<'a> = { line: &'a mut first } in
+  let changed: unit = editor.line = &'a mut second in
+  first.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "1");
+    run(&["verify", path(&db)]);
+}
+
+#[test]
+fn assigning_one_nested_let_reference_field_keeps_sibling_loan_live() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("mut-field-reassign-sibling.sqlite");
+    let source = temp.path().join("mut-field-reassign-sibling.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+}
+
+record PairEditor<'a> {
+  first: &'a mut Line
+  second: &'a mut Line
+}
+
+record LineEditor<'a> {
+  line: &'a mut Line
+}
+
+fn main<'a>() -> i64 effects[state] =
+  let first: Line = { price_cents: 1 } in
+  let second: Line = { price_cents: 2 } in
+  let third: Line = { price_cents: 3 } in
+  let editor: PairEditor<'a> =
+    (let built: PairEditor<'a> =
+       { first: &'a mut first, second: &'a mut second } in
+     built) in
+  let changed: unit = editor.first = &'a mut third in
+  let duplicate: LineEditor<'a> = { line: &'a mut second } in
+  let write_a: unit = editor.second.price_cents = 10 in
+  let write_b: unit = duplicate.line.price_cents = 20 in
+  0
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_borrow"))
+        .stderr(predicate::str::contains("exclusive loan conflict"));
+}
+
+#[test]
 fn assignment_requires_state_effect() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("missing-state-effect.sqlite");

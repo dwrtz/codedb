@@ -205,6 +205,43 @@ fn trace_failures_include_structured_diagnostics() {
 }
 
 #[test]
+fn trace_reports_semantic_places_for_borrows_and_field_access() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("trace-v2-places.sqlite");
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), "examples/v2/line_view_refs.cdb"]);
+
+    let trace = parse_json(&run(&["trace", path(&db), "main", "--json"]));
+    assert_eq!(trace["status"], "ok");
+
+    let borrow = events(&trace)
+        .iter()
+        .find(|event| event["event"] == "borrow_shared")
+        .expect("borrow_shared event");
+    assert_eq!(borrow["place"]["root"], "local");
+    assert_eq!(borrow["place"]["index"], 0);
+    assert_eq!(borrow["place"]["path"], json!([]));
+    assert!(borrow["region"].as_str().unwrap().starts_with("sha256:"));
+    assert!(
+        borrow["referent_type_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+
+    let price_field = events(&trace)
+        .iter()
+        .find(|event| {
+            event["event"] == "field_access"
+                && event["place"]["path"] == json!(["line", "price_cents"])
+        })
+        .expect("price_cents field access event");
+    assert_eq!(price_field["place"]["root"], "param");
+    assert_eq!(price_field["place"]["index"], 0);
+    assert_eq!(price_field["field"], "price_cents");
+}
+
+#[test]
 fn workspace_api_runs_semantic_trace() {
     let temp = tempdir().unwrap();
     let db_path = temp.path().join("trace-api.sqlite");

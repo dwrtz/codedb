@@ -221,6 +221,14 @@ struct LoanPlace {
     fields: Vec<String>,
 }
 
+impl LoanPlace {
+    fn with_field(&self, field: &str) -> Self {
+        let mut place = self.clone();
+        place.fields.push(field.to_string());
+        place
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveLoan {
     kind: LoanKind,
@@ -3605,11 +3613,28 @@ impl CodeDb {
                     .get("value")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("assign missing value"))?;
+                let pre_value_state = state.clone();
                 self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
                 let target_place = self.loan_place_for_expr(target, param_types, &state.locals)?;
                 self.check_place_not_moved(&target_place, state)?;
                 self.check_loan_conflicts(&LoanKind::Mutable, &target_place, &state.active)?;
                 self.verify_expr_borrows(root, value, param_types, state, ExprUse::Value)?;
+                let target_type = self.expr_declared_type(target)?;
+                let target_class = self.value_class_in_root(root, &target_type)?;
+                if target_class.contains_reference {
+                    let value_loans = self.collect_value_loans_for_store(
+                        root,
+                        value,
+                        param_types,
+                        &pre_value_state,
+                        &target_place,
+                    )?;
+                    self.check_loans_point_to_live_storage(&value_loans, state)?;
+                    state
+                        .active
+                        .retain(|loan| !loan_owner_overlaps(loan, &target_place));
+                    self.add_checked_value_loans(&mut state.active, &value_loans)?;
+                }
                 Ok(())
             }
             "let" => {
@@ -3629,37 +3654,42 @@ impl CodeDb {
                     param_types,
                     &pre_value_state.locals,
                 )?;
-                let mut value_loans =
-                    self.collect_value_loans(root, value_hash, param_types, &pre_value_state)?;
-                self.check_loans_point_to_live_storage(&value_loans, state)?;
-                if let Some(owner) = &transfer_owner {
-                    state
-                        .active
-                        .retain(|loan| !loan_owner_overlaps(loan, owner));
-                }
-                let mut active_with_value_loans = state.active.clone();
-                self.add_checked_value_loans(&mut active_with_value_loans, &value_loans)?;
                 let local_id = state.next_local;
                 state.next_local += 1;
                 let local_owner = LoanPlace {
                     root: LoanRoot::Local(local_id),
                     fields: Vec::new(),
                 };
-                for loan in &mut value_loans {
-                    loan.owner = Some(local_owner.clone());
+                let value_loans = self.collect_value_loans_for_store(
+                    root,
+                    value_hash,
+                    param_types,
+                    &pre_value_state,
+                    &local_owner,
+                )?;
+                self.check_loans_point_to_live_storage(&value_loans, state)?;
+                if let Some(owner) = &transfer_owner {
+                    state
+                        .active
+                        .retain(|loan| !loan_owner_overlaps(loan, owner));
                 }
                 state.locals.push(local_id);
-                state.active.extend(value_loans);
+                self.add_checked_value_loans(&mut state.active, &value_loans)?;
                 let body_result =
                     self.verify_expr_borrows(root, body_hash, param_types, state, ExprUse::Value);
                 state
                     .active
                     .retain(|loan| !loan_owner_overlaps(loan, &local_owner));
+                let scope_result = if body_result.is_ok() {
+                    self.check_no_loans_outlive_local(local_id, state)
+                } else {
+                    Ok(())
+                };
                 state
                     .moved
                     .retain(|place| !matches!(place.root, LoanRoot::Local(id) if id == local_id));
                 state.locals.pop();
-                body_result
+                body_result.and(scope_result)
             }
             "if" => {
                 let cond = payload
@@ -3884,21 +3914,23 @@ impl CodeDb {
                     param_types,
                     &nested_state.locals,
                 )?;
-                let mut value_loans =
-                    self.collect_value_loans(root, value_hash, param_types, &nested_state)?;
-                if let Some(owner) = &transfer_owner {
-                    nested_state
-                        .active
-                        .retain(|loan| !loan_owner_overlaps(loan, owner));
-                }
                 let local_id = nested_state.next_local;
                 nested_state.next_local += 1;
                 let local_owner = LoanPlace {
                     root: LoanRoot::Local(local_id),
                     fields: Vec::new(),
                 };
-                for loan in &mut value_loans {
-                    loan.owner = Some(local_owner.clone());
+                let value_loans = self.collect_value_loans_for_store(
+                    root,
+                    value_hash,
+                    param_types,
+                    &nested_state,
+                    &local_owner,
+                )?;
+                if let Some(owner) = &transfer_owner {
+                    nested_state
+                        .active
+                        .retain(|loan| !loan_owner_overlaps(loan, owner));
                 }
                 nested_state.locals.push(local_id);
                 nested_state.active.extend(value_loans);
@@ -3940,6 +3972,132 @@ impl CodeDb {
         Ok(out)
     }
 
+    fn collect_value_loans_for_store(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        param_types: &[String],
+        state: &MoveBorrowState,
+        target_owner: &LoanPlace,
+    ) -> Result<Vec<ActiveLoan>> {
+        let payload = self.get_payload(expr_hash)?;
+        match payload
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
+        {
+            "record_literal" => {
+                let mut out = Vec::new();
+                for field in payload
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("record_literal missing fields"))?
+                {
+                    let name = field
+                        .get("name")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("record field missing name"))?;
+                    let value = field
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("record field missing value"))?;
+                    let field_owner = target_owner.with_field(name);
+                    out.extend(self.collect_value_loans_for_store(
+                        root,
+                        value,
+                        param_types,
+                        state,
+                        &field_owner,
+                    )?);
+                }
+                Ok(out)
+            }
+            "if" => {
+                let then_hash = payload
+                    .get("then")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("if missing then"))?;
+                let else_hash = payload
+                    .get("else")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("if missing else"))?;
+                Ok(alternative_value_loans(
+                    self.collect_value_loans_for_store(
+                        root,
+                        then_hash,
+                        param_types,
+                        state,
+                        target_owner,
+                    )?,
+                    self.collect_value_loans_for_store(
+                        root,
+                        else_hash,
+                        param_types,
+                        state,
+                        target_owner,
+                    )?,
+                ))
+            }
+            "let" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing value"))?;
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing body"))?;
+                let mut nested_state = state.clone();
+                let transfer_owner = self.move_source_place_for_expr(
+                    root,
+                    value_hash,
+                    param_types,
+                    &nested_state.locals,
+                )?;
+                let local_id = nested_state.next_local;
+                nested_state.next_local += 1;
+                let local_owner = LoanPlace {
+                    root: LoanRoot::Local(local_id),
+                    fields: Vec::new(),
+                };
+                let value_loans = self.collect_value_loans_for_store(
+                    root,
+                    value_hash,
+                    param_types,
+                    &nested_state,
+                    &local_owner,
+                )?;
+                if let Some(owner) = &transfer_owner {
+                    nested_state
+                        .active
+                        .retain(|loan| !loan_owner_overlaps(loan, owner));
+                }
+                nested_state.locals.push(local_id);
+                nested_state.active.extend(value_loans);
+                self.collect_value_loans_for_store(
+                    root,
+                    body_hash,
+                    param_types,
+                    &nested_state,
+                    target_owner,
+                )
+            }
+            _ => {
+                let mut loans = self.collect_value_loans(root, expr_hash, param_types, state)?;
+                let source_owner =
+                    self.source_place_for_value_expr(expr_hash, param_types, &state.locals)?;
+                for loan in &mut loans {
+                    loan.owner = Some(rebased_loan_owner(
+                        loan.owner.as_ref(),
+                        source_owner.as_ref(),
+                        target_owner,
+                    ));
+                }
+                Ok(loans)
+            }
+        }
+    }
+
     fn check_loans_point_to_live_storage(
         &self,
         loans: &[ActiveLoan],
@@ -3949,6 +4107,19 @@ impl CodeDb {
             if let LoanRoot::Local(local_id) = loan.place.root
                 && !state.locals.contains(&local_id)
             {
+                bail!(
+                    "loan of {:?} outlives local storage {:?}",
+                    loan.place,
+                    local_id
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn check_no_loans_outlive_local(&self, local_id: usize, state: &MoveBorrowState) -> Result<()> {
+        for loan in &state.active {
+            if matches!(loan.place.root, LoanRoot::Local(id) if id == local_id) {
                 bail!(
                     "loan of {:?} outlives local storage {:?}",
                     loan.place,
@@ -4009,6 +4180,40 @@ impl CodeDb {
                 nested_locals.push(synthetic_local);
                 let source =
                     self.move_source_place_for_expr(root, body_hash, param_types, &nested_locals)?;
+                let Some(source) = source else {
+                    return Ok(None);
+                };
+                if matches!(source.root, LoanRoot::Local(id) if id == synthetic_local) {
+                    Ok(None)
+                } else {
+                    Ok(Some(source))
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn source_place_for_value_expr(
+        &self,
+        expr_hash: &str,
+        param_types: &[String],
+        locals: &[usize],
+    ) -> Result<Option<LoanPlace>> {
+        let payload = self.get_payload(expr_hash)?;
+        match payload.get("expr_kind").and_then(JsonValue::as_str) {
+            Some("param_ref" | "local_ref" | "field_access") => Ok(Some(
+                self.loan_place_for_expr(expr_hash, param_types, locals)?,
+            )),
+            Some("let") => {
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing body"))?;
+                let mut nested_locals = locals.to_vec();
+                let synthetic_local = synthetic_let_local_id(&nested_locals);
+                nested_locals.push(synthetic_local);
+                let source =
+                    self.source_place_for_value_expr(body_hash, param_types, &nested_locals)?;
                 let Some(source) = source else {
                     return Ok(None);
                 };
@@ -4845,6 +5050,31 @@ fn loan_owner_overlaps(loan: &ActiveLoan, owner: &LoanPlace) -> bool {
     loan.owner
         .as_ref()
         .is_some_and(|loan_owner| places_overlap(loan_owner, owner))
+}
+
+fn rebased_loan_owner(
+    existing_owner: Option<&LoanPlace>,
+    source_owner: Option<&LoanPlace>,
+    target_owner: &LoanPlace,
+) -> LoanPlace {
+    let Some(existing_owner) = existing_owner else {
+        return target_owner.clone();
+    };
+    let Some(source_owner) = source_owner else {
+        return target_owner.clone();
+    };
+    if existing_owner.root != source_owner.root
+        || !fields_prefix(&source_owner.fields, &existing_owner.fields)
+    {
+        return target_owner.clone();
+    }
+    let mut rebased = target_owner.clone();
+    rebased.fields.extend(
+        existing_owner.fields[source_owner.fields.len()..]
+            .iter()
+            .cloned(),
+    );
+    rebased
 }
 
 fn alternative_value_loans(left: Vec<ActiveLoan>, right: Vec<ActiveLoan>) -> Vec<ActiveLoan> {

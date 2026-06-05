@@ -42,6 +42,13 @@ pub struct TraceLocation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TracePlace {
+    pub root: String,
+    pub index: usize,
+    pub path: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TraceValue {
     I64 {
@@ -130,6 +137,38 @@ pub enum TraceEvent {
         function_def_hash: String,
         expr_hash: String,
         expr_kind: String,
+        type_hash: String,
+    },
+    BorrowShared {
+        root_hash: String,
+        frame: usize,
+        symbol_hash: String,
+        function_def_hash: String,
+        expr_hash: String,
+        place: TracePlace,
+        region: String,
+        referent_type_hash: String,
+        type_hash: String,
+    },
+    BorrowMut {
+        root_hash: String,
+        frame: usize,
+        symbol_hash: String,
+        function_def_hash: String,
+        expr_hash: String,
+        place: TracePlace,
+        region: String,
+        referent_type_hash: String,
+        type_hash: String,
+    },
+    FieldAccess {
+        root_hash: String,
+        frame: usize,
+        symbol_hash: String,
+        function_def_hash: String,
+        expr_hash: String,
+        place: TracePlace,
+        field: String,
         type_hash: String,
     },
     Value {
@@ -577,7 +616,7 @@ impl CodeDb {
             function_def_hash: function_def_hash.to_string(),
             expr_hash: expr_hash.to_string(),
             expr_kind: expr_kind.clone(),
-            type_hash,
+            type_hash: type_hash.clone(),
         });
 
         let result = match expr_kind.as_str() {
@@ -787,6 +826,27 @@ impl CodeDb {
                     .get("target")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_shared missing target"))?;
+                let region = payload
+                    .get("region")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_shared missing region"))?
+                    .to_string();
+                let referent_type_hash = payload
+                    .get("referent_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_shared missing referent_type"))?
+                    .to_string();
+                state.events.push(TraceEvent::BorrowShared {
+                    root_hash: state.root_hash.clone(),
+                    frame,
+                    symbol_hash: symbol_hash.to_string(),
+                    function_def_hash: function_def_hash.to_string(),
+                    expr_hash: expr_hash.to_string(),
+                    place: self.trace_place_for_expr(target_hash, locals.len())?,
+                    region,
+                    referent_type_hash,
+                    type_hash: type_hash.clone(),
+                });
                 let value = self
                     .trace_place_cell(target_hash, args, locals)
                     .map(Value::SharedRef);
@@ -804,6 +864,27 @@ impl CodeDb {
                     .get("target")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_mut missing target"))?;
+                let region = payload
+                    .get("region")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_mut missing region"))?
+                    .to_string();
+                let referent_type_hash = payload
+                    .get("referent_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("borrow_mut missing referent_type"))?
+                    .to_string();
+                state.events.push(TraceEvent::BorrowMut {
+                    root_hash: state.root_hash.clone(),
+                    frame,
+                    symbol_hash: symbol_hash.to_string(),
+                    function_def_hash: function_def_hash.to_string(),
+                    expr_hash: expr_hash.to_string(),
+                    place: self.trace_place_for_expr(target_hash, locals.len())?,
+                    region,
+                    referent_type_hash,
+                    type_hash: type_hash.clone(),
+                });
                 let value = self
                     .trace_place_cell(target_hash, args, locals)
                     .map(Value::MutRef);
@@ -1005,6 +1086,21 @@ impl CodeDb {
                 Ok(value)
             }
             "field_access" => {
+                let field = payload
+                    .get("field")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing field"))?
+                    .to_string();
+                state.events.push(TraceEvent::FieldAccess {
+                    root_hash: state.root_hash.clone(),
+                    frame,
+                    symbol_hash: symbol_hash.to_string(),
+                    function_def_hash: function_def_hash.to_string(),
+                    expr_hash: expr_hash.to_string(),
+                    place: self.trace_place_for_expr(expr_hash, locals.len())?,
+                    field,
+                    type_hash: type_hash.clone(),
+                });
                 let value = self
                     .trace_place_cell(expr_hash, args, locals)
                     .map(|value| value.borrow().clone());
@@ -1210,6 +1306,57 @@ impl CodeDb {
                 field_cell(&target, field)
             }
             other => bail!("expression kind {other} is not an assignable place"),
+        }
+    }
+
+    fn trace_place_for_expr(&self, expr_hash: &str, locals_len: usize) -> Result<TracePlace> {
+        let payload = self.get_payload(expr_hash)?;
+        match payload
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
+        {
+            "param_ref" => {
+                let index = payload
+                    .get("index")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("param_ref missing index"))?
+                    as usize;
+                Ok(TracePlace {
+                    root: "param".to_string(),
+                    index,
+                    path: Vec::new(),
+                })
+            }
+            "local_ref" => {
+                let depth = payload
+                    .get("depth")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
+                    as usize;
+                let index = locals_len
+                    .checked_sub(depth + 1)
+                    .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))?;
+                Ok(TracePlace {
+                    root: "local".to_string(),
+                    index,
+                    path: Vec::new(),
+                })
+            }
+            "field_access" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing target"))?;
+                let field = payload
+                    .get("field")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing field"))?;
+                let mut place = self.trace_place_for_expr(target, locals_len)?;
+                place.path.push(field.to_string());
+                Ok(place)
+            }
+            other => bail!("expression kind {other} is not a semantic place"),
         }
     }
 }

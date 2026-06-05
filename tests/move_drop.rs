@@ -203,6 +203,43 @@ fn main<'a>() -> i64 =
 }
 
 #[test]
+fn mutable_reference_record_parameter_gets_drop_scaffold() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("param-drop-scaffold.sqlite");
+    let source = temp.path().join("param-drop-scaffold.cdb");
+    let ir_path = temp.path().join("consume.ir.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+}
+
+record LineEditor<'a> {
+  line: &'a mut Line
+}
+
+fn consume<'a>(editor: LineEditor<'a>) -> i64 = editor.line.price_cents
+
+fn main<'a>() -> i64 =
+  let line: Line = { price_cents: 25 } in
+  let editor: LineEditor<'a> = { line: &'a mut line } in
+  consume(editor)
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&["emit-ir", path(&db), "consume", "--out", path(&ir_path)]);
+    let ir = read_json(&ir_path);
+    let ops = op_names(&ir);
+    assert!(ops.contains(&"drop".to_string()));
+    run(&["verify", path(&db)]);
+}
+
+#[test]
 fn using_moved_move_only_record_is_rejected() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("use-after-move.sqlite");
@@ -336,6 +373,44 @@ fn main<'a>() -> i64 effects[state] =
      { line: &'a mut line }) in
   let changed: unit = editor.line.price_cents = 99 in
   editor.line.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_borrow"))
+        .stderr(predicate::str::contains("outlives local storage"));
+}
+
+#[test]
+fn assignment_cannot_smuggle_inner_mutable_borrow_out() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("assign-smuggle-inner-mut.sqlite");
+    let source = temp.path().join("assign-smuggle-inner-mut.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+}
+
+record LineEditor<'a> {
+  line: &'a mut Line
+}
+
+fn main<'a>() -> i64 effects[state] =
+  let outer: Line = { price_cents: 1 } in
+  let editor: LineEditor<'a> = { line: &'a mut outer } in
+  let leaked: LineEditor<'a> =
+    (let inner: Line = { price_cents: 2 } in
+     let changed: unit = editor.line = &'a mut inner in
+     editor) in
+  leaked.line.price_cents
 "#,
     )
     .unwrap();
