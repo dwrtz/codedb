@@ -277,6 +277,79 @@ fn main<'a>() -> i64 =
 }
 
 #[test]
+fn shared_reference_record_cannot_outlive_inner_local_storage() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("shared-record-inner-local.sqlite");
+    let source = temp.path().join("shared-record-inner-local.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+record LineView<'a> {
+  line: &'a Line
+}
+
+fn main<'a>() -> i64 =
+  let view: LineView<'a> =
+    (let line: Line = { price_cents: 25, qty: 4 } in
+     { line: &'a line }) in
+  view.line.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_borrow"))
+        .stderr(predicate::str::contains("outlives local storage"));
+}
+
+#[test]
+fn mutable_reference_record_cannot_outlive_inner_local_storage() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("mutable-record-inner-local.sqlite");
+    let source = temp.path().join("mutable-record-inner-local.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+record LineEditor<'a> {
+  line: &'a mut Line
+}
+
+fn main<'a>() -> i64 effects[state] =
+  let editor: LineEditor<'a> =
+    (let line: Line = { price_cents: 25, qty: 4 } in
+     { line: &'a mut line }) in
+  let changed: unit = editor.line.price_cents = 99 in
+  editor.line.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_borrow"))
+        .stderr(predicate::str::contains("outlives local storage"));
+}
+
+#[test]
 fn moving_outer_mutable_reference_record_through_inner_let_transfers_loan() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("outer-move-through-inner-let.sqlite");

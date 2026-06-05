@@ -18,8 +18,8 @@ use crate::model::{
 use crate::store::{CodeDb, canonical_json, hash_bytes};
 use crate::tests::{test_points_to_entry_symbol, validate_test_value_for_type};
 use crate::types::{
-    Effect, ParamSpec, RegionParamDef, TypeDefinition, TypeDefinitionKind, TypeMemberDef,
-    TypeMemberSpec, TypeSpec,
+    Effect, ParamSpec, RegionParamDef, SymbolBirthSpec, TypeDefinition, TypeDefinitionIdentity,
+    TypeDefinitionKind, TypeMemberDef, TypeMemberSpec, TypeSpec,
 };
 use crate::{HISTORY_DOMAIN, MAIN_BRANCH, MIGRATION_DOMAIN};
 
@@ -63,6 +63,8 @@ pub(crate) enum Operation {
         #[serde(default)]
         region_params: Vec<String>,
         definition: TypeDefinitionKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<TypeDefinitionIdentity>,
     },
     RenameType {
         module: String,
@@ -2783,6 +2785,7 @@ impl CodeDb {
                 birth_seed,
                 region_params,
                 definition,
+                identity,
             } => self.apply_create_type(
                 input_root,
                 parent_history_hash,
@@ -2791,6 +2794,7 @@ impl CodeDb {
                 birth_seed,
                 region_params,
                 definition,
+                identity.as_ref(),
             ),
             Operation::RenameType {
                 module,
@@ -3199,6 +3203,7 @@ impl CodeDb {
         birth_seed: &str,
         region_param_names: &[String],
         definition: &TypeDefinitionKind,
+        identity: Option<&TypeDefinitionIdentity>,
     ) -> Result<String> {
         validate_module_path("module", module)?;
         validate_projection_identifier("type name", name)?;
@@ -3213,12 +3218,17 @@ impl CodeDb {
             bail!("type name already exists: {module}.{name}");
         }
 
-        let type_symbol = self.put_type_symbol_birth(parent_history_hash, birth_seed)?;
+        let type_symbol = if let Some(identity) = identity {
+            self.put_symbol_birth_spec(&identity.type_symbol_birth, "type", None)?
+        } else {
+            self.put_type_symbol_birth(parent_history_hash, birth_seed)?
+        };
         let (region_params, region_scope) = self.create_region_params(
             parent_history_hash,
             &type_symbol,
             birth_seed,
             region_param_names,
+            identity.map(|identity| identity.region_param_births.as_slice()),
         )?;
         let semantic_definition = self.type_definition_from_source(
             &root,
@@ -3229,6 +3239,7 @@ impl CodeDb {
             region_params,
             &region_scope,
             definition,
+            identity,
         )?;
         let type_def = self.put_type_def(&type_symbol, &semantic_definition)?;
         root.types.push(RootTypePayload {
@@ -4376,16 +4387,34 @@ impl CodeDb {
         type_symbol: &str,
         birth_seed: &str,
         region_param_names: &[String],
+        region_param_births: Option<&[SymbolBirthSpec]>,
     ) -> Result<(Vec<RegionParamDef>, BTreeMap<String, String>)> {
         validate_region_param_names(region_param_names)?;
+        if let Some(region_param_births) = region_param_births
+            && region_param_births.len() != region_param_names.len()
+        {
+            bail!(
+                "projection identity region parameter count mismatch: expected {}, got {}",
+                region_param_names.len(),
+                region_param_births.len()
+            );
+        }
         let mut params = Vec::with_capacity(region_param_names.len());
         let mut scope = BTreeMap::new();
         for (idx, name) in region_param_names.iter().enumerate() {
-            let region = self.put_region_param_birth(
-                parent_history_hash,
-                type_symbol,
-                &format!("{birth_seed}:region:{idx}:{name}"),
-            )?;
+            let region = if let Some(region_param_births) = region_param_births {
+                self.put_symbol_birth_spec(
+                    &region_param_births[idx],
+                    "region_param",
+                    Some(type_symbol),
+                )?
+            } else {
+                self.put_region_param_birth(
+                    parent_history_hash,
+                    type_symbol,
+                    &format!("{birth_seed}:region:{idx}:{name}"),
+                )?
+            };
             params.push(RegionParamDef {
                 region: region.clone(),
                 name: name.clone(),
@@ -4406,20 +4435,39 @@ impl CodeDb {
         region_params: Vec<RegionParamDef>,
         region_scope: &BTreeMap<String, String>,
         definition: &TypeDefinitionKind,
+        identity: Option<&TypeDefinitionIdentity>,
     ) -> Result<TypeDefinition> {
         match definition {
             TypeDefinitionKind::Record { fields } => {
+                if let Some(identity) = identity
+                    && identity.member_births.len() != fields.len()
+                {
+                    bail!(
+                        "projection identity record field count mismatch: expected {}, got {}",
+                        fields.len(),
+                        identity.member_births.len()
+                    );
+                }
                 let fields = fields
                     .iter()
                     .enumerate()
                     .map(|(idx, field)| {
                         validate_projection_identifier("record field", &field.name)?;
-                        Ok(TypeMemberDef {
-                            member_symbol: self.put_record_field_birth(
+                        let member_symbol = if let Some(identity) = identity {
+                            self.put_symbol_birth_spec(
+                                &identity.member_births[idx],
+                                "record_field",
+                                Some(type_symbol),
+                            )?
+                        } else {
+                            self.put_record_field_birth(
                                 parent_history_hash,
                                 type_symbol,
                                 &format!("{birth_seed}:field:{idx}:{}", field.name),
-                            )?,
+                            )?
+                        };
+                        Ok(TypeMemberDef {
+                            member_symbol,
                             name: field.name.clone(),
                             type_hash: self.resolve_type_in_root_with_regions(
                                 module,
@@ -4437,17 +4485,35 @@ impl CodeDb {
                 })
             }
             TypeDefinitionKind::Enum { variants } => {
+                if let Some(identity) = identity
+                    && identity.member_births.len() != variants.len()
+                {
+                    bail!(
+                        "projection identity enum variant count mismatch: expected {}, got {}",
+                        variants.len(),
+                        identity.member_births.len()
+                    );
+                }
                 let variants = variants
                     .iter()
                     .enumerate()
                     .map(|(idx, variant)| {
                         validate_projection_identifier("enum variant", &variant.name)?;
-                        Ok(TypeMemberDef {
-                            member_symbol: self.put_enum_variant_birth(
+                        let member_symbol = if let Some(identity) = identity {
+                            self.put_symbol_birth_spec(
+                                &identity.member_births[idx],
+                                "enum_variant",
+                                Some(type_symbol),
+                            )?
+                        } else {
+                            self.put_enum_variant_birth(
                                 parent_history_hash,
                                 type_symbol,
                                 &format!("{birth_seed}:variant:{idx}:{}", variant.name),
-                            )?,
+                            )?
+                        };
+                        Ok(TypeMemberDef {
+                            member_symbol,
                             name: variant.name.clone(),
                             type_hash: self.resolve_type_in_root_with_regions(
                                 module,

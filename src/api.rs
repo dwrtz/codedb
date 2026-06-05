@@ -736,6 +736,7 @@ impl CodeDb {
                     .unwrap_or_else(|| format!("json:type:{module}:{name}")),
                 region_params: region_params.clone(),
                 definition: definition.clone(),
+                identity: None,
             }),
             ApiOperation::RenameType {
                 module,

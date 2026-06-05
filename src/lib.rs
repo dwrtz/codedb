@@ -106,6 +106,7 @@ impl CodeDb {
                         birth_seed,
                         region_params: definition.region_params,
                         definition: definition.definition,
+                        identity: definition.identity,
                     }
                 }
                 ProgramItem::Function(function) => {

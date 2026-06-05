@@ -176,6 +176,80 @@ fn field_and_variant_renames_preserve_member_identity() {
 }
 
 #[test]
+fn renamed_types_and_members_round_trip_projection_with_stable_identities() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("renamed-identities.sqlite");
+    let rebuilt = temp.path().join("renamed-identities-rebuilt.sqlite");
+    let source = temp.path().join("renamed-identities.cdb");
+    let rename_type = temp.path().join("rename-type.json");
+    let rename_field = temp.path().join("rename-field.json");
+    let rename_variant = temp.path().join("rename-variant.json");
+    let projection = temp.path().join("renamed-identities.projection.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+enum Discount {
+  none: unit
+  percent: i64
+}
+
+fn main() -> i64 = 1
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &rename_type,
+        r#"{ "kind": "rename_type", "name": "Line", "new_name": "InvoiceLine" }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &rename_field,
+        r#"{ "kind": "rename_field", "type": "InvoiceLine", "field": "price_cents", "new_name": "amount_cents" }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &rename_variant,
+        r#"{ "kind": "rename_variant", "type": "Discount", "variant": "percent", "new_name": "pct" }"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&["apply", path(&db), "--json", path(&rename_type)]);
+    run(&["apply", path(&db), "--json", path(&rename_field)]);
+    run(&["apply", path(&db), "--json", path(&rename_variant)]);
+    run(&["verify", path(&db)]);
+
+    run(&[
+        "export",
+        path(&db),
+        "--branch",
+        "main",
+        "--out",
+        path(&projection),
+    ]);
+    let exported = std::fs::read_to_string(&projection).unwrap();
+    assert!(exported.contains("record InvoiceLine"));
+    assert!(exported.contains("amount_cents: i64"));
+    assert!(exported.contains("pct: i64"));
+
+    run(&["init", path(&rebuilt)]);
+    run(&["import", path(&rebuilt), path(&projection)]);
+    run(&["verify", path(&rebuilt)]);
+
+    assert_eq!(
+        type_identity_summary(&list_json(&db)),
+        type_identity_summary(&list_json(&rebuilt))
+    );
+}
+
+#[test]
 fn field_rename_updates_existing_function_bodies() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("rename-used-field.sqlite");

@@ -30,6 +30,68 @@ pub struct TypeMemberSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SymbolBirthSpec {
+    pub(crate) symbol_kind: String,
+    pub(crate) birth_history_hash: String,
+    pub(crate) local_nonce: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) owner_type_symbol: Option<String>,
+}
+
+impl SymbolBirthSpec {
+    pub(crate) fn from_payload(payload: &JsonValue) -> Result<Self> {
+        let symbol_kind = payload
+            .get("symbol_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("SymbolBirth missing symbol_kind"))?
+            .to_string();
+        let birth_history_hash = payload
+            .get("birth_history_hash")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("SymbolBirth missing birth_history_hash"))?
+            .to_string();
+        let local_nonce = payload
+            .get("local_nonce")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("SymbolBirth missing local_nonce"))?
+            .to_string();
+        let owner_type_symbol = payload
+            .get("owner_type_symbol")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
+        Ok(Self {
+            symbol_kind,
+            birth_history_hash,
+            local_nonce,
+            owner_type_symbol,
+        })
+    }
+
+    pub(crate) fn to_payload(&self) -> JsonValue {
+        let mut payload = json!({
+            "symbol_kind": self.symbol_kind.clone(),
+            "birth_history_hash": self.birth_history_hash.clone(),
+            "local_nonce": self.local_nonce.clone(),
+        });
+        if let Some(owner_type_symbol) = &self.owner_type_symbol {
+            payload["owner_type_symbol"] = JsonValue::String(owner_type_symbol.clone());
+        }
+        payload
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TypeDefinitionIdentity {
+    pub(crate) type_symbol_birth: SymbolBirthSpec,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) region_param_births: Vec<SymbolBirthSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) member_births: Vec<SymbolBirthSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TypeDefinitionKind {
     Record { fields: Vec<TypeMemberSpec> },
@@ -254,6 +316,43 @@ impl CodeDb {
         birth_seed: &str,
     ) -> Result<String> {
         self.put_symbol_birth_with_kind(parent_history_hash, birth_seed, "type")
+    }
+
+    pub(crate) fn symbol_birth_spec(&self, symbol: &str) -> Result<SymbolBirthSpec> {
+        let kind = self.get_kind(symbol)?;
+        if kind != "SymbolBirth" {
+            bail!("symbol {symbol} is {kind}, not SymbolBirth");
+        }
+        SymbolBirthSpec::from_payload(&self.get_payload(symbol)?)
+    }
+
+    pub(crate) fn put_symbol_birth_spec(
+        &mut self,
+        spec: &SymbolBirthSpec,
+        expected_kind: &str,
+        expected_owner_type_symbol: Option<&str>,
+    ) -> Result<String> {
+        if spec.symbol_kind != expected_kind {
+            bail!(
+                "projection identity expected {expected_kind} SymbolBirth, got {}",
+                spec.symbol_kind
+            );
+        }
+        match (
+            expected_owner_type_symbol,
+            spec.owner_type_symbol.as_deref(),
+        ) {
+            (Some(expected), Some(actual)) if actual == expected => {}
+            (Some(expected), Some(actual)) => {
+                bail!("projection identity owner mismatch: expected {expected}, got {actual}")
+            }
+            (Some(expected), None) => {
+                bail!("projection identity missing owner type symbol {expected}")
+            }
+            (None, Some(actual)) => bail!("projection identity has unexpected owner {actual}"),
+            (None, None) => {}
+        }
+        self.put_object("SymbolBirth", &spec.to_payload())
     }
 
     pub(crate) fn put_region_param_birth(
@@ -3388,6 +3487,7 @@ impl CodeDb {
                     self.verify_expr_borrows(root, &arg, param_types, state, ExprUse::Value)?;
                     let arg_loans =
                         self.collect_value_loans(root, &arg, param_types, &pre_arg_state)?;
+                    self.check_loans_point_to_live_storage(&arg_loans, state)?;
                     if let Some(owner) = transfer_owner {
                         moved_call_owners.push(owner);
                     }
@@ -3477,6 +3577,7 @@ impl CodeDb {
                 )?;
                 let mut value_loans =
                     self.collect_value_loans(root, value_hash, param_types, &pre_value_state)?;
+                self.check_loans_point_to_live_storage(&value_loans, state)?;
                 if let Some(owner) = &transfer_owner {
                     state
                         .active
@@ -3748,12 +3849,10 @@ impl CodeDb {
                 }
                 nested_state.locals.push(local_id);
                 nested_state.active.extend(value_loans);
-                out.extend(self.collect_value_loans(
-                    root,
-                    body_hash,
-                    param_types,
-                    &nested_state,
-                )?);
+                let body_loans =
+                    self.collect_value_loans(root, body_hash, param_types, &nested_state)?;
+                self.check_loans_point_to_live_storage(&body_loans, state)?;
+                out.extend(body_loans);
             }
             "if" => {
                 for key in ["then", "else"] {
@@ -3781,6 +3880,25 @@ impl CodeDb {
             _ => {}
         }
         Ok(out)
+    }
+
+    fn check_loans_point_to_live_storage(
+        &self,
+        loans: &[ActiveLoan],
+        state: &MoveBorrowState,
+    ) -> Result<()> {
+        for loan in loans {
+            if let LoanRoot::Local(local_id) = loan.place.root
+                && !state.locals.contains(&local_id)
+            {
+                bail!(
+                    "loan of {:?} outlives local storage {:?}",
+                    loan.place,
+                    local_id
+                );
+            }
+        }
+        Ok(())
     }
 
     fn verify_place_value_use(

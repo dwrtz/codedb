@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display};
 use std::rc::Rc;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -12,10 +12,10 @@ use crate::model::{
     NameBinding, ProgramRootPayload, RootSymbolPayload, param_names, preferred_names,
     preferred_type_names, root_module_names,
 };
-use crate::store::CodeDb;
+use crate::store::{CodeDb, canonical_json};
 use crate::types::{
-    Effect, ParamSpec, RegionParamDef, TypeDefinition, TypeDefinitionKind, TypeMemberSpec,
-    TypeSpec, normalize_effects, visible_effects,
+    Effect, ParamSpec, RegionParamDef, SymbolBirthSpec, TypeDefinition, TypeDefinitionIdentity,
+    TypeDefinitionKind, TypeMemberSpec, TypeSpec, normalize_effects, visible_effects,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +149,7 @@ pub struct TypeDefinitionSource {
     pub name: String,
     pub region_params: Vec<String>,
     pub definition: TypeDefinitionKind,
+    pub(crate) identity: Option<TypeDefinitionIdentity>,
 }
 
 #[derive(Debug, Clone)]
@@ -726,6 +727,16 @@ impl CodeDb {
         root_type: &crate::model::RootTypePayload,
     ) -> Result<String> {
         let definition = self.type_definition(&root_type.type_def)?;
+        let type_identity = TypeDefinitionIdentity {
+            type_symbol_birth: self.symbol_birth_spec(definition.type_symbol())?,
+            region_param_births: definition
+                .region_params()
+                .iter()
+                .map(|param| self.symbol_birth_spec(&param.region))
+                .collect::<Result<Vec<_>>>()?,
+            member_births: Vec::new(),
+        };
+        let type_identity = canonical_json(&serde_json::to_value(&type_identity)?);
         let region_names = definition
             .region_params()
             .iter()
@@ -749,8 +760,12 @@ impl CodeDb {
                 let rendered_fields = fields
                     .iter()
                     .map(|field| {
+                        let member_identity = canonical_json(&serde_json::to_value(
+                            self.symbol_birth_spec(&field.member_symbol)?,
+                        )?);
                         Ok(format!(
-                            "  {}: {}",
+                            "  // codedb:member_identity {}\n  {}: {}",
+                            member_identity,
                             field.name,
                             self.type_name_in_root_with_regions(
                                 root,
@@ -762,7 +777,8 @@ impl CodeDb {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(format!(
-                    "record {}{} {{\n{}\n}}",
+                    "// codedb:type_identity {}\nrecord {}{} {{\n{}\n}}",
+                    type_identity,
                     binding.display_name,
                     region_suffix,
                     rendered_fields.join("\n")
@@ -772,8 +788,12 @@ impl CodeDb {
                 let rendered_variants = variants
                     .iter()
                     .map(|variant| {
+                        let member_identity = canonical_json(&serde_json::to_value(
+                            self.symbol_birth_spec(&variant.member_symbol)?,
+                        )?);
                         Ok(format!(
-                            "  {}: {}",
+                            "  // codedb:member_identity {}\n  {}: {}",
+                            member_identity,
                             variant.name,
                             self.type_name_in_root_with_regions(
                                 root,
@@ -785,7 +805,8 @@ impl CodeDb {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(format!(
-                    "enum {}{} {{\n{}\n}}",
+                    "// codedb:type_identity {}\nenum {}{} {{\n{}\n}}",
+                    type_identity,
                     binding.display_name,
                     region_suffix,
                     rendered_variants.join("\n")
@@ -2393,25 +2414,55 @@ enum Token {
     Ident(String),
     Number(String),
     String(String),
+    Comment(String),
     Symbol(String),
     Eof,
+}
+
+#[derive(Default)]
+struct ProjectionMetadata {
+    type_identity: Option<TypeDefinitionIdentity>,
+    member_identity: Option<SymbolBirthSpec>,
+}
+
+impl ProjectionMetadata {
+    fn is_empty(&self) -> bool {
+        self.type_identity.is_none() && self.member_identity.is_none()
+    }
 }
 
 pub(crate) fn parse_program(source: &str) -> Result<Vec<ProgramItem>> {
     let mut parser = Parser::new(source)?;
     let mut items = Vec::new();
-    while !parser.at_eof() {
+    loop {
+        let metadata = parser.take_projection_metadata()?;
+        if parser.at_eof_raw() {
+            if !metadata.is_empty() {
+                bail!("projection identity comment is not attached to a program item");
+            }
+            break;
+        }
         if parser.consume_ident_value("module") {
+            if !metadata.is_empty() {
+                bail!("projection identity comment cannot attach to module");
+            }
             let module = parser.expect_name_path()?;
             parser.expect_symbol("{")?;
-            while !parser.consume_symbol("}") {
-                if parser.at_eof() {
+            loop {
+                let metadata = parser.take_projection_metadata()?;
+                if parser.consume_symbol("}") {
+                    if !metadata.is_empty() {
+                        bail!("projection identity comment cannot attach to module end");
+                    }
+                    break;
+                }
+                if parser.at_eof_raw() {
                     bail!("unterminated module {module}");
                 }
-                items.push(parser.parse_program_item_in_module(module.clone())?);
+                items.push(parser.parse_program_item_in_module(module.clone(), metadata)?);
             }
         } else {
-            items.push(parser.parse_program_item_in_module(MAIN_BRANCH.to_string())?);
+            items.push(parser.parse_program_item_in_module(MAIN_BRANCH.to_string(), metadata)?);
         }
     }
     Ok(items)
@@ -2446,11 +2497,16 @@ impl Parser {
         })
     }
 
-    fn at_eof(&self) -> bool {
+    fn at_eof(&mut self) -> bool {
+        self.skip_comments();
         matches!(self.peek(), Token::Eof)
     }
 
-    fn expect_eof(&self) -> Result<()> {
+    fn at_eof_raw(&self) -> bool {
+        matches!(self.tokens.get(self.pos).unwrap_or(&Token::Eof), Token::Eof)
+    }
+
+    fn expect_eof(&mut self) -> Result<()> {
         if self.at_eof() {
             Ok(())
         } else {
@@ -2462,20 +2518,30 @@ impl Parser {
         self.parse_function_in_module(MAIN_BRANCH.to_string())
     }
 
-    fn parse_program_item_in_module(&mut self, module: String) -> Result<ProgramItem> {
+    fn parse_program_item_in_module(
+        &mut self,
+        module: String,
+        metadata: ProjectionMetadata,
+    ) -> Result<ProgramItem> {
         if self.consume_ident_value("extern") {
+            if !metadata.is_empty() {
+                bail!("projection identity comment cannot attach to extern function");
+            }
             Ok(ProgramItem::ExternalFunction(
                 self.parse_external_function_in_module(module)?,
             ))
         } else if self.consume_ident_value("record") {
             Ok(ProgramItem::TypeDefinition(
-                self.parse_type_definition_in_module(module, "record")?,
+                self.parse_type_definition_in_module(module, "record", metadata)?,
             ))
         } else if self.consume_ident_value("enum") {
             Ok(ProgramItem::TypeDefinition(
-                self.parse_type_definition_in_module(module, "enum")?,
+                self.parse_type_definition_in_module(module, "enum", metadata)?,
             ))
         } else {
+            if !metadata.is_empty() {
+                bail!("projection identity comment cannot attach to function");
+            }
             Ok(ProgramItem::Function(
                 self.parse_function_in_module(module)?,
             ))
@@ -2486,37 +2552,62 @@ impl Parser {
         &mut self,
         module: String,
         kind: &str,
+        metadata: ProjectionMetadata,
     ) -> Result<TypeDefinitionSource> {
+        if metadata.member_identity.is_some() {
+            bail!("member identity comment cannot attach to type definition");
+        }
         let name = self.expect_ident()?;
         let region_params = self.parse_optional_region_params()?;
         self.expect_symbol("{")?;
         let mut members = Vec::new();
-        if self.consume_symbol("}") {
-            bail!("{kind} definition must have at least one member");
-        }
+        let mut member_births = Vec::new();
         loop {
+            let member_metadata = self.take_projection_metadata()?;
+            if member_metadata.type_identity.is_some() {
+                bail!("type identity comment cannot attach to type member");
+            }
+            if self.consume_symbol_raw("}") {
+                if member_metadata.member_identity.is_some() {
+                    bail!("member identity comment cannot attach to type definition end");
+                }
+                if members.is_empty() {
+                    bail!("{kind} definition must have at least one member");
+                }
+                break;
+            }
             let member_name = self.expect_ident()?;
             self.expect_symbol(":")?;
             let ty = self.parse_type_source()?;
+            member_births.extend(member_metadata.member_identity);
             members.push(TypeMemberSpec {
                 name: member_name,
                 ty,
             });
-            if self.consume_symbol("}") {
+            if self.consume_symbol_raw("}") {
                 break;
             }
-            let _ = self.consume_symbol(",");
+            let _ = self.consume_symbol_raw(",");
         }
         let definition = match kind {
             "record" => TypeDefinitionKind::Record { fields: members },
             "enum" => TypeDefinitionKind::Enum { variants: members },
             other => bail!("unknown type definition kind {other}"),
         };
+        let identity = match metadata.type_identity {
+            Some(mut identity) => {
+                identity.member_births = member_births;
+                Some(identity)
+            }
+            None if member_births.is_empty() => None,
+            None => bail!("member identity comments require a type identity comment"),
+        };
         Ok(TypeDefinitionSource {
             module,
             name,
             region_params,
             definition,
+            identity,
         })
     }
 
@@ -2946,17 +3037,17 @@ impl Parser {
     }
 
     fn parse_optional_type_region_args(&mut self) -> Result<Vec<String>> {
-        if !self.consume_symbol("<") {
+        if !self.consume_symbol_raw("<") {
             return Ok(Vec::new());
         }
         let mut args = Vec::new();
-        if self.consume_symbol(">") {
+        if self.consume_symbol_raw(">") {
             bail!("region argument list must not be empty");
         }
         loop {
             self.expect_symbol("'")?;
             args.push(self.expect_ident()?);
-            if self.consume_symbol(">") {
+            if self.consume_symbol_raw(">") {
                 break;
             }
             self.expect_symbol(",")?;
@@ -3012,7 +3103,7 @@ impl Parser {
 
     fn finish_name_path(&mut self, first: String) -> Result<String> {
         let mut parts = vec![first];
-        while self.consume_symbol(".") {
+        while self.consume_symbol_raw(".") {
             parts.push(self.expect_ident()?);
         }
         Ok(parts.join("."))
@@ -3052,11 +3143,55 @@ impl Parser {
         }
     }
 
-    fn peek(&self) -> &Token {
+    fn consume_symbol_raw(&mut self, expected: &str) -> bool {
+        match self.tokens.get(self.pos).unwrap_or(&Token::Eof) {
+            Token::Symbol(value) if value == expected => {
+                self.pos += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn take_projection_metadata(&mut self) -> Result<ProjectionMetadata> {
+        let mut metadata = ProjectionMetadata::default();
+        while let Some(Token::Comment(text)) = self.tokens.get(self.pos) {
+            let text = text.trim().to_string();
+            self.pos += 1;
+            if let Some(value) = text.strip_prefix("codedb:type_identity ") {
+                if metadata.type_identity.is_some() {
+                    bail!("duplicate codedb:type_identity comment");
+                }
+                metadata.type_identity = Some(
+                    serde_json::from_str(value)
+                        .with_context(|| "invalid codedb:type_identity comment")?,
+                );
+            } else if let Some(value) = text.strip_prefix("codedb:member_identity ") {
+                if metadata.member_identity.is_some() {
+                    bail!("duplicate codedb:member_identity comment");
+                }
+                metadata.member_identity = Some(
+                    serde_json::from_str(value)
+                        .with_context(|| "invalid codedb:member_identity comment")?,
+                );
+            }
+        }
+        Ok(metadata)
+    }
+
+    fn skip_comments(&mut self) {
+        while matches!(self.tokens.get(self.pos), Some(Token::Comment(_))) {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&mut self) -> &Token {
+        self.skip_comments();
         self.tokens.get(self.pos).unwrap_or(&Token::Eof)
     }
 
     fn next(&mut self) -> Token {
+        self.skip_comments();
         let token = self.tokens.get(self.pos).cloned().unwrap_or(Token::Eof);
         if !matches!(token, Token::Eof) {
             self.pos += 1;
@@ -3116,6 +3251,13 @@ fn lex(source: &str) -> Result<Vec<Token>> {
                 bail!("unterminated string literal");
             }
             tokens.push(Token::String(value));
+        } else if ch == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+            i += 2;
+            let start = i;
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            tokens.push(Token::Comment(chars[start..i].iter().collect()));
         } else if i + 1 < chars.len() {
             let two = [chars[i], chars[i + 1]].iter().collect::<String>();
             if matches!(
