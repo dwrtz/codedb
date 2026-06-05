@@ -154,6 +154,14 @@ pub(crate) enum TestValue {
     I64 { value: String },
     Bool { value: bool },
     Unit,
+    Record { fields: Vec<TestRecordField> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TestRecordField {
+    pub(crate) name: String,
+    pub(crate) value: TestValue,
 }
 
 #[derive(Debug, Clone)]

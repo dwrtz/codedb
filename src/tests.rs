@@ -10,10 +10,11 @@ use crate::expr::Value;
 use crate::migrations::Operation;
 use crate::model::{
     ProgramRootPayload, RootTestBinding, TEST_CASE_SCHEMA_V1, TEST_CASE_SCHEMA_V2, TestCasePayload,
-    TestCategory, TestMode, TestValue, exports_for, test_binding_for,
+    TestCategory, TestMode, TestRecordField, TestValue, exports_for, test_binding_for,
     validate_projection_identifier,
 };
 use crate::store::{CodeDb, canonical_json};
+use crate::types::TypeSpec;
 use crate::{APPLE_ARM64_TARGET, DEFAULT_NATIVE_TARGET, LINUX_X86_64_TARGET, MAIN_BRANCH};
 
 const TEST_LIST_SCHEMA: &str = "codedb/tests-list/v1";
@@ -258,11 +259,9 @@ impl CodeDb {
             );
         }
         for (idx, (arg, type_hash)) in case.args.iter().zip(param_types.iter()).enumerate() {
-            let type_name = self.type_name(type_hash)?;
-            validate_test_value_type(arg, &type_name, &format!("argument {idx}"))?;
+            validate_test_value_for_type(self, root, arg, type_hash, &format!("argument {idx}"))?;
         }
-        let return_type_name = self.type_name(&return_type)?;
-        validate_test_value_type(&case.expected, &return_type_name, "expected value")?;
+        validate_test_value_for_type(self, root, &case.expected, &return_type, "expected value")?;
         let args = case
             .args
             .iter()
@@ -1348,6 +1347,19 @@ pub(crate) fn value_from_test_value(value: &TestValue) -> Result<Value> {
             .with_context(|| format!("invalid i64 test value {value:?}")),
         TestValue::Bool { value } => Ok(Value::Bool(*value)),
         TestValue::Unit => Ok(Value::Unit),
+        TestValue::Record { fields } => {
+            let mut values = BTreeMap::new();
+            for field in fields {
+                validate_projection_identifier("record test field", &field.name)?;
+                if values
+                    .insert(field.name.clone(), value_from_test_value(&field.value)?)
+                    .is_some()
+                {
+                    bail!("duplicate record test field {}", field.name);
+                }
+            }
+            Ok(Value::Record(values))
+        }
     }
 }
 
@@ -1358,24 +1370,65 @@ pub(crate) fn test_value_from_value(value: &Value) -> TestValue {
         },
         Value::Bool(value) => TestValue::Bool { value: *value },
         Value::Unit => TestValue::Unit,
-        Value::SharedRef(_) | Value::MutRef(_) | Value::Record(_) | Value::Enum { .. } => {
-            panic!("semantic test values do not support aggregate actual values")
+        Value::Record(fields) => TestValue::Record {
+            fields: fields
+                .iter()
+                .map(|(name, value)| TestRecordField {
+                    name: name.clone(),
+                    value: test_value_from_value(value),
+                })
+                .collect(),
+        },
+        Value::SharedRef(_) | Value::MutRef(_) | Value::Enum { .. } => {
+            panic!("semantic test values do not support reference or enum actual values")
         }
     }
 }
 
-pub(crate) fn validate_test_value_type(
+pub(crate) fn validate_test_value_for_type(
+    db: &CodeDb,
+    root: &ProgramRootPayload,
     value: &TestValue,
-    type_name: &str,
+    type_hash: &str,
     label: &str,
 ) -> Result<Value> {
     let parsed = value_from_test_value(value)?;
-    match (&parsed, type_name) {
-        (Value::I64(_), "i64") | (Value::Bool(_), "bool") | (Value::Unit, "unit") => Ok(parsed),
-        _ => bail!(
-            "{label} must be {type_name}, got {}",
+    if test_value_has_type(db, root, &parsed, type_hash)? {
+        Ok(parsed)
+    } else {
+        bail!(
+            "{label} must be {}, got {}",
+            db.type_name(type_hash)?,
             display_test_value(value)
-        ),
+        )
+    }
+}
+
+fn test_value_has_type(
+    db: &CodeDb,
+    root: &ProgramRootPayload,
+    value: &Value,
+    type_hash: &str,
+) -> Result<bool> {
+    match (value, db.type_spec_in_root(root, type_hash)?) {
+        (Value::I64(_), TypeSpec::Builtin(kind)) => Ok(kind == "I64"),
+        (Value::Bool(_), TypeSpec::Builtin(kind)) => Ok(kind == "Bool"),
+        (Value::Unit, TypeSpec::Builtin(kind)) => Ok(kind == "Unit"),
+        (Value::Record(values), TypeSpec::Record(fields)) => {
+            if values.len() != fields.len() {
+                return Ok(false);
+            }
+            for field in fields {
+                let Some(value) = values.get(&field.name) else {
+                    return Ok(false);
+                };
+                if !test_value_has_type(db, root, value, &field.type_hash)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
     }
 }
 
@@ -1452,6 +1505,13 @@ fn display_test_value(value: &TestValue) -> String {
         TestValue::I64 { value } => format!("i64:{value}"),
         TestValue::Bool { value } => format!("bool:{value}"),
         TestValue::Unit => "unit:()".to_string(),
+        TestValue::Record { fields } => {
+            let rendered = fields
+                .iter()
+                .map(|field| format!("{}: {}", field.name, display_test_value(&field.value)))
+                .collect::<Vec<_>>();
+            format!("record{{{}}}", rendered.join(", "))
+        }
     }
 }
 

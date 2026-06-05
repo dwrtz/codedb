@@ -159,6 +159,76 @@ fn main() -> i64 = sum_pair({ left: 2, right: 3 }) + sum_pair(make_pair()) + sum
     }
 }
 
+#[test]
+fn record_return_test_values_serialize_and_compare_reference_results() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("record-test-values.sqlite");
+    let source = temp.path().join("record-test-values.cdb");
+    let apply = temp.path().join("record-test-values.apply.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Pair {
+  left: i64
+  right: i64
+}
+
+fn make_pair() -> Pair =
+  let pair: Pair = { left: 10, right: 7 } in
+  pair
+
+fn main() -> i64 = 1
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    std::fs::write(
+        &apply,
+        serde_json::to_string_pretty(&json!({
+            "schema": "codedb/apply/v1",
+            "operations": [
+                {
+                    "kind": "create_test",
+                    "name": "make_pair_record",
+                    "entry": "make_pair",
+                    "expected": {
+                        "kind": "record",
+                        "fields": [
+                            { "name": "left", "value": { "kind": "i64", "value": "10" } },
+                            { "name": "right", "value": { "kind": "i64", "value": "7" } }
+                        ]
+                    }
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let created = parse_json(&run(&["apply", path(&db), "--json", path(&apply)]));
+    assert_eq!(created["status"], "applied");
+
+    let listed = parse_json(&run(&["test", path(&db), "--list", "--json"]));
+    assert_eq!(listed["tests"][0]["expected"]["kind"], "record");
+    let report = parse_json(&run(&["test", path(&db), "--json"]));
+    assert_eq!(report["status"], "passed");
+    assert_eq!(report["passed"], 1);
+    assert_eq!(report["tests"][0]["reference"]["status"], "passed");
+    assert_eq!(
+        report["tests"][0]["reference"]["actual"],
+        json!({
+            "kind": "record",
+            "fields": [
+                { "name": "left", "value": { "kind": "i64", "value": "10" } },
+                { "name": "right", "value": { "kind": "i64", "value": "7" } }
+            ]
+        })
+    );
+    run(&["verify", path(&db)]);
+}
+
 fn can_build_default_native_target() -> bool {
     let native_target = (std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64")
         || (std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64");

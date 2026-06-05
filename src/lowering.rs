@@ -1422,7 +1422,7 @@ impl CodeDb {
         field: &str,
     ) -> Result<LoweredFieldInfo> {
         let offset_bytes = self.layout_field_offset_bytes(root, type_hash, field)?;
-        if let TypeSpec::Named { type_symbol, .. } = self.type_spec(type_hash)? {
+        let field_symbol = if let TypeSpec::Named { type_symbol, .. } = self.type_spec(type_hash)? {
             let entry = self
                 .root_type(root, &type_symbol)
                 .ok_or_else(|| anyhow!("named record missing from root {type_symbol}"))?;
@@ -1430,16 +1430,13 @@ impl CodeDb {
             else {
                 bail!("field access requires record type");
             };
-            return fields
+            fields
                 .into_iter()
                 .find(|candidate| candidate.name == field)
-                .map(|candidate| LoweredFieldInfo {
-                    type_hash: candidate.type_hash,
-                    field_symbol: Some(candidate.member_symbol),
-                    offset_bytes,
-                })
-                .ok_or_else(|| anyhow!("record has no field {field}"));
-        }
+                .map(|candidate| candidate.member_symbol)
+        } else {
+            None
+        };
 
         match self.type_spec_in_root(root, type_hash)? {
             TypeSpec::Record(fields) => fields
@@ -1447,7 +1444,7 @@ impl CodeDb {
                 .find(|candidate| candidate.name == field)
                 .map(|candidate| LoweredFieldInfo {
                     type_hash: candidate.type_hash,
-                    field_symbol: None,
+                    field_symbol,
                     offset_bytes,
                 })
                 .ok_or_else(|| anyhow!("record has no field {field}")),

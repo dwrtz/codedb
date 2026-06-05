@@ -1312,6 +1312,20 @@ fn bundle_object_closure_from_map(
 fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<String>) {
     match kind {
         "Type" => match payload.get("type_kind").and_then(JsonValue::as_str) {
+            Some("Named") => {
+                push_hash_ref(payload.get("type_symbol"), refs);
+                push_hash_array_refs(payload.get("region_args"), refs);
+            }
+            Some("Reference") => {
+                push_hash_ref(payload.get("region"), refs);
+                push_hash_ref(payload.get("referent"), refs);
+            }
+            Some("RawPointer") => {
+                push_hash_ref(payload.get("pointee"), refs);
+            }
+            Some("FixedArray") => {
+                push_hash_ref(payload.get("element"), refs);
+            }
             Some("Record") => {
                 for field in payload
                     .get("fields")
@@ -1336,6 +1350,14 @@ fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<St
         },
         "SymbolBirth" => {}
         "FunctionSignature" => {
+            for param in payload
+                .get("region_params")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_hash_ref(param.get("region"), refs);
+            }
             push_hash_array_refs(payload.get("params"), refs);
             push_hash_ref(payload.get("return"), refs);
         }
@@ -1432,6 +1454,23 @@ fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<St
                 .flatten()
             {
                 push_hash_ref(binding.get("symbol"), refs);
+            }
+            for entry in payload
+                .get("types")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_hash_ref(entry.get("type_symbol"), refs);
+                push_hash_ref(entry.get("type_def"), refs);
+            }
+            for binding in payload
+                .get("type_names")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_hash_ref(binding.get("type_symbol"), refs);
             }
             for entry in payload
                 .get("param_names")

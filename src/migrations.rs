@@ -16,7 +16,7 @@ use crate::model::{
     test_binding_for, upsert_param_names, validate_module_path, validate_projection_identifier,
 };
 use crate::store::{CodeDb, canonical_json, hash_bytes};
-use crate::tests::{test_points_to_entry_symbol, validate_test_value_type};
+use crate::tests::{test_points_to_entry_symbol, validate_test_value_for_type};
 use crate::types::{
     Effect, ParamSpec, RegionParamDef, TypeDefinition, TypeDefinitionKind, TypeMemberDef,
     TypeMemberSpec,
@@ -4203,11 +4203,9 @@ impl CodeDb {
             );
         }
         for (idx, (arg, type_hash)) in args.iter().zip(param_types.iter()).enumerate() {
-            let type_name = self.type_name(type_hash)?;
-            validate_test_value_type(arg, &type_name, &format!("argument {idx}"))?;
+            validate_test_value_for_type(self, &root, arg, type_hash, &format!("argument {idx}"))?;
         }
-        let return_type_name = self.type_name(&return_type)?;
-        validate_test_value_type(expected, &return_type_name, "expected value")?;
+        validate_test_value_for_type(self, &root, expected, &return_type, "expected value")?;
         let native_agreement = native_agreement || native_required;
         let mode = if native_agreement || native_required {
             TestMode::ReferenceAndNative

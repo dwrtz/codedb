@@ -193,6 +193,44 @@ fn leak<'a>() -> &'a Line =
 }
 
 #[test]
+fn borrowed_field_and_polymorphic_call_returns_use_caller_region() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("borrowed-return.sqlite");
+    let source = temp.path().join("borrowed-return.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+record LineView<'a> {
+  line: &'a Line
+}
+
+fn first_line<'a>(view: LineView<'a>) -> &'a Line = view.line
+
+fn id_ref<'a>(line: &'a Line) -> &'a Line = line
+
+fn main<'a>() -> i64 =
+  let line: Line = { price_cents: 25, qty: 4 } in
+  let view: LineView<'a> = { line: &'a line } in
+  let borrowed: &'a Line = first_line(view) in
+  let same: &'a Line = id_ref(&'a line) in
+  borrowed.price_cents + same.qty
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "29");
+    run(&["verify", path(&db)]);
+}
+
+#[test]
 fn verify_rejects_shared_borrow_region_outside_function_scope() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("bad-shared-borrow-region.sqlite");

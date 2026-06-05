@@ -773,33 +773,250 @@ impl CodeDb {
         type_hash: &str,
     ) -> Result<TypeSpec> {
         match self.type_spec(type_hash)? {
-            TypeSpec::Named { type_symbol, .. } => {
-                let entry = self
-                    .root_type(root, &type_symbol)
-                    .ok_or_else(|| anyhow!("named type missing from root {type_symbol}"))?;
-                match self.type_definition(&entry.type_def)? {
+            TypeSpec::Named {
+                type_symbol,
+                region_args,
+            } => {
+                let (definition, region_substitutions) =
+                    self.named_type_definition_with_regions(root, &type_symbol, &region_args)?;
+                match definition {
                     TypeDefinition::Record { fields, .. } => Ok(TypeSpec::Record(
                         fields
                             .into_iter()
-                            .map(|field| TypeFieldSpec {
-                                name: field.name,
-                                type_hash: field.type_hash,
+                            .map(|field| {
+                                Ok(TypeFieldSpec {
+                                    name: field.name,
+                                    type_hash: self.substitute_type_regions_hash(
+                                        &field.type_hash,
+                                        &region_substitutions,
+                                    )?,
+                                })
                             })
-                            .collect(),
+                            .collect::<Result<Vec<_>>>()?,
                     )),
                     TypeDefinition::Enum { variants, .. } => Ok(TypeSpec::Enum(
                         variants
                             .into_iter()
-                            .map(|variant| TypeFieldSpec {
-                                name: variant.name,
-                                type_hash: variant.type_hash,
+                            .map(|variant| {
+                                Ok(TypeFieldSpec {
+                                    name: variant.name,
+                                    type_hash: self.substitute_type_regions_hash(
+                                        &variant.type_hash,
+                                        &region_substitutions,
+                                    )?,
+                                })
                             })
-                            .collect(),
+                            .collect::<Result<Vec<_>>>()?,
                     )),
                 }
             }
             other => Ok(other),
         }
+    }
+
+    fn named_type_definition_with_regions(
+        &self,
+        root: &ProgramRootPayload,
+        type_symbol: &str,
+        region_args: &[String],
+    ) -> Result<(TypeDefinition, BTreeMap<String, String>)> {
+        let entry = self
+            .root_type(root, type_symbol)
+            .ok_or_else(|| anyhow!("named type missing from root {type_symbol}"))?;
+        let definition = self.type_definition(&entry.type_def)?;
+        if definition.region_params().len() != region_args.len() {
+            bail!(
+                "named type {type_symbol} expects {} region args, got {}",
+                definition.region_params().len(),
+                region_args.len()
+            );
+        }
+        let region_substitutions = definition
+            .region_params()
+            .iter()
+            .zip(region_args.iter())
+            .map(|(param, arg)| (param.region.clone(), arg.clone()))
+            .collect();
+        Ok((definition, region_substitutions))
+    }
+
+    fn substitute_region_hash(
+        &self,
+        region: String,
+        region_substitutions: &BTreeMap<String, String>,
+    ) -> String {
+        region_substitutions.get(&region).cloned().unwrap_or(region)
+    }
+
+    fn substitute_type_regions_hash(
+        &self,
+        type_hash: &str,
+        region_substitutions: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        if region_substitutions.is_empty() {
+            return Ok(type_hash.to_string());
+        }
+        match self.type_spec(type_hash)? {
+            TypeSpec::Builtin(_) => Ok(type_hash.to_string()),
+            TypeSpec::Named {
+                type_symbol,
+                region_args,
+            } => hash_for_type_spec(&TypeSpec::Named {
+                type_symbol,
+                region_args: region_args
+                    .into_iter()
+                    .map(|region| self.substitute_region_hash(region, region_substitutions))
+                    .collect(),
+            }),
+            TypeSpec::Reference {
+                region,
+                mutable,
+                referent,
+            } => {
+                let referent =
+                    self.substitute_type_regions_hash(&referent, region_substitutions)?;
+                hash_for_type_spec(&TypeSpec::Reference {
+                    region: self.substitute_region_hash(region, region_substitutions),
+                    mutable,
+                    referent,
+                })
+            }
+            TypeSpec::RawPointer { mutable, pointee } => {
+                let pointee = self.substitute_type_regions_hash(&pointee, region_substitutions)?;
+                hash_for_type_spec(&TypeSpec::RawPointer { mutable, pointee })
+            }
+            TypeSpec::FixedArray { element, len } => {
+                let element = self.substitute_type_regions_hash(&element, region_substitutions)?;
+                hash_for_type_spec(&TypeSpec::FixedArray { element, len })
+            }
+            TypeSpec::Record(fields) => {
+                let fields = fields
+                    .into_iter()
+                    .map(|field| {
+                        Ok(TypeFieldSpec {
+                            name: field.name,
+                            type_hash: self.substitute_type_regions_hash(
+                                &field.type_hash,
+                                region_substitutions,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                hash_for_type_spec(&TypeSpec::Record(fields))
+            }
+            TypeSpec::Enum(variants) => {
+                let variants = variants
+                    .into_iter()
+                    .map(|variant| {
+                        Ok(TypeFieldSpec {
+                            name: variant.name,
+                            type_hash: self.substitute_type_regions_hash(
+                                &variant.type_hash,
+                                region_substitutions,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                hash_for_type_spec(&TypeSpec::Enum(variants))
+            }
+        }
+    }
+
+    fn put_substituted_type_regions(
+        &mut self,
+        type_hash: &str,
+        region_substitutions: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        if region_substitutions.is_empty() {
+            return Ok(type_hash.to_string());
+        }
+        match self.type_spec(type_hash)? {
+            TypeSpec::Builtin(_) => Ok(type_hash.to_string()),
+            TypeSpec::Named {
+                type_symbol,
+                region_args,
+            } => self.put_structural_type(TypeSpec::Named {
+                type_symbol,
+                region_args: region_args
+                    .into_iter()
+                    .map(|region| self.substitute_region_hash(region, region_substitutions))
+                    .collect(),
+            }),
+            TypeSpec::Reference {
+                region,
+                mutable,
+                referent,
+            } => {
+                let referent =
+                    self.put_substituted_type_regions(&referent, region_substitutions)?;
+                self.put_structural_type(TypeSpec::Reference {
+                    region: self.substitute_region_hash(region, region_substitutions),
+                    mutable,
+                    referent,
+                })
+            }
+            TypeSpec::RawPointer { mutable, pointee } => {
+                let pointee = self.put_substituted_type_regions(&pointee, region_substitutions)?;
+                self.put_structural_type(TypeSpec::RawPointer { mutable, pointee })
+            }
+            TypeSpec::FixedArray { element, len } => {
+                let element = self.put_substituted_type_regions(&element, region_substitutions)?;
+                self.put_structural_type(TypeSpec::FixedArray { element, len })
+            }
+            TypeSpec::Record(fields) => {
+                let fields = fields
+                    .into_iter()
+                    .map(|field| {
+                        Ok(TypeFieldSpec {
+                            name: field.name,
+                            type_hash: self.put_substituted_type_regions(
+                                &field.type_hash,
+                                region_substitutions,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.put_structural_type(TypeSpec::Record(fields))
+            }
+            TypeSpec::Enum(variants) => {
+                let variants = variants
+                    .into_iter()
+                    .map(|variant| {
+                        Ok(TypeFieldSpec {
+                            name: variant.name,
+                            type_hash: self.put_substituted_type_regions(
+                                &variant.type_hash,
+                                region_substitutions,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.put_structural_type(TypeSpec::Enum(variants))
+            }
+        }
+    }
+
+    fn materialize_named_type_expansion(
+        &mut self,
+        root: &ProgramRootPayload,
+        type_symbol: &str,
+        region_args: &[String],
+    ) -> Result<()> {
+        let (definition, region_substitutions) =
+            self.named_type_definition_with_regions(root, type_symbol, region_args)?;
+        match definition {
+            TypeDefinition::Record { fields, .. } => {
+                for field in fields {
+                    self.put_substituted_type_regions(&field.type_hash, &region_substitutions)?;
+                }
+            }
+            TypeDefinition::Enum { variants, .. } => {
+                for variant in variants {
+                    self.put_substituted_type_regions(&variant.type_hash, &region_substitutions)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn record_field_type_in_root(
@@ -906,6 +1123,117 @@ impl CodeDb {
                 Ok(true)
             }
             _ => Ok(false),
+        }
+    }
+
+    fn infer_call_region_substitutions(
+        &self,
+        root: &ProgramRootPayload,
+        actual: &str,
+        expected: &str,
+        callee_regions: &BTreeSet<String>,
+        substitutions: &mut BTreeMap<String, String>,
+    ) -> Result<()> {
+        if actual == expected {
+            return Ok(());
+        }
+        match (
+            self.type_spec_in_root(root, actual)?,
+            self.type_spec_in_root(root, expected)?,
+        ) {
+            (
+                TypeSpec::Reference {
+                    region: actual_region,
+                    mutable: actual_mutable,
+                    referent: actual_referent,
+                },
+                TypeSpec::Reference {
+                    region: expected_region,
+                    mutable: expected_mutable,
+                    referent: expected_referent,
+                },
+            ) => {
+                if actual_mutable != expected_mutable {
+                    return Ok(());
+                }
+                record_call_region_substitution(
+                    expected_region,
+                    actual_region,
+                    callee_regions,
+                    substitutions,
+                )?;
+                self.infer_call_region_substitutions(
+                    root,
+                    &actual_referent,
+                    &expected_referent,
+                    callee_regions,
+                    substitutions,
+                )
+            }
+            (
+                TypeSpec::Named {
+                    type_symbol: actual_symbol,
+                    region_args: actual_args,
+                },
+                TypeSpec::Named {
+                    type_symbol: expected_symbol,
+                    region_args: expected_args,
+                },
+            ) => {
+                if actual_symbol != expected_symbol || actual_args.len() != expected_args.len() {
+                    return Ok(());
+                }
+                for (actual_region, expected_region) in actual_args.into_iter().zip(expected_args) {
+                    record_call_region_substitution(
+                        expected_region,
+                        actual_region,
+                        callee_regions,
+                        substitutions,
+                    )?;
+                }
+                Ok(())
+            }
+            (
+                TypeSpec::RawPointer {
+                    pointee: actual, ..
+                },
+                TypeSpec::RawPointer {
+                    pointee: expected, ..
+                },
+            )
+            | (
+                TypeSpec::FixedArray {
+                    element: actual, ..
+                },
+                TypeSpec::FixedArray {
+                    element: expected, ..
+                },
+            ) => self.infer_call_region_substitutions(
+                root,
+                &actual,
+                &expected,
+                callee_regions,
+                substitutions,
+            ),
+            (TypeSpec::Record(actual_fields), TypeSpec::Record(expected_fields))
+            | (TypeSpec::Enum(actual_fields), TypeSpec::Enum(expected_fields)) => {
+                for expected_field in expected_fields {
+                    if let Some(actual_field) = actual_fields
+                        .iter()
+                        .find(|field| field.name == expected_field.name)
+                    {
+                        self.infer_call_region_substitutions(
+                            root,
+                            &actual_field.type_hash,
+                            &expected_field.type_hash,
+                            callee_regions,
+                            substitutions,
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 
@@ -1023,10 +1351,12 @@ impl CodeDb {
                     );
                 }
                 let region_args = resolve_region_args(region_args, region_scope)?;
-                self.put_structural_type(TypeSpec::Named {
-                    type_symbol,
-                    region_args,
-                })
+                let type_hash = self.put_structural_type(TypeSpec::Named {
+                    type_symbol: type_symbol.clone(),
+                    region_args: region_args.clone(),
+                })?;
+                self.materialize_named_type_expansion(root, &type_symbol, &region_args)?;
+                Ok(type_hash)
             }
             ParsedTypeSpec::Reference {
                 region,
@@ -1677,6 +2007,12 @@ impl CodeDb {
                     );
                 }
                 let mut typed_args = Vec::with_capacity(args.len());
+                let callee_regions = self
+                    .signature_region_params(&callee.signature)?
+                    .into_iter()
+                    .map(|param| param.region)
+                    .collect::<BTreeSet<_>>();
+                let mut region_substitutions = BTreeMap::new();
                 for (idx, arg) in args.iter().enumerate() {
                     let typed = self.type_expr_with_locals(
                         current_module,
@@ -1699,8 +2035,17 @@ impl CodeDb {
                             self.type_name(&typed.type_hash)?
                         );
                     }
+                    self.infer_call_region_substitutions(
+                        root,
+                        &typed.type_hash,
+                        &expected_params[idx],
+                        &callee_regions,
+                        &mut region_substitutions,
+                    )?;
                     typed_args.push(typed.expr_hash);
                 }
+                let return_type =
+                    self.put_substituted_type_regions(&return_type, &region_substitutions)?;
                 let expr_hash = self.put_object(
                     "Expression",
                     &json!({
@@ -3496,6 +3841,12 @@ impl CodeDb {
                 if args.len() != expected_params.len() {
                     bail!("call arity mismatch for {symbol}");
                 }
+                let callee_regions = self
+                    .signature_region_params(&callee.signature)?
+                    .into_iter()
+                    .map(|param| param.region)
+                    .collect::<BTreeSet<_>>();
+                let mut region_substitutions = BTreeMap::new();
                 for (idx, arg) in args.iter().enumerate() {
                     let arg_hash = arg
                         .as_str()
@@ -3510,8 +3861,15 @@ impl CodeDb {
                     if !self.type_assignable_in_root(root, &arg_type, &expected_params[idx])? {
                         bail!("call arg type mismatch for {symbol} at arg {idx}");
                     }
+                    self.infer_call_region_substitutions(
+                        root,
+                        &arg_type,
+                        &expected_params[idx],
+                        &callee_regions,
+                        &mut region_substitutions,
+                    )?;
                 }
-                return_type
+                self.substitute_type_regions_hash(&return_type, &region_substitutions)?
             }
             "binary" => {
                 let op = payload
@@ -4046,6 +4404,27 @@ fn fields_prefix(prefix: &[String], value: &[String]) -> bool {
             .iter()
             .zip(value.iter())
             .all(|(left, right)| left == right)
+}
+
+fn record_call_region_substitution(
+    expected_region: String,
+    actual_region: String,
+    callee_regions: &BTreeSet<String>,
+    substitutions: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    if !callee_regions.contains(&expected_region) {
+        return Ok(());
+    }
+    match substitutions.get(&expected_region) {
+        Some(existing) if existing != &actual_region => bail!(
+            "call region inference conflict for {expected_region}: {existing} vs {actual_region}"
+        ),
+        Some(_) => Ok(()),
+        None => {
+            substitutions.insert(expected_region, actual_region);
+            Ok(())
+        }
+    }
 }
 
 pub(crate) fn type_hash_for(type_kind: &str) -> String {
