@@ -146,6 +146,12 @@ pub(crate) enum LoweredPlace {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub(crate) enum LoweredOp {
+    /// A direct parameter value. Since the Phase 5 place/address scaffold,
+    /// lowering reads parameters through `addr_of_param` + `load` instead, so
+    /// this variant is no longer emitted; it is retained (with verifier and
+    /// backend support) for reading older lowered-IR artifacts. The
+    /// `lowered_memory_ir` regression test asserts current lowering does not
+    /// produce it.
     Param {
         id: String,
         slot: usize,
@@ -408,6 +414,26 @@ impl LowerCtx {
                 .collect(),
         }
     }
+}
+
+/// Slots newly moved by an `if` branch (relative to `before`) that are visible
+/// outside the branch: parameters, and locals that existed before the branch
+/// (slot index `< locals_boundary`). Locals created and moved entirely within
+/// the branch are self-contained — their drop is handled inside the branch — so
+/// they are excluded and do not count toward the symmetric-move requirement.
+fn outer_branch_moves(
+    after: &BTreeSet<RootSlot>,
+    before: &BTreeSet<RootSlot>,
+    locals_boundary: usize,
+) -> BTreeSet<RootSlot> {
+    after
+        .difference(before)
+        .copied()
+        .filter(|slot| match slot {
+            RootSlot::Param(_) => true,
+            RootSlot::Local(index) => *index < locals_boundary,
+        })
+        .collect()
 }
 
 impl CodeDb {
@@ -1082,8 +1108,29 @@ impl CodeDb {
                 if cond.type_hash != type_hash_for("Bool") {
                     bail!("if condition must lower to bool");
                 }
+                // `if` branches are alternative paths, so a value moved in one
+                // branch is live (and must still be dropped) on the other. The
+                // current scaffold emits a single unconditional drop per owned
+                // slot, which is only sound when both branches move the same set
+                // of *outer* slots (a value existing before the `if`). Track
+                // moves per branch and reject an asymmetric conditional move of
+                // an outer slot fail-closed; symmetric moves (both branches, or
+                // neither) and moves of branch-local temporaries are fine.
+                // Conditional drop glue is deferred (SPEC_V2 §12, PLAN_V2 Phase 15).
+                let locals_boundary = ctx.next_local;
+                let moved_before = ctx.moved.clone();
                 let then_expr = self.lower_expr(root, then_hash, param_types, ctx, locals)?;
+                let then_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
+                ctx.moved = moved_before.clone();
                 let else_expr = self.lower_expr(root, else_hash, param_types, ctx, locals)?;
+                let else_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
+                if then_moved != else_moved {
+                    bail!(
+                        "lowering does not support moving an owned value in only one branch of an `if` (asymmetric conditional move); move it in both branches or neither — conditional drop glue is not yet implemented (SPEC_V2 §12, PLAN_V2 Phase 15)"
+                    );
+                }
+                // The outer-slot moves match, so `ctx.moved` (now moved_before ∪
+                // else-branch moves) is the correct post-`if` move set.
                 if then_expr.type_hash != else_expr.type_hash || then_expr.type_hash != type_hash {
                     bail!("if branch type mismatch while lowering");
                 }
@@ -1198,6 +1245,18 @@ impl CodeDb {
     ) -> Result<LoweredExpr> {
         let lowered = self.lower_place(root, expr_hash, param_types, ctx, locals)?;
         if self.type_is_move_only(root, ctx.target_triple(), type_hash)? {
+            // A move-only value may only be moved out of a whole owned slot (a
+            // parameter or local). Moving it out of a field or element
+            // projection is a partial move that leaves the enclosing aggregate
+            // with a moved-out hole; because the drop scaffold drops whole slots
+            // only, the aggregate's later drop would double-drop the moved
+            // field. Reject partial moves of owned aggregates fail-closed until
+            // field-granular drop glue lands (SPEC_V2 §12, PLAN_V2 Phase 15).
+            let Some(root_slot) = self.place_whole_root_slot(expr_hash, locals)? else {
+                bail!(
+                    "lowering does not support moving a move-only value out of a field or element projection (partial move of an owned aggregate); field-granular drop glue is not yet implemented (SPEC_V2 §12, PLAN_V2 Phase 15)"
+                );
+            };
             let id = ctx.value();
             ctx.push_debug_op(expr_hash, "move", &id);
             let mut operations = lowered.operations;
@@ -1206,9 +1265,7 @@ impl CodeDb {
                 address: lowered.address,
                 type_hash: type_hash.to_string(),
             });
-            if let Some(root_slot) = self.place_whole_root_slot(expr_hash, locals)? {
-                ctx.mark_moved(root_slot);
-            }
+            ctx.mark_moved(root_slot);
             return Ok(LoweredExpr {
                 operations,
                 value: id,

@@ -216,6 +216,54 @@ fn main() -> i64 = 1
 }
 
 #[test]
+fn record_layout_inserts_interior_alignment_padding() {
+    // A small field followed by a larger-aligned field must pad the larger
+    // field up to its alignment (interior padding), not pack it tight. Existing
+    // fixtures only exercise trailing padding; this pins the `align_up(offset,
+    // field.align)` path: flag@0 (1 byte) then value@8 (i64), size 16, align 8.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("interior-padding.sqlite");
+    let source = temp.path().join("interior-padding.cdb");
+    let padded_layout = temp.path().join("padded-layout.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Padded {
+  flag: bool
+  value: i64
+}
+
+fn main() -> i64 = 1
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&[
+        "emit-type-layout",
+        path(&db),
+        "Padded",
+        "--out",
+        path(&padded_layout),
+    ]);
+    run(&["verify", path(&db)]);
+
+    let padded = read_json(&padded_layout);
+    assert_eq!(padded["kind"], "record");
+    assert_eq!(padded["size_bytes"], 16);
+    assert_eq!(padded["align_bytes"], 8);
+    assert_eq!(padded["fields"][0]["name"], "flag");
+    assert_eq!(padded["fields"][0]["offset_bytes"], 0);
+    assert_eq!(padded["fields"][0]["size_bytes"], 1);
+    assert_eq!(padded["fields"][1]["name"], "value");
+    // Interior padding: value is aligned to 8 despite flag ending at byte 1.
+    assert_eq!(padded["fields"][1]["offset_bytes"], 8);
+    assert_eq!(padded["fields"][1]["size_bytes"], 8);
+}
+
+#[test]
 fn verify_recomputes_and_rejects_malformed_type_layout_artifact() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("bad-layout.sqlite");

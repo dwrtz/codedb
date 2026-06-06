@@ -497,8 +497,18 @@ layout metadata during semantic verification and lowered IR verification.
 Shared-reference records remain Copy and duplicate their carried loans when
 copied. Mutable-reference records are move-only; moving one transfers its loan
 to the new owner, using the old owner is rejected as `bad_move`, and lexical
-drop/end-of-scope removes the carried loan. Lowering now emits explicit
-`copy`, `move`, and `drop` scaffolding for these cases.
+drop/end-of-scope removes the carried loan. Lowering emits explicit `copy`,
+`move`, and `drop` scaffolding for whole-slot moves of named `let` bindings and
+parameters.
+
+The drop scaffold drops whole owned slots only and emits one unconditional drop
+per slot. Cases that would need conditional or field-granular drop glue — an
+asymmetric conditional move (moving an owned value in only one `if` branch) and
+a partial move (moving a move-only value out of a record field or array
+element) — are rejected fail-closed at lowering until that glue lands (Phase
+15), so no latent double-drop or skipped-drop survives into native codegen. The
+lowered `drop` op currently generates no machine code; real drop glue is Phase
+15.
 
 Deliverables:
 

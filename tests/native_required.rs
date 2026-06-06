@@ -89,6 +89,48 @@ fn native_required_scalar_test_reports_native_outcome_on_every_host() {
 }
 
 #[test]
+fn native_required_flag_survives_history_export_import() {
+    // The native-required gate is only trustworthy if the flag, mode, and
+    // labels round-trip through migration replay; a dropped flag would silently
+    // downgrade a v2 acceptance test to reference-only. This is host-independent
+    // (no native build), so it always exercises the preservation guarantee.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("native-required-replay.sqlite");
+    let rebuilt = temp.path().join("native-required-replay-rebuilt.sqlite");
+    let source = temp.path().join("native-required-replay.cdb");
+    let history = temp.path().join("history.ndjson");
+
+    std::fs::write(&source, "fn main() -> i64 = 7\n").unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&[
+        "create-test",
+        path(&db),
+        "main_returns_7_native",
+        "--entry",
+        "main",
+        "--expect-i64",
+        "7",
+        "--native-required",
+        "--json",
+    ]);
+
+    let listed = parse_json(&run(&["test", path(&db), "--list", "--json"]));
+    assert_eq!(listed["tests"][0]["mode"], "reference_and_native");
+    assert_eq!(listed["tests"][0]["native_required"], true);
+    assert_eq!(listed["tests"][0]["labels"], json!(["v2_native_required"]));
+
+    run(&["export-history", path(&db), "--out", path(&history)]);
+    run(&["init", path(&rebuilt)]);
+    run(&["import-history", path(&rebuilt), path(&history)]);
+
+    // The full listing (mode, native_agreement, native_required, labels,
+    // expected, schema) must be byte-identical after replay.
+    let rebuilt_listed = parse_json(&run(&["test", path(&rebuilt), "--list", "--json"]));
+    assert_eq!(rebuilt_listed, listed);
+}
+
+#[test]
 fn native_required_unsupported_feature_is_a_failed_test() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("native-required-unsupported.sqlite");

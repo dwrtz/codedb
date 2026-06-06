@@ -519,18 +519,25 @@ impl CodeDb {
             .map(value_from_test_value)
             .collect::<Result<Vec<_>>>()?;
         let reference_result = match self.eval_symbol(root_hash, &case.entry_symbol, args) {
-            Ok(actual) => {
-                let status = if actual == expected {
-                    "passed"
-                } else {
-                    "failed"
-                };
-                json!({
-                    "status": status,
+            Ok(actual) => match test_value_from_value(&actual) {
+                Ok(actual_value) => {
+                    let status = if actual == expected {
+                        "passed"
+                    } else {
+                        "failed"
+                    };
+                    json!({
+                        "status": status,
+                        "expected": &case.expected,
+                        "actual": actual_value,
+                    })
+                }
+                Err(err) => json!({
+                    "status": "error",
                     "expected": &case.expected,
-                    "actual": test_value_from_value(&actual),
-                })
-            }
+                    "error": format!("{err:#}"),
+                }),
+            },
             Err(err) => json!({
                 "status": "error",
                 "expected": &case.expected,
@@ -1474,8 +1481,8 @@ pub(crate) fn value_from_test_value(value: &TestValue) -> Result<Value> {
     }
 }
 
-pub(crate) fn test_value_from_value(value: &Value) -> TestValue {
-    match value {
+pub(crate) fn test_value_from_value(value: &Value) -> Result<TestValue> {
+    Ok(match value {
         Value::I64(value) => TestValue::I64 {
             value: value.to_string(),
         },
@@ -1484,16 +1491,22 @@ pub(crate) fn test_value_from_value(value: &Value) -> TestValue {
         Value::Record(fields) => TestValue::Record {
             fields: fields
                 .iter()
-                .map(|(name, value)| TestRecordField {
-                    name: name.clone(),
-                    value: test_value_from_value(&value.borrow()),
+                .map(|(name, value)| {
+                    Ok(TestRecordField {
+                        name: name.clone(),
+                        value: test_value_from_value(&value.borrow())?,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>>>()?,
         },
+        // A registered test's expected value is validated against the entry's
+        // return type, which cannot be a reference, so a reference/enum actual
+        // is unreachable for a validatable test. Return an error rather than
+        // panicking if the evaluator ever produces one.
         Value::SharedRef(_) | Value::MutRef(_) | Value::Enum { .. } => {
-            panic!("semantic test values do not support reference or enum actual values")
+            bail!("semantic test values do not support reference or enum actual values")
         }
-    }
+    })
 }
 
 pub(crate) fn validate_test_value_for_type(

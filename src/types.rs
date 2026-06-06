@@ -3360,7 +3360,20 @@ impl CodeDb {
     ) -> Result<()> {
         match self.type_spec_in_root(root, type_hash)? {
             TypeSpec::Builtin(_) => Ok(()),
-            TypeSpec::Named { .. } => Ok(()),
+            // `type_spec_in_root` expands named types into their structural
+            // Record/Enum form (with regions substituted), so this arm is not
+            // reached today; the expanded fields below carry the reference
+            // regions. Collect the instantiated region arguments anyway so the
+            // function stays sound (rather than silently dropping regions) if the
+            // resolver is ever switched to a non-expanding form — every reference
+            // region inside a named type is bound to one of its region
+            // parameters and so appears in `region_args`.
+            TypeSpec::Named { region_args, .. } => {
+                for region in region_args {
+                    regions.insert(region);
+                }
+                Ok(())
+            }
             TypeSpec::Reference {
                 region, referent, ..
             } => {

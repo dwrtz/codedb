@@ -154,7 +154,7 @@ fn id(x: i64) -> i64 = x
     run(&["init", path(&db)]);
     run(&["import", path(&db), path(&source)]);
     run(&["emit-ir", path(&db), "id", "--out", path(&ir_path)]);
-    corrupt_first_load_type(&db, type_hash_for("Bool"));
+    corrupt_first_op_type(&db, "load", type_hash_for("Bool"));
 
     bin()
         .args(["verify", path(&db)])
@@ -162,6 +162,37 @@ fn id(x: i64) -> i64 = x
         .failure()
         .stderr(predicate::str::contains("bad_lowered_ir"))
         .stderr(predicate::str::contains("lowered load type mismatch"));
+}
+
+#[test]
+fn verify_rejects_lowered_store_with_incompatible_address_type() {
+    // The store verifier requires the stored type to match the destination
+    // address's type. Corrupting a let-binding store's type_hash must be
+    // rejected fail-closed, mirroring the load case.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("bad-store-memory-ir.sqlite");
+    let source = temp.path().join("bad-store-memory-ir.cdb");
+    let ir_path = temp.path().join("store_id.ir.json");
+
+    std::fs::write(
+        &source,
+        r#"
+fn store_id(x: i64) -> i64 = let y: i64 = x in y
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&["emit-ir", path(&db), "store_id", "--out", path(&ir_path)]);
+    corrupt_first_op_type(&db, "store", type_hash_for("Bool"));
+
+    bin()
+        .args(["verify", path(&db)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_lowered_ir"))
+        .stderr(predicate::str::contains("lowered store address type mismatch"));
 }
 
 fn op_names(ir: &JsonValue) -> Vec<String> {
@@ -173,7 +204,7 @@ fn op_names(ir: &JsonValue) -> Vec<String> {
         .collect()
 }
 
-fn corrupt_first_load_type(db: &Path, type_hash: String) {
+fn corrupt_first_op_type(db: &Path, op_name: &str, type_hash: String) {
     let conn = Connection::open(db).unwrap();
     let (cache_key, artifact_json): (String, String) = conn
         .query_row(
@@ -187,11 +218,11 @@ fn corrupt_first_load_type(db: &Path, type_hash: String) {
         .unwrap();
     let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
     let operations = value["metadata"]["operations"].as_array_mut().unwrap();
-    let load = operations
+    let op = operations
         .iter_mut()
-        .find(|op| op["op"].as_str() == Some("load"))
-        .expect("load operation");
-    load["type_hash"] = JsonValue::String(type_hash);
+        .find(|op| op["op"].as_str() == Some(op_name))
+        .unwrap_or_else(|| panic!("{op_name} operation"));
+    op["type_hash"] = JsonValue::String(type_hash);
     let metadata_hash = bytes_hash(canonical_json(&value["metadata"]).as_bytes());
     value["metadata_hash"] = JsonValue::String(metadata_hash.clone());
     conn.execute(

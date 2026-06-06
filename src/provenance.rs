@@ -1084,7 +1084,7 @@ impl CodeDb {
                     "entry_name": self.symbol_display(&root, &case.entry_symbol)?,
                     "category": case.category.as_str(),
                     "expected": case.expected,
-                    "actual": test_value_from_value(&actual),
+                    "actual": test_value_from_value(&actual)?,
                 }))
             }
             Err(err) => Ok(json!({

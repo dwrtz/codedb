@@ -15,6 +15,11 @@ fn run(args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("utf8 stdout")
 }
 
+fn run_fail(args: &[&str]) -> String {
+    let output = bin().args(args).assert().failure().get_output().clone();
+    String::from_utf8(output.stderr).expect("utf8 stderr")
+}
+
 fn path(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
 }
@@ -637,6 +642,84 @@ fn main<'a>() -> i64 =
     let ops = op_names(&ir);
     assert!(ops.contains(&"move".to_string()));
     assert!(ops.contains(&"drop".to_string()));
+}
+
+#[test]
+fn asymmetric_conditional_move_is_rejected_until_conditional_drop() {
+    // Moving an owned (move-only) value in only one branch of an `if` would
+    // leave it live on the other branch, but the drop scaffold emits a single
+    // unconditional drop. Lowering must reject this fail-closed until
+    // conditional drop glue exists, otherwise the value's drop is silently
+    // skipped on the path that did not move it.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("asym-if-move.sqlite");
+    let source = temp.path().join("asym-if-move.cdb");
+    let ir_path = temp.path().join("pick.ir.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line { price_cents: i64 }
+
+record LineEditor<'a> { line: &'a mut Line }
+
+fn pick<'a>(editor: LineEditor<'a>, other: LineEditor<'a>, choose: bool) -> i64 =
+  let chosen: LineEditor<'a> = (if choose then editor else other) in
+  chosen.line.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    // The program is borrow-safe, so semantic verify still passes; the native
+    // gate is enforced at lowering, like other not-yet-lowerable constructs.
+    run(&["verify", path(&db)]);
+    let stderr = run_fail(&["emit-ir", path(&db), "pick", "--out", path(&ir_path)]);
+    assert!(
+        stderr.contains("asymmetric conditional move"),
+        "expected asymmetric-move rejection, got: {stderr}"
+    );
+}
+
+#[test]
+fn partial_field_move_of_move_only_value_is_rejected_until_field_drop() {
+    // Moving a move-only value out of a record field is a partial move that
+    // leaves the enclosing aggregate with a hole. The whole-slot drop scaffold
+    // would double-drop the moved field, so lowering must reject this
+    // fail-closed until field-granular drop glue exists.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("partial-field-move.sqlite");
+    let source = temp.path().join("partial-field-move.cdb");
+    let ir_path = temp.path().join("main.ir.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line { price_cents: i64 }
+
+record LineEditor<'a> { line: &'a mut Line }
+
+record Pair<'a> { ed: LineEditor<'a>, n: i64 }
+
+fn take<'a>(editor: LineEditor<'a>) -> i64 = editor.line.price_cents
+
+fn main<'a>() -> i64 =
+  let line: Line = { price_cents: 25 } in
+  let pair: Pair<'a> = { ed: { line: &'a mut line }, n: 7 } in
+  let observed: i64 = take(pair.ed) in
+  observed
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    let stderr = run_fail(&["emit-ir", path(&db), "main", "--out", path(&ir_path)]);
+    assert!(
+        stderr.contains("partial move of an owned aggregate"),
+        "expected partial-move rejection, got: {stderr}"
+    );
 }
 
 fn op_names(ir: &JsonValue) -> Vec<String> {
