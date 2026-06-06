@@ -648,13 +648,14 @@ fn main<'a>() -> i64 =
 fn asymmetric_conditional_move_is_rejected_until_conditional_drop() {
     // Moving an owned (move-only) value in only one branch of an `if` would
     // leave it live on the other branch, but the drop scaffold emits a single
-    // unconditional drop. Lowering must reject this fail-closed until
-    // conditional drop glue exists, otherwise the value's drop is silently
-    // skipped on the path that did not move it.
+    // unconditional drop. The whole-slot drop scaffold can only stay sound
+    // ("drops occur exactly once", SPEC_V2 §20) if such moves are rejected, so
+    // the move checker rejects this fail-closed at the semantic gate (import),
+    // until conditional drop glue exists. The lowering guard remains as a
+    // defense-in-depth backstop for any IR that bypasses the semantic check.
     let temp = tempdir().unwrap();
     let db = temp.path().join("asym-if-move.sqlite");
     let source = temp.path().join("asym-if-move.cdb");
-    let ir_path = temp.path().join("pick.ir.json");
 
     std::fs::write(
         &source,
@@ -671,11 +672,11 @@ fn pick<'a>(editor: LineEditor<'a>, other: LineEditor<'a>, choose: bool) -> i64 
     .unwrap();
 
     run(&["init", path(&db)]);
-    run(&["import", path(&db), path(&source)]);
-    // The program is borrow-safe, so semantic verify still passes; the native
-    // gate is enforced at lowering, like other not-yet-lowerable constructs.
-    run(&["verify", path(&db)]);
-    let stderr = run_fail(&["emit-ir", path(&db), "pick", "--out", path(&ir_path)]);
+    let stderr = run_fail(&["import", path(&db), path(&source)]);
+    assert!(
+        stderr.contains("unsupported_move"),
+        "expected structured unsupported_move code, got: {stderr}"
+    );
     assert!(
         stderr.contains("asymmetric conditional move"),
         "expected asymmetric-move rejection, got: {stderr}"
@@ -686,12 +687,12 @@ fn pick<'a>(editor: LineEditor<'a>, other: LineEditor<'a>, choose: bool) -> i64 
 fn partial_field_move_of_move_only_value_is_rejected_until_field_drop() {
     // Moving a move-only value out of a record field is a partial move that
     // leaves the enclosing aggregate with a hole. The whole-slot drop scaffold
-    // would double-drop the moved field, so lowering must reject this
-    // fail-closed until field-granular drop glue exists.
+    // would double-drop the moved field, so the move checker rejects this
+    // fail-closed at the semantic gate (import) until field-granular drop glue
+    // exists. The lowering guard remains as a defense-in-depth backstop.
     let temp = tempdir().unwrap();
     let db = temp.path().join("partial-field-move.sqlite");
     let source = temp.path().join("partial-field-move.cdb");
-    let ir_path = temp.path().join("main.ir.json");
 
     std::fs::write(
         &source,
@@ -714,8 +715,11 @@ fn main<'a>() -> i64 =
     .unwrap();
 
     run(&["init", path(&db)]);
-    run(&["import", path(&db), path(&source)]);
-    let stderr = run_fail(&["emit-ir", path(&db), "main", "--out", path(&ir_path)]);
+    let stderr = run_fail(&["import", path(&db), path(&source)]);
+    assert!(
+        stderr.contains("unsupported_move"),
+        "expected structured unsupported_move code, got: {stderr}"
+    );
     assert!(
         stderr.contains("partial move of an owned aggregate"),
         "expected partial-move rejection, got: {stderr}"
@@ -730,11 +734,12 @@ fn partial_field_move_of_move_only_aggregate_into_let_is_rejected() {
     // not `lower_place_value`. That path previously emitted a Move of the field
     // address without bailing or marking it moved, so the whole-`container` drop
     // scaffold double-dropped the moved-out cursor and `verify` still passed.
-    // It must now be rejected fail-closed until field-granular drop glue lands.
+    // The move checker now rejects the partial move fail-closed at the semantic
+    // gate (import), until field-granular drop glue lands; the lowering guard
+    // remains as a defense-in-depth backstop.
     let temp = tempdir().unwrap();
     let db = temp.path().join("partial-agg-move-let.sqlite");
     let source = temp.path().join("partial-agg-move-let.cdb");
-    let ir_path = temp.path().join("main.ir.json");
 
     std::fs::write(
         &source,
@@ -755,11 +760,7 @@ fn main<'a>() -> i64 =
     .unwrap();
 
     run(&["init", path(&db)]);
-    run(&["import", path(&db), path(&source)]);
-    // The program is valid semantically (only lowering is deferred), so verify
-    // still passes; the rejection must surface at IR lowering.
-    run(&["verify", path(&db)]);
-    let stderr = run_fail(&["emit-ir", path(&db), "main", "--out", path(&ir_path)]);
+    let stderr = run_fail(&["import", path(&db), path(&source)]);
     assert!(
         stderr.contains("unsupported_move:"),
         "expected structured unsupported_move code, got: {stderr}"
@@ -773,11 +774,11 @@ fn main<'a>() -> i64 =
 #[test]
 fn partial_field_move_of_move_only_aggregate_from_param_is_rejected() {
     // Same aggregate-init hole, by-value-parameter form: moving a move-only
-    // aggregate field out of a by-value record parameter must also be rejected.
+    // aggregate field out of a by-value record parameter must also be rejected
+    // fail-closed at the semantic gate (import).
     let temp = tempdir().unwrap();
     let db = temp.path().join("partial-agg-move-param.sqlite");
     let source = temp.path().join("partial-agg-move-param.cdb");
-    let ir_path = temp.path().join("take.ir.json");
 
     std::fs::write(
         &source,
@@ -796,8 +797,11 @@ fn take<'a>(container: Container<'a>) -> i64 =
     .unwrap();
 
     run(&["init", path(&db)]);
-    run(&["import", path(&db), path(&source)]);
-    let stderr = run_fail(&["emit-ir", path(&db), "take", "--out", path(&ir_path)]);
+    let stderr = run_fail(&["import", path(&db), path(&source)]);
+    assert!(
+        stderr.contains("unsupported_move"),
+        "expected structured unsupported_move code, got: {stderr}"
+    );
     assert!(
         stderr.contains("partial move of an owned aggregate"),
         "expected partial-move rejection, got: {stderr}"

@@ -3767,6 +3767,7 @@ impl CodeDb {
                     .get("else")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("if missing else"))?;
+                let boundary = state.next_local;
                 let mut then_state = state.clone();
                 let mut else_state = state.clone();
                 self.verify_expr_borrows(
@@ -3783,6 +3784,20 @@ impl CodeDb {
                     &mut else_state,
                     ExprUse::Value,
                 )?;
+                // An owned value moved in one branch but not the other (an
+                // asymmetric conditional move of a slot that outlives the `if`)
+                // leaves the unconditional whole-slot drop scaffold unable to
+                // decide whether to drop it. Lowering rejects this fail-closed;
+                // reject here too so `verify` agrees with codegen. Branch-local
+                // temporaries (slots minted at or above `boundary`) are dropped
+                // within their branch and are not compared.
+                let then_outer = outer_branch_moves(&then_state, boundary);
+                let else_outer = outer_branch_moves(&else_state, boundary);
+                if !move_sets_match(&then_outer, &else_outer) {
+                    bail!(
+                        "unsupported_move: asymmetric conditional move; a move-only value is moved in only one branch of an if"
+                    );
+                }
                 merge_branch_state(state, then_state, else_state);
                 Ok(())
             }
@@ -4466,6 +4481,17 @@ impl CodeDb {
         let type_hash = self.expr_declared_type(expr_hash)?;
         let class = self.value_class_in_root(root, &type_hash)?;
         if class.copy_kind == ValueCopyKind::MoveOnly {
+            // Moving a move-only value out of a record field or array element is
+            // a partial move; the whole-slot drop scaffold cannot express it, so
+            // lowering rejects it fail-closed (deferred to Phase 15). Reject here
+            // too so `verify` is a faithful safety gate rather than deferring the
+            // decision to codegen.
+            if !place.fields.is_empty() {
+                bail!(
+                    "unsupported_move: partial move of an owned aggregate at {:?}; moving a move-only value out of a record field or array element is not yet supported",
+                    place
+                );
+            }
             self.check_move_conflicts(&place, &state.active)?;
             state.moved.push(place);
         } else {
@@ -5531,6 +5557,28 @@ fn places_overlap(left: &LoanPlace, right: &LoanPlace) -> bool {
 /// a leading field-path prefix). Unlike [`places_overlap`] this is directional.
 fn place_is_prefix_of(prefix: &LoanPlace, value: &LoanPlace) -> bool {
     prefix.root == value.root && fields_prefix(&prefix.fields, &value.fields)
+}
+
+/// Moved places that refer to storage outliving the current `if` — parameters
+/// and locals minted before `boundary`. Branch-local temporaries (slots at or
+/// above `boundary`) are dropped within their own branch and excluded.
+fn outer_branch_moves(state: &MoveBorrowState, boundary: usize) -> Vec<LoanPlace> {
+    state
+        .moved
+        .iter()
+        .filter(|place| match place.root {
+            LoanRoot::Local(id) => id < boundary,
+            LoanRoot::Param(_) => true,
+        })
+        .cloned()
+        .collect()
+}
+
+/// Set equality for move place lists (each place is moved at most once).
+fn move_sets_match(left: &[LoanPlace], right: &[LoanPlace]) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|place| right.contains(place))
+        && right.iter().all(|place| left.contains(place))
 }
 
 fn fields_prefix(prefix: &[String], value: &[String]) -> bool {
