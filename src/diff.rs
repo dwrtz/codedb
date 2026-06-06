@@ -5,8 +5,9 @@ use rusqlite::{Connection, params};
 use serde_json::{Value as JsonValue, json};
 
 use crate::abi::internal_abi_symbol;
-use crate::model::ProgramRootPayload;
+use crate::model::{ProgramRootPayload, preferred_type_binding};
 use crate::store::{CodeDb, canonical_json};
+use crate::types::{TypeDefinition, TypeMemberDef};
 
 impl CodeDb {
     pub fn diff_roots(&self, root_a: &str, root_b: &str) -> Result<String> {
@@ -160,6 +161,11 @@ impl CodeDb {
             ));
         }
 
+        for record in self.type_diff_records(&a, &b)? {
+            emitted = true;
+            render_type_change_text(&record, &mut out);
+        }
+
         if !emitted {
             out.push_str("Only root metadata or ordering changed.\n");
         }
@@ -309,7 +315,171 @@ impl CodeDb {
                 "exported_abi_symbol": &export.1,
             }));
         }
+        changes.extend(self.type_diff_records(&a, &b)?);
         Ok(changes)
+    }
+
+    /// Structured change records for type definitions (added/removed/renamed/
+    /// moved types and per-member field/variant changes keyed by stable member
+    /// identity). Shared by the text and JSON diff paths.
+    fn type_diff_records(
+        &self,
+        a: &ProgramRootPayload,
+        b: &ProgramRootPayload,
+    ) -> Result<Vec<JsonValue>> {
+        let a_types = a
+            .types
+            .iter()
+            .map(|entry| (entry.type_symbol.as_str(), entry.type_def.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        let b_types = b
+            .types
+            .iter()
+            .map(|entry| (entry.type_symbol.as_str(), entry.type_def.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        let all_types = a_types
+            .keys()
+            .chain(b_types.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        let mut records = Vec::new();
+        for type_symbol in all_types {
+            match (a_types.get(type_symbol), b_types.get(type_symbol)) {
+                (None, Some(_)) => records.push(json!({
+                    "kind": "type_added",
+                    "type_symbol": type_symbol,
+                    "name": type_display(b, type_symbol),
+                })),
+                (Some(_), None) => records.push(json!({
+                    "kind": "type_removed",
+                    "type_symbol": type_symbol,
+                    "name": type_display(a, type_symbol),
+                })),
+                (Some(a_def), Some(b_def)) => {
+                    let a_name = type_display(a, type_symbol);
+                    let b_name = type_display(b, type_symbol);
+                    if a_name != b_name {
+                        let moved = preferred_type_binding(a, type_symbol)
+                            .map(|binding| binding.display_name.as_str())
+                            == preferred_type_binding(b, type_symbol)
+                                .map(|binding| binding.display_name.as_str());
+                        records.push(json!({
+                            "kind": if moved { "type_moved" } else { "type_renamed" },
+                            "type_symbol": type_symbol,
+                            "from": a_name,
+                            "to": b_name,
+                        }));
+                    }
+                    if a_def != b_def {
+                        self.push_member_diff_records(
+                            a_def,
+                            b_def,
+                            type_symbol,
+                            &b_name,
+                            &mut records,
+                        )?;
+                    }
+                }
+                (None, None) => unreachable!(),
+            }
+        }
+        Ok(records)
+    }
+
+    fn push_member_diff_records(
+        &self,
+        a_def_hash: &str,
+        b_def_hash: &str,
+        type_symbol: &str,
+        type_name: &str,
+        records: &mut Vec<JsonValue>,
+    ) -> Result<()> {
+        let a_def = self.type_definition(a_def_hash)?;
+        let b_def = self.type_definition(b_def_hash)?;
+        if a_def.kind_name() != b_def.kind_name() {
+            records.push(json!({
+                "kind": "type_definition_changed",
+                "type_symbol": type_symbol,
+                "name": type_name,
+                "from_kind": a_def.kind_name(),
+                "to_kind": b_def.kind_name(),
+            }));
+            return Ok(());
+        }
+        let label = member_label(&b_def);
+        let a_members = members_of(&a_def)
+            .iter()
+            .map(|member| (member.member_symbol.as_str(), member))
+            .collect::<BTreeMap<_, _>>();
+        let b_members = members_of(&b_def)
+            .iter()
+            .map(|member| (member.member_symbol.as_str(), member))
+            .collect::<BTreeMap<_, _>>();
+        let all_members = a_members
+            .keys()
+            .chain(b_members.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut member_change = false;
+        for member_symbol in all_members {
+            match (a_members.get(member_symbol), b_members.get(member_symbol)) {
+                (None, Some(member)) => {
+                    member_change = true;
+                    records.push(json!({
+                        "kind": format!("{label}_added"),
+                        "type_symbol": type_symbol,
+                        "type_name": type_name,
+                        "member_symbol": member_symbol,
+                        "member_name": member.name,
+                    }));
+                }
+                (Some(member), None) => {
+                    member_change = true;
+                    records.push(json!({
+                        "kind": format!("{label}_removed"),
+                        "type_symbol": type_symbol,
+                        "type_name": type_name,
+                        "member_symbol": member_symbol,
+                        "member_name": member.name,
+                    }));
+                }
+                (Some(a_member), Some(b_member)) => {
+                    if a_member.name != b_member.name {
+                        member_change = true;
+                        records.push(json!({
+                            "kind": format!("{label}_renamed"),
+                            "type_symbol": type_symbol,
+                            "type_name": type_name,
+                            "member_symbol": member_symbol,
+                            "from": a_member.name,
+                            "to": b_member.name,
+                        }));
+                    }
+                    if a_member.type_hash != b_member.type_hash {
+                        member_change = true;
+                        records.push(json!({
+                            "kind": format!("{label}_type_changed"),
+                            "type_symbol": type_symbol,
+                            "type_name": type_name,
+                            "member_symbol": member_symbol,
+                            "member_name": b_member.name,
+                        }));
+                    }
+                }
+                (None, None) => unreachable!(),
+            }
+        }
+        // A definition-hash change with no member identity change (e.g. region
+        // parameters changed) must still be reported, never silently dropped.
+        if !member_change {
+            records.push(json!({
+                "kind": "type_definition_changed",
+                "type_symbol": type_symbol,
+                "name": type_name,
+            }));
+        }
+        Ok(())
     }
 
     fn diff_exprs(
@@ -529,6 +699,46 @@ fn qualified_aliases_for(root: &ProgramRootPayload, symbol: &str) -> BTreeSet<St
         .filter(|binding| binding.symbol == symbol && !binding.is_preferred)
         .map(|binding| format!("{}.{}", binding.module, binding.display_name))
         .collect()
+}
+
+fn type_display(root: &ProgramRootPayload, type_symbol: &str) -> String {
+    preferred_type_binding(root, type_symbol)
+        .map(|binding| format!("{}.{}", binding.module, binding.display_name))
+        .unwrap_or_else(|| type_symbol.to_string())
+}
+
+fn members_of(definition: &TypeDefinition) -> &[TypeMemberDef] {
+    match definition {
+        TypeDefinition::Record { fields, .. } => fields,
+        TypeDefinition::Enum { variants, .. } => variants,
+    }
+}
+
+fn member_label(definition: &TypeDefinition) -> &'static str {
+    match definition {
+        TypeDefinition::Record { .. } => "field",
+        TypeDefinition::Enum { .. } => "variant",
+    }
+}
+
+fn render_type_change_text(record: &JsonValue, out: &mut String) {
+    let Some(object) = record.as_object() else {
+        return;
+    };
+    if let Some(kind) = object.get("kind").and_then(JsonValue::as_str) {
+        out.push_str(&format!("{kind}:\n"));
+    }
+    for (key, value) in object {
+        if key == "kind" {
+            continue;
+        }
+        let rendered = value
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| value.to_string());
+        out.push_str(&format!("  {key}: {rendered}\n"));
+    }
+    out.push('\n');
 }
 
 fn short_json(value: &JsonValue) -> String {

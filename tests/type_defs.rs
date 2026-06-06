@@ -828,3 +828,80 @@ fn type_identity_summary(listing: &JsonValue) -> TypeIdentitySummary {
         })
         .collect()
 }
+
+#[test]
+fn diff_reports_type_and_member_changes() {
+    // Regression: `diff` must surface type-definition changes (added types and
+    // per-member field/variant changes keyed by stable member identity) rather
+    // than reporting "Only root metadata or ordering changed".
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("diff-types.sqlite");
+    let create = temp.path().join("create.json");
+    let rename = temp.path().join("rename.json");
+
+    run(&["init", path(&db)]);
+    let initial: JsonValue = serde_json::from_str(&run(&["list", path(&db), "--json"])).unwrap();
+    let initial_root = initial["root_hash"].as_str().unwrap().to_string();
+
+    std::fs::write(
+        &create,
+        r#"{
+  "schema": "codedb/apply/v1",
+  "operations": [
+    {
+      "kind": "create_type",
+      "name": "Money",
+      "birth_seed": "money-type",
+      "definition": { "kind": "record", "fields": [ { "name": "cents", "type": "i64" } ] }
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+    let created: JsonValue =
+        serde_json::from_str(&run(&["apply", path(&db), "--json", path(&create)])).unwrap();
+    let root_with_money = created["new_root_hash"].as_str().unwrap().to_string();
+
+    // The create itself, diffed against the empty initial root, reports type_added.
+    let create_diff = run(&["diff", path(&db), &initial_root, &root_with_money]);
+    assert!(create_diff.contains("type_added"), "diff: {create_diff}");
+    assert!(create_diff.contains("Money"), "diff: {create_diff}");
+
+    std::fs::write(
+        &rename,
+        format!(
+            r#"{{
+  "schema": "codedb/apply/v1",
+  "expect_root_hash": "{root_with_money}",
+  "operations": [
+    {{ "kind": "rename_field", "type": "Money", "field": "cents", "new_name": "pennies" }}
+  ]
+}}"#
+        ),
+    )
+    .unwrap();
+    let renamed: JsonValue =
+        serde_json::from_str(&run(&["apply", path(&db), "--json", path(&rename)])).unwrap();
+    let renamed_root = renamed["new_root_hash"].as_str().unwrap().to_string();
+
+    // Text diff must show the field rename by identity, not a metadata-only note.
+    let text = run(&["diff", path(&db), &root_with_money, &renamed_root]);
+    assert!(text.contains("field_renamed"), "diff text: {text}");
+    assert!(text.contains("pennies"), "diff text: {text}");
+    assert!(
+        !text.contains("Only root metadata or ordering changed"),
+        "diff text falsely reported metadata-only: {text}"
+    );
+
+    // JSON diff must carry a field_renamed change record.
+    let json: JsonValue =
+        serde_json::from_str(&run(&["diff", path(&db), &root_with_money, &renamed_root, "--json"]))
+            .unwrap();
+    let kinds = json["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|change| change["kind"].as_str())
+        .collect::<Vec<_>>();
+    assert!(kinds.contains(&"field_renamed"), "kinds: {kinds:?}");
+}
