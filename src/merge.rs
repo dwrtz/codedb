@@ -6,7 +6,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::migrations::{MergeObjectPayload, MigrationOutcome, MigrationStatus, Operation};
 use crate::model::{
     BranchState, ExportBinding, NameBinding, ParamNames, ProgramRootPayload, RootSymbolPayload,
-    RootTestBinding, normalize_root,
+    RootTestBinding, RootTypePayload, TypeNameBinding, normalize_root,
 };
 use crate::store::{CodeDb, canonical_json, extract_hash_strings};
 
@@ -548,6 +548,31 @@ fn merge_root_payloads(
         replace_symbol_state(&mut merged, &symbol, &next);
     }
 
+    let all_types = root_type_symbols(ancestor)
+        .into_iter()
+        .chain(root_type_symbols(target))
+        .chain(root_type_symbols(source))
+        .collect::<BTreeSet<_>>();
+
+    for type_symbol in all_types {
+        let base = type_state(ancestor, &type_symbol);
+        let left = type_state(target, &type_symbol);
+        let right = type_state(source, &type_symbol);
+        let left_changed = left != base;
+        let right_changed = right != base;
+        if !right_changed {
+            continue;
+        }
+        let next = if !left_changed {
+            right
+        } else if left == right {
+            left
+        } else {
+            merge_type_state(&type_symbol, &base, &left, &right)?
+        };
+        replace_type_state(&mut merged, &type_symbol, &next);
+    }
+
     if source.tests != ancestor.tests {
         if target.tests == ancestor.tests {
             merged.tests = source.tests.clone();
@@ -579,6 +604,7 @@ fn merge_root_payloads(
     }
 
     validate_name_conflicts(&merged)?;
+    validate_type_name_conflicts(&merged)?;
     validate_export_conflicts(&merged)?;
     Ok(merged)
 }
@@ -780,6 +806,165 @@ fn signature_of(state: &SymbolState) -> Option<&str> {
 
 fn definition_of(state: &SymbolState) -> Option<&str> {
     state.entry.as_ref().map(|entry| entry.definition.as_str())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TypeState {
+    entry: Option<RootTypePayload>,
+    names: Vec<TypeNameBinding>,
+}
+
+impl TypeState {
+    fn absent() -> Self {
+        Self {
+            entry: None,
+            names: vec![],
+        }
+    }
+}
+
+fn type_state(root: &ProgramRootPayload, type_symbol: &str) -> TypeState {
+    let Some(entry) = root
+        .types
+        .iter()
+        .find(|entry| entry.type_symbol == type_symbol)
+    else {
+        return TypeState::absent();
+    };
+    let mut names = root
+        .type_names
+        .iter()
+        .filter(|binding| binding.type_symbol == type_symbol)
+        .cloned()
+        .collect::<Vec<_>>();
+    names.sort_by(|a, b| {
+        (&a.module, &a.display_name, a.is_preferred).cmp(&(
+            &b.module,
+            &b.display_name,
+            b.is_preferred,
+        ))
+    });
+    TypeState {
+        entry: Some(entry.clone()),
+        names,
+    }
+}
+
+fn replace_type_state(root: &mut ProgramRootPayload, type_symbol: &str, state: &TypeState) {
+    root.types.retain(|entry| entry.type_symbol != type_symbol);
+    root.type_names
+        .retain(|binding| binding.type_symbol != type_symbol);
+    if let Some(entry) = &state.entry {
+        root.types.push(entry.clone());
+        root.type_names.extend(state.names.clone());
+    }
+}
+
+fn root_type_symbols(root: &ProgramRootPayload) -> BTreeSet<String> {
+    root.types
+        .iter()
+        .map(|entry| entry.type_symbol.clone())
+        .chain(
+            root.type_names
+                .iter()
+                .map(|binding| binding.type_symbol.clone()),
+        )
+        .collect()
+}
+
+fn type_def_of(state: &TypeState) -> Option<&str> {
+    state.entry.as_ref().map(|entry| entry.type_def.as_str())
+}
+
+fn merge_type_state(
+    type_symbol: &str,
+    base: &TypeState,
+    left: &TypeState,
+    right: &TypeState,
+) -> std::result::Result<TypeState, MergeConflict> {
+    let left_presence_changed = left.entry.is_some() != base.entry.is_some();
+    let right_presence_changed = right.entry.is_some() != base.entry.is_some();
+    if left_presence_changed || right_presence_changed {
+        return Err(type_conflict(
+            "delete_conflict",
+            "one branch removed or added a type changed by the other branch",
+            type_symbol,
+            "presence",
+        ));
+    }
+
+    let left_definition_changed = type_def_of(left) != type_def_of(base);
+    let right_definition_changed = type_def_of(right) != type_def_of(base);
+    if left_definition_changed
+        && right_definition_changed
+        && type_def_of(left) != type_def_of(right)
+    {
+        return Err(type_conflict(
+            "dependency_conflict",
+            "both branches changed the same type definition",
+            type_symbol,
+            "definition",
+        ));
+    }
+
+    if left.names != base.names && right.names != base.names && left.names != right.names {
+        return Err(type_conflict(
+            "name_conflict",
+            "both branches changed names for the same type",
+            type_symbol,
+            "names",
+        ));
+    }
+
+    Ok(TypeState {
+        entry: if type_def_of(right) != type_def_of(base) {
+            right.entry.clone()
+        } else {
+            left.entry.clone()
+        },
+        names: if right.names != base.names {
+            right.names.clone()
+        } else {
+            left.names.clone()
+        },
+    })
+}
+
+fn type_conflict(kind: &str, message: &str, type_symbol: &str, facet: &str) -> MergeConflict {
+    MergeConflict {
+        kind: kind.to_string(),
+        message: message.to_string(),
+        symbols: vec![type_symbol.to_string()],
+        details: json!({
+            "facet": facet,
+        }),
+    }
+}
+
+fn validate_type_name_conflicts(
+    root: &ProgramRootPayload,
+) -> std::result::Result<(), MergeConflict> {
+    let mut names = BTreeMap::<(String, String), String>::new();
+    for binding in &root.type_names {
+        let key = (binding.module.clone(), binding.display_name.clone());
+        if let Some(existing) = names.insert(key.clone(), binding.type_symbol.clone())
+            && existing != binding.type_symbol
+        {
+            return Err(MergeConflict {
+                kind: "name_conflict".to_string(),
+                message: format!(
+                    "type name {}.{} is bound to multiple type symbols after merge",
+                    key.0, key.1
+                ),
+                symbols: vec![existing, binding.type_symbol.clone()],
+                details: json!({
+                    "module": key.0,
+                    "name": key.1,
+                }),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_name_conflicts(root: &ProgramRootPayload) -> std::result::Result<(), MergeConflict> {

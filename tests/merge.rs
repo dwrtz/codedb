@@ -23,6 +23,10 @@ fn parse_json(text: &str) -> JsonValue {
     serde_json::from_str(text).unwrap_or_else(|err| panic!("invalid json: {err}\n{text}"))
 }
 
+fn read_json(path: &Path) -> JsonValue {
+    parse_json(&std::fs::read_to_string(path).unwrap())
+}
+
 fn current_root(db: &Path) -> String {
     parse_json(&run(&["list", path(db), "--json"]))["root_hash"]
         .as_str()
@@ -455,4 +459,163 @@ fn conservative_merge_reports_semantic_conflicts() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn conservative_merge_preserves_type_added_on_source() {
+    // Regression: branch merge must reconcile type definitions, not silently
+    // keep the target's. A record added on the source branch (disjoint from a
+    // target-only function change) must survive the merge into main.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("merge-add-type.sqlite");
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), "examples/shop.cdb"]);
+    let base_root = current_root(&db);
+
+    run(&[
+        "branch",
+        "create",
+        path(&db),
+        "agent/types",
+        "--from",
+        "main",
+        "--json",
+    ]);
+    let added = apply_branch(
+        temp.path(),
+        &db,
+        "add-money.apply.json",
+        "agent/types",
+        &base_root,
+        json!({
+            "kind": "create_type",
+            "name": "Money",
+            "definition": {
+                "kind": "record",
+                "fields": [{ "name": "cents", "type": "i64" }],
+            },
+        }),
+    );
+    assert_eq!(added["status"], "applied");
+
+    let target_change = parse_json(&run(&[
+        "replace-body",
+        path(&db),
+        "total",
+        "subtotal + 1",
+        "--expect-root",
+        &base_root,
+        "--json",
+    ]));
+    assert_eq!(target_change["status"], "applied");
+    let target_root = target_change["new_root_hash"].as_str().unwrap().to_string();
+
+    let applied = parse_json(&run(&[
+        "merge",
+        "apply",
+        path(&db),
+        "main",
+        "agent/types",
+        "--expect-root",
+        &target_root,
+        "--json",
+    ]));
+    assert_eq!(applied["status"], "merged");
+    assert_eq!(applied["committed"], true);
+
+    // The added record must resolve in the merged main root: emit its layout.
+    let layout_path = temp.path().join("money.layout.json");
+    run(&[
+        "emit-type-layout",
+        path(&db),
+        "Money",
+        "--out",
+        path(&layout_path),
+    ]);
+    let layout = read_json(&layout_path);
+    assert_eq!(layout["kind"], "record");
+    assert_eq!(layout["fields"][0]["name"], "cents");
+    // The disjoint target-side change must also be present (total = subtotal + 1,
+    // main = total(100)).
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "101");
+    run(&["verify", path(&db)]);
+}
+
+#[test]
+fn conservative_merge_reports_type_definition_conflict() {
+    // Regression: when both branches change the same type definition divergently
+    // (here renaming the same field two different ways), the merge must report a
+    // conflict instead of silently keeping the target's definition.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("merge-type-conflict.sqlite");
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), "examples/shop.cdb"]);
+    let root0 = current_root(&db);
+
+    // Put Money into the common ancestor on main.
+    let base = apply_branch(
+        temp.path(),
+        &db,
+        "money-base.apply.json",
+        "main",
+        &root0,
+        json!({
+            "kind": "create_type",
+            "name": "Money",
+            "definition": {
+                "kind": "record",
+                "fields": [{ "name": "cents", "type": "i64" }],
+            },
+        }),
+    );
+    let base_root = base["new_root_hash"].as_str().unwrap().to_string();
+
+    run(&[
+        "branch",
+        "create",
+        path(&db),
+        "agent/field",
+        "--from",
+        "main",
+        "--json",
+    ]);
+    apply_branch(
+        temp.path(),
+        &db,
+        "rename-pennies.apply.json",
+        "agent/field",
+        &base_root,
+        json!({
+            "kind": "rename_field",
+            "type": "Money",
+            "field": "cents",
+            "new_name": "pennies",
+        }),
+    );
+    apply_branch(
+        temp.path(),
+        &db,
+        "rename-units.apply.json",
+        "main",
+        &base_root,
+        json!({
+            "kind": "rename_field",
+            "type": "Money",
+            "field": "cents",
+            "new_name": "units",
+        }),
+    );
+
+    let conflict = parse_json(&run(&[
+        "merge",
+        "preview",
+        path(&db),
+        "main",
+        "agent/field",
+        "--json",
+    ]));
+    assert_eq!(conflict["status"], "conflict");
+    assert_eq!(conflict["conflicts"][0]["kind"], "dependency_conflict");
 }
