@@ -590,7 +590,8 @@ impl CodeDb {
         }
 
         let mut ctx = LowerCtx::new(target_triple);
-        let mut lowered = self.lower_expr(root, &body, &param_types, &mut ctx, &mut Vec::new())?;
+        let mut lowered =
+            self.lower_expr_as(root, &body, &return_type, &param_types, &mut ctx, &mut Vec::new())?;
         lowered.operations.extend(self.lower_param_drop_scaffolds(
             root,
             target_triple,
@@ -727,17 +728,25 @@ impl CodeDb {
                 if self.root_symbol(root, &target_symbol_hash).is_none() {
                     bail!("call target missing from root {target_symbol_hash}");
                 }
+                let (callee_param_types, _) = self.signature_parts(&target.signature)?;
                 let mut operations = Vec::new();
                 let mut arg_values = Vec::new();
-                for arg in payload
+                for (index, arg) in payload
                     .get("args")
                     .and_then(JsonValue::as_array)
                     .ok_or_else(|| anyhow!("call missing args"))?
+                    .iter()
+                    .enumerate()
                 {
                     let arg_hash = arg
                         .as_str()
                         .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                    let lowered = self.lower_expr(root, arg_hash, param_types, ctx, locals)?;
+                    let lowered = match callee_param_types.get(index) {
+                        Some(expected) => {
+                            self.lower_expr_as(root, arg_hash, expected, param_types, ctx, locals)?
+                        }
+                        None => self.lower_expr(root, arg_hash, param_types, ctx, locals)?,
+                    };
                     operations.extend(lowered.operations);
                     arg_values.push(lowered.value);
                 }
@@ -897,7 +906,14 @@ impl CodeDb {
                         locals,
                     )?);
                 } else {
-                    let value = self.lower_expr(root, value_hash, param_types, ctx, locals)?;
+                    let value = self.lower_expr_as(
+                        root,
+                        value_hash,
+                        &binding_type,
+                        param_types,
+                        ctx,
+                        locals,
+                    )?;
                     if !self.type_assignable_in_root(root, &value.type_hash, &binding_type)? {
                         bail!("let binding type mismatch while lowering");
                     }
@@ -1046,50 +1062,14 @@ impl CodeDb {
                 })
             }
             "record_literal" => {
-                let slot_size = stack_slot_size_bytes(self.layout_size_bytes(
-                    root,
-                    ctx.target_triple(),
-                    &type_hash,
-                )?);
-                let slot = ctx.local_slot(type_hash.clone(), slot_size);
-                let address = ctx.value();
-                ctx.push_debug_op(expr_hash, "addr_of_local", &address);
-                let mut operations = vec![LoweredOp::AddrOfLocal {
-                    id: address.clone(),
-                    place: LoweredPlace::Local {
-                        slot,
-                        type_hash: type_hash.clone(),
-                    },
-                }];
-                operations.extend(self.lower_record_init_to_address(
+                self.lower_record_literal_into_slot(
                     root,
                     expr_hash,
                     &type_hash,
-                    &address,
                     param_types,
                     ctx,
                     locals,
-                )?);
-                if self.type_passes_indirect(root, ctx.target_triple(), &type_hash)? {
-                    Ok(LoweredExpr {
-                        operations,
-                        value: address,
-                        type_hash,
-                    })
-                } else {
-                    let id = ctx.value();
-                    ctx.push_debug_op(expr_hash, "load", &id);
-                    operations.push(LoweredOp::Load {
-                        id: id.clone(),
-                        address,
-                        type_hash: type_hash.clone(),
-                    });
-                    Ok(LoweredExpr {
-                        operations,
-                        value: id,
-                        type_hash,
-                    })
-                }
+                )
             }
             "if" => {
                 let cond_hash = payload
@@ -1572,7 +1552,14 @@ impl CodeDb {
                 .ok_or_else(|| anyhow!("record field missing value"))?;
             let field_info =
                 self.lowered_record_field(root, ctx.target_triple(), target_type, name)?;
-            let value = self.lower_expr(root, value_hash, param_types, ctx, locals)?;
+            let value = self.lower_expr_as(
+                root,
+                value_hash,
+                &field_info.type_hash,
+                param_types,
+                ctx,
+                locals,
+            )?;
             if !self.type_assignable_in_root(root, &value.type_hash, &field_info.type_hash)? {
                 bail!("record initializer field {name} type mismatch while lowering");
             }
@@ -1708,6 +1695,191 @@ impl CodeDb {
             });
         }
         Ok(operations)
+    }
+
+    /// Lower a record literal into a fresh stack slot laid out as `slot_type`.
+    /// Building the literal directly in the destination type's layout (rather
+    /// than its structural, alphabetically-canonicalized type) keeps records
+    /// declared in a non-alphabetical field order correct. The safe
+    /// `let x: T = { .. }` path already did this; routing every value-flow
+    /// boundary through here closes the silent-miscompile holes (record return
+    /// values, call arguments, and nested record fields).
+    fn lower_record_literal_into_slot(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        slot_type: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let slot_size =
+            stack_slot_size_bytes(self.layout_size_bytes(root, ctx.target_triple(), slot_type)?);
+        let slot = ctx.local_slot(slot_type.to_string(), slot_size);
+        let address = ctx.value();
+        ctx.push_debug_op(expr_hash, "addr_of_local", &address);
+        let mut operations = vec![LoweredOp::AddrOfLocal {
+            id: address.clone(),
+            place: LoweredPlace::Local {
+                slot,
+                type_hash: slot_type.to_string(),
+            },
+        }];
+        operations.extend(self.lower_record_init_to_address(
+            root,
+            expr_hash,
+            slot_type,
+            &address,
+            param_types,
+            ctx,
+            locals,
+        )?);
+        if self.type_passes_indirect(root, ctx.target_triple(), slot_type)? {
+            Ok(LoweredExpr {
+                operations,
+                value: address,
+                type_hash: slot_type.to_string(),
+            })
+        } else {
+            let id = ctx.value();
+            ctx.push_debug_op(expr_hash, "load", &id);
+            operations.push(LoweredOp::Load {
+                id: id.clone(),
+                address,
+                type_hash: slot_type.to_string(),
+            });
+            Ok(LoweredExpr {
+                operations,
+                value: id,
+                type_hash: slot_type.to_string(),
+            })
+        }
+    }
+
+    /// Lower `expr_hash` so its result is usable where `expected_type` is
+    /// required. A record literal is built directly in `expected_type`'s layout.
+    /// Any other value whose static type differs from `expected_type` is allowed
+    /// only when a verbatim byte copy reinterpreted under the destination layout
+    /// is provably sound; otherwise lowering fails closed instead of silently
+    /// reordering fields. This closes the structural-vs-nominal record layout
+    /// hole at every value-flow boundary.
+    fn lower_expr_as(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        expected_type: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let is_record_literal = self
+            .get_payload(expr_hash)?
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            == Some("record_literal");
+        if is_record_literal && self.type_is_record(root, expected_type)? {
+            return self.lower_record_literal_into_slot(
+                root,
+                expr_hash,
+                expected_type,
+                param_types,
+                ctx,
+                locals,
+            );
+        }
+        let value = self.lower_expr(root, expr_hash, param_types, ctx, locals)?;
+        if value.type_hash != expected_type
+            && (self.type_is_record(root, &value.type_hash)?
+                || self.type_is_record(root, expected_type)?)
+            && !self.layouts_blind_copy_compatible(
+                root,
+                ctx.target_triple(),
+                &value.type_hash,
+                expected_type,
+            )?
+        {
+            bail!(
+                "unsupported_record_layout: a value of type {} cannot be used where {} is expected because their native field layouts differ (the named type is declared in a non-canonical field order); bind it with an explicit `let x: <Type> = <record literal>` so it is built in the destination layout",
+                value.type_hash,
+                expected_type
+            );
+        }
+        Ok(value)
+    }
+
+    fn type_is_record(&self, root: &ProgramRootPayload, type_hash: &str) -> Result<bool> {
+        Ok(matches!(
+            self.type_spec_in_root(root, type_hash)?,
+            TypeSpec::Record(_)
+        ))
+    }
+
+    /// Whether a verbatim byte copy of a `src`-typed value reinterpreted as
+    /// `dst` is sound: identical hashes, layout-equal scalars/references, or
+    /// records whose shared field names sit at identical offsets with
+    /// recursively-compatible field types and equal total size. Differing field
+    /// order (the bug class) yields differing offsets and is rejected.
+    fn layouts_blind_copy_compatible(
+        &self,
+        root: &ProgramRootPayload,
+        target_triple: &str,
+        src: &str,
+        dst: &str,
+    ) -> Result<bool> {
+        if src == dst {
+            return Ok(true);
+        }
+        match (
+            self.type_spec_in_root(root, src)?,
+            self.type_spec_in_root(root, dst)?,
+        ) {
+            (TypeSpec::Record(src_fields), TypeSpec::Record(dst_fields)) => {
+                if src_fields.len() != dst_fields.len() {
+                    return Ok(false);
+                }
+                for dst_field in &dst_fields {
+                    let Some(src_field) = src_fields
+                        .iter()
+                        .find(|candidate| candidate.name == dst_field.name)
+                    else {
+                        return Ok(false);
+                    };
+                    let src_offset =
+                        self.layout_field_offset_bytes(root, target_triple, src, &dst_field.name)?;
+                    let dst_offset =
+                        self.layout_field_offset_bytes(root, target_triple, dst, &dst_field.name)?;
+                    if src_offset != dst_offset {
+                        return Ok(false);
+                    }
+                    if !self.layouts_blind_copy_compatible(
+                        root,
+                        target_triple,
+                        &src_field.type_hash,
+                        &dst_field.type_hash,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                Ok(self.layout_size_bytes(root, target_triple, src)?
+                    == self.layout_size_bytes(root, target_triple, dst)?)
+            }
+            (TypeSpec::Record(_), _) | (_, TypeSpec::Record(_)) => Ok(false),
+            _ => self.scalar_layouts_equal(root, target_triple, src, dst),
+        }
+    }
+
+    fn scalar_layouts_equal(
+        &self,
+        root: &ProgramRootPayload,
+        target_triple: &str,
+        src: &str,
+        dst: &str,
+    ) -> Result<bool> {
+        let src_layout = self.compute_type_layout(root, src, target_triple)?;
+        let dst_layout = self.compute_type_layout(root, dst, target_triple)?;
+        Ok(src_layout.metadata.get("kind") == dst_layout.metadata.get("kind")
+            && src_layout.metadata.get("size_bytes") == dst_layout.metadata.get("size_bytes")
+            && src_layout.metadata.get("align_bytes") == dst_layout.metadata.get("align_bytes"))
     }
 
     fn lowered_record_field(

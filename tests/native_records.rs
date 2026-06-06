@@ -702,6 +702,89 @@ fn first(pair: Pair) -> i64 = pair.left
     run(&["verify", path(&db)]);
 }
 
+#[test]
+fn non_alphabetical_record_field_order_agrees_with_native() {
+    // Regression: a record declared in a non-alphabetical field order
+    // (`Foo { b; a }`) must compile so native results agree with the reference
+    // oracle. The structural record type canonicalizes fields alphabetically; if
+    // a record value flows through a return, a call argument, or a nested field
+    // as a raw byte copy under the destination's (declared-order) layout, native
+    // silently reads the wrong field. Every `via_*` path reads field `a` (== 1).
+    // Before the fix native returned `2` (field `b`) on all three paths.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("field-order.sqlite");
+    let source = temp.path().join("field-order.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Foo {
+  b: i64
+  a: i64
+}
+
+record Outer {
+  inner: Foo
+}
+
+fn get_a(f: Foo) -> i64 = f.a
+
+fn make_foo() -> Foo = { a: 1, b: 2 }
+
+fn read_inner(o: Outer) -> i64 = o.inner.a
+
+fn via_return() -> i64 = get_a(make_foo())
+
+fn via_argument() -> i64 = get_a({ a: 1, b: 2 })
+
+fn via_nested() -> i64 = read_inner({ inner: { a: 1, b: 2 } })
+
+fn main() -> i64 = via_return() + via_argument() + via_nested()
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    // The reference oracle reads field `a` (== 1) on every path.
+    assert_eq!(run(&["eval", path(&db), "via_return"]).trim(), "1");
+    assert_eq!(run(&["eval", path(&db), "via_argument"]).trim(), "1");
+    assert_eq!(run(&["eval", path(&db), "via_nested"]).trim(), "1");
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "3");
+    run(&["verify", path(&db)]);
+
+    if can_build_default_native_target() {
+        for (name, entry) in [
+            ("field_order_via_return", "via_return"),
+            ("field_order_via_argument", "via_argument"),
+            ("field_order_via_nested", "via_nested"),
+        ] {
+            run(&[
+                "create-test",
+                path(&db),
+                name,
+                "--entry",
+                entry,
+                "--expect-i64",
+                "1",
+                "--native-required",
+                "--json",
+            ]);
+        }
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["native_mismatches"], 0);
+        assert_eq!(report["unsupported"], 0);
+        for test in report["tests"].as_array().unwrap() {
+            assert_eq!(test["native"]["status"], "passed");
+            assert_eq!(
+                test["native"]["comparison"]["actual"],
+                json!({"kind": "i64", "value": "1"})
+            );
+        }
+    }
+}
+
 fn can_build_default_native_target() -> bool {
     let native_target = (std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64")
         || (std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64");
