@@ -291,19 +291,22 @@ impl CodeDb {
     }
 
     pub fn list_tests_main_branch(&self) -> Result<String> {
-        self.list_tests_branch(MAIN_BRANCH)
+        self.list_tests_branch(MAIN_BRANCH, &[])
     }
 
     pub fn list_tests_main_branch_json(&self) -> Result<String> {
-        self.list_tests_branch_json(MAIN_BRANCH)
+        self.list_tests_branch_json(MAIN_BRANCH, &[])
     }
 
-    pub fn list_tests_branch(&self, branch_name: &str) -> Result<String> {
+    pub fn list_tests_branch(&self, branch_name: &str, labels: &[String]) -> Result<String> {
         let branch = self.branch(branch_name)?;
         let root = self.load_root(&branch.root_hash)?;
         let mut out = String::new();
         for binding in &root.tests {
             let case = self.load_test_case(&binding.test)?;
+            if !case_matches_labels(&case, labels) {
+                continue;
+            }
             out.push_str(&format!(
                 "{} category {} entry {} expected {} mode {} native_agreement {} native_required {}\n",
                 binding.name,
@@ -321,14 +324,17 @@ impl CodeDb {
         Ok(out)
     }
 
-    pub fn list_tests_branch_json(&self, branch_name: &str) -> Result<String> {
+    pub fn list_tests_branch_json(&self, branch_name: &str, labels: &[String]) -> Result<String> {
         let branch = self.branch(branch_name)?;
         let root = self.load_root(&branch.root_hash)?;
-        let tests = root
-            .tests
-            .iter()
-            .map(|binding| self.test_listing_json(&root, binding))
-            .collect::<Result<Vec<_>>>()?;
+        let mut tests = Vec::new();
+        for binding in &root.tests {
+            let case = self.load_test_case(&binding.test)?;
+            if !case_matches_labels(&case, labels) {
+                continue;
+            }
+            tests.push(self.test_listing_json(&root, binding)?);
+        }
         Ok(format!(
             "{}\n",
             canonical_json(&json!({
@@ -367,16 +373,16 @@ impl CodeDb {
     }
 
     pub fn run_tests_main_branch(&mut self) -> Result<String> {
-        self.run_tests_branch(MAIN_BRANCH)
+        self.run_tests_branch(MAIN_BRANCH, &[])
     }
 
     pub fn run_tests_main_branch_json(&mut self) -> Result<String> {
-        self.run_tests_branch_json(MAIN_BRANCH)
+        self.run_tests_branch_json(MAIN_BRANCH, &[])
     }
 
-    pub fn run_tests_branch(&mut self, branch_name: &str) -> Result<String> {
+    pub fn run_tests_branch(&mut self, branch_name: &str, labels: &[String]) -> Result<String> {
         let payload: JsonValue =
-            serde_json::from_str(self.run_tests_branch_json(branch_name)?.trim_end())?;
+            serde_json::from_str(self.run_tests_branch_json(branch_name, labels)?.trim_end())?;
         let mut out = String::new();
         for test in payload
             .get("tests")
@@ -436,7 +442,7 @@ impl CodeDb {
         Ok(out)
     }
 
-    pub fn run_tests_branch_json(&mut self, branch_name: &str) -> Result<String> {
+    pub fn run_tests_branch_json(&mut self, branch_name: &str, labels: &[String]) -> Result<String> {
         let branch = self.branch(branch_name)?;
         let root = self.load_root(&branch.root_hash)?;
         let test_bindings = root.tests.clone();
@@ -449,6 +455,10 @@ impl CodeDb {
         let mut native_skipped = 0usize;
 
         for binding in &test_bindings {
+            let case = self.load_test_case(&binding.test)?;
+            if !case_matches_labels(&case, labels) {
+                continue;
+            }
             let result = self.run_one_test(branch_name, &branch.root_hash, &root, binding)?;
             match result.get("status").and_then(JsonValue::as_str) {
                 Some("passed") => passed += 1,
@@ -1684,6 +1694,19 @@ fn display_test_value(value: &TestValue) -> String {
             format!("record{{{}}}", rendered.join(", "))
         }
     }
+}
+
+/// True when a test case should run under the given label filter. An empty
+/// filter selects everything; otherwise the case must carry at least one of the
+/// requested labels (e.g. `v2_native_required` for the native-required CI gate).
+fn case_matches_labels(case: &TestCasePayload, filter: &[String]) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    let have = case.labels();
+    filter
+        .iter()
+        .any(|wanted| have.iter().any(|label| *label == wanted.as_str()))
 }
 
 fn native_target_is_host_linkable(target: &str) -> bool {

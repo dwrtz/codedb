@@ -71,8 +71,11 @@ Native run JSON includes a structured native result object with schema
 `passed`; native-required unsupported results count as failed tests and are
 reported with the `v2_native_required` label.
 
-The `v2_native_required` label is the selector intended for a CI job that runs
-native-required tests on a host with a native toolchain. Because acceptance
+The `v2_native_required` label is the selector for a CI job that runs
+native-required tests on a host with a native toolchain. A CI job runs
+`codedb test --label v2_native_required` (and `--list --label v2_native_required`
+to enumerate the gated set); the `--label` filter selects only tests carrying
+the label and otherwise leaves the run report unchanged. Because acceptance
 tests that build native artifacts can only do so where a toolchain is present,
 the harness's own gate test asserts the native-required outcome on *every* host:
 it passes through real codegen where native is available, and otherwise asserts

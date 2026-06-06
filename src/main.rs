@@ -59,6 +59,8 @@ enum Command {
         branch: String,
         #[arg(long)]
         list: bool,
+        #[arg(long = "label")]
+        labels: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -558,19 +560,20 @@ fn main() -> Result<()> {
             db,
             branch,
             list,
+            labels,
             json,
         } => {
             let mut codedb = codedb::CodeDb::open(db)?;
             if list {
                 if json {
-                    print!("{}", codedb.list_tests_branch_json(&branch)?);
+                    print!("{}", codedb.list_tests_branch_json(&branch, &labels)?);
                 } else {
-                    print!("{}", codedb.list_tests_branch(&branch)?);
+                    print!("{}", codedb.list_tests_branch(&branch, &labels)?);
                 }
             } else if json {
-                print!("{}", codedb.run_tests_branch_json(&branch)?);
+                print!("{}", codedb.run_tests_branch_json(&branch, &labels)?);
             } else {
-                print!("{}", codedb.run_tests_branch(&branch)?);
+                print!("{}", codedb.run_tests_branch(&branch, &labels)?);
             }
         }
         Command::CreateTest {

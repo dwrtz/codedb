@@ -1404,8 +1404,9 @@ fn debug_run(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodRes
 
 fn tests_list(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
     let branch = branch_param(params)?;
+    let labels = labels_param(params)?;
     let result = parse_json_payload(
-        db.list_tests_branch_json(&branch)
+        db.list_tests_branch_json(&branch, &labels)
             .map_err(WorkspaceMethodError::method)?,
     )?;
     let snapshot = workspace_snapshot(db, &branch)?;
@@ -1414,8 +1415,9 @@ fn tests_list(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodRe
 
 fn tests_run(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
     let branch = branch_param(params)?;
+    let labels = labels_param(params)?;
     let result = parse_json_payload(
-        db.run_tests_branch_json(&branch)
+        db.run_tests_branch_json(&branch, &labels)
             .map_err(WorkspaceMethodError::method)?,
     )?;
     let snapshot = workspace_snapshot(db, &branch)?;
@@ -1549,6 +1551,24 @@ fn branch_param(params: &JsonValue) -> MethodResult<String> {
     Ok(optional_str(object, "branch")?
         .unwrap_or(MAIN_BRANCH)
         .to_string())
+}
+
+fn labels_param(params: &JsonValue) -> MethodResult<Vec<String>> {
+    let object = params_object(params)?;
+    match object.get("labels") {
+        None | Some(JsonValue::Null) => Ok(Vec::new()),
+        Some(JsonValue::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    WorkspaceMethodError::invalid_params("labels entries must be strings")
+                })
+            })
+            .collect(),
+        Some(_) => Err(WorkspaceMethodError::invalid_params(
+            "labels must be an array of strings",
+        )),
+    }
 }
 
 fn branch_source_state(

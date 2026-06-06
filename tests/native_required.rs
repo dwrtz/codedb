@@ -163,6 +163,68 @@ fn native_scalar_agreement_does_not_alias_through_exit_code() {
 }
 
 #[test]
+fn test_label_filter_selects_native_required_tests() {
+    // The `v2_native_required` label is the documented CI selector; `test
+    // --label` must run/list only the tests carrying it, leaving the unfiltered
+    // run unchanged.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("label-filter.sqlite");
+    let source = temp.path().join("label-filter.cdb");
+
+    std::fs::write(&source, "fn a() -> i64 = 1\nfn b() -> i64 = 2\n").unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&[
+        "create-test",
+        path(&db),
+        "t_a",
+        "--entry",
+        "a",
+        "--expect-i64",
+        "1",
+        "--native-required",
+        "--json",
+    ]);
+    run(&[
+        "create-test",
+        path(&db),
+        "t_b",
+        "--entry",
+        "b",
+        "--expect-i64",
+        "2",
+        "--json",
+    ]);
+
+    let names = |report: &JsonValue| -> Vec<String> {
+        report["tests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|test| test["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // No filter: both tests.
+    let all = parse_json(&run(&["test", path(&db), "--list", "--json"]));
+    assert_eq!(names(&all), vec!["t_a", "t_b"]);
+
+    // List filtered to the native-required label: only t_a.
+    let listed =
+        parse_json(&run(&["test", path(&db), "--list", "--label", "v2_native_required", "--json"]));
+    assert_eq!(names(&listed), vec!["t_a"]);
+
+    // Run filtered: only t_a executes.
+    let ran = parse_json(&run(&["test", path(&db), "--label", "v2_native_required", "--json"]));
+    assert_eq!(names(&ran), vec!["t_a"]);
+
+    // Unknown label: nothing runs, run is vacuously passing.
+    let none = parse_json(&run(&["test", path(&db), "--label", "no_such_label", "--json"]));
+    assert!(names(&none).is_empty());
+    assert_eq!(none["status"], "passed");
+}
+
+#[test]
 fn native_required_flag_survives_history_export_import() {
     // The native-required gate is only trustworthy if the flag, mode, and
     // labels round-trip through migration replay; a dropped flag would silently
