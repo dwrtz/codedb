@@ -146,6 +146,60 @@ fn test_impact_selects_reachable_body_changes_and_skips_unrelated_changes() {
 }
 
 #[test]
+fn test_impact_selects_behavior_tests_for_type_definition_changes() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("type-change.sqlite");
+    let source = temp.path().join("type-change.cdb");
+    let add_field = temp.path().join("add-field.json");
+
+    std::fs::write(
+        &source,
+        "record Config {\n\
+           flag: i64\n\
+         }\n\
+         \n\
+         fn main() -> i64 = 1\n\
+         \n\
+         fn unused() -> i64 = 1\n",
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&[
+        "create-test",
+        path(&db),
+        "main_returns_1",
+        "--entry",
+        "main",
+        "--expect-i64",
+        "1",
+    ]);
+    let old_root = current_root(&db);
+    std::fs::write(
+        &add_field,
+        r#"{ "kind": "add_field", "type": "Config", "field": { "name": "limit", "type": "i64" } }"#,
+    )
+    .unwrap();
+    run(&["apply", path(&db), "--json", path(&add_field)]);
+    run(&["replace-body", path(&db), "unused", "2"]);
+    let new_root = current_root(&db);
+
+    let report = parse_json(&run(&[
+        "test-impact",
+        path(&db),
+        &old_root,
+        &new_root,
+        "--json",
+    ]));
+    assert_eq!(report["selected"], 1);
+    assert_eq!(report["skipped"], 0);
+    let test = test_status(&report, "main_returns_1");
+    assert_eq!(test["status"], "selected");
+    assert!(reason_kinds(test).contains(&"type_definition_changed"));
+}
+
+#[test]
 fn test_impact_skips_behavior_rename_but_selects_projection_category() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("rename.sqlite");

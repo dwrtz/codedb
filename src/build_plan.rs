@@ -41,6 +41,7 @@ pub(crate) enum BuildImpactReason {
     ImplementationHashChanged,
     BodyExpressionHashChanged,
     DependencySetChanged,
+    TypeDefinitionChanged,
     ExportMapChanged,
     UnclassifiedRootChange,
 }
@@ -56,6 +57,7 @@ impl BuildImpactReason {
             BuildImpactReason::ImplementationHashChanged => "implementation_hash_changed",
             BuildImpactReason::BodyExpressionHashChanged => "body_expression_hash_changed",
             BuildImpactReason::DependencySetChanged => "dependency_set_changed",
+            BuildImpactReason::TypeDefinitionChanged => "type_definition_changed",
             BuildImpactReason::ExportMapChanged => "export_map_changed",
             BuildImpactReason::UnclassifiedRootChange => "unclassified_root_change",
         }
@@ -217,10 +219,11 @@ impl CodeDb {
                 changed_symbols.insert(symbol);
             }
         }
-        if old_root.types != new_root.types {
+        let type_definitions_changed = old_root.types != new_root.types;
+        if type_definitions_changed {
             raise_kind(&mut kind, BuildImpactKind::FullRebuild);
             relink = true;
-            reasons.insert(BuildImpactReason::UnclassifiedRootChange);
+            reasons.insert(BuildImpactReason::TypeDefinitionChanged);
         }
 
         for symbol in all_symbols {
@@ -309,6 +312,14 @@ impl CodeDb {
                 }
                 (None, None) => unreachable!(),
             }
+        }
+
+        if type_definitions_changed {
+            for symbol in new_symbols.keys() {
+                changed_symbols.insert(symbol.clone());
+                recompile_symbols.insert(symbol.clone());
+            }
+            unchanged_function_defs.clear();
         }
 
         if reasons.is_empty() {

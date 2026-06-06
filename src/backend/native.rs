@@ -1066,6 +1066,10 @@ fn native_type_size(layouts: &BTreeMap<String, LoweredTypeLayout>, type_hash: &s
     Ok(native_type_layout(layouts, type_hash)?.size_bytes)
 }
 
+fn native_stack_slot_size_bytes(layout_size_bytes: u64) -> u64 {
+    layout_size_bytes.max(1).div_ceil(8) * 8
+}
+
 fn native_passes_indirect(
     layouts: &BTreeMap<String, LoweredTypeLayout>,
     type_hash: &str,
@@ -1150,9 +1154,17 @@ struct TextRelocation {
 struct StackLayout {
     hidden_return_offset: Option<i32>,
     param_offsets: Vec<i32>,
+    param_copies: Vec<StackParamCopy<i32>>,
     local_offsets: BTreeMap<usize, i32>,
     value_offsets: BTreeMap<String, i32>,
     stack_size: i32,
+}
+
+#[derive(Debug, Clone)]
+struct StackParamCopy<T> {
+    slot: usize,
+    offset: T,
+    type_hash: String,
 }
 
 fn compile_x86_64_function(
@@ -1213,6 +1225,23 @@ impl StackLayout {
         collect_value_ids(&ir.operations, &mut ids)?;
         let mut value_offsets = BTreeMap::new();
         let mut next_offset = (ir.params.len() + hidden_return_count) as i32 * 8;
+        let mut param_copies = Vec::new();
+        for param in &ir.params {
+            if native_passes_indirect(&type_layouts, &param.type_hash)? {
+                let size = native_stack_slot_size_bytes(native_type_size(
+                    &type_layouts,
+                    &param.type_hash,
+                )?);
+                let size = i32::try_from(size)?;
+                let offset = -(next_offset + size);
+                param_copies.push(StackParamCopy {
+                    slot: param.slot,
+                    offset,
+                    type_hash: param.type_hash.clone(),
+                });
+                next_offset += size;
+            }
+        }
         let mut local_offsets = BTreeMap::new();
         for local in &ir.locals {
             if local.slot != local_offsets.len() {
@@ -1242,6 +1271,7 @@ impl StackLayout {
         Ok(Self {
             hidden_return_offset,
             param_offsets,
+            param_copies,
             local_offsets,
             value_offsets,
             stack_size,
@@ -1336,6 +1366,18 @@ impl FunctionEmitter {
         }
         for slot in 0..param_count {
             self.mov_stack_arg_reg(self.layout.param_offsets[slot], slot + arg_shift)?;
+        }
+        for copy in self.layout.param_copies.clone() {
+            let source_pointer = *self
+                .layout
+                .param_offsets
+                .get(copy.slot)
+                .ok_or_else(|| anyhow!("parameter slot out of bounds {}", copy.slot))?;
+            self.copy_memory_from_stack_pointer_to_stack(
+                copy.offset,
+                source_pointer,
+                self.type_size(&copy.type_hash)?,
+            )?;
         }
         Ok(())
     }
@@ -1457,7 +1499,16 @@ impl FunctionEmitter {
                     .get(*slot)
                     .ok_or_else(|| anyhow!("parameter slot out of bounds {slot}"))?;
                 if *indirect {
-                    self.mov_rax_stack(offset);
+                    let copy_offset = self
+                        .layout
+                        .param_copies
+                        .iter()
+                        .find(|copy| copy.slot == *slot)
+                        .map(|copy| copy.offset)
+                        .ok_or_else(|| {
+                            anyhow!("missing indirect parameter copy for slot {slot}")
+                        })?;
+                    self.lea_rax_stack(copy_offset);
                 } else {
                     self.lea_rax_stack(offset);
                 }
@@ -1955,6 +2006,7 @@ impl FunctionEmitter {
 struct Arm64StackLayout {
     hidden_return_offset: Option<u32>,
     param_offsets: Vec<u32>,
+    param_copies: Vec<StackParamCopy<u32>>,
     local_offsets: BTreeMap<usize, u32>,
     value_offsets: BTreeMap<String, u32>,
     stack_size: u32,
@@ -2018,6 +2070,23 @@ impl Arm64StackLayout {
         collect_value_ids(&ir.operations, &mut ids)?;
         let mut value_offsets = BTreeMap::new();
         let mut next_offset = (ir.params.len() + hidden_return_count) as u32 * 8;
+        let mut param_copies = Vec::new();
+        for param in &ir.params {
+            if native_passes_indirect(&type_layouts, &param.type_hash)? {
+                let size = native_stack_slot_size_bytes(native_type_size(
+                    &type_layouts,
+                    &param.type_hash,
+                )?);
+                let size = u32::try_from(size)?;
+                let offset = next_offset;
+                param_copies.push(StackParamCopy {
+                    slot: param.slot,
+                    offset,
+                    type_hash: param.type_hash.clone(),
+                });
+                next_offset += size;
+            }
+        }
         let mut local_offsets = BTreeMap::new();
         for local in &ir.locals {
             if local.slot != local_offsets.len() {
@@ -2050,6 +2119,7 @@ impl Arm64StackLayout {
         Ok(Self {
             hidden_return_offset,
             param_offsets,
+            param_copies,
             local_offsets,
             value_offsets,
             stack_size,
@@ -2081,6 +2151,18 @@ impl Arm64Emitter {
         }
         for slot in 0..param_count {
             self.str_stack((slot + arg_shift) as u8, self.layout.param_offsets[slot])?;
+        }
+        for copy in self.layout.param_copies.clone() {
+            let source_pointer = *self
+                .layout
+                .param_offsets
+                .get(copy.slot)
+                .ok_or_else(|| anyhow!("parameter slot out of bounds {}", copy.slot))?;
+            self.copy_memory_from_stack_pointer_to_stack(
+                copy.offset,
+                source_pointer,
+                self.type_size(&copy.type_hash)?,
+            )?;
         }
         Ok(())
     }
@@ -2206,7 +2288,16 @@ impl Arm64Emitter {
                     .get(*slot)
                     .ok_or_else(|| anyhow!("parameter slot out of bounds {slot}"))?;
                 if *indirect {
-                    self.ldr_stack(0, offset)?;
+                    let copy_offset = self
+                        .layout
+                        .param_copies
+                        .iter()
+                        .find(|copy| copy.slot == *slot)
+                        .map(|copy| copy.offset)
+                        .ok_or_else(|| {
+                            anyhow!("missing indirect parameter copy for slot {slot}")
+                        })?;
+                    self.add_reg_sp_imm(0, copy_offset)?;
                 } else {
                     self.add_reg_sp_imm(0, offset)?;
                 }

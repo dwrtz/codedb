@@ -865,6 +865,14 @@ impl CodeDb {
                 .projection_global_reasons
                 .insert("root_metadata_changed");
         }
+        if old_root.types != new_root.types {
+            classification
+                .behavior_global_reasons
+                .insert("type_definition_changed");
+            classification
+                .projection_global_reasons
+                .insert("type_definition_changed");
+        }
         if old_root.tests != new_root.tests {
             classification.test_registry_changed = true;
         }

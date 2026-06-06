@@ -370,7 +370,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("param_ref missing index"))?
                     as usize;
                 args.get(index)
-                    .map(|value| value.borrow().clone())
+                    .map(|value| semantic_clone_value(&value.borrow()))
                     .ok_or_else(|| anyhow!("parameter index out of bounds: {index}"))
             }
             "local_ref" => {
@@ -380,7 +380,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("local_ref missing depth"))?
                     as usize;
                 local_at_depth(locals, depth)
-                    .map(|value| value.borrow().clone())
+                    .map(|value| semantic_clone_value(&value.borrow()))
                     .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))
             }
             "call" => {
@@ -530,10 +530,10 @@ impl CodeDb {
                 }
                 Ok(Value::Record(values))
             }
-            "field_access" => Ok(self
-                .eval_place_cell(expr_hash, args, locals)?
-                .borrow()
-                .clone()),
+            "field_access" => {
+                let value = self.eval_place_cell(expr_hash, args, locals)?;
+                Ok(semantic_clone_value(&value.borrow()))
+            }
             "enum_construct" => {
                 let variant = payload
                     .get("variant")
@@ -3303,6 +3303,31 @@ fn local_at_depth_mut<T>(locals: &mut [T], depth: usize) -> Option<&mut T> {
 
 pub(crate) fn value_cell(value: Value) -> ValueCell {
     Rc::new(RefCell::new(value))
+}
+
+fn semantic_clone_value(value: &Value) -> Value {
+    match value {
+        Value::I64(value) => Value::I64(*value),
+        Value::Bool(value) => Value::Bool(*value),
+        Value::Unit => Value::Unit,
+        Value::SharedRef(value) => Value::SharedRef(value.clone()),
+        Value::MutRef(value) => Value::MutRef(value.clone()),
+        Value::Record(fields) => Value::Record(
+            fields
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        value_cell(semantic_clone_value(&value.borrow())),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Enum { variant, value } => Value::Enum {
+            variant: variant.clone(),
+            value: value_cell(semantic_clone_value(&value.borrow())),
+        },
+    }
 }
 
 pub(crate) fn field_cell(value: &ValueCell, field: &str) -> Result<ValueCell> {

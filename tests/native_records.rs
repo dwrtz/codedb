@@ -189,6 +189,55 @@ fn main() -> i64 = sum_pair({ left: 2, right: 3 }) + sum_pair(make_pair()) + sum
 }
 
 #[test]
+fn indirect_record_parameters_are_callee_owned_by_value() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("record-param-by-value.sqlite");
+    let source = temp.path().join("record-param-by-value.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Pair {
+  left: i64
+  right: i64
+}
+
+fn mutate_param(pair: Pair) -> i64 effects[state] =
+  let _: unit = pair.left = 99 in
+  pair.right
+
+fn main() -> i64 effects[state] =
+  let pair: Pair = { left: 1, right: 2 } in
+  let _: i64 = mutate_param(pair) in
+  pair.left
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "1");
+
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "record_param_by_value",
+            "--entry",
+            "main",
+            "--expect-i64",
+            "1",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+    }
+}
+
+#[test]
 fn record_return_test_values_serialize_and_compare_reference_results() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("record-test-values.sqlite");
@@ -576,7 +625,27 @@ fn first(pair: Pair) -> i64 = pair.left
         r#"{ "kind": "add_field", "type": "Pair", "field": { "name": "right", "type": "i64" } }"#,
     )
     .unwrap();
-    run(&["apply", path(&db), "--json", path(&add_field)]);
+    let applied = parse_json(&run(&["apply", path(&db), "--json", path(&add_field)]));
+    let build_impact = &applied["results"][0]["summary"]["build_impact"];
+    assert_eq!(build_impact["kind"], "full_rebuild");
+    assert!(
+        build_impact["artifact_kinds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("lowered_ir"))
+    );
+    assert!(
+        build_impact["artifact_kinds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("object_file"))
+    );
+    assert!(
+        build_impact["reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("type_definition_changed"))
+    );
     run(&[
         "emit-object",
         path(&db),
