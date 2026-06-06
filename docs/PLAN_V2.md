@@ -64,7 +64,8 @@ canonical hashing is deterministic
 object edges are indexed
 projection syntax exists
 structural apply JSON exists
-semantic patch support exists where applicable
+semantic patch support exists only for features exposed through the semantic
+patch language; otherwise structural apply JSON is the mutation surface
 type checking succeeds/fails deterministically
 region/borrow/move/drop checking exists where applicable
 effect checking exists where applicable

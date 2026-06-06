@@ -446,6 +446,7 @@ fn compact_record_sizes_compile_and_run_native() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("compact-record.sqlite");
     let source = temp.path().join("compact-record.cdb");
+    let apply = temp.path().join("compact-record.apply.json");
     let object_path = temp.path().join("make-flags.o");
 
     std::fs::write(
@@ -494,9 +495,41 @@ fn main() -> bool = first(make_flags())
             "--json",
         ]));
         assert_eq!(created["status"], "applied");
+        std::fs::write(
+            &apply,
+            serde_json::to_string_pretty(&json!({
+                "schema": "codedb/apply/v1",
+                "operations": [
+                    {
+                        "kind": "create_test",
+                        "name": "compact_record_value_native",
+                        "entry": "make_flags",
+                        "native_required": true,
+                        "expected": {
+                            "kind": "record",
+                            "fields": [
+                                { "name": "a", "value": { "kind": "bool", "value": true } },
+                                { "name": "b", "value": { "kind": "bool", "value": false } }
+                            ]
+                        }
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let created = parse_json(&run(&["apply", path(&db), "--json", path(&apply)]));
+        assert_eq!(created["status"], "applied");
         let report = parse_json(&run(&["test", path(&db), "--json"]));
         assert_eq!(report["status"], "passed");
-        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+        assert_eq!(report["passed"], 2);
+        assert!(
+            report["tests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|test| test["native"]["status"] == "passed")
+        );
     }
 }
 

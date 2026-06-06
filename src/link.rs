@@ -886,7 +886,7 @@ impl CodeDb {
                 )
             }
             _ => bail!(
-                "native record harness supports only record values containing i64, bool, unit, or nested records"
+                "native record harness direct record-value comparison supports only semantic test values containing i64, bool, unit, or nested records; reference-carrying records must be tested through native-required scalar entrypoints"
             ),
         }
     }

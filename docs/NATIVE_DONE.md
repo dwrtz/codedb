@@ -20,7 +20,8 @@ layer:
 - root and branch integration preserves the feature;
 - projection syntax exists where the feature is user visible;
 - structural apply JSON exists where the feature is mutable by operation;
-- semantic patch support exists where applicable;
+- semantic patch support exists only for features exposed through the semantic
+  patch language; otherwise structural apply JSON is the mutation surface;
 - type checking succeeds and fails deterministically;
 - region, borrow, move, and drop checking exists where applicable;
 - effect checking exists where applicable;

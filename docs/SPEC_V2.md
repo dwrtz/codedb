@@ -87,7 +87,7 @@ object edges
 root/index integration
 projection syntax
 structural apply operations
-semantic patch support where applicable
+semantic patch support for features exposed through the semantic patch language
 type checking
 region / borrow / move / drop checking where applicable
 effect checking where applicable
