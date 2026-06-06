@@ -382,6 +382,45 @@ fn main<'a>() -> i64 effects[state] =
 }
 
 #[test]
+fn compiler_rejects_mutable_borrow_through_shared_reference() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("mut-borrow-through-shared.sqlite");
+    let source = temp.path().join("mut-borrow-through-shared.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+}
+
+record Wrapper {
+  line: Line
+}
+
+fn mutate_shared<'a>(wrapper: &'a Wrapper) -> i64 effects[state] =
+  let m: &'a mut Line = &'a mut wrapper.line in
+  let changed: unit = m.price_cents = 99 in
+  0
+
+fn main<'a>() -> i64 effects[state] =
+  let wrapper: Wrapper = { line: { price_cents: 25 } } in
+  let shared: &'a Wrapper = &'a wrapper in
+  mutate_shared(shared)
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("mutable borrow target"))
+        .stderr(predicate::str::contains("mutable semantic place"));
+}
+
+#[test]
 fn mutable_reference_assignment_updates_original_after_drop() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("mut-after-drop.sqlite");

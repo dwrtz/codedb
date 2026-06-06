@@ -2494,8 +2494,8 @@ impl CodeDb {
                     region_scope,
                     locals,
                 )?;
-                if !self.typed_expr_is_place(&target.expr_hash)? {
-                    bail!("mutable borrow target must be an addressable place");
+                if !self.typed_expr_is_assignable_place(root, &target.expr_hash)? {
+                    bail!("mutable borrow target must be a mutable semantic place");
                 }
                 let (region_name, region_hash) = match region {
                     Some(name) => (
@@ -4295,11 +4295,13 @@ impl CodeDb {
     ) -> Result<()> {
         let place = self.loan_place_for_expr(expr_hash, param_types, &state.locals)?;
         self.check_place_not_moved(&place, state)?;
-        self.check_shared_read_conflicts(&place, &state.active)?;
         let type_hash = self.expr_declared_type(expr_hash)?;
         let class = self.value_class_in_root(root, &type_hash)?;
         if class.copy_kind == ValueCopyKind::MoveOnly {
+            self.check_move_conflicts(&place, &state.active)?;
             state.moved.push(place);
+        } else {
+            self.check_shared_read_conflicts(&place, &state.active)?;
         }
         Ok(())
     }
@@ -4519,6 +4521,20 @@ impl CodeDb {
                 bail!(
                     "shared read of {:?} conflicts with live mutable borrow of {:?}",
                     place,
+                    loan.place
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn check_move_conflicts(&self, place: &LoanPlace, active: &[ActiveLoan]) -> Result<()> {
+        for loan in active {
+            if places_overlap(place, &loan.place) {
+                bail!(
+                    "move of {:?} conflicts with live {:?} borrow of {:?}",
+                    place,
+                    loan.kind,
                     loan.place
                 );
             }
@@ -4868,8 +4884,8 @@ impl CodeDb {
                 if referent_type != target_type {
                     bail!("borrow_mut referent type mismatch");
                 }
-                if !self.typed_expr_is_place(target)? {
-                    bail!("borrow_mut target must be an addressable place");
+                if !self.typed_expr_is_assignable_place(root, target)? {
+                    bail!("borrow_mut target must be a mutable semantic place");
                 }
                 hash_for_type_spec(&TypeSpec::Reference {
                     region: region.to_string(),

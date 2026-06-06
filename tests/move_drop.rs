@@ -150,6 +150,44 @@ fn main<'a>() -> i64 =
 }
 
 #[test]
+fn moving_move_only_record_while_shared_borrow_is_live_is_rejected() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("move-while-shared-borrow.sqlite");
+    let source = temp.path().join("move-while-shared-borrow.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+}
+
+record LineEditor<'a> {
+  line: &'a mut Line
+}
+
+fn main<'a>() -> i64 =
+  let line: Line = { price_cents: 25 } in
+  let editor: LineEditor<'a> = { line: &'a mut line } in
+  let shared: &'a LineEditor<'a> = &'a editor in
+  let moved: LineEditor<'a> = editor in
+  0
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_borrow"))
+        .stderr(predicate::str::contains("move of"))
+        .stderr(predicate::str::contains("live"))
+        .stderr(predicate::str::contains("borrow"));
+}
+
+#[test]
 fn moving_mutable_reference_record_through_if_transfers_loan() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("mutable-record-if-move.sqlite");
