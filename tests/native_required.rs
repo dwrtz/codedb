@@ -89,6 +89,80 @@ fn native_required_scalar_test_reports_native_outcome_on_every_host() {
 }
 
 #[test]
+fn native_required_scalar_supports_full_i64_range() {
+    // Regression: the native scalar agreement must compare the full value, not a
+    // process exit status. A value outside 0..=255 was previously permanently
+    // "unsupported" (and failed the native-required gate); it must now pass.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("native-required-bigrange.sqlite");
+    let source = temp.path().join("native-required-bigrange.cdb");
+
+    std::fs::write(&source, "fn main() -> i64 = 70000\n").unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&[
+        "create-test",
+        path(&db),
+        "main_returns_70000_native",
+        "--entry",
+        "main",
+        "--expect-i64",
+        "70000",
+        "--native-required",
+        "--json",
+    ]);
+
+    let report = parse_json(&run(&["test", path(&db), "--json"]));
+    assert_eq!(report["tests"][0]["reference"]["status"], "passed");
+    if can_build_default_native_target() {
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+        assert_eq!(
+            report["tests"][0]["native"]["comparison"]["actual"],
+            json!({"kind": "i64", "value": "70000"})
+        );
+    } else {
+        assert_eq!(report["tests"][0]["native"]["status"], "unsupported");
+    }
+}
+
+#[test]
+fn native_scalar_agreement_does_not_alias_through_exit_code() {
+    // Soundness regression: the native result must not be compared as an 8-bit
+    // exit status. A native value of 263 with expected 7 (263 % 256 == 7) must
+    // report a mismatch with actual 263 — never a false pass.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("native-alias.sqlite");
+    let source = temp.path().join("native-alias.cdb");
+
+    std::fs::write(&source, "fn main() -> i64 = 263\n").unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&[
+        "create-test",
+        path(&db),
+        "main_aliases_to_7",
+        "--entry",
+        "main",
+        "--expect-i64",
+        "7",
+        "--native-required",
+        "--json",
+    ]);
+
+    let report = parse_json(&run(&["test", path(&db), "--json"]));
+    if can_build_default_native_target() {
+        assert_eq!(report["tests"][0]["native"]["status"], "native_mismatch");
+        assert_eq!(
+            report["tests"][0]["native"]["comparison"]["actual"],
+            json!({"kind": "i64", "value": "263"})
+        );
+    } else {
+        assert_eq!(report["tests"][0]["native"]["status"], "unsupported");
+    }
+}
+
+#[test]
 fn native_required_flag_survives_history_export_import() {
     // The native-required gate is only trustworthy if the flag, mode, and
     // labels round-trip through migration replay; a dropped flag would silently

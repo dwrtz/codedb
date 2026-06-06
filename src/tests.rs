@@ -550,7 +550,7 @@ impl CodeDb {
             .unwrap_or("error")
             .to_string();
         let native_result =
-            self.native_agreement_result(branch_name, &entry_name, &case, &expected);
+            self.native_agreement_result(branch_name, &case, &expected);
         match native_result.get("status").and_then(JsonValue::as_str) {
             Some("failed")
                 if status != "error" && (case.native_required || case.native_requested()) =>
@@ -922,7 +922,6 @@ impl CodeDb {
     fn native_agreement_result(
         &mut self,
         branch_name: &str,
-        entry_name: &str,
         case: &TestCasePayload,
         expected: &Value,
     ) -> JsonValue {
@@ -936,16 +935,25 @@ impl CodeDb {
                 "native executable tests require an entry with no arguments",
             );
         }
-        let Some(expected_exit) = expected_native_exit_code(expected) else {
-            if matches!(expected, Value::Record(_)) {
-                return self.native_record_agreement_result(branch_name, case, expected);
+        match expected {
+            Value::I64(_) | Value::Bool(_) => {
+                self.native_scalar_agreement_result(branch_name, case, expected)
             }
-            return native_unavailable_result(
+            Value::Record(_) => self.native_record_agreement_result(branch_name, case, expected),
+            _ => native_unavailable_result(
                 case,
                 "unsupported_feature",
-                "expected value cannot be represented as a native process exit status",
-            );
-        };
+                "expected value cannot be compared by the native test harness",
+            ),
+        }
+    }
+
+    fn native_scalar_agreement_result(
+        &mut self,
+        branch_name: &str,
+        case: &TestCasePayload,
+        expected: &Value,
+    ) -> JsonValue {
         if !native_target_is_host_linkable(DEFAULT_NATIVE_TARGET) {
             return native_unavailable_result(
                 case,
@@ -960,7 +968,11 @@ impl CodeDb {
                 "cc linker is not available",
             );
         }
-        let build = match self.build_branch(branch_name, entry_name, DEFAULT_NATIVE_TARGET) {
+        let build = match self.build_native_scalar_test_harness_branch(
+            branch_name,
+            &case.entry_symbol,
+            DEFAULT_NATIVE_TARGET,
+        ) {
             Ok(build) => build,
             Err(err) => {
                 return native_unavailable_result(
@@ -986,54 +998,89 @@ impl CodeDb {
                 )],
             );
         }
-        let output = ProcessCommand::new(&exe).status();
+        let output = ProcessCommand::new(&exe).output();
         let _ = std::fs::remove_file(&exe);
-        match output {
-            Ok(status) => {
-                let actual = status.code();
-                let passed = actual == Some(expected_exit);
-                let actual_value =
-                    actual.and_then(|code| native_test_value_from_exit_code(expected, code));
-                json!({
-                    "schema": NATIVE_TEST_RESULT_SCHEMA,
-                    "status": if passed { "passed" } else { "native_mismatch" },
-                    "mode": case.mode.as_str(),
-                    "native_required": case.native_required,
-                    "target_triple": DEFAULT_NATIVE_TARGET,
-                    "reason_code": if passed { JsonValue::Null } else { JsonValue::String("native_mismatch".to_string()) },
-                    "reason": if passed { JsonValue::Null } else { JsonValue::String("native result did not match expected value".to_string()) },
-                    "expected_exit_code": expected_exit,
-                    "actual_exit_code": actual,
-                    "comparison": {
-                        "kind": "process_exit_scalar",
-                        "expected": &case.expected,
-                        "actual": actual_value,
-                        "expected_exit_code": expected_exit,
-                        "actual_exit_code": actual,
-                    },
-                    "executable_cache_key": build.cache_key,
-                    "executable_artifact_hash": build.artifact_hash,
-                    "diagnostics": if passed {
-                        Vec::<JsonValue>::new()
-                    } else {
-                        vec![native_diagnostic(
-                            "native_mismatch",
-                            "native result did not match expected value",
-                        )]
-                    },
-                })
+        let output = match output {
+            Ok(output) => output,
+            Err(err) => {
+                return native_result_base(
+                    case,
+                    "failed",
+                    Some("native_execution_failed"),
+                    Some(format!("failed to run native executable: {err}")),
+                    vec![native_diagnostic(
+                        "native_execution_failed",
+                        &format!("failed to run native executable: {err}"),
+                    )],
+                );
             }
-            Err(err) => native_result_base(
+        };
+        if !output.status.success() {
+            let detail = format!(
+                "native executable exited with status {:?}",
+                output.status.code()
+            );
+            return native_result_base(
                 case,
                 "failed",
                 Some("native_execution_failed"),
-                Some(format!("failed to run native executable: {err}")),
-                vec![native_diagnostic(
-                    "native_execution_failed",
-                    &format!("failed to run native executable: {err}"),
-                )],
-            ),
+                Some(detail.clone()),
+                vec![native_diagnostic("native_execution_failed", &detail)],
+            );
         }
+        // The harness prints the full-width scalar result to stdout, so the
+        // comparison is exact over the whole i64 range and never aliases through
+        // the 8-bit process exit status.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let printed = stdout.trim();
+        let Ok(actual_i64) = printed.parse::<i64>() else {
+            let detail = format!("native executable printed unparseable scalar output {printed:?}");
+            return native_result_base(
+                case,
+                "failed",
+                Some("native_execution_failed"),
+                Some(detail.clone()),
+                vec![native_diagnostic("native_execution_failed", &detail)],
+            );
+        };
+        let (passed, actual_value) = match expected {
+            Value::I64(value) => (
+                *value == actual_i64,
+                TestValue::I64 {
+                    value: actual_i64.to_string(),
+                },
+            ),
+            Value::Bool(value) => {
+                let actual_bool = actual_i64 != 0;
+                (*value == actual_bool, TestValue::Bool { value: actual_bool })
+            }
+            _ => unreachable!("native_scalar_agreement_result only handles i64/bool"),
+        };
+        json!({
+            "schema": NATIVE_TEST_RESULT_SCHEMA,
+            "status": if passed { "passed" } else { "native_mismatch" },
+            "mode": case.mode.as_str(),
+            "native_required": case.native_required,
+            "target_triple": DEFAULT_NATIVE_TARGET,
+            "reason_code": if passed { JsonValue::Null } else { JsonValue::String("native_mismatch".to_string()) },
+            "reason": if passed { JsonValue::Null } else { JsonValue::String("native result did not match expected value".to_string()) },
+            "comparison": {
+                "kind": "native_scalar_stdout",
+                "expected": &case.expected,
+                "actual": actual_value,
+            },
+            "executable_cache_key": JsonValue::Null,
+            "executable_artifact_hash": build.artifact_hash,
+            "harness_kind": build.harness_kind,
+            "diagnostics": if passed {
+                Vec::<JsonValue>::new()
+            } else {
+                vec![native_diagnostic(
+                    "native_mismatch",
+                    "native result did not match expected value",
+                )]
+            },
+        })
     }
 
     fn native_record_agreement_result(
@@ -1636,35 +1683,6 @@ fn display_test_value(value: &TestValue) -> String {
                 .collect::<Vec<_>>();
             format!("record{{{}}}", rendered.join(", "))
         }
-    }
-}
-
-fn expected_native_exit_code(value: &Value) -> Option<i32> {
-    match value {
-        Value::I64(value) => i32::try_from(*value)
-            .ok()
-            .filter(|value| (0..=255).contains(value)),
-        Value::Bool(value) => Some(i32::from(*value)),
-        Value::Unit => None,
-        Value::SharedRef(_) | Value::MutRef(_) | Value::Record(_) | Value::Enum { .. } => None,
-    }
-}
-
-fn native_test_value_from_exit_code(expected: &Value, code: i32) -> Option<TestValue> {
-    match expected {
-        Value::I64(_) => Some(TestValue::I64 {
-            value: code.to_string(),
-        }),
-        Value::Bool(_) => match code {
-            0 => Some(TestValue::Bool { value: false }),
-            1 => Some(TestValue::Bool { value: true }),
-            _ => None,
-        },
-        Value::Unit
-        | Value::SharedRef(_)
-        | Value::MutRef(_)
-        | Value::Record(_)
-        | Value::Enum { .. } => None,
     }
 }
 

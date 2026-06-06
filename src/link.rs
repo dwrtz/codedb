@@ -324,6 +324,51 @@ impl CodeDb {
         })
     }
 
+    /// Build an executable whose `main` prints the scalar (i64/bool) result of
+    /// the entry to stdout as a full-width decimal integer, then exits 0. The
+    /// caller parses and compares the printed value, so the comparison is exact
+    /// over the whole i64 range and never aliases through the 8-bit process exit
+    /// status (unlike encoding the result in the exit code).
+    pub(crate) fn build_native_scalar_test_harness_branch(
+        &mut self,
+        branch_name: &str,
+        entry_symbol: &str,
+        target_triple: &str,
+    ) -> Result<NativeTestHarnessBuild> {
+        self.ensure_initialized()?;
+        let branch = self.branch(branch_name)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let prepared =
+            self.prepare_link_plan(&branch.root_hash, &root, entry_symbol, target_triple)?;
+        let root_entry = self
+            .root_symbol(&root, entry_symbol)
+            .ok_or_else(|| anyhow!("entry symbol missing from root {entry_symbol}"))?;
+        let (params, return_type_hash) = self.signature_parts(&root_entry.signature)?;
+        if !params.is_empty() {
+            bail!("native scalar harness entry must not take parameters");
+        }
+        match self.type_spec_in_root(&root, &return_type_hash)? {
+            TypeSpec::Builtin(kind) if kind == "I64" || kind == "Bool" => {}
+            _ => bail!("native scalar harness entry must return i64 or bool"),
+        }
+        let entry_abi_symbol = prepared
+            .plan
+            .get("entry_abi_symbol")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("link plan missing entry ABI symbol"))?;
+        let export_wrappers = export_wrapper_source(&prepared.plan)?;
+        let harness = format!(
+            "{export_wrappers}#include <stdio.h>\nlong {entry_abi_symbol}(void);\nint main(void) {{ printf(\"%lld\\n\", (long long){entry_abi_symbol}()); return 0; }}\n"
+        );
+        let executable = link_with_cc_harness(&prepared, &harness)?;
+        let artifact_hash = hash_bytes(BYTES_DOMAIN, &executable);
+        Ok(NativeTestHarnessBuild {
+            executable,
+            artifact_hash,
+            harness_kind: "c-main-print-scalar".to_string(),
+        })
+    }
+
     fn prepare_link_plan_main_branch(
         &mut self,
         entry_name: &str,
