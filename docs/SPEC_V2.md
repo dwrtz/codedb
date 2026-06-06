@@ -602,7 +602,13 @@ concurrent, later
 Rules:
 
 ```text
-Writing through &mut T requires state.
+Writing through &mut T requires state. More generally, any assignment to a
+semantic place requires state: v2 has no immutable-binding distinction yet, so
+every local is mutable and every assignment is treated as a state effect. This
+is conservative (it can over-require state on a function that only mutates a
+private local), which is safe because effect checking fails closed; a future
+let-mut / immutability distinction may narrow it back toward "only writes
+through &mut T".
 Allocating or freeing owned heap values requires alloc, unless hidden as compiler-generated drop under a declared allocation model.
 Bounds checks may trap.
 Raw pointer dereference requires unsafe.
