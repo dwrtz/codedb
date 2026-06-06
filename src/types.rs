@@ -3105,7 +3105,7 @@ impl CodeDb {
                     .get("target")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow expression missing target"))?;
-                self.borrow_target_is_local_storage(root, target)
+                self.borrow_target_is_local_storage(root, target, locals_with_local_borrows)
             }
             "assign" => Ok(false),
             "let" => {
@@ -3259,6 +3259,7 @@ impl CodeDb {
         &self,
         root: &ProgramRootPayload,
         expr_hash: &str,
+        locals_with_local_borrows: &mut Vec<bool>,
     ) -> Result<bool> {
         let payload = self.get_payload(expr_hash)?;
         let expr_kind = payload
@@ -3277,9 +3278,16 @@ impl CodeDb {
                     self.type_spec_in_root(root, &target_type)?,
                     TypeSpec::Reference { .. }
                 ) {
-                    Ok(false)
+                    // The borrow target is `(*r).field`, i.e. a reborrow through
+                    // the reference value `target`. The storage it names is local
+                    // exactly when `target` is itself a reference into local
+                    // storage (e.g. `let r = &local`). Resolve that by asking the
+                    // escape analysis whether the reference value carries a borrow
+                    // of a local; a reference *parameter* points to caller storage
+                    // and is correctly not local.
+                    self.expr_escapes_local_borrow(root, target, locals_with_local_borrows)
                 } else {
-                    self.borrow_target_is_local_storage(root, target)
+                    self.borrow_target_is_local_storage(root, target, locals_with_local_borrows)
                 }
             }
             _ => Ok(false),
@@ -3656,9 +3664,37 @@ impl CodeDb {
                         &target_place,
                     )?;
                     self.check_loans_point_to_live_storage(&value_loans, state)?;
-                    state
-                        .active
-                        .retain(|loan| !loan_owner_overlaps(loan, &target_place));
+                    // Reassigning a reference-carrying place ends the loans that
+                    // the overwritten place (and its sub-places) carried, then
+                    // attributes the stored value's loans to it. Only retire
+                    // loans owned by the assigned place or below it. A loan owned
+                    // by a STRICT ANCESTOR of the assigned place is tracked at a
+                    // coarser (whole-aggregate) granularity than the assignment:
+                    // ending it would also discard the sibling fields' loans it
+                    // represents — the aliasing-&mut hole — so reject fail-closed
+                    // rather than silently drop them. Values built per-field via a
+                    // record literal carry per-field owners and take the precise
+                    // path.
+                    let mut retained = Vec::with_capacity(state.active.len());
+                    for loan in state.active.drain(..) {
+                        match loan.owner.as_ref() {
+                            Some(owner) if place_is_prefix_of(&target_place, owner) => {
+                                // Owned by the assigned place or a sub-place: retire.
+                            }
+                            Some(owner)
+                                if place_is_prefix_of(owner, &target_place)
+                                    && owner != &target_place =>
+                            {
+                                bail!(
+                                    "unsupported_assign: cannot reassign reference place {:?}; its loans are tracked at the coarser granularity {:?}. Build the value with a record literal so per-field loans are tracked.",
+                                    target_place,
+                                    owner
+                                );
+                            }
+                            _ => retained.push(loan),
+                        }
+                    }
+                    state.active = retained;
                     self.add_checked_value_loans(&mut state.active, &value_loans)?;
                 }
                 Ok(())
@@ -3764,7 +3800,20 @@ impl CodeDb {
                 }
                 let value_loans = self.collect_value_loans(root, expr_hash, param_types, state)?;
                 self.check_loans_point_to_live_storage(&value_loans, state)?;
+                // A field value may *move* an existing move-only binding into the
+                // record; that binding's loan is being transferred into the new
+                // value, not aliased. Retire the moved sources from the working
+                // copy before checking carried-loan conflicts so the transfer
+                // does not conflict with itself, while still catching genuine
+                // duplicates (e.g. two `&mut x` fields, which are not moves).
+                let transfer_owners =
+                    self.move_source_places_for_expr(root, expr_hash, param_types, &state.locals)?;
                 let mut active = state.active.clone();
+                active.retain(|loan| {
+                    !transfer_owners
+                        .iter()
+                        .any(|owner| loan_owner_overlaps(loan, owner))
+                });
                 self.add_checked_value_loans(&mut active, &value_loans)?;
                 Ok(())
             }
@@ -4259,16 +4308,118 @@ impl CodeDb {
                 let mut loans = self.collect_value_loans(root, expr_hash, param_types, state)?;
                 let source_owner =
                     self.source_place_for_value_expr(expr_hash, param_types, &state.locals)?;
+                // When the stored value is not itself a place (e.g. a call
+                // result), its carried loans have no per-field source structure
+                // to preserve. If the value's type has exactly one
+                // reference-bearing field position, attribute every carried loan
+                // to that field so a later single-field reassignment can retire
+                // it precisely. Otherwise fall back to whole-value attribution,
+                // which makes a partial reassignment fail closed rather than
+                // silently drop a sibling field's loan (aliasing-&mut hole).
+                let attributed_owner = if source_owner.is_none() {
+                    let value_type = self.expr_declared_type(expr_hash)?;
+                    match self.single_reference_field_path(root, &value_type)? {
+                        Some(path) if !path.is_empty() => {
+                            let mut owner = target_owner.clone();
+                            owner.fields.extend(path);
+                            Some(owner)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 for loan in &mut loans {
-                    loan.owner = Some(rebased_loan_owner(
-                        loan.owner.as_ref(),
-                        source_owner.as_ref(),
-                        target_owner,
-                    ));
+                    loan.owner = Some(match attributed_owner.as_ref() {
+                        Some(owner) => owner.clone(),
+                        None => rebased_loan_owner(
+                            loan.owner.as_ref(),
+                            source_owner.as_ref(),
+                            target_owner,
+                        ),
+                    });
                 }
                 Ok(loans)
             }
         }
+    }
+
+    /// Returns the field path to the type's sole reference-bearing position when
+    /// it has exactly one reachable purely through record fields, else `None`
+    /// (zero, several, or references reachable only through an array element or
+    /// enum payload, which are not field-addressable places). Used to attribute
+    /// a call result's carried loans at field granularity. See the default arm
+    /// of [`Self::collect_value_loans_for_store`].
+    fn single_reference_field_path(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+    ) -> Result<Option<Vec<String>>> {
+        let mut paths = Vec::new();
+        let mut prefix = Vec::new();
+        let mut resolvable = true;
+        self.collect_reference_field_paths(
+            root,
+            type_hash,
+            &mut prefix,
+            &mut paths,
+            &mut resolvable,
+        )?;
+        if resolvable && paths.len() == 1 {
+            Ok(paths.into_iter().next())
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn collect_reference_field_paths(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+        prefix: &mut Vec<String>,
+        paths: &mut Vec<Vec<String>>,
+        resolvable: &mut bool,
+    ) -> Result<()> {
+        match self.type_spec_in_root(root, type_hash)? {
+            TypeSpec::Reference { .. } => paths.push(prefix.clone()),
+            TypeSpec::Record(fields) => {
+                for field in fields {
+                    if self
+                        .value_class_in_root(root, &field.type_hash)?
+                        .contains_reference
+                    {
+                        prefix.push(field.name.clone());
+                        self.collect_reference_field_paths(
+                            root,
+                            &field.type_hash,
+                            prefix,
+                            paths,
+                            resolvable,
+                        )?;
+                        prefix.pop();
+                    }
+                }
+            }
+            TypeSpec::Enum(variants) => {
+                for variant in variants {
+                    if self
+                        .value_class_in_root(root, &variant.type_hash)?
+                        .contains_reference
+                    {
+                        // References in an enum payload are not field-addressable.
+                        *resolvable = false;
+                    }
+                }
+            }
+            TypeSpec::FixedArray { element, .. } => {
+                if self.value_class_in_root(root, &element)?.contains_reference {
+                    // References in array elements are not field-addressable.
+                    *resolvable = false;
+                }
+            }
+            TypeSpec::Builtin(_) | TypeSpec::RawPointer { .. } | TypeSpec::Named { .. } => {}
+        }
+        Ok(())
     }
 
     fn check_loans_point_to_live_storage(
@@ -4379,6 +4530,40 @@ impl CodeDb {
                     }
                 }
                 Ok(sources)
+            }
+            // Constructors move their move-only operands into the new value, so
+            // they must report those operands as move sources — otherwise the
+            // enclosing binding never retires the source binding's loan and the
+            // freshly-attributed loan spuriously conflicts with it. Keep this in
+            // lock-step with the `record_literal`/`enum_construct` arms of
+            // `collect_value_loans_for_store`.
+            Some("record_literal") => {
+                let mut sources = Vec::new();
+                for field in payload
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("record_literal missing fields"))?
+                {
+                    let value = field
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("record field missing value"))?;
+                    for source in
+                        self.move_source_places_for_expr(root, value, param_types, locals)?
+                    {
+                        if !sources.contains(&source) {
+                            sources.push(source);
+                        }
+                    }
+                }
+                Ok(sources)
+            }
+            Some("enum_construct") => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("enum_construct missing value"))?;
+                self.move_source_places_for_expr(root, value, param_types, locals)
             }
             _ => Ok(Vec::new()),
         }
@@ -5340,6 +5525,12 @@ fn places_overlap(left: &LoanPlace, right: &LoanPlace) -> bool {
         return false;
     }
     fields_prefix(&left.fields, &right.fields) || fields_prefix(&right.fields, &left.fields)
+}
+
+/// True when `prefix` denotes `value` or an ancestor place of it (same root and
+/// a leading field-path prefix). Unlike [`places_overlap`] this is directional.
+fn place_is_prefix_of(prefix: &LoanPlace, value: &LoanPlace) -> bool {
+    prefix.root == value.root && fields_prefix(&prefix.fields, &value.fields)
 }
 
 fn fields_prefix(prefix: &[String], value: &[String]) -> bool {

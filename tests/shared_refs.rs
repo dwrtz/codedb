@@ -192,6 +192,77 @@ fn leak<'a>() -> &'a Line =
         ));
 }
 
+/// Escape analysis must follow reborrows through a reference bound to a local.
+/// `&'a r.l` where `r = &'a outer` reborrows into local `outer`, so returning it
+/// returns a dangling reference and must be rejected — even though the borrow
+/// target is a field access *through* a reference value.
+#[test]
+fn returning_reborrow_through_reference_to_local_is_rejected() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("leak-reborrow.sqlite");
+    let source = temp.path().join("leak-reborrow.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+record Outer {
+  l: Line
+}
+
+fn leak<'a>() -> &'a Line =
+  let outer: Outer = { l: { price_cents: 25, qty: 4 } } in
+  let r: &'a Outer = &'a outer in
+  &'a r.l
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_borrow"))
+        .stderr(predicate::str::contains(
+            "returns reference to local storage",
+        ));
+}
+
+/// A reborrow through a reference *parameter* points into caller storage, not a
+/// local, so returning it is legal and must remain accepted (no false positive).
+#[test]
+fn returning_reborrow_through_reference_parameter_is_accepted() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("reborrow-param.sqlite");
+    let source = temp.path().join("reborrow-param.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+record Outer {
+  l: Line
+}
+
+fn first<'a>(outer: &'a Outer) -> &'a Line = &'a outer.l
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["verify", path(&db)]).trim(), "verify ok");
+}
+
 #[test]
 fn returning_reference_to_local_storage_through_call_is_rejected() {
     let temp = tempdir().unwrap();
