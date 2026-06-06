@@ -19,7 +19,7 @@ use crate::store::{CodeDb, canonical_json, hash_bytes};
 use crate::tests::{test_points_to_entry_symbol, validate_test_value_for_type};
 use crate::types::{
     Effect, ParamSpec, RegionParamDef, SymbolBirthSpec, TypeDefinition, TypeDefinitionIdentity,
-    TypeDefinitionKind, TypeMemberDef, TypeMemberSpec, TypeSpec,
+    TypeDefinitionKind, TypeMemberDef, TypeMemberSpec, TypeSpec, type_hash_for,
 };
 use crate::{HISTORY_DOMAIN, MAIN_BRANCH, MIGRATION_DOMAIN};
 
@@ -3247,6 +3247,48 @@ impl CodeDb {
             region_param_names,
             identity.map(|identity| identity.region_param_births.as_slice()),
         )?;
+        // Two-phase create so a type's own fields can reference it and its
+        // region parameters — reference-based recursive/self-referential types
+        // (SPEC_V2 §11). Register a placeholder definition under the new name and
+        // symbol BEFORE resolving member types, so a self-reference resolves;
+        // then overwrite it with the fully-resolved definition. Only the
+        // placeholder's region-parameter arity is consulted during field
+        // resolution; its single dummy member exists solely to satisfy the
+        // non-empty-members validation and is discarded by the overwrite. The
+        // final root is identical to the single-phase result for non-recursive
+        // types (the placeholder TypeDef object is dangling and unreferenced), so
+        // replay stays deterministic. (Mutual recursion split across two separate
+        // create_type operations is still unsupported: each operation
+        // type-checks its own output root, and the second type does not yet exist
+        // when the first op finishes.)
+        let placeholder_member = TypeMemberDef {
+            member_symbol: type_symbol.clone(),
+            name: "placeholder".to_string(),
+            type_hash: type_hash_for("I64"),
+        };
+        let placeholder = match definition {
+            TypeDefinitionKind::Record { .. } => TypeDefinition::Record {
+                type_symbol: type_symbol.clone(),
+                region_params: region_params.clone(),
+                fields: vec![placeholder_member],
+            },
+            TypeDefinitionKind::Enum { .. } => TypeDefinition::Enum {
+                type_symbol: type_symbol.clone(),
+                region_params: region_params.clone(),
+                variants: vec![placeholder_member],
+            },
+        };
+        let placeholder_def = self.put_type_def(&type_symbol, &placeholder)?;
+        root.types.push(RootTypePayload {
+            type_symbol: type_symbol.clone(),
+            type_def: placeholder_def,
+        });
+        root.type_names.push(TypeNameBinding {
+            module: module.to_string(),
+            display_name: name.to_string(),
+            type_symbol: type_symbol.clone(),
+            is_preferred: true,
+        });
         let semantic_definition = self.type_definition_from_source(
             &root,
             module,
@@ -3258,17 +3300,7 @@ impl CodeDb {
             definition,
             identity,
         )?;
-        let type_def = self.put_type_def(&type_symbol, &semantic_definition)?;
-        root.types.push(RootTypePayload {
-            type_symbol: type_symbol.clone(),
-            type_def,
-        });
-        root.type_names.push(TypeNameBinding {
-            module: module.to_string(),
-            display_name: name.to_string(),
-            type_symbol,
-            is_preferred: true,
-        });
+        self.update_type_definition(&mut root, &type_symbol, semantic_definition)?;
         if module != MAIN_BRANCH
             || root
                 .metadata

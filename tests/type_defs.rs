@@ -905,3 +905,73 @@ fn diff_reports_type_and_member_changes() {
         .collect::<Vec<_>>();
     assert!(kinds.contains(&"field_renamed"), "kinds: {kinds:?}");
 }
+
+#[test]
+fn reference_recursive_type_creates_verifies_and_lays_out() {
+    // SPEC_V2 §11: a type may reference itself (and its region parameters)
+    // through a reference field. Creation must succeed (two-phase resolution),
+    // verification must pass, and the layout must place the self-reference as a
+    // pointer-sized field rather than recursing forever.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("recursive.sqlite");
+    let source = temp.path().join("recursive.cdb");
+    let layout = temp.path().join("node.layout.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Node<'a> {
+  value: i64
+  next: &'a Node<'a>
+}
+"#,
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&["verify", path(&db)]);
+    run(&[
+        "emit-type-layout",
+        path(&db),
+        "Node",
+        "--out",
+        path(&layout),
+    ]);
+    let layout: JsonValue =
+        serde_json::from_str(&std::fs::read_to_string(&layout).unwrap()).unwrap();
+    assert_eq!(layout["kind"], "record");
+    let fields = layout["fields"].as_array().unwrap();
+    let next = fields
+        .iter()
+        .find(|field| field["name"] == "next")
+        .expect("next field");
+    // The self-reference is a pointer-sized field (8 bytes), not the whole Node.
+    assert_eq!(next["size_bytes"], 8);
+}
+
+#[test]
+fn movable_self_referential_record_is_rejected_at_layout() {
+    // A record that embeds itself by value (not through a reference) has no
+    // finite layout. SPEC_V2 §22 lists this as a non-goal; it must be rejected
+    // fail-closed at layout rather than recursing forever.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("movable-self.sqlite");
+    let source = temp.path().join("movable-self.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Bad {
+  next: Bad
+}
+"#,
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    bin()
+        .args(["emit-type-layout", path(&db), "Bad", "--out", path(&db.with_extension("layout.json"))])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("recursive type layout is not supported"));
+}
