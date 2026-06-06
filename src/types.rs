@@ -3862,6 +3862,14 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("case missing expr"))?;
                 self.verify_expr_borrows(root, expr, param_types, state, ExprUse::Value)?;
                 let base_state = state.clone();
+                // An owned value moved in only some `case` arms leaves the
+                // unconditional whole-slot drop scaffold unable to decide whether
+                // to drop it — the same hazard the `if` arm rejects above. Track
+                // each arm's moves of slots that outlive the `case` and require
+                // them to match, fail-closed (SPEC_V2 §20), so `verify` agrees
+                // with codegen once enum/case lowering lands (PLAN_V2 Phase 10).
+                let boundary = base_state.next_local;
+                let mut arm_outer_moves: Option<Vec<LoanPlace>> = None;
                 let mut merged: Option<MoveBorrowState> = None;
                 for arm in payload
                     .get("arms")
@@ -3937,6 +3945,17 @@ impl CodeDb {
                             &mut arm_state,
                             ExprUse::Value,
                         )?;
+                    }
+                    let this_outer = outer_branch_moves(&arm_state, boundary);
+                    match &arm_outer_moves {
+                        None => arm_outer_moves = Some(this_outer),
+                        Some(first) => {
+                            if !move_sets_match(first, &this_outer) {
+                                bail!(
+                                    "unsupported_move: asymmetric conditional move; a move-only value is moved in only some arms of a case"
+                                );
+                            }
+                        }
                     }
                     merged = Some(match merged {
                         Some(previous) => merged_branch_states(previous, arm_state),

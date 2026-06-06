@@ -817,6 +817,89 @@ fn op_names(ir: &JsonValue) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn asymmetric_conditional_move_through_case_is_rejected() {
+    // Moving the move-only `ed` in only one `case` arm leaves the unconditional
+    // whole-slot drop scaffold unable to decide whether to drop it — the same
+    // hazard the `if` arm already rejects. `verify`/`import` must fail closed so
+    // the borrow checker agrees with codegen once enum/case lowering lands.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("case-asymmetric-move.sqlite");
+    let source = temp.path().join("case-asymmetric-move.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+record LineEditor<'a> {
+  line: &'a mut Line
+}
+
+enum Sel {
+  yes: i64
+  no: i64
+}
+
+fn consume<'a>(ed: LineEditor<'a>) -> i64 = ed.line.price_cents
+
+fn drop_in_one_arm<'a>(sel: Sel, line: &'a mut Line) -> i64 =
+  let ed: LineEditor<'a> = { line: line } in
+  case sel of yes(u) => consume(ed) | no(v) => 0
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("asymmetric conditional move"));
+}
+
+#[test]
+fn symmetric_conditional_move_through_case_is_accepted() {
+    // Moving `ed` in *every* arm is a sound whole-slot move; the case move guard
+    // must not over-reject it.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("case-symmetric-move.sqlite");
+    let source = temp.path().join("case-symmetric-move.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+record LineEditor<'a> {
+  line: &'a mut Line
+}
+
+enum Sel {
+  yes: i64
+  no: i64
+}
+
+fn consume<'a>(ed: LineEditor<'a>) -> i64 = ed.line.price_cents
+
+fn drop_in_both_arms<'a>(sel: Sel, line: &'a mut Line) -> i64 =
+  let ed: LineEditor<'a> = { line: line } in
+  case sel of yes(u) => consume(ed) | no(v) => consume(ed)
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&["verify", path(&db)]);
+}
+
 fn can_build_default_native_target() -> bool {
     let native_target = (std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64")
         || (std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64");
