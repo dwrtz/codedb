@@ -290,6 +290,65 @@ fn type_move_add_and_remove_operations_update_type_definitions() {
 }
 
 #[test]
+fn move_type_within_same_module_is_idempotent_no_op() {
+    // A same-module move is a no-op. The apply path already short-circuits it,
+    // but the MoveType postcondition previously asserted both
+    // TypeNamePointsToType and a contradictory TypeNameAbsent for the same
+    // module, so an idempotent move failed with a spurious postcondition error.
+    // It must now succeed and leave the type unchanged.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("move-type-same-module.sqlite");
+    let create = temp.path().join("create.json");
+    let move_same = temp.path().join("move-same.json");
+
+    run(&["init", path(&db)]);
+    std::fs::write(
+        &create,
+        r#"
+{
+  "schema": "codedb/apply/v1",
+  "operations": [
+    {
+      "kind": "create_type",
+      "name": "Line",
+      "birth_seed": "line-type",
+      "definition": {
+        "kind": "record",
+        "fields": [
+          { "name": "price_cents", "type": "i64" }
+        ]
+      }
+    }
+  ]
+}
+"#,
+    )
+    .unwrap();
+    run(&["apply", path(&db), "--json", path(&create)]);
+
+    let before = list_json(&db);
+    let module_before = type_by_name(&before, "Line")["module"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    std::fs::write(
+        &move_same,
+        format!(r#"{{ "kind": "move_type", "name": "Line", "new_module": "{module_before}" }}"#),
+    )
+    .unwrap();
+    // Must not fail with a postcondition error.
+    run(&["apply", path(&db), "--json", path(&move_same)]);
+    run(&["verify", path(&db)]);
+
+    let after = list_json(&db);
+    assert_eq!(
+        type_by_name(&after, "Line")["module"],
+        module_before.as_str()
+    );
+}
+
+#[test]
 fn renamed_types_and_members_round_trip_projection_with_stable_identities() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("renamed-identities.sqlite");

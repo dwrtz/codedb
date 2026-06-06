@@ -1126,7 +1126,7 @@ impl CodeDb {
                 let else_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
                 if then_moved != else_moved {
                     bail!(
-                        "lowering does not support moving an owned value in only one branch of an `if` (asymmetric conditional move); move it in both branches or neither — conditional drop glue is not yet implemented (SPEC_V2 §12, PLAN_V2 Phase 15)"
+                        "unsupported_move: lowering does not support moving an owned value in only one branch of an `if` (asymmetric conditional move); move it in both branches or neither — conditional drop glue is not yet implemented (SPEC_V2 §12, PLAN_V2 Phase 15)"
                     );
                 }
                 // The outer-slot moves match, so `ctx.moved` (now moved_before ∪
@@ -1234,6 +1234,28 @@ impl CodeDb {
         }
     }
 
+    /// A move-only value may only be moved out of a whole owned slot (a
+    /// parameter or local). Moving it out of a field/element/deref projection is
+    /// a partial move that leaves the enclosing aggregate with a moved-out hole;
+    /// because the drop scaffold drops whole slots only, the aggregate's later
+    /// drop would double-drop the moved field. Reject partial moves of owned
+    /// aggregates fail-closed until field-granular drop glue lands (SPEC_V2 §12,
+    /// PLAN_V2 Phase 15). Every move-lowering path routes through here so the
+    /// guard cannot drift between sites; `verify_lowered_ir`'s `Move` check is
+    /// the independent backstop.
+    fn require_whole_slot_move(
+        &self,
+        expr_hash: &str,
+        locals: &[LocalLoweredBinding],
+    ) -> Result<RootSlot> {
+        self.place_whole_root_slot(expr_hash, locals)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "unsupported_move: lowering does not support moving a move-only value out of a field or element projection (partial move of an owned aggregate); field-granular drop glue is not yet implemented (SPEC_V2 §12, PLAN_V2 Phase 15)"
+                )
+            })
+    }
+
     fn lower_place_value(
         &self,
         root: &ProgramRootPayload,
@@ -1252,11 +1274,7 @@ impl CodeDb {
             // only, the aggregate's later drop would double-drop the moved
             // field. Reject partial moves of owned aggregates fail-closed until
             // field-granular drop glue lands (SPEC_V2 §12, PLAN_V2 Phase 15).
-            let Some(root_slot) = self.place_whole_root_slot(expr_hash, locals)? else {
-                bail!(
-                    "lowering does not support moving a move-only value out of a field or element projection (partial move of an owned aggregate); field-granular drop glue is not yet implemented (SPEC_V2 §12, PLAN_V2 Phase 15)"
-                );
-            };
+            let root_slot = self.require_whole_slot_move(expr_hash, locals)?;
             let id = ctx.value();
             ctx.push_debug_op(expr_hash, "move", &id);
             let mut operations = lowered.operations;
@@ -1606,15 +1624,14 @@ impl CodeDb {
         let mut operations = source.operations;
         let scaffold_id = ctx.value();
         if self.type_is_move_only(root, ctx.target_triple(), &source_type)? {
+            let root_slot = self.require_whole_slot_move(expr_hash, locals)?;
             ctx.push_debug_op(expr_hash, "move", &scaffold_id);
             operations.push(LoweredOp::Move {
                 id: scaffold_id,
                 address: source.address.clone(),
                 type_hash: source_type.clone(),
             });
-            if let Some(root_slot) = self.place_whole_root_slot(expr_hash, locals)? {
-                ctx.mark_moved(root_slot);
-            }
+            ctx.mark_moved(root_slot);
         } else {
             ctx.push_debug_op(expr_hash, "copy", &scaffold_id);
             operations.push(LoweredOp::Copy {
@@ -2661,11 +2678,25 @@ impl CodeDb {
                     if address_type(addresses, address)? != type_hash {
                         bail!("lowered move type mismatch");
                     }
-                    // Moving a whole owned slot consumes it; record so a later
-                    // drop of the same slot is rejected.
-                    if let Some(root_slot) = drop_state.addr_roots.get(address).copied() {
-                        drop_state.moved.insert(root_slot);
-                    }
+                    // SPEC_V2 §20 (fail closed): a move consumes a whole owned
+                    // slot. A move whose address is a field/element/deref
+                    // projection would be a partial move that leaves the
+                    // enclosing aggregate with a moved-out hole the whole-slot
+                    // drop scaffold cannot track, so a later whole-slot drop of
+                    // the aggregate would double-drop the moved field. Reject it
+                    // until field-granular drop glue lands (PLAN_V2 Phase 15).
+                    // This is the independent backstop for the lowering guard in
+                    // `require_whole_slot_move`. `addr_roots` holds every
+                    // AddrOfParam/AddrOfLocal id (drop-relevant or not), so a
+                    // bare move-only whole-slot move still passes.
+                    let Some(root_slot) = drop_state.addr_roots.get(address).copied() else {
+                        bail!(
+                            "lowered move of a non-whole-slot place (partial move of an owned aggregate)"
+                        );
+                    };
+                    // Consuming the slot; record so a later drop of the same
+                    // slot is rejected.
+                    drop_state.moved.insert(root_slot);
                     insert_value(values, id, type_hash)?;
                     if self.type_passes_indirect(root, target_triple, type_hash)? {
                         insert_address(addresses, id, type_hash)?;

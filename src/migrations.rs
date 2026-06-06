@@ -1987,20 +1987,28 @@ impl CodeDb {
                 type_symbol,
                 name,
                 new_module,
-            } => vec![
-                Postcondition::RootExists {
-                    root: output_root.to_string(),
-                },
-                Postcondition::TypeNamePointsToType {
-                    module: new_module.clone(),
-                    name: name.clone(),
-                    type_symbol: type_symbol.clone(),
-                },
-                Postcondition::TypeNameAbsent {
-                    module: module.clone(),
-                    name: name.clone(),
-                },
-            ],
+            } => {
+                let mut postconditions = vec![
+                    Postcondition::RootExists {
+                        root: output_root.to_string(),
+                    },
+                    Postcondition::TypeNamePointsToType {
+                        module: new_module.clone(),
+                        name: name.clone(),
+                        type_symbol: type_symbol.clone(),
+                    },
+                ];
+                // A same-module move is a no-op (the precondition short-circuits
+                // it too); asserting the name is absent in its own module would
+                // contradict the TypeNamePointsToType postcondition above.
+                if module != new_module {
+                    postconditions.push(Postcondition::TypeNameAbsent {
+                        module: module.clone(),
+                        name: name.clone(),
+                    });
+                }
+                postconditions
+            }
             Operation::AddField {
                 type_symbol, field, ..
             } => {
@@ -2143,20 +2151,28 @@ impl CodeDb {
                 symbol,
                 name,
                 new_module,
-            } => vec![
-                Postcondition::RootExists {
-                    root: output_root.to_string(),
-                },
-                Postcondition::NamePointsToSymbol {
-                    module: new_module.clone(),
-                    name: name.clone(),
-                    symbol: symbol.clone(),
-                },
-                Postcondition::NameAbsent {
-                    module: module.clone(),
-                    name: name.clone(),
-                },
-            ],
+            } => {
+                let mut postconditions = vec![
+                    Postcondition::RootExists {
+                        root: output_root.to_string(),
+                    },
+                    Postcondition::NamePointsToSymbol {
+                        module: new_module.clone(),
+                        name: name.clone(),
+                        symbol: symbol.clone(),
+                    },
+                ];
+                // A same-module move is a no-op (the precondition short-circuits
+                // it too); asserting the name is absent in its own module would
+                // contradict the NamePointsToSymbol postcondition above.
+                if module != new_module {
+                    postconditions.push(Postcondition::NameAbsent {
+                        module: module.clone(),
+                        name: name.clone(),
+                    });
+                }
+                postconditions
+            }
             Operation::ReplaceFunctionBody {
                 module,
                 symbol,

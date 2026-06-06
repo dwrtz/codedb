@@ -4439,6 +4439,20 @@ impl CodeDb {
         Ok(())
     }
 
+    /// Map a borrow-target expression to the `LoanPlace` (root slot + field
+    /// path) it names.
+    ///
+    /// LOAD-BEARING INVARIANT for exclusivity: two distinct `LoanPlace`s must
+    /// denote disjoint storage, so that `places_overlap` can decide loan
+    /// conflicts purely structurally. This holds today only because a borrow
+    /// target can be rooted at a `param_ref`/`local_ref` plus `field_access`
+    /// projections — there is NO deref/reborrow place form (`&mut *r`), so a
+    /// borrow can never alias storage reached through another reference's
+    /// pointee. `param_types` is intentionally unused for that reason.
+    ///
+    /// If a deref/reborrow place form is ever added, this function MUST resolve
+    /// it to the pointee's recorded loan identity (not the syntactic path), or
+    /// the disjointness invariant breaks and aliasing `&mut` would be accepted.
     fn loan_place_for_expr(
         &self,
         expr_hash: &str,

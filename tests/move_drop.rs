@@ -722,6 +722,88 @@ fn main<'a>() -> i64 =
     );
 }
 
+#[test]
+fn partial_field_move_of_move_only_aggregate_into_let_is_rejected() {
+    // Regression for the aggregate-init move path: `let c = container.cursor`
+    // where the moved field is a move-only aggregate LARGER than a register
+    // (here Cursor is 16 bytes) routes through `lower_aggregate_place_init_to_address`,
+    // not `lower_place_value`. That path previously emitted a Move of the field
+    // address without bailing or marking it moved, so the whole-`container` drop
+    // scaffold double-dropped the moved-out cursor and `verify` still passed.
+    // It must now be rejected fail-closed until field-granular drop glue lands.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("partial-agg-move-let.sqlite");
+    let source = temp.path().join("partial-agg-move-let.cdb");
+    let ir_path = temp.path().join("main.ir.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line { price_cents: i64 }
+
+record Cursor<'a> { line: &'a mut Line, pos: i64 }
+
+record Container<'a> { cursor: Cursor<'a>, tag: i64 }
+
+fn main<'a>() -> i64 =
+  let line: Line = { price_cents: 25 } in
+  let container: Container<'a> = { cursor: { line: &'a mut line, pos: 7 }, tag: 3 } in
+  let c: Cursor<'a> = container.cursor in
+  c.line.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    // The program is valid semantically (only lowering is deferred), so verify
+    // still passes; the rejection must surface at IR lowering.
+    run(&["verify", path(&db)]);
+    let stderr = run_fail(&["emit-ir", path(&db), "main", "--out", path(&ir_path)]);
+    assert!(
+        stderr.contains("unsupported_move:"),
+        "expected structured unsupported_move code, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("partial move of an owned aggregate"),
+        "expected partial-move rejection, got: {stderr}"
+    );
+}
+
+#[test]
+fn partial_field_move_of_move_only_aggregate_from_param_is_rejected() {
+    // Same aggregate-init hole, by-value-parameter form: moving a move-only
+    // aggregate field out of a by-value record parameter must also be rejected.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("partial-agg-move-param.sqlite");
+    let source = temp.path().join("partial-agg-move-param.cdb");
+    let ir_path = temp.path().join("take.ir.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line { price_cents: i64 }
+
+record Cursor<'a> { line: &'a mut Line, pos: i64 }
+
+record Container<'a> { cursor: Cursor<'a>, tag: i64 }
+
+fn take<'a>(container: Container<'a>) -> i64 =
+  let c: Cursor<'a> = container.cursor in
+  c.line.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    let stderr = run_fail(&["emit-ir", path(&db), "take", "--out", path(&ir_path)]);
+    assert!(
+        stderr.contains("partial move of an owned aggregate"),
+        "expected partial-move rejection, got: {stderr}"
+    );
+}
+
 fn op_names(ir: &JsonValue) -> Vec<String> {
     ir["ir"]["operations"]
         .as_array()

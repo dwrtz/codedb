@@ -385,6 +385,51 @@ fn main() -> i64 = 1
         .stderr(predicate::str::contains("bad_type_layout"));
 }
 
+#[test]
+fn verify_recomputes_and_rejects_malformed_type_layout_field_offset() {
+    // Phase 9 acceptance: "verify catches invalid field offsets". The offset is
+    // rehashed so the artifact stays internally consistent, forcing verify to
+    // recompute the layout from the type and compare offsets rather than relying
+    // on a metadata_hash mismatch.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("bad-layout-offset.sqlite");
+    let source = temp.path().join("line.cdb");
+    let layout_path = temp.path().join("line-layout.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+fn main() -> i64 = 1
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&[
+        "emit-type-layout",
+        path(&db),
+        "Line",
+        "--out",
+        path(&layout_path),
+    ]);
+    run(&["verify", path(&db)]);
+
+    // qty is the second field at offset 8; shift it to a wrong offset.
+    corrupt_first_type_layout_field_offset(&db, 1, 16);
+
+    bin()
+        .args(["verify", path(&db)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_type_layout"));
+}
+
 fn read_json(path: &Path) -> JsonValue {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
@@ -465,6 +510,33 @@ fn corrupt_first_type_layout_abi(db: &Path, pass: &str, return_: &str) {
     let mut artifact: JsonValue = serde_json::from_str(&artifact_json).unwrap();
     artifact["metadata"]["abi"]["pass"] = JsonValue::from(pass);
     artifact["metadata"]["abi"]["return"] = JsonValue::from(return_);
+    let metadata_hash = hash_bytes(
+        b"codedb/bytes/v1\0",
+        canonical_json(&artifact["metadata"]).as_bytes(),
+    );
+    artifact["metadata_hash"] = JsonValue::from(metadata_hash.clone());
+    conn.execute(
+        "UPDATE compile_cache SET artifact_hash = ?1, artifact_json = ?2 WHERE cache_key = ?3",
+        (metadata_hash, canonical_json(&artifact), cache_key),
+    )
+    .unwrap();
+}
+
+fn corrupt_first_type_layout_field_offset(db: &Path, field_index: usize, offset_bytes: u64) {
+    let conn = Connection::open(db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json
+             FROM compile_cache
+             WHERE artifact_kind = 'type_layout'
+             ORDER BY created_at
+             LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut artifact: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    artifact["metadata"]["fields"][field_index]["offset_bytes"] = JsonValue::from(offset_bytes);
     let metadata_hash = hash_bytes(
         b"codedb/bytes/v1\0",
         canonical_json(&artifact["metadata"]).as_bytes(),
