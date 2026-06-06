@@ -497,6 +497,43 @@ fn main() -> i64 =
 }
 
 #[test]
+fn named_record_cannot_be_erased_through_structural_record() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("nominal-record-erasure.sqlite");
+    let source = temp.path().join("nominal-record-erasure.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Cents {
+  value: i64
+}
+
+record Quantity {
+  value: i64
+}
+
+fn erase(q: record { value: i64 }) -> record { value: i64 } = q
+
+fn use_cents(c: Cents) -> i64 = c.value
+
+fn main() -> i64 =
+  let q: Quantity = { value: 7 } in
+  use_cents(erase(q))
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("call arg 0 for erase expected"))
+        .stderr(predicate::str::contains("got type<"));
+}
+
+#[test]
 fn distinct_named_enums_with_same_shape_are_not_assignable() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("nominal-enums.sqlite");
@@ -529,6 +566,45 @@ fn main() -> i64 = value(SecondaryDiscount::percent(10))
         .assert()
         .failure()
         .stderr(predicate::str::contains("call arg 0 for value expected"))
+        .stderr(predicate::str::contains("got type<"));
+}
+
+#[test]
+fn named_enum_cannot_be_erased_through_structural_enum() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("nominal-enum-erasure.sqlite");
+    let source = temp.path().join("nominal-enum-erasure.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+enum PrimaryDiscount {
+  none: unit
+  percent: i64
+}
+
+enum SecondaryDiscount {
+  none: unit
+  percent: i64
+}
+
+fn erase(discount: enum { none: unit, percent: i64 }) -> enum { none: unit, percent: i64 } =
+  discount
+
+fn value(discount: PrimaryDiscount) -> i64 =
+  case discount of none => 0 | percent(amount) => amount
+
+fn main() -> i64 = value(erase(SecondaryDiscount::percent(10)))
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("call arg 0 for erase expected"))
         .stderr(predicate::str::contains("got type<"));
 }
 

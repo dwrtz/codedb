@@ -1191,7 +1191,7 @@ impl CodeDb {
             return Ok(true);
         }
         if let Some(assignable) =
-            same_named_type_assignable(&self.type_spec(actual)?, &self.type_spec(expected)?)
+            named_actual_type_assignable(&self.type_spec(actual)?, &self.type_spec(expected)?)
         {
             return Ok(assignable);
         }
@@ -1251,7 +1251,7 @@ impl CodeDb {
         if actual == expected {
             return Ok(true);
         }
-        if let Some(assignable) = same_named_type_assignable_for_call(
+        if let Some(assignable) = named_actual_type_assignable_for_call(
             &self.type_spec(actual)?,
             &self.type_spec(expected)?,
             callee_regions,
@@ -5319,40 +5319,42 @@ fn fields_prefix(prefix: &[String], value: &[String]) -> bool {
             .all(|(left, right)| left == right)
 }
 
-fn same_named_type_assignable(actual: &TypeSpec, expected: &TypeSpec) -> Option<bool> {
-    let (
-        TypeSpec::Named {
-            type_symbol: actual_symbol,
-            region_args: actual_args,
-        },
-        TypeSpec::Named {
-            type_symbol: expected_symbol,
-            region_args: expected_args,
-        },
-    ) = (actual, expected)
+fn named_actual_type_assignable(actual: &TypeSpec, expected: &TypeSpec) -> Option<bool> {
+    let TypeSpec::Named {
+        type_symbol: actual_symbol,
+        region_args: actual_args,
+    } = actual
     else {
         return None;
+    };
+    let TypeSpec::Named {
+        type_symbol: expected_symbol,
+        region_args: expected_args,
+    } = expected
+    else {
+        return Some(false);
     };
     Some(actual_symbol == expected_symbol && actual_args == expected_args)
 }
 
-fn same_named_type_assignable_for_call(
+fn named_actual_type_assignable_for_call(
     actual: &TypeSpec,
     expected: &TypeSpec,
     callee_regions: &BTreeSet<String>,
 ) -> Option<bool> {
-    let (
-        TypeSpec::Named {
-            type_symbol: actual_symbol,
-            region_args: actual_args,
-        },
-        TypeSpec::Named {
-            type_symbol: expected_symbol,
-            region_args: expected_args,
-        },
-    ) = (actual, expected)
+    let TypeSpec::Named {
+        type_symbol: actual_symbol,
+        region_args: actual_args,
+    } = actual
     else {
         return None;
+    };
+    let TypeSpec::Named {
+        type_symbol: expected_symbol,
+        region_args: expected_args,
+    } = expected
+    else {
+        return Some(false);
     };
     if actual_symbol != expected_symbol || actual_args.len() != expected_args.len() {
         return Some(false);
