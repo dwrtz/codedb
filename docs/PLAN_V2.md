@@ -537,8 +537,10 @@ storage, record field reads and writes use layout-driven byte/word access,
 record parameters cross the internal native ABI by indirect pointer, and record
 returns use hidden return slots. Lowered IR carries recomputed type layout and
 ABI metadata, native backends copy aggregate byte ranges explicitly, and
-native-required record tests cover small records, large records, record returns,
-and records carrying references.
+native-required record tests cover small records, large records, and record
+returns. Reference-carrying records are covered through native object emission
+and native-required scalar entrypoints, since semantic test values do not encode
+references for direct record-value comparison.
 
 Deliverables:
 

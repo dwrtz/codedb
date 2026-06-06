@@ -456,7 +456,9 @@ fn region_parameterized_record_return_lowers_and_runs_native() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("region-record-return.sqlite");
     let source = temp.path().join("region-record-return.cdb");
-    let ir_path = temp.path().join("main.ir.json");
+    let main_ir_path = temp.path().join("main.ir.json");
+    let id_view_ir_path = temp.path().join("id-view.ir.json");
+    let id_view_object_path = temp.path().join("id-view.o");
 
     std::fs::write(
         &source,
@@ -484,7 +486,33 @@ fn main<'a>() -> i64 =
     run(&["init", path(&db)]);
     run(&["import", path(&db), path(&source)]);
     assert_eq!(run(&["eval", path(&db), "main"]).trim(), "25");
-    run(&["emit-ir", path(&db), "main", "--out", path(&ir_path)]);
+    run(&["emit-ir", path(&db), "main", "--out", path(&main_ir_path)]);
+    run(&[
+        "emit-ir",
+        path(&db),
+        "id_view",
+        "--out",
+        path(&id_view_ir_path),
+    ]);
+    let id_view_ir = read_json(&id_view_ir_path);
+    let id_view_return_layout = id_view_ir["ir"]["type_layouts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|layout| layout["type_hash"] == id_view_ir["ir"]["return_type_hash"])
+        .unwrap();
+    assert_eq!(id_view_return_layout["kind"], "record");
+    assert_eq!(id_view_return_layout["size_bytes"], 8);
+    assert_eq!(id_view_return_layout["abi"]["return"], "by_value");
+    run(&[
+        "emit-object",
+        path(&db),
+        "id_view",
+        "--target",
+        codedb::DEFAULT_NATIVE_TARGET,
+        "--out",
+        path(&id_view_object_path),
+    ]);
     run(&["verify", path(&db)]);
 
     if can_build_default_native_target() {
