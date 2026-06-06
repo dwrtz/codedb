@@ -7,11 +7,15 @@ use serde_json::{Value as JsonValue, json};
 use crate::MAIN_BRANCH;
 use crate::migrations::Operation;
 use crate::model::{ProgramRootPayload, aliases_for, param_names, test_binding_for};
+use crate::types::TypeDefinition;
 use crate::store::{CodeDb, canonical_json};
 use crate::tests::{test_value_from_value, value_from_test_value};
 
 const BLAME_SYMBOL_SCHEMA: &str = "codedb/blame-symbol/v1";
 const BLAME_EXPR_SCHEMA: &str = "codedb/blame-expr/v1";
+const BLAME_TYPE_SCHEMA: &str = "codedb/blame-type/v1";
+const BLAME_FIELD_SCHEMA: &str = "codedb/blame-field/v1";
+const BLAME_VARIANT_SCHEMA: &str = "codedb/blame-variant/v1";
 const BISECT_HISTORY_SCHEMA: &str = "codedb/bisect-history/v1";
 const WHY_SCHEMA: &str = "codedb/why/v1";
 
@@ -169,6 +173,296 @@ impl CodeDb {
             "last_name_migration": last_name,
             "last_rename_migration": last_rename,
             "last_export_migration": last_export,
+            "involved_migrations": involved,
+        }))
+    }
+
+    pub fn blame_type_main_branch_json(&self, type_or_name: &str) -> Result<String> {
+        self.blame_type_branch_json(MAIN_BRANCH, type_or_name)
+    }
+
+    pub fn blame_type_branch_json(&self, branch: &str, type_or_name: &str) -> Result<String> {
+        Ok(format!(
+            "{}\n",
+            canonical_json(&self.blame_type_branch_value(branch, type_or_name)?)
+        ))
+    }
+
+    pub fn blame_type_main_branch(&self, type_or_name: &str) -> Result<String> {
+        self.blame_type_branch(MAIN_BRANCH, type_or_name)
+    }
+
+    pub fn blame_type_branch(&self, branch: &str, type_or_name: &str) -> Result<String> {
+        let payload = self.blame_type_branch_value(branch, type_or_name)?;
+        let mut out = String::new();
+        out.push_str(&format!(
+            "branch {}\n",
+            payload["branch"].as_str().unwrap_or(branch)
+        ));
+        out.push_str(&format!(
+            "root {}\n",
+            payload["root_hash"].as_str().unwrap_or("")
+        ));
+        out.push_str(&format!(
+            "history {}\n",
+            payload["history_hash"].as_str().unwrap_or("none")
+        ));
+        out.push_str(&format!(
+            "type {}\n",
+            payload["type_symbol"].as_str().unwrap_or(type_or_name)
+        ));
+        if let Some(name) = payload["name"].as_str() {
+            out.push_str(&format!(
+                "name {}.{}\n",
+                payload["module"].as_str().unwrap_or(MAIN_BRANCH),
+                name
+            ));
+        }
+        push_blame_line(&mut out, "birth_migration", &payload["birth_migration"]);
+        push_blame_line(
+            &mut out,
+            "last_definition_migration",
+            &payload["last_definition_migration"],
+        );
+        push_blame_line(
+            &mut out,
+            "last_name_migration",
+            &payload["last_name_migration"],
+        );
+        push_blame_line(
+            &mut out,
+            "last_rename_migration",
+            &payload["last_rename_migration"],
+        );
+        Ok(out)
+    }
+
+    fn blame_type_branch_value(&self, branch_name: &str, type_or_name: &str) -> Result<JsonValue> {
+        let branch = self.branch(branch_name)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let type_symbol = self.resolve_type_for_blame(&branch.root_hash, type_or_name)?;
+        let binding = self.preferred_type_binding(&root, &type_symbol);
+        let current_entry = self.root_type(&root, &type_symbol);
+        let type_def_hash = current_entry.map(|entry| entry.type_def.clone());
+
+        let mut birth = None;
+        let mut last_definition = None;
+        let mut last_name = None;
+        let mut last_rename = None;
+        let mut involved = Vec::new();
+        for item in self.provenance_history_chain(branch_name)? {
+            let classifications = self.classify_type_migration(&item, &type_symbol)?;
+            if classifications.is_empty() {
+                continue;
+            }
+            let record = item.to_json_with_reasons(&classifications)?;
+            if classifications.contains(&"birth") {
+                birth = Some(record.clone());
+            }
+            if classifications.contains(&"definition") {
+                last_definition = Some(record.clone());
+            }
+            if classifications.contains(&"name") {
+                last_name = Some(record.clone());
+            }
+            if classifications.contains(&"rename") {
+                last_rename = Some(record.clone());
+            }
+            involved.push(record);
+        }
+
+        Ok(json!({
+            "schema": BLAME_TYPE_SCHEMA,
+            "branch": branch_name,
+            "root_hash": branch.root_hash,
+            "history_hash": branch.history_hash,
+            "type_symbol": type_symbol,
+            "module": binding.map(|binding| binding.module.as_str()),
+            "name": binding.map(|binding| binding.display_name.as_str()),
+            "type_def_hash": type_def_hash,
+            "birth_migration": birth,
+            "last_definition_migration": last_definition,
+            "last_name_migration": last_name,
+            "last_rename_migration": last_rename,
+            "involved_migrations": involved,
+        }))
+    }
+
+    pub fn blame_field_main_branch_json(&self, type_or_name: &str, field: &str) -> Result<String> {
+        self.blame_field_branch_json(MAIN_BRANCH, type_or_name, field)
+    }
+
+    pub fn blame_field_branch_json(
+        &self,
+        branch: &str,
+        type_or_name: &str,
+        field: &str,
+    ) -> Result<String> {
+        Ok(format!(
+            "{}\n",
+            canonical_json(&self.blame_member_branch_value(branch, type_or_name, field, true)?)
+        ))
+    }
+
+    pub fn blame_field_main_branch(&self, type_or_name: &str, field: &str) -> Result<String> {
+        self.blame_field_branch(MAIN_BRANCH, type_or_name, field)
+    }
+
+    pub fn blame_field_branch(
+        &self,
+        branch: &str,
+        type_or_name: &str,
+        field: &str,
+    ) -> Result<String> {
+        self.blame_member_branch(branch, type_or_name, field, true)
+    }
+
+    pub fn blame_variant_main_branch_json(
+        &self,
+        type_or_name: &str,
+        variant: &str,
+    ) -> Result<String> {
+        self.blame_variant_branch_json(MAIN_BRANCH, type_or_name, variant)
+    }
+
+    pub fn blame_variant_branch_json(
+        &self,
+        branch: &str,
+        type_or_name: &str,
+        variant: &str,
+    ) -> Result<String> {
+        Ok(format!(
+            "{}\n",
+            canonical_json(&self.blame_member_branch_value(branch, type_or_name, variant, false)?)
+        ))
+    }
+
+    pub fn blame_variant_main_branch(&self, type_or_name: &str, variant: &str) -> Result<String> {
+        self.blame_variant_branch(MAIN_BRANCH, type_or_name, variant)
+    }
+
+    pub fn blame_variant_branch(
+        &self,
+        branch: &str,
+        type_or_name: &str,
+        variant: &str,
+    ) -> Result<String> {
+        self.blame_member_branch(branch, type_or_name, variant, false)
+    }
+
+    fn blame_member_branch(
+        &self,
+        branch: &str,
+        type_or_name: &str,
+        member: &str,
+        is_field: bool,
+    ) -> Result<String> {
+        let payload = self.blame_member_branch_value(branch, type_or_name, member, is_field)?;
+        let kind = if is_field { "field" } else { "variant" };
+        let mut out = String::new();
+        out.push_str(&format!(
+            "branch {}\n",
+            payload["branch"].as_str().unwrap_or(branch)
+        ));
+        out.push_str(&format!(
+            "root {}\n",
+            payload["root_hash"].as_str().unwrap_or("")
+        ));
+        out.push_str(&format!(
+            "history {}\n",
+            payload["history_hash"].as_str().unwrap_or("none")
+        ));
+        if let Some(type_name) = payload["type_name"].as_str() {
+            out.push_str(&format!(
+                "type {}.{}\n",
+                payload["type_module"].as_str().unwrap_or(MAIN_BRANCH),
+                type_name
+            ));
+        }
+        out.push_str(&format!(
+            "{kind} {}\n",
+            payload["member_symbol"].as_str().unwrap_or(member)
+        ));
+        if let Some(name) = payload["name"].as_str() {
+            out.push_str(&format!("name {name}\n"));
+        }
+        push_blame_line(&mut out, "birth_migration", &payload["birth_migration"]);
+        push_blame_line(
+            &mut out,
+            "last_name_migration",
+            &payload["last_name_migration"],
+        );
+        push_blame_line(
+            &mut out,
+            "last_rename_migration",
+            &payload["last_rename_migration"],
+        );
+        push_blame_line(
+            &mut out,
+            "last_remove_migration",
+            &payload["last_remove_migration"],
+        );
+        Ok(out)
+    }
+
+    fn blame_member_branch_value(
+        &self,
+        branch_name: &str,
+        type_or_name: &str,
+        member: &str,
+        is_field: bool,
+    ) -> Result<JsonValue> {
+        let branch = self.branch(branch_name)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let type_symbol = self.resolve_type_for_blame(&branch.root_hash, type_or_name)?;
+        let member_symbol = self.resolve_member_for_blame(&root, &type_symbol, member, is_field)?;
+        let type_binding = self.preferred_type_binding(&root, &type_symbol);
+
+        let mut birth = None;
+        let mut last_name = None;
+        let mut last_rename = None;
+        let mut last_remove = None;
+        let mut involved = Vec::new();
+        for item in self.provenance_history_chain(branch_name)? {
+            let classifications =
+                self.classify_member_migration(&item, &type_symbol, &member_symbol, is_field)?;
+            if classifications.is_empty() {
+                continue;
+            }
+            let record = item.to_json_with_reasons(&classifications)?;
+            if classifications.contains(&"birth") {
+                birth = Some(record.clone());
+            }
+            if classifications.contains(&"name") {
+                last_name = Some(record.clone());
+            }
+            if classifications.contains(&"rename") {
+                last_rename = Some(record.clone());
+            }
+            if classifications.contains(&"remove") {
+                last_remove = Some(record.clone());
+            }
+            involved.push(record);
+        }
+
+        let schema = if is_field {
+            BLAME_FIELD_SCHEMA
+        } else {
+            BLAME_VARIANT_SCHEMA
+        };
+        Ok(json!({
+            "schema": schema,
+            "branch": branch_name,
+            "root_hash": branch.root_hash,
+            "history_hash": branch.history_hash,
+            "type_symbol": type_symbol,
+            "type_module": type_binding.map(|binding| binding.module.as_str()),
+            "type_name": type_binding.map(|binding| binding.display_name.as_str()),
+            "member_symbol": member_symbol,
+            "birth_migration": birth,
+            "last_name_migration": last_name,
+            "last_rename_migration": last_rename,
+            "last_remove_migration": last_remove,
             "involved_migrations": involved,
         }))
     }
@@ -752,6 +1046,258 @@ impl CodeDb {
             }
         }
         Ok(reasons.into_iter().collect())
+    }
+
+    fn resolve_type_for_blame(&self, root_hash: &str, type_or_name: &str) -> Result<String> {
+        if type_or_name.starts_with("sha256:") {
+            let kind = self.get_kind(type_or_name)?;
+            if kind != "SymbolBirth" {
+                bail!("object {type_or_name} is {kind}, not SymbolBirth");
+            }
+            return Ok(type_or_name.to_string());
+        }
+        self.resolve_type_name(root_hash, MAIN_BRANCH, type_or_name)
+    }
+
+    fn resolve_member_for_blame(
+        &self,
+        root: &ProgramRootPayload,
+        type_symbol: &str,
+        member_or_name: &str,
+        is_field: bool,
+    ) -> Result<String> {
+        if member_or_name.starts_with("sha256:") {
+            let kind = self.get_kind(member_or_name)?;
+            if kind != "SymbolBirth" {
+                bail!("object {member_or_name} is {kind}, not SymbolBirth");
+            }
+            return Ok(member_or_name.to_string());
+        }
+        if is_field {
+            self.field_symbol_by_name(root, type_symbol, member_or_name)
+        } else {
+            self.variant_symbol_by_name(root, type_symbol, member_or_name)
+        }
+    }
+
+    fn classify_type_migration(
+        &self,
+        item: &ProvenanceHistoryItem,
+        type_symbol: &str,
+    ) -> Result<Vec<&'static str>> {
+        let mut reasons = BTreeSet::new();
+        match &item.operation {
+            Operation::CreateType { module, name, .. } => {
+                if self
+                    .resolve_type_name(&item.output_root, module, name)
+                    .is_ok_and(|created| created == type_symbol)
+                {
+                    reasons.insert("birth");
+                    reasons.insert("definition");
+                    reasons.insert("name");
+                }
+            }
+            Operation::RenameType {
+                type_symbol: changed,
+                ..
+            } => {
+                if changed == type_symbol {
+                    reasons.insert("name");
+                    reasons.insert("rename");
+                }
+            }
+            Operation::MoveType {
+                type_symbol: changed,
+                ..
+            } => {
+                if changed == type_symbol {
+                    reasons.insert("name");
+                    reasons.insert("move");
+                }
+            }
+            Operation::AddField {
+                type_symbol: changed,
+                ..
+            }
+            | Operation::RemoveField {
+                type_symbol: changed,
+                ..
+            }
+            | Operation::RenameField {
+                type_symbol: changed,
+                ..
+            }
+            | Operation::AddVariant {
+                type_symbol: changed,
+                ..
+            }
+            | Operation::RemoveVariant {
+                type_symbol: changed,
+                ..
+            }
+            | Operation::RenameVariant {
+                type_symbol: changed,
+                ..
+            } => {
+                if changed == type_symbol {
+                    reasons.insert("definition");
+                    reasons.insert("member");
+                }
+            }
+            Operation::MergeBranch { .. } => {
+                if self.type_changed_between(&item.input_root, &item.output_root, type_symbol)? {
+                    reasons.insert("merge");
+                    reasons.insert("definition");
+                }
+            }
+            _ => {}
+        }
+        Ok(reasons.into_iter().collect())
+    }
+
+    fn classify_member_migration(
+        &self,
+        item: &ProvenanceHistoryItem,
+        type_symbol: &str,
+        member_symbol: &str,
+        is_field: bool,
+    ) -> Result<Vec<&'static str>> {
+        let mut reasons = BTreeSet::new();
+        match &item.operation {
+            Operation::CreateType { module, name, .. } => {
+                // A member born with its type (not via a later add_field/variant)
+                // is introduced by the create_type operation.
+                if self
+                    .resolve_type_name(&item.output_root, module, name)
+                    .is_ok_and(|created| created == type_symbol)
+                    && self.type_has_member(&item.output_root, type_symbol, member_symbol, is_field)?
+                {
+                    reasons.insert("birth");
+                    reasons.insert("name");
+                }
+            }
+            Operation::AddField {
+                type_symbol: changed,
+                field,
+                ..
+            } if is_field => {
+                if changed == type_symbol
+                    && self
+                        .field_symbol_by_name(&self.load_root(&item.output_root)?, changed, &field.name)
+                        .is_ok_and(|symbol| symbol == member_symbol)
+                {
+                    reasons.insert("birth");
+                    reasons.insert("name");
+                }
+            }
+            Operation::RenameField {
+                type_symbol: changed,
+                field_symbol: changed_member,
+                ..
+            } if is_field => {
+                if changed == type_symbol && changed_member == member_symbol {
+                    reasons.insert("name");
+                    reasons.insert("rename");
+                }
+            }
+            Operation::RemoveField {
+                type_symbol: changed,
+                field_symbol: changed_member,
+                ..
+            } if is_field => {
+                if changed == type_symbol && changed_member == member_symbol {
+                    reasons.insert("remove");
+                }
+            }
+            Operation::AddVariant {
+                type_symbol: changed,
+                variant,
+                ..
+            } if !is_field => {
+                if changed == type_symbol
+                    && self
+                        .variant_symbol_by_name(
+                            &self.load_root(&item.output_root)?,
+                            changed,
+                            &variant.name,
+                        )
+                        .is_ok_and(|symbol| symbol == member_symbol)
+                {
+                    reasons.insert("birth");
+                    reasons.insert("name");
+                }
+            }
+            Operation::RenameVariant {
+                type_symbol: changed,
+                variant_symbol: changed_member,
+                ..
+            } if !is_field => {
+                if changed == type_symbol && changed_member == member_symbol {
+                    reasons.insert("name");
+                    reasons.insert("rename");
+                }
+            }
+            Operation::RemoveVariant {
+                type_symbol: changed,
+                variant_symbol: changed_member,
+                ..
+            } if !is_field => {
+                if changed == type_symbol && changed_member == member_symbol {
+                    reasons.insert("remove");
+                }
+            }
+            Operation::MergeBranch { .. } => {
+                if self.type_changed_between(&item.input_root, &item.output_root, type_symbol)? {
+                    reasons.insert("merge");
+                }
+            }
+            _ => {}
+        }
+        Ok(reasons.into_iter().collect())
+    }
+
+    fn type_has_member(
+        &self,
+        root_hash: &str,
+        type_symbol: &str,
+        member_symbol: &str,
+        is_field: bool,
+    ) -> Result<bool> {
+        let root = self.load_root(root_hash)?;
+        let Some(entry) = self.root_type(&root, type_symbol) else {
+            return Ok(false);
+        };
+        let definition = self.type_definition(&entry.type_def)?;
+        let members = match (&definition, is_field) {
+            (TypeDefinition::Record { fields, .. }, true) => fields,
+            (TypeDefinition::Enum { variants, .. }, false) => variants,
+            _ => return Ok(false),
+        };
+        Ok(members
+            .iter()
+            .any(|member| member.member_symbol == member_symbol))
+    }
+
+    fn type_changed_between(
+        &self,
+        old_root: &str,
+        new_root: &str,
+        type_symbol: &str,
+    ) -> Result<bool> {
+        let old = self.load_root(old_root)?;
+        let new = self.load_root(new_root)?;
+        let old_def = self.root_type(&old, type_symbol).map(|entry| &entry.type_def);
+        let new_def = self.root_type(&new, type_symbol).map(|entry| &entry.type_def);
+        if old_def != new_def {
+            return Ok(true);
+        }
+        let old_name = self
+            .preferred_type_binding(&old, type_symbol)
+            .map(|binding| (&binding.module, &binding.display_name));
+        let new_name = self
+            .preferred_type_binding(&new, type_symbol)
+            .map(|binding| (&binding.module, &binding.display_name));
+        Ok(old_name != new_name)
     }
 
     fn classify_root_symbol_change_between(

@@ -222,6 +222,35 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Explain which migrations affected a type definition")]
+    BlameType {
+        db: PathBuf,
+        type_or_name: String,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Explain which migrations affected a record field")]
+    BlameField {
+        db: PathBuf,
+        type_or_name: String,
+        field: String,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Explain which migrations affected an enum variant")]
+    BlameVariant {
+        db: PathBuf,
+        type_or_name: String,
+        variant: String,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Find the first history migration where a semantic predicate changes")]
     BisectHistory {
         db: PathBuf,
@@ -815,6 +844,59 @@ fn main() -> Result<()> {
                 print!("{}", codedb.blame_expr_branch_json(&branch, &expr_hash)?);
             } else {
                 print!("{}", codedb.blame_expr_branch(&branch, &expr_hash)?);
+            }
+        }
+        Command::BlameType {
+            db,
+            type_or_name,
+            branch,
+            json,
+        } => {
+            let codedb = codedb::CodeDb::open(db)?;
+            if json {
+                print!("{}", codedb.blame_type_branch_json(&branch, &type_or_name)?);
+            } else {
+                print!("{}", codedb.blame_type_branch(&branch, &type_or_name)?);
+            }
+        }
+        Command::BlameField {
+            db,
+            type_or_name,
+            field,
+            branch,
+            json,
+        } => {
+            let codedb = codedb::CodeDb::open(db)?;
+            if json {
+                print!(
+                    "{}",
+                    codedb.blame_field_branch_json(&branch, &type_or_name, &field)?
+                );
+            } else {
+                print!(
+                    "{}",
+                    codedb.blame_field_branch(&branch, &type_or_name, &field)?
+                );
+            }
+        }
+        Command::BlameVariant {
+            db,
+            type_or_name,
+            variant,
+            branch,
+            json,
+        } => {
+            let codedb = codedb::CodeDb::open(db)?;
+            if json {
+                print!(
+                    "{}",
+                    codedb.blame_variant_branch_json(&branch, &type_or_name, &variant)?
+                );
+            } else {
+                print!(
+                    "{}",
+                    codedb.blame_variant_branch(&branch, &type_or_name, &variant)?
+                );
             }
         }
         Command::BisectHistory {

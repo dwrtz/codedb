@@ -1704,9 +1704,7 @@ fn case_matches_labels(case: &TestCasePayload, filter: &[String]) -> bool {
         return true;
     }
     let have = case.labels();
-    filter
-        .iter()
-        .any(|wanted| have.iter().any(|label| *label == wanted.as_str()))
+    filter.iter().any(|wanted| have.contains(&wanted.as_str()))
 }
 
 fn native_target_is_host_linkable(target: &str) -> bool {

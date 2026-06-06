@@ -514,3 +514,89 @@ fn add_parameter_default_updates_caller_body_blame() {
             .contains(&json!("body"))
     );
 }
+
+#[test]
+fn type_field_and_variant_blame_follow_migration_history() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("type-blame.sqlite");
+
+    run(&["init", path(&db)]);
+    let create = write_json(
+        temp.path(),
+        "create.json",
+        json!({
+            "schema": "codedb/apply/v1",
+            "operations": [
+                {
+                    "kind": "create_type",
+                    "name": "Money",
+                    "birth_seed": "money",
+                    "definition": { "kind": "record", "fields": [ { "name": "cents", "type": "i64" } ] }
+                },
+                {
+                    "kind": "create_type",
+                    "name": "Discount",
+                    "birth_seed": "discount",
+                    "definition": { "kind": "enum", "variants": [ { "name": "none", "type": "unit" }, { "name": "percent", "type": "i64" } ] }
+                }
+            ]
+        }),
+    );
+    run(&["apply", path(&db), "--json", path(&create)]);
+
+    let rename_field = write_json(
+        temp.path(),
+        "rename-field.json",
+        json!({ "schema": "codedb/apply/v1", "operations": [
+            { "kind": "rename_field", "type": "Money", "field": "cents", "new_name": "pennies" }
+        ]}),
+    );
+    run(&["apply", path(&db), "--json", path(&rename_field)]);
+
+    let rename_variant = write_json(
+        temp.path(),
+        "rename-variant.json",
+        json!({ "schema": "codedb/apply/v1", "operations": [
+            { "kind": "rename_variant", "type": "Discount", "variant": "percent", "new_name": "pct" }
+        ]}),
+    );
+    run(&["apply", path(&db), "--json", path(&rename_variant)]);
+
+    let rename_type = write_json(
+        temp.path(),
+        "rename-type.json",
+        json!({ "schema": "codedb/apply/v1", "operations": [
+            { "kind": "rename_type", "name": "Money", "new_name": "Cash" }
+        ]}),
+    );
+    run(&["apply", path(&db), "--json", path(&rename_type)]);
+
+    // blame-type: born at create_type, last renamed by rename_type.
+    let type_blame = parse_json(&run(&["blame-type", path(&db), "Cash", "--json"]));
+    assert_eq!(type_blame["schema"], "codedb/blame-type/v1");
+    assert_eq!(type_blame["name"], "Cash");
+    assert_eq!(type_blame["birth_migration"]["operation_kind"], "create_type");
+    assert_eq!(
+        type_blame["last_rename_migration"]["operation_kind"],
+        "rename_type"
+    );
+
+    // blame-field: born with its type (create_type), last renamed by rename_field.
+    let field_blame = parse_json(&run(&["blame-field", path(&db), "Cash", "pennies", "--json"]));
+    assert_eq!(field_blame["schema"], "codedb/blame-field/v1");
+    assert_eq!(field_blame["birth_migration"]["operation_kind"], "create_type");
+    assert_eq!(
+        field_blame["last_rename_migration"]["operation_kind"],
+        "rename_field"
+    );
+
+    // blame-variant: last renamed by rename_variant.
+    let variant_blame =
+        parse_json(&run(&["blame-variant", path(&db), "Discount", "pct", "--json"]));
+    assert_eq!(variant_blame["schema"], "codedb/blame-variant/v1");
+    assert_eq!(variant_blame["birth_migration"]["operation_kind"], "create_type");
+    assert_eq!(
+        variant_blame["last_rename_migration"]["operation_kind"],
+        "rename_variant"
+    );
+}
