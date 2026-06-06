@@ -608,6 +608,21 @@ impl CodeDb {
                 )?;
             }
         }
+
+        // Drop lowered-IR cache entries whose function definition is no longer
+        // present in any indexed root. Such orphans would otherwise receive only
+        // shape-level verification — the value/address discipline and load/store
+        // type checks need a live root to resolve named types and call targets —
+        // and they can never be served for a live build (a reintroduced
+        // definition is content-addressed and gets re-lowered and fully
+        // verified). Cache contents are not part of any hash, so this does not
+        // affect root identity or replay determinism.
+        self.conn.execute(
+            "DELETE FROM compile_cache
+             WHERE artifact_kind = ?1
+               AND input_hash NOT IN (SELECT definition_hash FROM root_symbols)",
+            params![ArtifactKind::LoweredIr.as_str()],
+        )?;
         Ok(())
     }
 

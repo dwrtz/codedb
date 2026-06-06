@@ -1586,3 +1586,70 @@ fn test_canonical_json(value: &JsonValue) -> String {
         }
     }
 }
+
+#[test]
+fn index_root_prunes_orphan_lowered_ir_cache_entries() {
+    // A lowered-IR cache entry whose function definition is in no indexed root
+    // would otherwise receive only shape-level verification. index_root prunes
+    // such orphans so verify never audits an entry that can never be served for
+    // a live build. (Cache contents are not hashed, so this does not affect root
+    // identity or replay determinism.)
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("orphan-cache.sqlite");
+    setup_shop(&db);
+
+    let conn = Connection::open(&db).unwrap();
+    // Any stored object that is not a function definition in any root makes a
+    // valid (FK-satisfying) but orphaned cache input.
+    let orphan_input: String = conn
+        .query_row(
+            "SELECT hash FROM objects
+             WHERE hash NOT IN (SELECT definition_hash FROM root_symbols)
+             ORDER BY hash LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO compile_cache
+         (cache_key, cache_key_json, input_hash, backend, target, compiler_version,
+          artifact_kind, artifact_hash, artifact_json)
+         VALUES ('orphan-test-key', '{}', ?1, 'test-backend', 'test-target',
+                 'test-compiler', 'lowered_ir', 'sha256:orphan', '{}')",
+        [&orphan_input],
+    )
+    .unwrap();
+    let before: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM compile_cache WHERE cache_key = 'orphan-test-key'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(before, 1);
+    drop(conn);
+
+    // Any migration re-indexes a root and runs the prune.
+    let listing: JsonValue =
+        serde_json::from_str(&run(&["list", db.to_str().unwrap(), "--json"])).unwrap();
+    let root = listing["root_hash"].as_str().unwrap().to_string();
+    run(&[
+        "replace-body",
+        db.to_str().unwrap(),
+        "total",
+        "subtotal + 2",
+        "--expect-root",
+        &root,
+        "--json",
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM compile_cache WHERE cache_key = 'orphan-test-key'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(after, 0, "orphan lowered-IR cache entry should be pruned");
+}
