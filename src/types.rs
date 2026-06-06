@@ -3762,6 +3762,10 @@ impl CodeDb {
                         .ok_or_else(|| anyhow!("record field missing value"))?;
                     self.verify_expr_borrows(root, child, param_types, state, ExprUse::Value)?;
                 }
+                let value_loans = self.collect_value_loans(root, expr_hash, param_types, state)?;
+                self.check_loans_point_to_live_storage(&value_loans, state)?;
+                let mut active = state.active.clone();
+                self.add_checked_value_loans(&mut active, &value_loans)?;
                 Ok(())
             }
             "field_access" => {

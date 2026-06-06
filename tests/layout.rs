@@ -431,7 +431,11 @@ fn corrupt_first_type_layout_copy_kind(db: &Path) {
         .unwrap();
     let mut artifact: JsonValue = serde_json::from_str(&artifact_json).unwrap();
     let current = artifact["metadata"]["copy_kind"].as_str().unwrap_or("copy");
-    let flipped = if current == "copy" { "move_only" } else { "copy" };
+    let flipped = if current == "copy" {
+        "move_only"
+    } else {
+        "copy"
+    };
     artifact["metadata"]["copy_kind"] = JsonValue::from(flipped);
     let metadata_hash = hash_bytes(
         b"codedb/bytes/v1\0",

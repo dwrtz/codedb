@@ -232,6 +232,41 @@ fn main<'a>() -> i64 =
 }
 
 #[test]
+fn compiler_rejects_duplicate_mutable_borrows_inside_returned_record_literal() {
+    let temp = tempdir().unwrap();
+    let db = temp
+        .path()
+        .join("duplicate-mut-borrow-returned-record.sqlite");
+    let source = temp.path().join("duplicate-mut-borrow-returned-record.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Cell {
+  value: i64
+}
+
+record Pair<'a> {
+  first: &'a mut i64
+  second: &'a mut i64
+}
+
+fn dup<'a>(cell: &'a mut Cell) -> Pair<'a> =
+  { first: &'a mut cell.value, second: &'a mut cell.value }
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_borrow"))
+        .stderr(predicate::str::contains("exclusive loan conflict"));
+}
+
+#[test]
 fn conditional_same_mutable_borrow_is_one_live_loan() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("conditional-same-mut-borrow.sqlite");

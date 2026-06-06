@@ -2526,7 +2526,9 @@ impl CodeDb {
                         bail!("lowered addr_of_param indirect flag mismatch");
                     }
                     insert_address(addresses, id, type_hash)?;
-                    drop_state.addr_roots.insert(id.clone(), RootSlot::Param(*slot));
+                    drop_state
+                        .addr_roots
+                        .insert(id.clone(), RootSlot::Param(*slot));
                     if self.type_passes_indirect(root, target_triple, type_hash)? {
                         insert_value(values, id, type_hash)?;
                     }
@@ -2542,7 +2544,9 @@ impl CodeDb {
                         bail!("lowered addr_of_local slot {slot} type mismatch");
                     }
                     insert_address(addresses, id, type_hash)?;
-                    drop_state.addr_roots.insert(id.clone(), RootSlot::Local(*slot));
+                    drop_state
+                        .addr_roots
+                        .insert(id.clone(), RootSlot::Local(*slot));
                     if self.is_aggregate_ir_type(root, type_hash)? {
                         insert_value(values, id, type_hash)?;
                     }

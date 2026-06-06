@@ -192,7 +192,9 @@ fn store_id(x: i64) -> i64 = let y: i64 = x in y
         .assert()
         .failure()
         .stderr(predicate::str::contains("bad_lowered_ir"))
-        .stderr(predicate::str::contains("lowered store address type mismatch"));
+        .stderr(predicate::str::contains(
+            "lowered store address type mismatch",
+        ));
 }
 
 fn op_names(ir: &JsonValue) -> Vec<String> {
