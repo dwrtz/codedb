@@ -13,6 +13,11 @@ use crate::types::{
 use crate::{ABI_TAG, APPLE_ARM64_TARGET, LINUX_X86_64_TARGET, MAIN_BRANCH};
 
 pub(crate) const TYPE_LAYOUT_SCHEMA: &str = "codedb/type-layout/v2";
+// The version tag (`:v2`) in `TYPE_LAYOUT_BACKEND_ID` is what versions the
+// layout cache key: bumping it invalidates every cached layout. `LAYOUT_VERSION`
+// records the same tag in artifact metadata. The two MUST carry the same tag, so
+// a layout-format change invalidates caches rather than silently reusing stale
+// layouts; `layout_cache_key_is_versioned` guards against drift.
 pub(crate) const TYPE_LAYOUT_BACKEND_ID: &str = "type-layout:v2";
 pub(crate) const LAYOUT_VERSION: &str = "layout:v2";
 
@@ -673,6 +678,25 @@ mod tests {
     use crate::DEFAULT_NATIVE_TARGET;
     use crate::model::resolve_function_name_in_root;
     use tempfile::tempdir;
+
+    #[test]
+    fn layout_cache_key_is_versioned() {
+        // The layout cache key must encode the layout-format version so that a
+        // format bump invalidates cached layouts (rather than silently reusing
+        // stale ones). The backend id carries the version tag, and
+        // LAYOUT_VERSION metadata must use the same tag; this fails if they drift.
+        let backend_tag = TYPE_LAYOUT_BACKEND_ID.rsplit(':').next().unwrap();
+        let version_tag = LAYOUT_VERSION.rsplit(':').next().unwrap();
+        assert_eq!(
+            backend_tag, version_tag,
+            "layout backend id and layout_version must share a version tag"
+        );
+        let key = type_layout_cache_key_input(&type_hash_for("I64"), DEFAULT_NATIVE_TARGET, vec![]);
+        assert!(
+            key.backend_id.ends_with(version_tag),
+            "layout cache key backend_id must encode the layout version tag"
+        );
+    }
 
     #[test]
     fn named_record_layout_fields_use_instantiated_region_args() {

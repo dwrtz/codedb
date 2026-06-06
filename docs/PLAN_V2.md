@@ -284,6 +284,15 @@ enum, reference, raw pointer, and fixed-array metadata with target-specific
 size/alignment, ABI classification, copy/move/drop scaffold classification,
 layout cache keys, and verification that recomputes cached layout artifacts.
 
+The remaining SPEC §8 layout kinds — `box`, `slice`, and
+`static_string_or_bytes_view` — are deferred to the phases that introduce those
+types (Phases 12, 15, 17). The `contains_box` and `contains_capability_handle`
+classification flags are emitted but always `false` until those types exist; no
+type the current language can express sets them. The layout cache key versions
+on the backend id tag (`type-layout:v2`); `LAYOUT_VERSION` carries the same tag,
+guarded by `layout_cache_key_is_versioned` so a layout-format bump invalidates
+cached layouts.
+
 Deliverables:
 
 ```text

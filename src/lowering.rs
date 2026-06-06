@@ -303,12 +303,37 @@ struct LocalLoweredBinding {
     type_hash: String,
 }
 
+/// Identifies an addressable owned storage slot (a parameter or a local). Used
+/// to track which slots have had their whole value moved out, so the drop
+/// scaffold does not drop moved-out (or already-dropped) storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RootSlot {
+    Param(usize),
+    Local(usize),
+}
+
+/// Verifier-side tracking of whole-slot moves and drops, enforcing that an
+/// owned slot is never dropped after it was moved out and never dropped twice
+/// (SPEC_V2 §20, "drops occur exactly once for owned values"). Address ids and
+/// local slots are globally unique within a function, and parameters are only
+/// dropped at function end, so a single shared tracker is sound across the
+/// `if`/else blocks the verifier recurses into.
+#[derive(Debug, Default)]
+struct DropTracker {
+    /// Address ids that name a whole owned slot (bare `addr_of_param` /
+    /// `addr_of_local`). Field/index/deref addresses are intentionally absent.
+    addr_roots: BTreeMap<String, RootSlot>,
+    moved: BTreeSet<RootSlot>,
+    dropped: BTreeSet<RootSlot>,
+}
+
 struct LowerCtx {
     target_triple: String,
     next_value: usize,
     next_local: usize,
     local_slots: Vec<LoweredLocalSlot>,
     debug_operations: Vec<LoweredDebugOp>,
+    moved: BTreeSet<RootSlot>,
 }
 
 impl LowerCtx {
@@ -319,11 +344,22 @@ impl LowerCtx {
             next_local: 0,
             local_slots: Vec::new(),
             debug_operations: Vec::new(),
+            moved: BTreeSet::new(),
         }
     }
 
     fn target_triple(&self) -> &str {
         &self.target_triple
+    }
+
+    /// Record that the whole value of `root` was moved out of its slot.
+    fn mark_moved(&mut self, root: RootSlot) {
+        self.moved.insert(root);
+    }
+
+    /// Whether the whole value of `root` was moved out somewhere in the body.
+    fn is_moved(&self, root: RootSlot) -> bool {
+        self.moved.contains(&root)
     }
 
     fn value(&mut self) -> String {
@@ -854,7 +890,9 @@ impl CodeDb {
                 locals.pop();
                 let body = body?;
                 operations.extend(body.operations);
-                if self.type_requires_drop_scaffold(root, ctx.target_triple(), &binding_type)? {
+                if self.type_requires_drop_scaffold(root, ctx.target_triple(), &binding_type)?
+                    && !ctx.is_moved(RootSlot::Local(slot))
+                {
                     operations.push(LoweredOp::Drop {
                         address,
                         type_hash: binding_type,
@@ -1094,6 +1132,9 @@ impl CodeDb {
             if !self.type_requires_drop_scaffold(root, target_triple, type_hash)? {
                 continue;
             }
+            if ctx.is_moved(RootSlot::Param(slot)) {
+                continue;
+            }
             let address = ctx.value();
             ctx.push_debug_op(debug_expr_hash, "addr_of_param", &address);
             operations.push(LoweredOp::AddrOfParam {
@@ -1110,6 +1151,40 @@ impl CodeDb {
             });
         }
         Ok(operations)
+    }
+
+    /// If `expr_hash` is a bare parameter or local reference (a whole owned
+    /// slot, not a field/index/deref projection), return the slot it names.
+    /// Moving such a place moves the entire slot, so its drop scaffold must be
+    /// suppressed. Projections return `None` (partial moves are not tracked at
+    /// this scaffold layer).
+    fn place_whole_root_slot(
+        &self,
+        expr_hash: &str,
+        locals: &[LocalLoweredBinding],
+    ) -> Result<Option<RootSlot>> {
+        let payload = self.get_payload(expr_hash)?;
+        match payload.get("expr_kind").and_then(JsonValue::as_str) {
+            Some("param_ref") => {
+                let slot = payload
+                    .get("index")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("param_ref missing index"))?
+                    as usize;
+                Ok(Some(RootSlot::Param(slot)))
+            }
+            Some("local_ref") => {
+                let depth = payload
+                    .get("depth")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
+                    as usize;
+                let binding = local_lowered_at_depth(locals, depth)
+                    .ok_or_else(|| anyhow!("local_ref depth out of bounds {depth}"))?;
+                Ok(Some(RootSlot::Local(binding.slot)))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn lower_place_value(
@@ -1131,6 +1206,9 @@ impl CodeDb {
                 address: lowered.address,
                 type_hash: type_hash.to_string(),
             });
+            if let Some(root_slot) = self.place_whole_root_slot(expr_hash, locals)? {
+                ctx.mark_moved(root_slot);
+            }
             return Ok(LoweredExpr {
                 operations,
                 value: id,
@@ -1477,6 +1555,9 @@ impl CodeDb {
                 address: source.address.clone(),
                 type_hash: source_type.clone(),
             });
+            if let Some(root_slot) = self.place_whole_root_slot(expr_hash, locals)? {
+                ctx.mark_moved(root_slot);
+            }
         } else {
             ctx.push_debug_op(expr_hash, "copy", &scaffold_id);
             operations.push(LoweredOp::Copy {
@@ -1714,12 +1795,11 @@ impl CodeDb {
             Some(other) => bail!("unknown drop_kind {other} for type {type_hash}"),
             None => bail!("type layout missing drop_kind for {type_hash}"),
         };
-        let contains_reference = layout
-            .metadata
-            .get("contains_reference")
-            .and_then(JsonValue::as_bool)
-            .ok_or_else(|| anyhow!("type layout missing contains_reference for {type_hash}"))?;
-        Ok(move_only || needs_drop || contains_reference)
+        // Copy values own nothing and must not be dropped (SPEC_V2 §12). A
+        // shared-reference record is Copy (`contains_reference` true but
+        // `copy_kind` "copy"); only move-only or needs-drop values get a drop
+        // scaffold.
+        Ok(move_only || needs_drop)
     }
 
     fn layout_field_offset_bytes(
@@ -2068,6 +2148,7 @@ impl CodeDb {
     ) -> Result<()> {
         let mut values = BTreeMap::new();
         let mut addresses = BTreeMap::new();
+        let mut drop_state = DropTracker::default();
         let (last, body_ops) = ir
             .operations
             .split_last()
@@ -2080,6 +2161,7 @@ impl CodeDb {
             &ir.locals,
             &mut values,
             &mut addresses,
+            &mut drop_state,
         )?;
         match last {
             LoweredOp::Return { value, type_hash } => {
@@ -2108,6 +2190,7 @@ impl CodeDb {
         local_slots: &[LoweredLocalSlot],
         values: &mut BTreeMap<String, String>,
         addresses: &mut BTreeMap<String, String>,
+        drop_state: &mut DropTracker,
     ) -> Result<()> {
         for op in operations {
             match op {
@@ -2268,6 +2351,7 @@ impl CodeDb {
                         local_slots,
                         values,
                         addresses,
+                        drop_state,
                     )?;
                     let else_type = self.verify_lowered_block(
                         root,
@@ -2277,6 +2361,7 @@ impl CodeDb {
                         local_slots,
                         values,
                         addresses,
+                        drop_state,
                     )?;
                     if then_type != else_type || then_type != *type_hash {
                         bail!("lowered if branch type mismatch");
@@ -2384,6 +2469,7 @@ impl CodeDb {
                         bail!("lowered addr_of_param indirect flag mismatch");
                     }
                     insert_address(addresses, id, type_hash)?;
+                    drop_state.addr_roots.insert(id.clone(), RootSlot::Param(*slot));
                     if self.type_passes_indirect(root, target_triple, type_hash)? {
                         insert_value(values, id, type_hash)?;
                     }
@@ -2399,6 +2485,7 @@ impl CodeDb {
                         bail!("lowered addr_of_local slot {slot} type mismatch");
                     }
                     insert_address(addresses, id, type_hash)?;
+                    drop_state.addr_roots.insert(id.clone(), RootSlot::Local(*slot));
                     if self.is_aggregate_ir_type(root, type_hash)? {
                         insert_value(values, id, type_hash)?;
                     }
@@ -2513,6 +2600,11 @@ impl CodeDb {
                     if address_type(addresses, address)? != type_hash {
                         bail!("lowered move type mismatch");
                     }
+                    // Moving a whole owned slot consumes it; record so a later
+                    // drop of the same slot is rejected.
+                    if let Some(root_slot) = drop_state.addr_roots.get(address).copied() {
+                        drop_state.moved.insert(root_slot);
+                    }
                     insert_value(values, id, type_hash)?;
                     if self.type_passes_indirect(root, target_triple, type_hash)? {
                         insert_address(addresses, id, type_hash)?;
@@ -2524,6 +2616,16 @@ impl CodeDb {
                     }
                     if address_type(addresses, address)? != type_hash {
                         bail!("lowered drop type mismatch");
+                    }
+                    // SPEC_V2 §20: an owned slot is dropped exactly once and
+                    // never after being moved out.
+                    if let Some(root_slot) = drop_state.addr_roots.get(address).copied() {
+                        if drop_state.moved.contains(&root_slot) {
+                            bail!("lowered drop of moved-out storage");
+                        }
+                        if !drop_state.dropped.insert(root_slot) {
+                            bail!("lowered double drop of storage");
+                        }
                     }
                 }
                 LoweredOp::BorrowDebug {
@@ -2559,9 +2661,14 @@ impl CodeDb {
         local_slots: &[LoweredLocalSlot],
         parent_values: &BTreeMap<String, String>,
         parent_addresses: &BTreeMap<String, String>,
+        drop_state: &mut DropTracker,
     ) -> Result<String> {
         let mut values = parent_values.clone();
         let mut addresses = parent_addresses.clone();
+        // Values/addresses are branch-local (cloned), but `drop_state` is shared
+        // on purpose: local slots and address ids are globally unique within a
+        // function and parameters are dropped only at function end, so a move in
+        // either branch must remain visible to the function-end drop scaffold.
         self.verify_value_ops(
             root,
             &block.operations,
@@ -2570,6 +2677,7 @@ impl CodeDb {
             local_slots,
             &mut values,
             &mut addresses,
+            drop_state,
         )?;
         value_type(&values, &block.result).cloned()
     }

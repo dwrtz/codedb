@@ -71,6 +71,15 @@ Native run JSON includes a structured native result object with schema
 `passed`; native-required unsupported results count as failed tests and are
 reported with the `v2_native_required` label.
 
+The `v2_native_required` label is the selector intended for a CI job that runs
+native-required tests on a host with a native toolchain. Because acceptance
+tests that build native artifacts can only do so where a toolchain is present,
+the harness's own gate test asserts the native-required outcome on *every* host:
+it passes through real codegen where native is available, and otherwise asserts
+the run reports `unsupported` and fails — never a silent pass. Feature tests that
+build executables still guard the build step on toolchain availability, so the
+native-required CI selector is what guarantees those gates are exercised.
+
 ## Phase 1 Feature Gates
 
 Phase 1 opens only the version-boundary documentation gate. It is accepted when:

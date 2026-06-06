@@ -609,6 +609,59 @@ fn main() -> i64 = value(erase(SecondaryDiscount::percent(10)))
 }
 
 #[test]
+fn import_rejects_record_with_duplicate_field_names() {
+    // Phase 3: duplicate record fields must be rejected (the projection parser
+    // and the member validator both guard this).
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("dup-field.sqlite");
+    let source = temp.path().join("dup-field.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  price_cents: i64
+}
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("duplicate record field"));
+}
+
+#[test]
+fn import_rejects_enum_with_duplicate_variant_names() {
+    // Phase 3: duplicate enum variants must be rejected.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("dup-variant.sqlite");
+    let source = temp.path().join("dup-variant.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+enum Discount {
+  none: unit
+  none: i64
+}
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("duplicate"));
+}
+
+#[test]
 fn verify_rejects_type_definition_with_invalid_region_reference() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("bad-region.sqlite");

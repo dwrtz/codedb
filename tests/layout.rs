@@ -295,6 +295,48 @@ fn main() -> i64 = 1
         .stderr(predicate::str::contains("bad_type_layout"));
 }
 
+#[test]
+fn verify_recomputes_and_rejects_malformed_type_layout_classification() {
+    // Phase 8: copy/move/drop classification is recomputed by verify, never
+    // trusted. Flipping a stored copy_kind must be caught as bad_type_layout.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("bad-layout-class.sqlite");
+    let source = temp.path().join("line.cdb");
+    let layout_path = temp.path().join("line-layout.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+fn main() -> i64 = 1
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&[
+        "emit-type-layout",
+        path(&db),
+        "Line",
+        "--out",
+        path(&layout_path),
+    ]);
+    run(&["verify", path(&db)]);
+
+    corrupt_first_type_layout_copy_kind(&db);
+
+    bin()
+        .args(["verify", path(&db)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_type_layout"));
+}
+
 fn read_json(path: &Path) -> JsonValue {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
@@ -314,6 +356,35 @@ fn corrupt_first_type_layout_size(db: &Path, size_bytes: u64) {
         .unwrap();
     let mut artifact: JsonValue = serde_json::from_str(&artifact_json).unwrap();
     artifact["metadata"]["size_bytes"] = JsonValue::from(size_bytes);
+    let metadata_hash = hash_bytes(
+        b"codedb/bytes/v1\0",
+        canonical_json(&artifact["metadata"]).as_bytes(),
+    );
+    artifact["metadata_hash"] = JsonValue::from(metadata_hash.clone());
+    conn.execute(
+        "UPDATE compile_cache SET artifact_hash = ?1, artifact_json = ?2 WHERE cache_key = ?3",
+        (metadata_hash, canonical_json(&artifact), cache_key),
+    )
+    .unwrap();
+}
+
+fn corrupt_first_type_layout_copy_kind(db: &Path) {
+    let conn = Connection::open(db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json
+             FROM compile_cache
+             WHERE artifact_kind = 'type_layout'
+             ORDER BY created_at
+             LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut artifact: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    let current = artifact["metadata"]["copy_kind"].as_str().unwrap_or("copy");
+    let flipped = if current == "copy" { "move_only" } else { "copy" };
+    artifact["metadata"]["copy_kind"] = JsonValue::from(flipped);
     let metadata_hash = hash_bytes(
         b"codedb/bytes/v1\0",
         canonical_json(&artifact["metadata"]).as_bytes(),

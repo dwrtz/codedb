@@ -23,10 +23,11 @@ fn parse_json(text: &str) -> JsonValue {
 }
 
 #[test]
-fn native_required_scalar_test_passes_when_host_native_is_available() {
-    if !can_build_default_native_target() {
-        return;
-    }
+fn native_required_scalar_test_reports_native_outcome_on_every_host() {
+    // This test must not be vacuous on a host without a native toolchain: a
+    // native-required test either passes through real codegen (native host) or
+    // fires the gate as `unsupported` and fails the run (no toolchain). It may
+    // never silently pass without exercising the gate.
     let temp = tempdir().unwrap();
     let db = temp.path().join("native-required-pass.sqlite");
     let source = temp.path().join("native-required-pass.cdb");
@@ -56,26 +57,35 @@ fn native_required_scalar_test_passes_when_host_native_is_available() {
 
     let report = parse_json(&run(&["test", path(&db), "--json"]));
     assert_eq!(report["schema"], "codedb/test-run/v1");
-    assert_eq!(report["status"], "passed");
-    assert_eq!(report["passed"], 1);
-    assert_eq!(report["failed"], 0);
-    assert_eq!(report["unsupported"], 0);
-    assert_eq!(report["native_mismatches"], 0);
-    assert_eq!(report["tests"][0]["status"], "passed");
     assert_eq!(report["tests"][0]["reference"]["status"], "passed");
     assert_eq!(
         report["tests"][0]["native"]["schema"],
         "codedb/native-test-result/v1"
     );
-    assert_eq!(report["tests"][0]["native"]["status"], "passed");
-    assert_eq!(
-        report["tests"][0]["native"]["comparison"]["expected"],
-        json!({"kind": "i64", "value": "7"})
-    );
-    assert_eq!(
-        report["tests"][0]["native"]["comparison"]["actual"],
-        json!({"kind": "i64", "value": "7"})
-    );
+
+    if can_build_default_native_target() {
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["passed"], 1);
+        assert_eq!(report["failed"], 0);
+        assert_eq!(report["unsupported"], 0);
+        assert_eq!(report["native_mismatches"], 0);
+        assert_eq!(report["tests"][0]["status"], "passed");
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+        assert_eq!(
+            report["tests"][0]["native"]["comparison"]["expected"],
+            json!({"kind": "i64", "value": "7"})
+        );
+        assert_eq!(
+            report["tests"][0]["native"]["comparison"]["actual"],
+            json!({"kind": "i64", "value": "7"})
+        );
+    } else {
+        // No toolchain: the native-required gate must fire rather than pass.
+        assert_eq!(report["status"], "failed");
+        assert_eq!(report["passed"], 0);
+        assert_eq!(report["unsupported"], 1);
+        assert_eq!(report["tests"][0]["native"]["status"], "unsupported");
+    }
 }
 
 #[test]

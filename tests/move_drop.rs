@@ -66,7 +66,10 @@ fn main<'a>() -> i64 =
     let ir = read_json(&ir_path);
     let ops = op_names(&ir);
     assert!(ops.contains(&"copy".to_string()));
-    assert!(ops.contains(&"drop".to_string()));
+    // LineView is Copy (shared reference), so it owns nothing and must not be
+    // dropped. The loan ending at scope is a borrow-checker property, not a
+    // lowered drop op.
+    assert!(!ops.contains(&"drop".to_string()));
 
     if can_build_default_native_target() {
         let created = parse_json(&run(&[
@@ -368,6 +371,45 @@ fn main<'a>() -> i64 =
     let ops = op_names(&ir);
     assert!(ops.contains(&"drop".to_string()));
     run(&["verify", path(&db)]);
+}
+
+#[test]
+fn moved_out_parameter_is_not_dropped() {
+    // Regression for the move-unaware drop scaffold: a parameter whose whole
+    // value is moved out (returned) must not also be dropped, or the lowered IR
+    // would drop storage the caller now owns (a latent double-free once real
+    // drop glue lands). The drop-once verifier also rejects a drop-after-move,
+    // so `verify` would fail if the scaffold regressed.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("moved-param-no-drop.sqlite");
+    let source = temp.path().join("moved-param-no-drop.cdb");
+    let ir_path = temp.path().join("passthrough.ir.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+}
+
+record LineEditor<'a> {
+  line: &'a mut Line
+}
+
+fn passthrough<'a>(editor: LineEditor<'a>) -> LineEditor<'a> = editor
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&["verify", path(&db)]);
+    run(&["emit-ir", path(&db), "passthrough", "--out", path(&ir_path)]);
+
+    let ir = read_json(&ir_path);
+    let ops = op_names(&ir);
+    assert!(ops.contains(&"move".to_string()));
+    assert!(!ops.contains(&"drop".to_string()));
 }
 
 #[test]
