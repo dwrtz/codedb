@@ -825,6 +825,107 @@ fn main() -> i64 = via_return() + via_argument() + via_nested()
     }
 }
 
+#[test]
+fn assignment_of_aggregate_literal_agrees_with_native() {
+    // Regression: the `assign` value-flow sink (`place = <aggregate literal>`)
+    // must build the value into the destination place's declared layout, exactly
+    // like a `let` binding. Previously `assign` lowered its value with a raw
+    // `lower_expr` and blind-`Store`d it under the destination type, so an
+    // aggregate literal — whose structural type canonicalizes fields/variants
+    // alphabetically — was reinterpreted under the named (declared-order) layout
+    // and native silently read swapped fields. Each entry reads field `a`
+    // (== 20) / variant `x`; before the fix native returned the `b`/`y` slot.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("assign-field-order.sqlite");
+    let source = temp.path().join("assign-field-order.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record R {
+  b: i64
+  a: i64
+}
+
+enum E {
+  y: i64
+  x: i64
+}
+
+fn combine(r: R) -> i64 = r.a * 1000 + r.b
+
+fn read_e(e: E) -> i64 = case e of y(p) => p | x(q) => q * 1000
+
+fn local_reassign() -> i64 effects[state] =
+  let r: R = { b: 1, a: 2 } in
+  let _: unit = r = { b: 10, a: 20 } in
+  combine(r)
+
+fn array_element_reassign() -> i64 effects[state] =
+  let arr: array<R, 2> = [{ b: 1, a: 2 }, { b: 3, a: 4 }] in
+  let _: unit = arr[0] = { b: 10, a: 20 } in
+  combine(arr[0])
+
+fn whole_array_reassign() -> i64 effects[state] =
+  let arr: array<R, 2> = [{ b: 1, a: 2 }, { b: 3, a: 4 }] in
+  let _: unit = arr = [{ b: 10, a: 20 }, { b: 30, a: 40 }] in
+  combine(arr[0]) + combine(arr[1])
+
+fn enum_reassign() -> i64 effects[state] =
+  let e: E = E::y(5) in
+  let _: unit = e = E::x(7) in
+  read_e(e)
+
+fn main() -> i64 effects[state] =
+  local_reassign() + array_element_reassign() + enum_reassign()
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    // Oracle reads field `a` (== 20) and variant `x` on every path.
+    assert_eq!(run(&["eval", path(&db), "local_reassign"]).trim(), "20010");
+    assert_eq!(
+        run(&["eval", path(&db), "array_element_reassign"]).trim(),
+        "20010"
+    );
+    assert_eq!(
+        run(&["eval", path(&db), "whole_array_reassign"]).trim(),
+        "60040"
+    );
+    assert_eq!(run(&["eval", path(&db), "enum_reassign"]).trim(), "7000");
+    run(&["verify", path(&db)]);
+
+    if can_build_default_native_target() {
+        for (name, entry, expect) in [
+            ("assign_local", "local_reassign", "20010"),
+            ("assign_array_element", "array_element_reassign", "20010"),
+            ("assign_whole_array", "whole_array_reassign", "60040"),
+            ("assign_enum", "enum_reassign", "7000"),
+        ] {
+            run(&[
+                "create-test",
+                path(&db),
+                name,
+                "--entry",
+                entry,
+                "--expect-i64",
+                expect,
+                "--native-required",
+                "--json",
+            ]);
+        }
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["native_mismatches"], 0);
+        assert_eq!(report["unsupported"], 0);
+        for test in report["tests"].as_array().unwrap() {
+            assert_eq!(test["native"]["status"], "passed");
+        }
+    }
+}
+
 fn can_build_default_native_target() -> bool {
     let native_target = (std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64")
         || (std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64");

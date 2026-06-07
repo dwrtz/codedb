@@ -1177,19 +1177,81 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("assign missing value"))?;
                 let target = self.lower_place(root, target_hash, param_types, ctx, locals)?;
-                let value = self.lower_expr(root, value_hash, param_types, ctx, locals)?;
-                if !self.type_assignable_in_root(root, &value.type_hash, &target.type_hash)? {
-                    bail!("assignment type mismatch while lowering");
+                let target_type = target.type_hash.clone();
+                let target_address = target.address.clone();
+                let mut operations = target.operations;
+                // The value must be built directly into the destination place's
+                // layout. A raw `lower_expr` + blind `Store` under `target_type`
+                // would reinterpret an aggregate literal's structural
+                // (alphabetical) field/variant order under the destination's
+                // declared order and miscompile non-alphabetical records/enums.
+                // This is the field-order invariant: every aggregate value-flow
+                // boundary goes through `lower_expr_as` / an `init_to_address`
+                // builder, never a blind byte copy. Mirror the `let` binding
+                // dispatch exactly, writing into the existing place address
+                // instead of a fresh local slot.
+                let value_kind = self
+                    .get_payload(value_hash)?
+                    .get("expr_kind")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string);
+                if value_kind.as_deref() == Some("record_literal") {
+                    operations.extend(self.lower_record_init_to_address(
+                        root,
+                        value_hash,
+                        &target_type,
+                        &target_address,
+                        param_types,
+                        ctx,
+                        locals,
+                    )?);
+                } else if value_kind.as_deref() == Some("enum_construct") {
+                    operations.extend(self.lower_enum_init_to_address(
+                        root,
+                        value_hash,
+                        &target_type,
+                        &target_address,
+                        param_types,
+                        ctx,
+                        locals,
+                    )?);
+                } else if value_kind.as_deref() == Some("array_literal") {
+                    operations.extend(self.lower_array_init_to_address(
+                        root,
+                        value_hash,
+                        &target_type,
+                        &target_address,
+                        param_types,
+                        ctx,
+                        locals,
+                    )?);
+                } else if self.type_passes_indirect(root, ctx.target_triple(), &target_type)?
+                    && self.expr_is_place(value_hash)?
+                {
+                    operations.extend(self.lower_aggregate_place_init_to_address(
+                        root,
+                        value_hash,
+                        &target_type,
+                        &target_address,
+                        param_types,
+                        ctx,
+                        locals,
+                    )?);
+                } else {
+                    let value =
+                        self.lower_expr_as(root, value_hash, &target_type, param_types, ctx, locals)?;
+                    if !self.type_assignable_in_root(root, &value.type_hash, &target_type)? {
+                        bail!("assignment type mismatch while lowering");
+                    }
+                    operations.extend(value.operations);
+                    operations.push(LoweredOp::Store {
+                        address: target_address,
+                        value: value.value,
+                        type_hash: target_type,
+                    });
                 }
                 let id = ctx.value();
                 ctx.push_debug_op(expr_hash, "const_unit", &id);
-                let mut operations = target.operations;
-                operations.extend(value.operations);
-                operations.push(LoweredOp::Store {
-                    address: target.address,
-                    value: value.value,
-                    type_hash: target.type_hash,
-                });
                 operations.push(LoweredOp::ConstUnit {
                     id: id.clone(),
                     type_hash: type_hash.clone(),
@@ -4570,8 +4632,37 @@ impl CodeDb {
                     if address_type(addresses, address)? != type_hash {
                         bail!("lowered store address type mismatch");
                     }
-                    if !self.type_assignable_in_root(root, value_type(values, value)?, type_hash)? {
+                    let value_ty = value_type(values, value)?;
+                    if !self.type_assignable_in_root(root, value_ty, type_hash)? {
                         bail!("lowered store value type mismatch");
+                    }
+                    // Layout backstop for the field/variant-order miscompile
+                    // class: a record/enum/array value whose static type is only
+                    // *name*-assignable to the destination (e.g. a structural,
+                    // alphabetically-ordered literal type vs a named type with a
+                    // different declared field/variant order) would blind-copy
+                    // its bytes to the wrong offsets. Require byte-layout
+                    // compatibility, mirroring `lower_expr_as`, so any value-flow
+                    // sink that forgets to build into the destination layout
+                    // fails closed here instead of miscompiling. Scalars and
+                    // references are layout-trivial under the assignable check.
+                    if value_ty != type_hash
+                        && (self.type_is_record(root, value_ty)?
+                            || self.type_is_record(root, type_hash)?
+                            || self.type_is_enum(root, value_ty)?
+                            || self.type_is_enum(root, type_hash)?
+                            || self.type_is_fixed_array(root, value_ty)?
+                            || self.type_is_fixed_array(root, type_hash)?)
+                        && !self.layouts_blind_copy_compatible(
+                            root,
+                            target_triple,
+                            value_ty,
+                            type_hash,
+                        )?
+                    {
+                        bail!(
+                            "lowered store reinterprets an aggregate value of type {value_ty} under incompatible destination layout {type_hash}"
+                        );
                     }
                 }
                 LoweredOp::Copy {
