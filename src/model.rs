@@ -151,10 +151,20 @@ impl TestCategory {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum TestValue {
-    I64 { value: String },
-    Bool { value: bool },
+    I64 {
+        value: String,
+    },
+    Bool {
+        value: bool,
+    },
     Unit,
-    Record { fields: Vec<TestRecordField> },
+    Record {
+        fields: Vec<TestRecordField>,
+    },
+    Enum {
+        variant: String,
+        value: Box<TestValue>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

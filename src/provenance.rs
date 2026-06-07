@@ -7,9 +7,9 @@ use serde_json::{Value as JsonValue, json};
 use crate::MAIN_BRANCH;
 use crate::migrations::Operation;
 use crate::model::{ProgramRootPayload, aliases_for, param_names, test_binding_for};
-use crate::types::TypeDefinition;
 use crate::store::{CodeDb, canonical_json};
 use crate::tests::{test_value_from_value, value_from_test_value};
+use crate::types::TypeDefinition;
 
 const BLAME_SYMBOL_SCHEMA: &str = "codedb/blame-symbol/v1";
 const BLAME_EXPR_SCHEMA: &str = "codedb/blame-expr/v1";
@@ -333,7 +333,12 @@ impl CodeDb {
     ) -> Result<String> {
         Ok(format!(
             "{}\n",
-            canonical_json(&self.blame_member_branch_value(branch, type_or_name, variant, false)?)
+            canonical_json(&self.blame_member_branch_value(
+                branch,
+                type_or_name,
+                variant,
+                false
+            )?)
         ))
     }
 
@@ -1170,7 +1175,12 @@ impl CodeDb {
                 if self
                     .resolve_type_name(&item.output_root, module, name)
                     .is_ok_and(|created| created == type_symbol)
-                    && self.type_has_member(&item.output_root, type_symbol, member_symbol, is_field)?
+                    && self.type_has_member(
+                        &item.output_root,
+                        type_symbol,
+                        member_symbol,
+                        is_field,
+                    )?
                 {
                     reasons.insert("birth");
                     reasons.insert("name");
@@ -1183,7 +1193,11 @@ impl CodeDb {
             } if is_field => {
                 if changed == type_symbol
                     && self
-                        .field_symbol_by_name(&self.load_root(&item.output_root)?, changed, &field.name)
+                        .field_symbol_by_name(
+                            &self.load_root(&item.output_root)?,
+                            changed,
+                            &field.name,
+                        )
                         .is_ok_and(|symbol| symbol == member_symbol)
                 {
                     reasons.insert("birth");
@@ -1286,8 +1300,12 @@ impl CodeDb {
     ) -> Result<bool> {
         let old = self.load_root(old_root)?;
         let new = self.load_root(new_root)?;
-        let old_def = self.root_type(&old, type_symbol).map(|entry| &entry.type_def);
-        let new_def = self.root_type(&new, type_symbol).map(|entry| &entry.type_def);
+        let old_def = self
+            .root_type(&old, type_symbol)
+            .map(|entry| &entry.type_def);
+        let new_def = self
+            .root_type(&new, type_symbol)
+            .map(|entry| &entry.type_def);
         if old_def != new_def {
             return Ok(true);
         }

@@ -76,6 +76,17 @@ pub(crate) struct LoweredBlock {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LoweredCaseArm {
+    pub(crate) variant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) variant_symbol: Option<String>,
+    pub(crate) tag_value: u64,
+    pub(crate) payload_type_hash: String,
+    pub(crate) payload_offset_bytes: u64,
+    pub(crate) block: LoweredBlock,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LoweredDebugMap {
     pub(crate) schema: String,
     pub(crate) operations: Vec<LoweredDebugOp>,
@@ -133,6 +144,16 @@ pub(crate) enum LoweredPlace {
         owner_type_hash: String,
         #[serde(default, skip_serializing_if = "is_zero_u64")]
         offset_bytes: u64,
+        type_hash: String,
+    },
+    EnumPayload {
+        base: String,
+        variant: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        variant_symbol: Option<String>,
+        owner_type_hash: String,
+        tag_value: u64,
+        payload_offset_bytes: u64,
         type_hash: String,
     },
     Index {
@@ -203,6 +224,13 @@ pub(crate) enum LoweredOp {
         else_block: LoweredBlock,
         type_hash: String,
     },
+    Case {
+        id: String,
+        scrutinee: String,
+        enum_type_hash: String,
+        arms: Vec<LoweredCaseArm>,
+        type_hash: String,
+    },
     BorrowShared {
         id: String,
         address: String,
@@ -239,9 +267,26 @@ pub(crate) enum LoweredOp {
         id: String,
         place: LoweredPlace,
     },
+    AddrOfEnumPayload {
+        id: String,
+        place: LoweredPlace,
+    },
     AddrOfIndex {
         id: String,
         place: LoweredPlace,
+    },
+    LoadEnumTag {
+        id: String,
+        address: String,
+        type_hash: String,
+    },
+    StoreEnumTag {
+        address: String,
+        type_hash: String,
+        variant: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        variant_symbol: Option<String>,
+        tag_value: u64,
     },
     Load {
         id: String,
@@ -301,6 +346,13 @@ struct LoweredFieldInfo {
     type_hash: String,
     field_symbol: Option<String>,
     offset_bytes: u64,
+}
+
+struct LoweredVariantInfo {
+    type_hash: String,
+    variant_symbol: Option<String>,
+    tag_value: u64,
+    payload_offset_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -590,8 +642,14 @@ impl CodeDb {
         }
 
         let mut ctx = LowerCtx::new(target_triple);
-        let mut lowered =
-            self.lower_expr_as(root, &body, &return_type, &param_types, &mut ctx, &mut Vec::new())?;
+        let mut lowered = self.lower_expr_as(
+            root,
+            &body,
+            &return_type,
+            &param_types,
+            &mut ctx,
+            &mut Vec::new(),
+        )?;
         lowered.operations.extend(self.lower_param_drop_scaffolds(
             root,
             target_triple,
@@ -878,13 +936,23 @@ impl CodeDb {
                         type_hash: binding_type.clone(),
                     },
                 }];
-                if self
+                let value_kind = self
                     .get_payload(value_hash)?
                     .get("expr_kind")
                     .and_then(JsonValue::as_str)
-                    == Some("record_literal")
-                {
+                    .map(str::to_string);
+                if value_kind.as_deref() == Some("record_literal") {
                     operations.extend(self.lower_record_init_to_address(
+                        root,
+                        value_hash,
+                        &binding_type,
+                        &address,
+                        param_types,
+                        ctx,
+                        locals,
+                    )?);
+                } else if value_kind.as_deref() == Some("enum_construct") {
+                    operations.extend(self.lower_enum_init_to_address(
                         root,
                         value_hash,
                         &binding_type,
@@ -1061,16 +1129,14 @@ impl CodeDb {
                     type_hash,
                 })
             }
-            "record_literal" => {
-                self.lower_record_literal_into_slot(
-                    root,
-                    expr_hash,
-                    &type_hash,
-                    param_types,
-                    ctx,
-                    locals,
-                )
-            }
+            "record_literal" => self.lower_record_literal_into_slot(
+                root,
+                expr_hash,
+                &type_hash,
+                param_types,
+                ctx,
+                locals,
+            ),
             "if" => {
                 let cond_hash = payload
                     .get("cond")
@@ -1139,9 +1205,15 @@ impl CodeDb {
             "field_access" => {
                 self.lower_place_value(root, expr_hash, &type_hash, param_types, ctx, locals)
             }
-            "enum_construct" | "case" => {
-                bail!("lowering v1 does not support aggregate expression kind {expr_kind}")
-            }
+            "enum_construct" => self.lower_enum_construct_into_slot(
+                root,
+                expr_hash,
+                &type_hash,
+                param_types,
+                ctx,
+                locals,
+            ),
+            "case" => self.lower_case(root, expr_hash, &type_hash, param_types, ctx, locals),
             other => bail!("unknown expression kind {other}"),
         }
     }
@@ -1592,6 +1664,80 @@ impl CodeDb {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn lower_enum_init_to_address(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        target_type: &str,
+        target_address: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<Vec<LoweredOp>> {
+        let payload = self.get_payload(expr_hash)?;
+        if payload.get("expr_kind").and_then(JsonValue::as_str) != Some("enum_construct") {
+            bail!("enum initializer must be enum_construct");
+        }
+        let declared_type = payload
+            .get("enum_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("enum_construct missing enum_type"))?;
+        if !self.type_assignable_in_root(root, declared_type, target_type)? {
+            bail!("enum initializer type mismatch while lowering");
+        }
+        let variant = payload
+            .get("variant")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("enum_construct missing variant"))?;
+        let value_hash = payload
+            .get("value")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("enum_construct missing value"))?;
+        let variant_info =
+            self.lowered_enum_variant(root, ctx.target_triple(), target_type, variant)?;
+        let value = self.lower_expr_as(
+            root,
+            value_hash,
+            &variant_info.type_hash,
+            param_types,
+            ctx,
+            locals,
+        )?;
+        if !self.type_assignable_in_root(root, &value.type_hash, &variant_info.type_hash)? {
+            bail!("enum initializer variant {variant} payload type mismatch while lowering");
+        }
+
+        let mut operations = value.operations;
+        operations.push(LoweredOp::StoreEnumTag {
+            address: target_address.to_string(),
+            type_hash: target_type.to_string(),
+            variant: variant.to_string(),
+            variant_symbol: variant_info.variant_symbol.clone(),
+            tag_value: variant_info.tag_value,
+        });
+        let payload_address = ctx.value();
+        ctx.push_debug_op(expr_hash, "addr_of_enum_payload", &payload_address);
+        operations.push(LoweredOp::AddrOfEnumPayload {
+            id: payload_address.clone(),
+            place: LoweredPlace::EnumPayload {
+                base: target_address.to_string(),
+                variant: variant.to_string(),
+                variant_symbol: variant_info.variant_symbol,
+                owner_type_hash: target_type.to_string(),
+                tag_value: variant_info.tag_value,
+                payload_offset_bytes: variant_info.payload_offset_bytes,
+                type_hash: variant_info.type_hash.clone(),
+            },
+        });
+        operations.push(LoweredOp::Store {
+            address: payload_address,
+            value: value.value,
+            type_hash: variant_info.type_hash,
+        });
+        Ok(operations)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn lower_aggregate_place_init_to_address(
         &self,
         root: &ProgramRootPayload,
@@ -1606,6 +1752,42 @@ impl CodeDb {
         let source_type = expr_type(&source_payload, expr_hash)?;
         if !self.type_assignable_in_root(root, &source_type, target_type)? {
             bail!("aggregate initializer type mismatch while lowering");
+        }
+        if self.type_is_enum(root, target_type)? {
+            if !self.layouts_blind_copy_compatible(
+                root,
+                ctx.target_triple(),
+                &source_type,
+                target_type,
+            )? {
+                bail!("unsupported_aggregate_layout: enum initializer layout mismatch");
+            }
+            let source = self.lower_place(root, expr_hash, param_types, ctx, locals)?;
+            let mut operations = source.operations;
+            let scaffold_id = ctx.value();
+            if self.type_is_move_only(root, ctx.target_triple(), &source_type)? {
+                let root_slot = self.require_whole_slot_move(expr_hash, locals)?;
+                ctx.push_debug_op(expr_hash, "move", &scaffold_id);
+                operations.push(LoweredOp::Move {
+                    id: scaffold_id.clone(),
+                    address: source.address,
+                    type_hash: source_type.clone(),
+                });
+                ctx.mark_moved(root_slot);
+            } else {
+                ctx.push_debug_op(expr_hash, "copy", &scaffold_id);
+                operations.push(LoweredOp::Copy {
+                    id: scaffold_id.clone(),
+                    value: source.address,
+                    type_hash: source_type.clone(),
+                });
+            }
+            operations.push(LoweredOp::Store {
+                address: target_address.to_string(),
+                value: scaffold_id,
+                type_hash: target_type.to_string(),
+            });
+            return Ok(operations);
         }
         let source = self.lower_place(root, expr_hash, param_types, ctx, locals)?;
         let mut operations = source.operations;
@@ -1756,6 +1938,280 @@ impl CodeDb {
         }
     }
 
+    fn lower_enum_construct_into_slot(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        slot_type: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let slot_size =
+            stack_slot_size_bytes(self.layout_size_bytes(root, ctx.target_triple(), slot_type)?);
+        let slot = ctx.local_slot(slot_type.to_string(), slot_size);
+        let address = ctx.value();
+        ctx.push_debug_op(expr_hash, "addr_of_local", &address);
+        let mut operations = vec![LoweredOp::AddrOfLocal {
+            id: address.clone(),
+            place: LoweredPlace::Local {
+                slot,
+                type_hash: slot_type.to_string(),
+            },
+        }];
+        operations.extend(self.lower_enum_init_to_address(
+            root,
+            expr_hash,
+            slot_type,
+            &address,
+            param_types,
+            ctx,
+            locals,
+        )?);
+        if self.type_passes_indirect(root, ctx.target_triple(), slot_type)? {
+            Ok(LoweredExpr {
+                operations,
+                value: address,
+                type_hash: slot_type.to_string(),
+            })
+        } else {
+            let id = ctx.value();
+            ctx.push_debug_op(expr_hash, "load", &id);
+            operations.push(LoweredOp::Load {
+                id: id.clone(),
+                address,
+                type_hash: slot_type.to_string(),
+            });
+            Ok(LoweredExpr {
+                operations,
+                value: id,
+                type_hash: slot_type.to_string(),
+            })
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_case(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let scrutinee_hash = payload
+            .get("expr")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("case missing expr"))?;
+        let scrutinee = self.lower_expr(root, scrutinee_hash, param_types, ctx, locals)?;
+        if !matches!(
+            self.type_spec_in_root(root, &scrutinee.type_hash)?,
+            TypeSpec::Enum(_)
+        ) {
+            bail!("case lowering requires enum scrutinee");
+        }
+        let arms = payload
+            .get("arms")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| anyhow!("case missing arms"))?;
+        if arms.is_empty() {
+            bail!("case lowering requires at least one arm");
+        }
+
+        let locals_boundary = ctx.next_local;
+        let moved_before = ctx.moved.clone();
+        let mut expected_arm_moves: Option<BTreeSet<RootSlot>> = None;
+        let mut lowered_arms = Vec::with_capacity(arms.len());
+        for arm in arms {
+            ctx.moved = moved_before.clone();
+            let variant = arm
+                .get("variant")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("case arm missing variant"))?;
+            let variant_info = self.lowered_enum_variant(
+                root,
+                ctx.target_triple(),
+                &scrutinee.type_hash,
+                variant,
+            )?;
+            let mut arm_operations = Vec::new();
+            if arm
+                .get("binding_name")
+                .and_then(JsonValue::as_str)
+                .is_some()
+            {
+                if self.type_is_move_only(root, ctx.target_triple(), &variant_info.type_hash)? {
+                    bail!(
+                        "unsupported_move: lowering does not support moving a move-only enum payload out of a case arm; field-granular drop glue is not yet implemented (SPEC_V2 §12, PLAN_V2 Phase 15)"
+                    );
+                }
+                let slot_size = stack_slot_size_bytes(self.layout_size_bytes(
+                    root,
+                    ctx.target_triple(),
+                    &variant_info.type_hash,
+                )?);
+                let slot = ctx.local_slot(variant_info.type_hash.clone(), slot_size);
+                let payload_address = ctx.value();
+                ctx.push_debug_op(expr_hash, "addr_of_enum_payload", &payload_address);
+                arm_operations.push(LoweredOp::AddrOfEnumPayload {
+                    id: payload_address.clone(),
+                    place: LoweredPlace::EnumPayload {
+                        base: scrutinee.value.clone(),
+                        variant: variant.to_string(),
+                        variant_symbol: variant_info.variant_symbol.clone(),
+                        owner_type_hash: scrutinee.type_hash.clone(),
+                        tag_value: variant_info.tag_value,
+                        payload_offset_bytes: variant_info.payload_offset_bytes,
+                        type_hash: variant_info.type_hash.clone(),
+                    },
+                });
+                let payload_value = self.lower_copy_value_from_address(
+                    root,
+                    expr_hash,
+                    &variant_info.type_hash,
+                    &payload_address,
+                    ctx,
+                    &mut arm_operations,
+                )?;
+                let local_address = ctx.value();
+                ctx.push_debug_op(expr_hash, "addr_of_local", &local_address);
+                arm_operations.push(LoweredOp::AddrOfLocal {
+                    id: local_address.clone(),
+                    place: LoweredPlace::Local {
+                        slot,
+                        type_hash: variant_info.type_hash.clone(),
+                    },
+                });
+                arm_operations.push(LoweredOp::Store {
+                    address: local_address,
+                    value: payload_value,
+                    type_hash: variant_info.type_hash.clone(),
+                });
+                locals.push(LocalLoweredBinding {
+                    slot,
+                    type_hash: variant_info.type_hash.clone(),
+                });
+                let body_hash = arm
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("case arm missing body"))?;
+                let body = self.lower_expr(root, body_hash, param_types, ctx, locals);
+                locals.pop();
+                let body = body?;
+                if body.type_hash != type_hash {
+                    bail!("case arm {variant} result type mismatch while lowering");
+                }
+                arm_operations.extend(body.operations);
+                lowered_arms.push(LoweredCaseArm {
+                    variant: variant.to_string(),
+                    variant_symbol: variant_info.variant_symbol,
+                    tag_value: variant_info.tag_value,
+                    payload_type_hash: variant_info.type_hash,
+                    payload_offset_bytes: variant_info.payload_offset_bytes,
+                    block: LoweredBlock {
+                        operations: arm_operations,
+                        result: body.value,
+                    },
+                });
+            } else {
+                let body_hash = arm
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("case arm missing body"))?;
+                let body = self.lower_expr(root, body_hash, param_types, ctx, locals)?;
+                if body.type_hash != type_hash {
+                    bail!("case arm {variant} result type mismatch while lowering");
+                }
+                arm_operations.extend(body.operations);
+                lowered_arms.push(LoweredCaseArm {
+                    variant: variant.to_string(),
+                    variant_symbol: variant_info.variant_symbol,
+                    tag_value: variant_info.tag_value,
+                    payload_type_hash: variant_info.type_hash,
+                    payload_offset_bytes: variant_info.payload_offset_bytes,
+                    block: LoweredBlock {
+                        operations: arm_operations,
+                        result: body.value,
+                    },
+                });
+            }
+
+            let arm_moves = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
+            match &expected_arm_moves {
+                Some(expected) if expected != &arm_moves => {
+                    bail!(
+                        "unsupported_move: lowering does not support moving an owned value in only some arms of a `case`; move it in every arm or none — conditional drop glue is not yet implemented (SPEC_V2 §12, PLAN_V2 Phase 15)"
+                    );
+                }
+                None => expected_arm_moves = Some(arm_moves),
+                _ => {}
+            }
+        }
+        if let Some(moves) = expected_arm_moves {
+            ctx.moved = moved_before.union(&moves).copied().collect();
+        } else {
+            ctx.moved = moved_before;
+        }
+
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "case", &id);
+        let mut operations = scrutinee.operations;
+        operations.push(LoweredOp::Case {
+            id: id.clone(),
+            scrutinee: scrutinee.value,
+            enum_type_hash: scrutinee.type_hash,
+            arms: lowered_arms,
+            type_hash: type_hash.to_string(),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash.to_string(),
+        })
+    }
+
+    fn lower_copy_value_from_address(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        address: &str,
+        ctx: &mut LowerCtx,
+        operations: &mut Vec<LoweredOp>,
+    ) -> Result<String> {
+        if self.type_passes_indirect(root, ctx.target_triple(), type_hash)? {
+            let id = ctx.value();
+            ctx.push_debug_op(expr_hash, "copy", &id);
+            operations.push(LoweredOp::Copy {
+                id: id.clone(),
+                value: address.to_string(),
+                type_hash: type_hash.to_string(),
+            });
+            return Ok(id);
+        }
+        let loaded_id = ctx.value();
+        ctx.push_debug_op(expr_hash, "load", &loaded_id);
+        operations.push(LoweredOp::Load {
+            id: loaded_id.clone(),
+            address: address.to_string(),
+            type_hash: type_hash.to_string(),
+        });
+        if self.type_requires_copy_scaffold(root, ctx.target_triple(), type_hash)? {
+            let copy_id = ctx.value();
+            ctx.push_debug_op(expr_hash, "copy", &copy_id);
+            operations.push(LoweredOp::Copy {
+                id: copy_id.clone(),
+                value: loaded_id,
+                type_hash: type_hash.to_string(),
+            });
+            Ok(copy_id)
+        } else {
+            Ok(loaded_id)
+        }
+    }
+
     /// Lower `expr_hash` so its result is usable where `expected_type` is
     /// required. A record literal is built directly in `expected_type`'s layout.
     /// Any other value whose static type differs from `expected_type` is allowed
@@ -1787,10 +2243,27 @@ impl CodeDb {
                 locals,
             );
         }
+        let is_enum_construct = self
+            .get_payload(expr_hash)?
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            == Some("enum_construct");
+        if is_enum_construct && self.type_is_enum(root, expected_type)? {
+            return self.lower_enum_construct_into_slot(
+                root,
+                expr_hash,
+                expected_type,
+                param_types,
+                ctx,
+                locals,
+            );
+        }
         let value = self.lower_expr(root, expr_hash, param_types, ctx, locals)?;
         if value.type_hash != expected_type
             && (self.type_is_record(root, &value.type_hash)?
-                || self.type_is_record(root, expected_type)?)
+                || self.type_is_record(root, expected_type)?
+                || self.type_is_enum(root, &value.type_hash)?
+                || self.type_is_enum(root, expected_type)?)
             && !self.layouts_blind_copy_compatible(
                 root,
                 ctx.target_triple(),
@@ -1799,7 +2272,7 @@ impl CodeDb {
             )?
         {
             bail!(
-                "unsupported_record_layout: a value of type {} cannot be used where {} is expected because their native field layouts differ (the named type is declared in a non-canonical field order); bind it with an explicit `let x: <Type> = <record literal>` so it is built in the destination layout",
+                "unsupported_aggregate_layout: a value of type {} cannot be used where {} is expected because their native layouts differ; bind aggregate literals with an explicit `let x: <Type> = <literal>` so they are built in the destination layout",
                 value.type_hash,
                 expected_type
             );
@@ -1811,6 +2284,13 @@ impl CodeDb {
         Ok(matches!(
             self.type_spec_in_root(root, type_hash)?,
             TypeSpec::Record(_)
+        ))
+    }
+
+    fn type_is_enum(&self, root: &ProgramRootPayload, type_hash: &str) -> Result<bool> {
+        Ok(matches!(
+            self.type_spec_in_root(root, type_hash)?,
+            TypeSpec::Enum(_)
         ))
     }
 
@@ -1863,7 +2343,42 @@ impl CodeDb {
                 Ok(self.layout_size_bytes(root, target_triple, src)?
                     == self.layout_size_bytes(root, target_triple, dst)?)
             }
-            (TypeSpec::Record(_), _) | (_, TypeSpec::Record(_)) => Ok(false),
+            (TypeSpec::Enum(src_variants), TypeSpec::Enum(dst_variants)) => {
+                if src_variants.len() != dst_variants.len() {
+                    return Ok(false);
+                }
+                let src_layout = self.compute_type_layout(root, src, target_triple)?.metadata;
+                let dst_layout = self.compute_type_layout(root, dst, target_triple)?.metadata;
+                for dst_variant in &dst_variants {
+                    let Some(src_variant) = src_variants
+                        .iter()
+                        .find(|candidate| candidate.name == dst_variant.name)
+                    else {
+                        return Ok(false);
+                    };
+                    let src_info = enum_variant_layout(&src_layout, &dst_variant.name)?;
+                    let dst_info = enum_variant_layout(&dst_layout, &dst_variant.name)?;
+                    if src_info.tag_value != dst_info.tag_value
+                        || src_info.payload_offset_bytes != dst_info.payload_offset_bytes
+                    {
+                        return Ok(false);
+                    }
+                    if !self.layouts_blind_copy_compatible(
+                        root,
+                        target_triple,
+                        &src_variant.type_hash,
+                        &dst_variant.type_hash,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                Ok(self.layout_size_bytes(root, target_triple, src)?
+                    == self.layout_size_bytes(root, target_triple, dst)?)
+            }
+            (TypeSpec::Record(_), _)
+            | (_, TypeSpec::Record(_))
+            | (TypeSpec::Enum(_), _)
+            | (_, TypeSpec::Enum(_)) => Ok(false),
             _ => self.scalar_layouts_equal(root, target_triple, src, dst),
         }
     }
@@ -1877,9 +2392,11 @@ impl CodeDb {
     ) -> Result<bool> {
         let src_layout = self.compute_type_layout(root, src, target_triple)?;
         let dst_layout = self.compute_type_layout(root, dst, target_triple)?;
-        Ok(src_layout.metadata.get("kind") == dst_layout.metadata.get("kind")
-            && src_layout.metadata.get("size_bytes") == dst_layout.metadata.get("size_bytes")
-            && src_layout.metadata.get("align_bytes") == dst_layout.metadata.get("align_bytes"))
+        Ok(
+            src_layout.metadata.get("kind") == dst_layout.metadata.get("kind")
+                && src_layout.metadata.get("size_bytes") == dst_layout.metadata.get("size_bytes")
+                && src_layout.metadata.get("align_bytes") == dst_layout.metadata.get("align_bytes"),
+        )
     }
 
     fn lowered_record_field(
@@ -1918,6 +2435,42 @@ impl CodeDb {
                 .ok_or_else(|| anyhow!("record has no field {field}")),
             other => bail!(
                 "field access requires record type, got {}",
+                other.to_source(self)?
+            ),
+        }
+    }
+
+    fn lowered_enum_variant(
+        &self,
+        root: &ProgramRootPayload,
+        target_triple: &str,
+        type_hash: &str,
+        variant: &str,
+    ) -> Result<LoweredVariantInfo> {
+        let layout = self
+            .compute_type_layout(root, type_hash, target_triple)?
+            .metadata;
+        let layout_variant = enum_variant_layout(&layout, variant)?;
+        let variant_symbol = layout_variant.variant_symbol;
+        match self.type_spec_in_root(root, type_hash)? {
+            TypeSpec::Enum(variants) => {
+                let variant_type = variants
+                    .into_iter()
+                    .find(|candidate| candidate.name == variant)
+                    .map(|candidate| candidate.type_hash)
+                    .ok_or_else(|| anyhow!("enum has no variant {variant}"))?;
+                if layout_variant.type_hash != variant_type {
+                    bail!("enum layout variant {variant} type mismatch");
+                }
+                Ok(LoweredVariantInfo {
+                    type_hash: variant_type,
+                    variant_symbol,
+                    tag_value: layout_variant.tag_value,
+                    payload_offset_bytes: layout_variant.payload_offset_bytes,
+                })
+            }
+            other => bail!(
+                "enum variant access requires enum type, got {}",
                 other.to_source(self)?
             ),
         }
@@ -2074,7 +2627,10 @@ impl CodeDb {
     ) -> Result<()> {
         let type_name = self.type_name(type_hash)?;
         match self.type_spec_in_root(root, type_hash)? {
-            TypeSpec::Builtin(_) | TypeSpec::Record(_) | TypeSpec::Reference { .. } => Ok(()),
+            TypeSpec::Builtin(_)
+            | TypeSpec::Record(_)
+            | TypeSpec::Enum(_)
+            | TypeSpec::Reference { .. } => Ok(()),
             _ => bail!("lowering v1 does not support aggregate return type {type_name}"),
         }
     }
@@ -2614,6 +3170,78 @@ impl CodeDb {
                     }
                     insert_value(values, id, type_hash)?;
                 }
+                LoweredOp::Case {
+                    id,
+                    scrutinee,
+                    enum_type_hash,
+                    arms,
+                    type_hash,
+                } => {
+                    if value_type(values, scrutinee)? != enum_type_hash {
+                        bail!("lowered case scrutinee type mismatch");
+                    }
+                    if self.type_passes_indirect(root, target_triple, enum_type_hash)?
+                        && address_type(addresses, scrutinee)? != enum_type_hash
+                    {
+                        bail!("lowered case scrutinee address type mismatch");
+                    }
+                    let TypeSpec::Enum(variants) = self.type_spec_in_root(root, enum_type_hash)?
+                    else {
+                        bail!("lowered case requires enum scrutinee");
+                    };
+                    let mut seen = BTreeSet::new();
+                    for arm in arms {
+                        if !seen.insert(arm.variant.clone()) {
+                            bail!("duplicate lowered case arm {}", arm.variant);
+                        }
+                        let variant = variants
+                            .iter()
+                            .find(|candidate| candidate.name == arm.variant)
+                            .ok_or_else(|| {
+                                anyhow!("lowered case arm uses unknown variant {}", arm.variant)
+                            })?;
+                        if variant.type_hash != arm.payload_type_hash {
+                            bail!("lowered case arm payload type mismatch");
+                        }
+                        let layout_variant = self.lowered_enum_variant(
+                            root,
+                            target_triple,
+                            enum_type_hash,
+                            &arm.variant,
+                        )?;
+                        if layout_variant.variant_symbol != arm.variant_symbol
+                            || layout_variant.tag_value != arm.tag_value
+                            || layout_variant.payload_offset_bytes != arm.payload_offset_bytes
+                            || layout_variant.type_hash != arm.payload_type_hash
+                        {
+                            bail!("lowered case arm layout metadata mismatch");
+                        }
+                        let arm_type = self.verify_lowered_block(
+                            root,
+                            &arm.block,
+                            target_triple,
+                            param_types,
+                            local_slots,
+                            values,
+                            addresses,
+                            drop_state,
+                        )?;
+                        if arm_type != *type_hash {
+                            bail!("lowered case arm result type mismatch");
+                        }
+                    }
+                    let expected = variants
+                        .iter()
+                        .map(|variant| variant.name.clone())
+                        .collect::<BTreeSet<_>>();
+                    if seen != expected {
+                        bail!("lowered case must cover every enum variant");
+                    }
+                    insert_value(values, id, type_hash)?;
+                    if self.type_passes_indirect(root, target_triple, type_hash)? {
+                        insert_address(addresses, id, type_hash)?;
+                    }
+                }
                 LoweredOp::BorrowShared {
                     id,
                     address,
@@ -2774,6 +3402,37 @@ impl CodeDb {
                         insert_value(values, id, type_hash)?;
                     }
                 }
+                LoweredOp::AddrOfEnumPayload { id, place } => {
+                    let LoweredPlace::EnumPayload {
+                        base,
+                        variant,
+                        variant_symbol,
+                        owner_type_hash,
+                        tag_value,
+                        payload_offset_bytes,
+                        type_hash,
+                    } = place
+                    else {
+                        bail!("addr_of_enum_payload must contain an enum payload place");
+                    };
+                    let base_type = address_type(addresses, base)?;
+                    if base_type != owner_type_hash {
+                        bail!("lowered addr_of_enum_payload owner type mismatch");
+                    }
+                    let variant_info =
+                        self.lowered_enum_variant(root, target_triple, owner_type_hash, variant)?;
+                    if variant_info.type_hash != *type_hash
+                        || variant_info.variant_symbol != *variant_symbol
+                        || variant_info.tag_value != *tag_value
+                        || variant_info.payload_offset_bytes != *payload_offset_bytes
+                    {
+                        bail!("lowered addr_of_enum_payload metadata mismatch");
+                    }
+                    insert_address(addresses, id, type_hash)?;
+                    if self.is_aggregate_ir_type(root, type_hash)? {
+                        insert_value(values, id, type_hash)?;
+                    }
+                }
                 LoweredOp::AddrOfIndex { id, place } => {
                     let LoweredPlace::Index {
                         base,
@@ -2800,6 +3459,37 @@ impl CodeDb {
                         ),
                     }
                     insert_address(addresses, id, type_hash)?;
+                }
+                LoweredOp::LoadEnumTag {
+                    id,
+                    address,
+                    type_hash,
+                } => {
+                    if address_type(addresses, address)? != type_hash {
+                        bail!("lowered load_enum_tag address type mismatch");
+                    }
+                    if !matches!(self.type_spec_in_root(root, type_hash)?, TypeSpec::Enum(_)) {
+                        bail!("lowered load_enum_tag requires enum type");
+                    }
+                    insert_value(values, id, &type_hash_for("I64"))?;
+                }
+                LoweredOp::StoreEnumTag {
+                    address,
+                    type_hash,
+                    variant,
+                    variant_symbol,
+                    tag_value,
+                } => {
+                    if address_type(addresses, address)? != type_hash {
+                        bail!("lowered store_enum_tag address type mismatch");
+                    }
+                    let variant_info =
+                        self.lowered_enum_variant(root, target_triple, type_hash, variant)?;
+                    if variant_info.variant_symbol != *variant_symbol
+                        || variant_info.tag_value != *tag_value
+                    {
+                        bail!("lowered store_enum_tag metadata mismatch");
+                    }
                 }
                 LoweredOp::Load {
                     id,
@@ -3152,6 +3842,7 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::Binary { id, .. }
         | LoweredOp::Call { id, .. }
         | LoweredOp::If { id, .. }
+        | LoweredOp::Case { id, .. }
         | LoweredOp::BorrowShared { id, .. }
         | LoweredOp::BorrowMut { id, .. }
         | LoweredOp::DerefShared { id, .. }
@@ -3159,11 +3850,14 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::AddrOfParam { id, .. }
         | LoweredOp::AddrOfLocal { id, .. }
         | LoweredOp::AddrOfField { id, .. }
+        | LoweredOp::AddrOfEnumPayload { id, .. }
         | LoweredOp::AddrOfIndex { id, .. }
+        | LoweredOp::LoadEnumTag { id, .. }
         | LoweredOp::Load { id, .. }
         | LoweredOp::Copy { id, .. }
         | LoweredOp::Move { id, .. } => Some(id),
         LoweredOp::Store { .. }
+        | LoweredOp::StoreEnumTag { .. }
         | LoweredOp::Drop { .. }
         | LoweredOp::BorrowDebug { .. }
         | LoweredOp::Return { .. } => None,
@@ -3180,6 +3874,7 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::Binary { .. } => "binary",
         LoweredOp::Call { .. } => "call",
         LoweredOp::If { .. } => "if",
+        LoweredOp::Case { .. } => "case",
         LoweredOp::BorrowShared { .. } => "borrow_shared",
         LoweredOp::BorrowMut { .. } => "borrow_mut",
         LoweredOp::DerefShared { .. } => "deref_shared",
@@ -3187,7 +3882,10 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::AddrOfParam { .. } => "addr_of_param",
         LoweredOp::AddrOfLocal { .. } => "addr_of_local",
         LoweredOp::AddrOfField { .. } => "addr_of_field",
+        LoweredOp::AddrOfEnumPayload { .. } => "addr_of_enum_payload",
         LoweredOp::AddrOfIndex { .. } => "addr_of_index",
+        LoweredOp::LoadEnumTag { .. } => "load_enum_tag",
+        LoweredOp::StoreEnumTag { .. } => "store_enum_tag",
         LoweredOp::Load { .. } => "load",
         LoweredOp::Store { .. } => "store",
         LoweredOp::Copy { .. } => "copy",
@@ -3259,6 +3957,10 @@ fn collect_lowered_value_debug_infos(
         {
             collect_lowered_value_debug_infos(&then_block.operations, out)?;
             collect_lowered_value_debug_infos(&else_block.operations, out)?;
+        } else if let LoweredOp::Case { arms, .. } = op {
+            for arm in arms {
+                collect_lowered_value_debug_infos(&arm.block.operations, out)?;
+            }
         }
     }
     Ok(())
@@ -3275,10 +3977,13 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::Binary { type_hash, .. }
             | LoweredOp::Call { type_hash, .. }
             | LoweredOp::If { type_hash, .. }
+            | LoweredOp::Case { type_hash, .. }
             | LoweredOp::BorrowShared { type_hash, .. }
             | LoweredOp::BorrowMut { type_hash, .. }
+            | LoweredOp::LoadEnumTag { type_hash, .. }
             | LoweredOp::Load { type_hash, .. }
             | LoweredOp::Store { type_hash, .. }
+            | LoweredOp::StoreEnumTag { type_hash, .. }
             | LoweredOp::Copy { type_hash, .. }
             | LoweredOp::Move { type_hash, .. }
             | LoweredOp::Drop { type_hash, .. }
@@ -3297,6 +4002,7 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             LoweredOp::AddrOfParam { place, .. }
             | LoweredOp::AddrOfLocal { place, .. }
             | LoweredOp::AddrOfField { place, .. }
+            | LoweredOp::AddrOfEnumPayload { place, .. }
             | LoweredOp::AddrOfIndex { place, .. } => collect_place_type_hashes(place, out),
         }
         if let LoweredOp::If {
@@ -3307,6 +4013,17 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
         {
             collect_op_type_hashes(&then_block.operations, out);
             collect_op_type_hashes(&else_block.operations, out);
+        } else if let LoweredOp::Case {
+            enum_type_hash,
+            arms,
+            ..
+        } = op
+        {
+            out.insert(enum_type_hash.clone());
+            for arm in arms {
+                out.insert(arm.payload_type_hash.clone());
+                collect_op_type_hashes(&arm.block.operations, out);
+            }
         }
     }
 }
@@ -3317,6 +4034,11 @@ fn collect_place_type_hashes(place: &LoweredPlace, out: &mut BTreeSet<String>) {
             out.insert(type_hash.clone());
         }
         LoweredPlace::Field {
+            owner_type_hash,
+            type_hash,
+            ..
+        }
+        | LoweredPlace::EnumPayload {
             owner_type_hash,
             type_hash,
             ..
@@ -3348,6 +4070,45 @@ fn required_layout_u64(metadata: &JsonValue, key: &str) -> Result<u64> {
         .get(key)
         .and_then(JsonValue::as_u64)
         .ok_or_else(|| anyhow!("type layout missing integer {key}"))
+}
+
+struct EnumVariantLayout {
+    variant_symbol: Option<String>,
+    type_hash: String,
+    tag_value: u64,
+    payload_offset_bytes: u64,
+}
+
+fn enum_variant_layout(layout: &JsonValue, variant: &str) -> Result<EnumVariantLayout> {
+    if layout.get("kind").and_then(JsonValue::as_str) != Some("enum") {
+        bail!("type layout metadata must have kind enum");
+    }
+    let entry = layout
+        .get("variants")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .find(|entry| entry.get("name").and_then(JsonValue::as_str) == Some(variant))
+        .ok_or_else(|| anyhow!("enum layout missing variant {variant}"))?;
+    Ok(EnumVariantLayout {
+        variant_symbol: entry
+            .get("variant_symbol")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string),
+        type_hash: entry
+            .get("type_hash")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("enum layout variant {variant} missing type_hash"))?
+            .to_string(),
+        tag_value: entry
+            .get("tag_value")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| anyhow!("enum layout variant {variant} missing tag_value"))?,
+        payload_offset_bytes: entry
+            .get("payload_offset_bytes")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| anyhow!("enum layout variant {variant} missing payload_offset_bytes"))?,
+    })
 }
 
 fn is_hash(value: &str) -> bool {

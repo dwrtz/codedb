@@ -210,16 +210,34 @@ fn test_label_filter_selects_native_required_tests() {
     assert_eq!(names(&all), vec!["t_a", "t_b"]);
 
     // List filtered to the native-required label: only t_a.
-    let listed =
-        parse_json(&run(&["test", path(&db), "--list", "--label", "v2_native_required", "--json"]));
+    let listed = parse_json(&run(&[
+        "test",
+        path(&db),
+        "--list",
+        "--label",
+        "v2_native_required",
+        "--json",
+    ]));
     assert_eq!(names(&listed), vec!["t_a"]);
 
     // Run filtered: only t_a executes.
-    let ran = parse_json(&run(&["test", path(&db), "--label", "v2_native_required", "--json"]));
+    let ran = parse_json(&run(&[
+        "test",
+        path(&db),
+        "--label",
+        "v2_native_required",
+        "--json",
+    ]));
     assert_eq!(names(&ran), vec!["t_a"]);
 
     // Unknown label: nothing runs, run is vacuously passing.
-    let none = parse_json(&run(&["test", path(&db), "--label", "no_such_label", "--json"]));
+    let none = parse_json(&run(&[
+        "test",
+        path(&db),
+        "--label",
+        "no_such_label",
+        "--json",
+    ]));
     assert!(names(&none).is_empty());
     assert_eq!(none["status"], "passed");
 }

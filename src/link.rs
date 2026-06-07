@@ -59,6 +59,12 @@ struct NativeRecordFieldLayout {
     offset_bytes: u64,
 }
 
+struct NativeEnumVariantLayout {
+    type_hash: String,
+    tag_value: u64,
+    payload_offset_bytes: u64,
+}
+
 struct PlannedLink {
     input: JsonValue,
     input_hash: String,
@@ -320,7 +326,7 @@ impl CodeDb {
         Ok(NativeTestHarnessBuild {
             executable,
             artifact_hash,
-            harness_kind: "c-main-compare-record-return".to_string(),
+            harness_kind: "c-main-compare-aggregate-return".to_string(),
         })
     }
 
@@ -779,23 +785,26 @@ impl CodeDb {
             .ok_or_else(|| anyhow!("entry symbol missing from root {entry_symbol}"))?;
         let (params, return_type_hash) = self.signature_parts(&root_entry.signature)?;
         if !params.is_empty() {
-            bail!("native record harness entry must not take parameters");
+            bail!("native aggregate harness entry must not take parameters");
         }
-        if !matches!(expected, Value::Record(_)) {
-            bail!("native record harness requires a record expected value");
+        if !matches!(expected, Value::Record(_) | Value::Enum { .. }) {
+            bail!("native aggregate harness requires a record or enum expected value");
         }
         if !matches!(
             self.type_spec_in_root(root, &return_type_hash)?,
-            TypeSpec::Record(_)
+            TypeSpec::Record(_) | TypeSpec::Enum(_)
         ) {
-            bail!("native record harness entry must return a record");
+            bail!("native aggregate harness entry must return a record or enum");
         }
 
         let layout = self
             .compute_type_layout(root, &return_type_hash, target_triple)?
             .metadata;
-        if layout.get("kind").and_then(JsonValue::as_str) != Some("record") {
-            bail!("native record harness expected record layout metadata");
+        if !matches!(
+            layout.get("kind").and_then(JsonValue::as_str),
+            Some("record" | "enum")
+        ) {
+            bail!("native aggregate harness expected record or enum layout metadata");
         }
         let size_bytes = required_metadata_u64(&layout, "size_bytes")?;
         let align_bytes = required_metadata_u64(&layout, "align_bytes")?;
@@ -807,11 +816,10 @@ impl CodeDb {
             .ok_or_else(|| anyhow!("link plan missing entry ABI symbol"))?;
         let mut comparisons = String::new();
         let mut next_check = 1;
-        self.native_record_comparisons(
+        self.native_value_comparison(
             root,
             &return_type_hash,
             expected,
-            &layout,
             0,
             target_triple,
             &mut next_check,
@@ -830,7 +838,7 @@ impl CodeDb {
             "by_value" => format!(
                 "uint64_t {entry_abi_symbol}(void);\nstruct codedb_result {{ unsigned char bytes[{storage_bytes}]; }} __attribute__((aligned({align_bytes})));\nint main(void) {{\n  struct codedb_result out;\n  memset(&out, 0, sizeof(out));\n  uint64_t result = {entry_abi_symbol}();\n  memcpy(&out, &result, {size_bytes});\n"
             ),
-            other => bail!("native record harness unsupported return ABI {other}"),
+            other => bail!("native aggregate harness unsupported return ABI {other}"),
         };
         Ok(format!(
             "{export_wrappers}#include <stdint.h>\n#include <string.h>\n{call}{comparisons}  return 0;\n}}\n"
@@ -930,8 +938,38 @@ impl CodeDb {
                     out,
                 )
             }
+            (Value::Enum { variant, value }, TypeSpec::Enum(variants)) => {
+                let layout = self
+                    .compute_type_layout(root, type_hash, target_triple)?
+                    .metadata;
+                let variant_layouts = native_enum_variant_layouts(&layout)?;
+                let variant_layout = variant_layouts
+                    .get(variant)
+                    .ok_or_else(|| anyhow!("native enum layout missing variant {variant}"))?;
+                let variant_type = variants
+                    .iter()
+                    .find(|candidate| candidate.name == *variant)
+                    .ok_or_else(|| anyhow!("native enum comparison unknown variant {variant}"))?;
+                if variant_layout.type_hash != variant_type.type_hash {
+                    bail!("native enum layout variant {variant} type mismatch");
+                }
+                let tag_code = next_native_check_code(next_check);
+                out.push_str(&format!(
+                    "  {{ uint64_t actual; memcpy(&actual, ((const unsigned char *)&out) + {offset}, sizeof(actual)); if (actual != {}ULL) return {tag_code}; }}\n",
+                    variant_layout.tag_value
+                ));
+                self.native_value_comparison(
+                    root,
+                    &variant_type.type_hash,
+                    &value.borrow(),
+                    offset + variant_layout.payload_offset_bytes,
+                    target_triple,
+                    next_check,
+                    out,
+                )
+            }
             _ => bail!(
-                "native record harness direct record-value comparison supports only semantic test values containing i64, bool, unit, or nested records; reference-carrying records must be tested through native-required scalar entrypoints"
+                "native aggregate harness direct comparison supports only semantic test values containing i64, bool, unit, nested records, or nested enums; reference-carrying aggregates must be tested through native-required scalar entrypoints"
             ),
         }
     }
@@ -1003,6 +1041,47 @@ fn native_record_field_layouts(
         }
     }
     Ok(fields)
+}
+
+fn native_enum_variant_layouts(
+    layout: &JsonValue,
+) -> Result<BTreeMap<String, NativeEnumVariantLayout>> {
+    if layout.get("kind").and_then(JsonValue::as_str) != Some("enum") {
+        bail!("native enum layout metadata must have kind enum");
+    }
+    let mut variants = BTreeMap::new();
+    for variant in layout
+        .get("variants")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| anyhow!("native enum layout missing variants"))?
+    {
+        let name = variant
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("native enum layout variant missing name"))?
+            .to_string();
+        let type_hash = variant
+            .get("type_hash")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("native enum layout variant missing type_hash"))?
+            .to_string();
+        let tag_value = required_metadata_u64(variant, "tag_value")?;
+        let payload_offset_bytes = required_metadata_u64(variant, "payload_offset_bytes")?;
+        if variants
+            .insert(
+                name.clone(),
+                NativeEnumVariantLayout {
+                    type_hash,
+                    tag_value,
+                    payload_offset_bytes,
+                },
+            )
+            .is_some()
+        {
+            bail!("native enum layout has duplicate variant {name}");
+        }
+    }
+    Ok(variants)
 }
 
 fn json_metadata(artifact_json: &JsonValue) -> Result<JsonValue> {

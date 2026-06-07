@@ -3801,6 +3801,11 @@ fn collect_lowered_call_targets(
                 collect_lowered_call_targets(&then_block.operations, targets)?;
                 collect_lowered_call_targets(&else_block.operations, targets)?;
             }
+            LoweredOp::Case { arms, .. } => {
+                for arm in arms {
+                    collect_lowered_call_targets(&arm.block.operations, targets)?;
+                }
+            }
             LoweredOp::Param { .. }
             | LoweredOp::ConstI64 { .. }
             | LoweredOp::ConstBool { .. }
@@ -3810,12 +3815,15 @@ fn collect_lowered_call_targets(
             | LoweredOp::AddrOfParam { .. }
             | LoweredOp::AddrOfLocal { .. }
             | LoweredOp::AddrOfField { .. }
+            | LoweredOp::AddrOfEnumPayload { .. }
             | LoweredOp::AddrOfIndex { .. }
             | LoweredOp::BorrowShared { .. }
             | LoweredOp::BorrowMut { .. }
             | LoweredOp::DerefShared { .. }
             | LoweredOp::DerefMut { .. }
+            | LoweredOp::LoadEnumTag { .. }
             | LoweredOp::Load { .. }
+            | LoweredOp::StoreEnumTag { .. }
             | LoweredOp::Store { .. }
             | LoweredOp::Copy { .. }
             | LoweredOp::Move { .. }

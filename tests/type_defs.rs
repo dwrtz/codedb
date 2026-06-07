@@ -894,9 +894,14 @@ fn diff_reports_type_and_member_changes() {
     );
 
     // JSON diff must carry a field_renamed change record.
-    let json: JsonValue =
-        serde_json::from_str(&run(&["diff", path(&db), &root_with_money, &renamed_root, "--json"]))
-            .unwrap();
+    let json: JsonValue = serde_json::from_str(&run(&[
+        "diff",
+        path(&db),
+        &root_with_money,
+        &renamed_root,
+        "--json",
+    ]))
+    .unwrap();
     let kinds = json["changes"]
         .as_array()
         .unwrap()
@@ -970,8 +975,16 @@ record Bad {
     run(&["init", path(&db)]);
     run(&["import", path(&db), path(&source)]);
     bin()
-        .args(["emit-type-layout", path(&db), "Bad", "--out", path(&db.with_extension("layout.json"))])
+        .args([
+            "emit-type-layout",
+            path(&db),
+            "Bad",
+            "--out",
+            path(&db.with_extension("layout.json")),
+        ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("recursive type layout is not supported"));
+        .stderr(predicate::str::contains(
+            "recursive type layout is not supported",
+        ));
 }

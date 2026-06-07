@@ -1216,7 +1216,8 @@ impl CodeDb {
                 }
                 self.type_assignable_in_root(root, &actual_referent, &expected_referent)
             }
-            (TypeSpec::Record(actual_fields), TypeSpec::Record(expected_fields)) => {
+            (TypeSpec::Record(actual_fields), TypeSpec::Record(expected_fields))
+            | (TypeSpec::Enum(actual_fields), TypeSpec::Enum(expected_fields)) => {
                 if actual_fields.len() != expected_fields.len() {
                     return Ok(false);
                 }

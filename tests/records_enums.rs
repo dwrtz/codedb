@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use assert_cmd::Command;
-use predicates::prelude::*;
 use tempfile::tempdir;
 
 fn bin() -> Command {
@@ -103,17 +102,12 @@ fn main() -> i64 = case maybe_value() of none => 0 | some(x) => x + 1
     assert_eq!(run(&["eval", path(&rebuilt), "main"]).trim(), "42");
     run(&["verify", path(&rebuilt)]);
 
-    bin()
-        .args([
-            "emit-object",
-            path(&db),
-            "maybe_value",
-            "--out",
-            path(&temp.path().join("maybe.o")),
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "lowering v1 does not support aggregate return type enum {none: unit, some: i64}",
-        ));
+    run(&[
+        "emit-object",
+        path(&db),
+        "maybe_value",
+        "--out",
+        path(&temp.path().join("maybe.o")),
+    ]);
+    run(&["verify", path(&db)]);
 }

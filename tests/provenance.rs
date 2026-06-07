@@ -575,26 +575,46 @@ fn type_field_and_variant_blame_follow_migration_history() {
     let type_blame = parse_json(&run(&["blame-type", path(&db), "Cash", "--json"]));
     assert_eq!(type_blame["schema"], "codedb/blame-type/v1");
     assert_eq!(type_blame["name"], "Cash");
-    assert_eq!(type_blame["birth_migration"]["operation_kind"], "create_type");
+    assert_eq!(
+        type_blame["birth_migration"]["operation_kind"],
+        "create_type"
+    );
     assert_eq!(
         type_blame["last_rename_migration"]["operation_kind"],
         "rename_type"
     );
 
     // blame-field: born with its type (create_type), last renamed by rename_field.
-    let field_blame = parse_json(&run(&["blame-field", path(&db), "Cash", "pennies", "--json"]));
+    let field_blame = parse_json(&run(&[
+        "blame-field",
+        path(&db),
+        "Cash",
+        "pennies",
+        "--json",
+    ]));
     assert_eq!(field_blame["schema"], "codedb/blame-field/v1");
-    assert_eq!(field_blame["birth_migration"]["operation_kind"], "create_type");
+    assert_eq!(
+        field_blame["birth_migration"]["operation_kind"],
+        "create_type"
+    );
     assert_eq!(
         field_blame["last_rename_migration"]["operation_kind"],
         "rename_field"
     );
 
     // blame-variant: last renamed by rename_variant.
-    let variant_blame =
-        parse_json(&run(&["blame-variant", path(&db), "Discount", "pct", "--json"]));
+    let variant_blame = parse_json(&run(&[
+        "blame-variant",
+        path(&db),
+        "Discount",
+        "pct",
+        "--json",
+    ]));
     assert_eq!(variant_blame["schema"], "codedb/blame-variant/v1");
-    assert_eq!(variant_blame["birth_migration"]["operation_kind"], "create_type");
+    assert_eq!(
+        variant_blame["birth_migration"]["operation_kind"],
+        "create_type"
+    );
     assert_eq!(
         variant_blame["last_rename_migration"]["operation_kind"],
         "rename_variant"

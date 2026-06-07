@@ -603,6 +603,13 @@ verify catches invalid field offsets and ABI metadata
 
 Goal: compile tagged unions and pattern matching/case to native code.
 
+Status: implemented. Enum construction now lowers to layout-driven native
+storage with explicit tag writes and payload stores, `case` lowers to a
+semantic `case` IR operation with checked tag dispatch and payload extraction,
+native object backends emit enum tag/payload code for x86_64 ELF and arm64
+Mach-O, enum test values serialize through semantic tests, and native-required
+enum tests compare direct enum returns through the aggregate harness.
+
 Deliverables:
 
 ```text

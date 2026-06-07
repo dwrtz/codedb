@@ -442,7 +442,11 @@ impl CodeDb {
         Ok(out)
     }
 
-    pub fn run_tests_branch_json(&mut self, branch_name: &str, labels: &[String]) -> Result<String> {
+    pub fn run_tests_branch_json(
+        &mut self,
+        branch_name: &str,
+        labels: &[String],
+    ) -> Result<String> {
         let branch = self.branch(branch_name)?;
         let root = self.load_root(&branch.root_hash)?;
         let test_bindings = root.tests.clone();
@@ -559,8 +563,7 @@ impl CodeDb {
             .and_then(JsonValue::as_str)
             .unwrap_or("error")
             .to_string();
-        let native_result =
-            self.native_agreement_result(branch_name, &case, &expected);
+        let native_result = self.native_agreement_result(branch_name, &case, &expected);
         match native_result.get("status").and_then(JsonValue::as_str) {
             Some("failed")
                 if status != "error" && (case.native_required || case.native_requested()) =>
@@ -949,7 +952,9 @@ impl CodeDb {
             Value::I64(_) | Value::Bool(_) => {
                 self.native_scalar_agreement_result(branch_name, case, expected)
             }
-            Value::Record(_) => self.native_record_agreement_result(branch_name, case, expected),
+            Value::Record(_) | Value::Enum { .. } => {
+                self.native_record_agreement_result(branch_name, case, expected)
+            }
             _ => native_unavailable_result(
                 case,
                 "unsupported_feature",
@@ -1062,7 +1067,10 @@ impl CodeDb {
             ),
             Value::Bool(value) => {
                 let actual_bool = actual_i64 != 0;
-                (*value == actual_bool, TestValue::Bool { value: actual_bool })
+                (
+                    *value == actual_bool,
+                    TestValue::Bool { value: actual_bool },
+                )
             }
             _ => unreachable!("native_scalar_agreement_result only handles i64/bool"),
         };
@@ -1124,7 +1132,7 @@ impl CodeDb {
                 return native_unavailable_result(
                     case,
                     "unsupported_feature",
-                    &format!("native record build unavailable: {err:#}"),
+                    &format!("native aggregate build unavailable: {err:#}"),
                 );
             }
         };
@@ -1157,9 +1165,9 @@ impl CodeDb {
                     "native_required": case.native_required,
                     "target_triple": DEFAULT_NATIVE_TARGET,
                     "reason_code": if passed { JsonValue::Null } else { JsonValue::String("native_mismatch".to_string()) },
-                    "reason": if passed { JsonValue::Null } else { JsonValue::String("native record result did not match expected value".to_string()) },
+                    "reason": if passed { JsonValue::Null } else { JsonValue::String("native aggregate result did not match expected value".to_string()) },
                     "comparison": {
-                        "kind": "native_record_harness",
+                        "kind": "native_aggregate_harness",
                         "expected": &case.expected,
                         "actual": if passed { json!(&case.expected) } else { JsonValue::Null },
                         "actual_exit_code": actual,
@@ -1172,7 +1180,7 @@ impl CodeDb {
                     } else {
                         vec![native_diagnostic(
                             "native_mismatch",
-                            "native record result did not match expected value",
+                            "native aggregate result did not match expected value",
                         )]
                     },
                 })
@@ -1535,6 +1543,13 @@ pub(crate) fn value_from_test_value(value: &TestValue) -> Result<Value> {
             }
             Ok(Value::Record(values))
         }
+        TestValue::Enum { variant, value } => {
+            validate_projection_identifier("enum test variant", variant)?;
+            Ok(Value::Enum {
+                variant: variant.clone(),
+                value: value_cell(value_from_test_value(value)?),
+            })
+        }
     }
 }
 
@@ -1556,12 +1571,15 @@ pub(crate) fn test_value_from_value(value: &Value) -> Result<TestValue> {
                 })
                 .collect::<Result<Vec<_>>>()?,
         },
+        Value::Enum { variant, value } => TestValue::Enum {
+            variant: variant.clone(),
+            value: Box::new(test_value_from_value(&value.borrow())?),
+        },
         // A registered test's expected value is validated against the entry's
-        // return type, which cannot be a reference, so a reference/enum actual
-        // is unreachable for a validatable test. Return an error rather than
+        // return type, which cannot be a reference. Return an error rather than
         // panicking if the evaluator ever produces one.
-        Value::SharedRef(_) | Value::MutRef(_) | Value::Enum { .. } => {
-            bail!("semantic test values do not support reference or enum actual values")
+        Value::SharedRef(_) | Value::MutRef(_) => {
+            bail!("semantic test values do not support reference actual values")
         }
     })
 }
@@ -1608,6 +1626,12 @@ fn test_value_has_type(
                 }
             }
             Ok(true)
+        }
+        (Value::Enum { variant, value }, TypeSpec::Enum(variants)) => {
+            let Some(variant) = variants.iter().find(|candidate| candidate.name == *variant) else {
+                return Ok(false);
+            };
+            test_value_has_type(db, root, &value.borrow(), &variant.type_hash)
         }
         _ => Ok(false),
     }
@@ -1692,6 +1716,13 @@ fn display_test_value(value: &TestValue) -> String {
                 .map(|field| format!("{}: {}", field.name, display_test_value(&field.value)))
                 .collect::<Vec<_>>();
             format!("record{{{}}}", rendered.join(", "))
+        }
+        TestValue::Enum { variant, value } => {
+            if matches!(**value, TestValue::Unit) {
+                format!("enum::{variant}")
+            } else {
+                format!("enum::{variant}({})", display_test_value(value))
+            }
         }
     }
 }

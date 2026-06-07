@@ -11,8 +11,9 @@ use crate::artifact::CacheKeyInput;
 use crate::backend::{ArtifactKind, ObjectBackend, ObjectBackendArtifact, ObjectBackendInput};
 use crate::jobs::{ArtifactJobClaim, artifact_job_error, new_worker_id};
 use crate::lowering::{
-    LoweredBlock, LoweredDebugOp, LoweredFunctionIr, LoweredLocalSlot, LoweredOp, LoweredParamSlot,
-    LoweredPlace, LoweredTypeLayout, lowered_op_value_id, lowered_value_debug_ops,
+    LoweredBlock, LoweredCaseArm, LoweredDebugOp, LoweredFunctionIr, LoweredLocalSlot, LoweredOp,
+    LoweredParamSlot, LoweredPlace, LoweredTypeLayout, lowered_op_value_id,
+    lowered_value_debug_ops,
 };
 use crate::model::ProgramRootPayload;
 use crate::store::{
@@ -578,6 +579,11 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
                 collect_called_symbols(&then_block.operations, out);
                 collect_called_symbols(&else_block.operations, out);
             }
+            LoweredOp::Case { arms, .. } => {
+                for arm in arms {
+                    collect_called_symbols(&arm.block.operations, out);
+                }
+            }
             LoweredOp::Param { .. }
             | LoweredOp::ConstI64 { .. }
             | LoweredOp::ConstBool { .. }
@@ -591,8 +597,11 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::AddrOfParam { .. }
             | LoweredOp::AddrOfLocal { .. }
             | LoweredOp::AddrOfField { .. }
+            | LoweredOp::AddrOfEnumPayload { .. }
             | LoweredOp::AddrOfIndex { .. }
+            | LoweredOp::LoadEnumTag { .. }
             | LoweredOp::Load { .. }
+            | LoweredOp::StoreEnumTag { .. }
             | LoweredOp::Store { .. }
             | LoweredOp::Copy { .. }
             | LoweredOp::Move { .. }
@@ -673,6 +682,7 @@ fn validate_native_ops(
             | LoweredOp::Binary { type_hash, .. }
             | LoweredOp::Call { type_hash, .. }
             | LoweredOp::If { type_hash, .. }
+            | LoweredOp::Case { type_hash, .. }
             | LoweredOp::Return { type_hash, .. } => {
                 native_supported_type(type_layouts, type_hash, i64_type, bool_type, unit_type)?;
             }
@@ -706,11 +716,19 @@ fn validate_native_ops(
                 }
             }
             LoweredOp::AddrOfField { .. } => {}
+            LoweredOp::AddrOfEnumPayload { .. } => {}
             LoweredOp::AddrOfIndex { .. } => {
                 bail!("native object backend v0 does not support index address operations");
             }
+            LoweredOp::LoadEnumTag { type_hash, .. } => {
+                let layout = native_type_layout(type_layouts, type_hash)?;
+                if layout.kind != "enum" {
+                    bail!("native object backend saw load_enum_tag for non-enum type");
+                }
+            }
             LoweredOp::Load { type_hash, .. }
             | LoweredOp::Store { type_hash, .. }
+            | LoweredOp::StoreEnumTag { type_hash, .. }
             | LoweredOp::Copy { type_hash, .. }
             | LoweredOp::Move { type_hash, .. }
             | LoweredOp::Drop { type_hash, .. }
@@ -751,6 +769,22 @@ fn validate_native_ops(
                 &mut else_values,
                 &mut else_addresses,
             )?;
+        } else if let LoweredOp::Case { arms, .. } = op {
+            for arm in arms {
+                let mut arm_values = values.clone();
+                let mut arm_addresses = addresses.clone();
+                validate_native_ops(
+                    &arm.block.operations,
+                    params,
+                    locals,
+                    i64_type,
+                    bool_type,
+                    unit_type,
+                    type_layouts,
+                    &mut arm_values,
+                    &mut arm_addresses,
+                )?;
+            }
         }
     }
     Ok(())
@@ -768,7 +802,7 @@ fn native_supported_type(
     }
     let layout = native_type_layout(type_layouts, type_hash)?;
     match layout.kind.as_str() {
-        "record" | "reference" | "raw_pointer" => Ok(()),
+        "record" | "enum" | "reference" | "raw_pointer" => Ok(()),
         other => bail!("native object backend v0 does not support native values of {other} type"),
     }
 }
@@ -852,6 +886,43 @@ fn validate_native_op_flow(
             native_value_type(values, cond)?;
             native_insert_value(values, id, type_hash)?;
         }
+        LoweredOp::Case {
+            id,
+            scrutinee,
+            enum_type_hash,
+            arms,
+            type_hash,
+        } => {
+            if native_value_type(values, scrutinee)? != enum_type_hash {
+                bail!("native object backend saw case scrutinee type mismatch");
+            }
+            if native_passes_indirect(type_layouts, enum_type_hash)?
+                && native_address_type(addresses, scrutinee)? != enum_type_hash
+            {
+                bail!("native object backend saw case scrutinee address mismatch");
+            }
+            let enum_layout = native_type_layout(type_layouts, enum_type_hash)?;
+            if enum_layout.kind != "enum" {
+                bail!("native object backend saw case over non-enum type");
+            }
+            if arms.is_empty() {
+                bail!("native object backend saw case without arms");
+            }
+            let mut seen_tags = BTreeSet::new();
+            for arm in arms {
+                native_case_arm_layout(type_layouts, enum_type_hash, arm)?;
+                if !seen_tags.insert(arm.tag_value) {
+                    bail!(
+                        "native object backend saw duplicate case tag {}",
+                        arm.tag_value
+                    );
+                }
+            }
+            native_insert_value(values, id, type_hash)?;
+            if native_passes_indirect(type_layouts, type_hash)? {
+                native_insert_address(addresses, id, type_hash)?;
+            }
+        }
         LoweredOp::BorrowShared {
             id,
             address,
@@ -930,7 +1001,51 @@ fn validate_native_op_flow(
             native_insert_address(addresses, id, type_hash)?;
             native_insert_value(values, id, type_hash)?;
         }
+        LoweredOp::AddrOfEnumPayload { id, place } => {
+            let LoweredPlace::EnumPayload {
+                base,
+                owner_type_hash,
+                variant,
+                tag_value,
+                payload_offset_bytes,
+                type_hash,
+                ..
+            } = place
+            else {
+                bail!("addr_of_enum_payload must contain an enum payload place");
+            };
+            if native_address_type(addresses, base)? != owner_type_hash {
+                bail!("native object backend saw addr_of_enum_payload owner mismatch");
+            }
+            let arm = LoweredCaseArm {
+                variant: variant.clone(),
+                variant_symbol: None,
+                tag_value: *tag_value,
+                payload_type_hash: type_hash.clone(),
+                payload_offset_bytes: *payload_offset_bytes,
+                block: LoweredBlock {
+                    operations: Vec::new(),
+                    result: String::new(),
+                },
+            };
+            native_case_arm_layout(type_layouts, owner_type_hash, &arm)?;
+            native_insert_address(addresses, id, type_hash)?;
+            native_insert_value(values, id, type_hash)?;
+        }
         LoweredOp::AddrOfIndex { .. } => {}
+        LoweredOp::LoadEnumTag {
+            id,
+            address,
+            type_hash,
+        } => {
+            if native_address_type(addresses, address)? != type_hash {
+                bail!("native object backend saw load_enum_tag address mismatch");
+            }
+            if native_type_layout(type_layouts, type_hash)?.kind != "enum" {
+                bail!("native object backend saw load_enum_tag for non-enum");
+            }
+            native_insert_value(values, id, &type_hash_for("I64"))?;
+        }
         LoweredOp::Load {
             id,
             address,
@@ -949,8 +1064,26 @@ fn validate_native_op_flow(
             if native_address_type(addresses, address)? != type_hash {
                 bail!("native object backend saw store address type mismatch");
             }
-            if native_value_type(values, value)? != type_hash {
+            let actual = native_value_type(values, value)?;
+            if actual != type_hash && !native_layout_compatible(type_layouts, actual, type_hash)? {
                 bail!("native object backend saw store value type mismatch");
+            }
+        }
+        LoweredOp::StoreEnumTag {
+            address,
+            type_hash,
+            variant: _,
+            tag_value,
+            ..
+        } => {
+            if native_address_type(addresses, address)? != type_hash {
+                bail!("native object backend saw store_enum_tag address mismatch");
+            }
+            if native_type_layout(type_layouts, type_hash)?.kind != "enum" {
+                bail!("native object backend saw store_enum_tag for non-enum");
+            }
+            if *tag_value > i32::MAX as u64 {
+                bail!("native object backend saw unencodable enum tag {tag_value}");
             }
         }
         LoweredOp::Copy {
@@ -1060,6 +1193,25 @@ fn native_type_layout<'a>(
     layouts
         .get(type_hash)
         .ok_or_else(|| anyhow!("native object backend missing type layout for {type_hash}"))
+}
+
+fn native_case_arm_layout(
+    layouts: &BTreeMap<String, LoweredTypeLayout>,
+    enum_type_hash: &str,
+    arm: &LoweredCaseArm,
+) -> Result<()> {
+    let layout = native_type_layout(layouts, enum_type_hash)?;
+    if layout.kind != "enum" {
+        bail!("native object backend expected enum layout for {enum_type_hash}");
+    }
+    if arm.payload_offset_bytes > layout.size_bytes {
+        bail!("native object backend saw enum payload offset outside layout");
+    }
+    let payload = native_type_layout(layouts, &arm.payload_type_hash)?;
+    if arm.payload_offset_bytes + payload.size_bytes > layout.size_bytes {
+        bail!("native object backend saw enum payload outside layout bounds");
+    }
+    Ok(())
 }
 
 fn native_type_size(layouts: &BTreeMap<String, LoweredTypeLayout>, type_hash: &str) -> Result<u64> {
@@ -1305,7 +1457,9 @@ fn collect_value_ids_inner(
             | LoweredOp::AddrOfParam { id, .. }
             | LoweredOp::AddrOfLocal { id, .. }
             | LoweredOp::AddrOfField { id, .. }
+            | LoweredOp::AddrOfEnumPayload { id, .. }
             | LoweredOp::AddrOfIndex { id, .. }
+            | LoweredOp::LoadEnumTag { id, .. }
             | LoweredOp::Load { id, .. }
             | LoweredOp::Copy { id, .. }
             | LoweredOp::Move { id, .. } => push_value_id(ids, seen, id)?,
@@ -1319,7 +1473,14 @@ fn collect_value_ids_inner(
                 collect_value_ids_inner(&then_block.operations, ids, seen)?;
                 collect_value_ids_inner(&else_block.operations, ids, seen)?;
             }
+            LoweredOp::Case { id, arms, .. } => {
+                push_value_id(ids, seen, id)?;
+                for arm in arms {
+                    collect_value_ids_inner(&arm.block.operations, ids, seen)?;
+                }
+            }
             LoweredOp::Store { .. }
+            | LoweredOp::StoreEnumTag { .. }
             | LoweredOp::Drop { .. }
             | LoweredOp::BorrowDebug { .. }
             | LoweredOp::Return { .. } => {}
@@ -1479,6 +1640,14 @@ impl FunctionEmitter {
             } => {
                 self.emit_if(id, cond, then_block, else_block)?;
             }
+            LoweredOp::Case {
+                id,
+                scrutinee,
+                arms,
+                ..
+            } => {
+                self.emit_case(id, scrutinee, arms)?;
+            }
             LoweredOp::BorrowShared { id, address, .. }
             | LoweredOp::BorrowMut { id, address, .. } => {
                 self.mov_rax_stack(self.value_offset(address)?);
@@ -1532,8 +1701,37 @@ impl FunctionEmitter {
                 self.add_rax_imm32(i32::try_from(*offset_bytes)?);
                 self.mov_stack_rax(self.value_offset(id)?);
             }
+            LoweredOp::AddrOfEnumPayload { id, place } => {
+                let LoweredPlace::EnumPayload {
+                    base,
+                    payload_offset_bytes,
+                    ..
+                } = place
+                else {
+                    bail!("addr_of_enum_payload must contain an enum payload place");
+                };
+                self.mov_rax_stack(self.value_offset(base)?);
+                self.add_rax_imm32(i32::try_from(*payload_offset_bytes)?);
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
             LoweredOp::AddrOfIndex { .. } => {
                 bail!("native x86_64 backend v0 does not support index address operations");
+            }
+            LoweredOp::LoadEnumTag {
+                id,
+                address,
+                type_hash: _,
+            } => {
+                self.mov_rax_stack(self.value_offset(address)?);
+                self.mov_rax_mem_rax();
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::StoreEnumTag {
+                address, tag_value, ..
+            } => {
+                self.mov_rax_stack(self.value_offset(address)?);
+                self.mov_rcx_imm64(*tag_value);
+                self.mov_mem_rax_rcx();
             }
             LoweredOp::Load {
                 id,
@@ -1843,6 +2041,40 @@ impl FunctionEmitter {
         Ok(())
     }
 
+    fn emit_case(&mut self, id: &str, scrutinee: &str, arms: &[LoweredCaseArm]) -> Result<()> {
+        if arms.is_empty() {
+            bail!("native x86_64 backend cannot emit empty case");
+        }
+        let mut end_patches = Vec::new();
+        for (idx, arm) in arms.iter().enumerate() {
+            if arm.tag_value > i32::MAX as u64 {
+                bail!(
+                    "native x86_64 backend cannot encode enum tag {}",
+                    arm.tag_value
+                );
+            }
+            if idx + 1 < arms.len() {
+                self.mov_rax_stack(self.value_offset(scrutinee)?);
+                self.mov_rax_mem_rax();
+                self.cmp_rax_imm32(i32::try_from(arm.tag_value)?);
+                let next_patch = self.emit_jne_placeholder();
+                self.emit_ops(&arm.block.operations)?;
+                self.mov_rax_stack(self.value_offset(&arm.block.result)?);
+                self.mov_stack_rax(self.value_offset(id)?);
+                end_patches.push(self.emit_jmp_placeholder());
+                self.patch_rel32(next_patch)?;
+            } else {
+                self.emit_ops(&arm.block.operations)?;
+                self.mov_rax_stack(self.value_offset(&arm.block.result)?);
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+        }
+        for patch in end_patches {
+            self.patch_rel32(patch)?;
+        }
+        Ok(())
+    }
+
     fn value_offset(&self, id: &str) -> Result<i32> {
         self.layout
             .value_offsets
@@ -1862,6 +2094,11 @@ impl FunctionEmitter {
     fn mov_rax_imm64(&mut self, value: i64) {
         self.text.extend_from_slice(&[0x48, 0xb8]);
         self.text.extend_from_slice(&(value as u64).to_le_bytes());
+    }
+
+    fn mov_rcx_imm64(&mut self, value: u64) {
+        self.text.extend_from_slice(&[0x48, 0xb9]);
+        self.text.extend_from_slice(&value.to_le_bytes());
     }
 
     fn mov_rax_imm32(&mut self, value: i32) {
@@ -1974,8 +2211,20 @@ impl FunctionEmitter {
         self.text.push(value as u8);
     }
 
+    fn cmp_rax_imm32(&mut self, value: i32) {
+        self.text.extend_from_slice(&[0x48, 0x3d]);
+        self.push_i32(value);
+    }
+
     fn emit_jz_placeholder(&mut self) -> usize {
         self.text.extend_from_slice(&[0x0f, 0x84]);
+        let patch = self.text.len();
+        self.text.extend_from_slice(&[0, 0, 0, 0]);
+        patch
+    }
+
+    fn emit_jne_placeholder(&mut self) -> usize {
+        self.text.extend_from_slice(&[0x0f, 0x85]);
         let patch = self.text.len();
         self.text.extend_from_slice(&[0, 0, 0, 0]);
         patch
@@ -2268,6 +2517,14 @@ impl Arm64Emitter {
             } => {
                 self.emit_if(id, cond, then_block, else_block)?;
             }
+            LoweredOp::Case {
+                id,
+                scrutinee,
+                arms,
+                ..
+            } => {
+                self.emit_case(id, scrutinee, arms)?;
+            }
             LoweredOp::BorrowShared { id, address, .. }
             | LoweredOp::BorrowMut { id, address, .. } => {
                 self.ldr_stack(0, self.value_offset(address)?)?;
@@ -2321,8 +2578,37 @@ impl Arm64Emitter {
                 self.add_reg_imm(0, 0, u32::try_from(*offset_bytes)?)?;
                 self.str_stack(0, self.value_offset(id)?)?;
             }
+            LoweredOp::AddrOfEnumPayload { id, place } => {
+                let LoweredPlace::EnumPayload {
+                    base,
+                    payload_offset_bytes,
+                    ..
+                } = place
+                else {
+                    bail!("addr_of_enum_payload must contain an enum payload place");
+                };
+                self.ldr_stack(0, self.value_offset(base)?)?;
+                self.add_reg_imm(0, 0, u32::try_from(*payload_offset_bytes)?)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
             LoweredOp::AddrOfIndex { .. } => {
                 bail!("native arm64 backend v0 does not support index address operations");
+            }
+            LoweredOp::LoadEnumTag {
+                id,
+                address,
+                type_hash: _,
+            } => {
+                self.ldr_stack(0, self.value_offset(address)?)?;
+                self.ldr_reg_addr(0, 0)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::StoreEnumTag {
+                address, tag_value, ..
+            } => {
+                self.mov_u64(0, *tag_value);
+                self.ldr_stack(1, self.value_offset(address)?)?;
+                self.str_reg_addr(0, 1)?;
             }
             LoweredOp::Load {
                 id,
@@ -2629,6 +2915,35 @@ impl Arm64Emitter {
         Ok(())
     }
 
+    fn emit_case(&mut self, id: &str, scrutinee: &str, arms: &[LoweredCaseArm]) -> Result<()> {
+        if arms.is_empty() {
+            bail!("native arm64 backend cannot emit empty case");
+        }
+        let mut end_patches = Vec::new();
+        for (idx, arm) in arms.iter().enumerate() {
+            if idx + 1 < arms.len() {
+                self.ldr_stack(0, self.value_offset(scrutinee)?)?;
+                self.ldr_reg_addr(0, 0)?;
+                self.mov_u64(1, arm.tag_value);
+                self.cmp_reg(0, 1);
+                let next_patch = self.emit_b_cond_placeholder(1);
+                self.emit_ops(&arm.block.operations)?;
+                self.ldr_stack(0, self.value_offset(&arm.block.result)?)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+                end_patches.push(self.emit_b_placeholder());
+                self.patch_imm19(next_patch)?;
+            } else {
+                self.emit_ops(&arm.block.operations)?;
+                self.ldr_stack(0, self.value_offset(&arm.block.result)?)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+        }
+        for patch in end_patches {
+            self.patch_imm26(patch)?;
+        }
+        Ok(())
+    }
+
     fn value_offset(&self, id: &str) -> Result<u32> {
         self.layout
             .value_offsets
@@ -2838,6 +3153,12 @@ impl Arm64Emitter {
     fn emit_b_placeholder(&mut self) -> usize {
         let patch = self.text.len();
         self.emit_u32(0x14000000);
+        patch
+    }
+
+    fn emit_b_cond_placeholder(&mut self, cond: u8) -> usize {
+        let patch = self.text.len();
+        self.emit_u32(0x54000000 | u32::from(cond));
         patch
     }
 
