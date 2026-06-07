@@ -118,10 +118,21 @@ pub struct RawRecordField {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawCaseArm {
-    pub variant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+    #[serde(default, skip_serializing_if = "raw_case_arm_default_is_false")]
+    pub default: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<String>,
     pub body: RawExpr,
+}
+
+fn raw_case_arm_default_is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn typed_case_arm_is_default(arm: &JsonValue) -> bool {
+    arm.get("default").and_then(JsonValue::as_bool) == Some(true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -780,6 +791,7 @@ impl CodeDb {
                 let arm = arms
                     .iter()
                     .find(|arm| arm.get("variant").and_then(JsonValue::as_str) == Some(&variant))
+                    .or_else(|| arms.iter().find(|arm| typed_case_arm_is_default(arm)))
                     .ok_or_else(|| anyhow!("case missing arm for variant {variant}"))?;
                 let body_hash = arm
                     .get("body")
@@ -2033,11 +2045,32 @@ impl CodeDb {
                 let rendered_arms = arms
                     .iter()
                     .map(|arm| {
+                        let binding = arm.get("binding_name").and_then(JsonValue::as_str);
+                        if typed_case_arm_is_default(arm) {
+                            if binding.is_some() {
+                                bail!("default case arm cannot bind a payload");
+                            }
+                            let body = arm
+                                .get("body")
+                                .and_then(JsonValue::as_str)
+                                .ok_or_else(|| anyhow!("case arm missing body"))?;
+                            return Ok(format!(
+                                "else => {}",
+                                self.expr_to_source_with_locals(
+                                    body,
+                                    root,
+                                    current_module,
+                                    local_params,
+                                    region_names,
+                                    local_names,
+                                    0,
+                                )?
+                            ));
+                        }
                         let variant = arm
                             .get("variant")
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("case arm missing variant"))?;
-                        let binding = arm.get("binding_name").and_then(JsonValue::as_str);
                         let body = arm
                             .get("body")
                             .and_then(JsonValue::as_str)
@@ -2680,15 +2713,35 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("case missing arms"))?
                     .iter()
                     .map(|arm| {
+                        let binding = arm
+                            .get("binding_name")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string);
+                        if typed_case_arm_is_default(arm) {
+                            if binding.is_some() {
+                                bail!("default case arm cannot bind a payload");
+                            }
+                            let body = self.typed_expr_to_raw_with_locals(
+                                arm.get("body")
+                                    .and_then(JsonValue::as_str)
+                                    .ok_or_else(|| anyhow!("case arm missing body"))?,
+                                root,
+                                current_module,
+                                region_names,
+                                local_names,
+                            )?;
+                            return Ok(RawCaseArm {
+                                variant: None,
+                                default: true,
+                                binding: None,
+                                body,
+                            });
+                        }
                         let variant = arm
                             .get("variant")
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("case arm missing variant"))?
                             .to_string();
-                        let binding = arm
-                            .get("binding_name")
-                            .and_then(JsonValue::as_str)
-                            .map(str::to_string);
                         if let Some(binding) = &binding {
                             local_names.push(binding.clone());
                         }
@@ -2705,7 +2758,8 @@ impl CodeDb {
                             local_names.pop();
                         }
                         Ok(RawCaseArm {
-                            variant,
+                            variant: Some(variant),
+                            default: false,
                             binding,
                             body: body?,
                         })
@@ -3467,23 +3521,39 @@ impl Parser {
             self.expect_ident_value("of")?;
             let mut arms = Vec::new();
             loop {
-                let variant = self.expect_ident()?;
-                let binding = if self.consume_symbol("(") {
-                    let binding = self.expect_ident()?;
-                    self.expect_symbol(")")?;
-                    Some(binding)
-                } else {
-                    None
-                };
-                self.expect_symbol("=>")?;
-                let body = self.parse_expr()?;
-                arms.push(RawCaseArm {
-                    variant,
-                    binding,
-                    body,
-                });
-                if !self.consume_symbol("|") {
+                if self.consume_ident_value("else") || self.consume_ident_value("default") {
+                    self.expect_symbol("=>")?;
+                    let body = self.parse_expr()?;
+                    arms.push(RawCaseArm {
+                        variant: None,
+                        default: true,
+                        binding: None,
+                        body,
+                    });
+                    if self.consume_symbol("|") {
+                        bail!("default case arm must be last");
+                    }
                     break;
+                } else {
+                    let variant = self.expect_ident()?;
+                    let binding = if self.consume_symbol("(") {
+                        let binding = self.expect_ident()?;
+                        self.expect_symbol(")")?;
+                        Some(binding)
+                    } else {
+                        None
+                    };
+                    self.expect_symbol("=>")?;
+                    let body = self.parse_expr()?;
+                    arms.push(RawCaseArm {
+                        variant: Some(variant),
+                        default: false,
+                        binding,
+                        body,
+                    });
+                    if !self.consume_symbol("|") {
+                        break;
+                    }
                 }
             }
             Ok(RawExpr::Case {

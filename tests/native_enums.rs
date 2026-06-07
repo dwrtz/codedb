@@ -209,6 +209,80 @@ fn bad(sel: Sel) -> i64 =
 }
 
 #[test]
+fn explicit_default_case_arm_covers_missing_variants() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("default-case-enum.sqlite");
+    let source = temp.path().join("default-case-enum.cdb");
+    let projection = temp.path().join("default-case-enum.export.cdb");
+    let amount_ir_path = temp.path().join("amount.ir.json");
+    let object_path = temp.path().join("main.o");
+
+    std::fs::write(
+        &source,
+        r#"
+enum Sel {
+  yes: i64
+  no: unit
+  maybe: i64
+}
+
+fn amount(sel: Sel) -> i64 =
+  case sel of yes(value) => value | else => 40
+
+fn main() -> i64 = amount(Sel::yes(9)) + amount(Sel::no) + amount(Sel::maybe(1))
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "89");
+
+    let trace = parse_json(&run(&["trace", path(&db), "main", "--json"]));
+    let case_variants = trace["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["event"] == "case_decision")
+        .map(|event| event["selected_variant"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(case_variants.contains(&"yes"));
+    assert!(case_variants.contains(&"no"));
+    assert!(case_variants.contains(&"maybe"));
+
+    run(&["export", path(&db), "--out", path(&projection)]);
+    let exported = std::fs::read_to_string(&projection).unwrap();
+    assert!(exported.contains("case sel of yes(value) => value | else => 40"));
+
+    run(&[
+        "emit-ir",
+        path(&db),
+        "amount",
+        "--out",
+        path(&amount_ir_path),
+    ]);
+    let amount_ir = read_json(&amount_ir_path);
+    let case_op = amount_ir["ir"]["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|op| op["op"] == "case")
+        .unwrap();
+    assert_eq!(case_op["arms"].as_array().unwrap().len(), 3);
+
+    run(&[
+        "emit-object",
+        path(&db),
+        "main",
+        "--target",
+        codedb::DEFAULT_NATIVE_TARGET,
+        "--out",
+        path(&object_path),
+    ]);
+    run(&["verify", path(&db)]);
+}
+
+#[test]
 fn renamed_enum_variant_still_lowers_to_native_case() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("renamed-native-enum.sqlite");

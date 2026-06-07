@@ -189,6 +189,46 @@ fn main() -> i64 = sum_pair({ left: 2, right: 3 }) + sum_pair(make_pair()) + sum
 }
 
 #[test]
+fn arm64_hidden_record_return_allows_six_scalar_parameters() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("arm64-hidden-return-params.sqlite");
+    let source = temp.path().join("arm64-hidden-return-params.cdb");
+    let object_path = temp.path().join("make-big.o");
+
+    std::fs::write(
+        &source,
+        r#"
+record Big {
+  a: i64
+  b: i64
+  c: i64
+  d: i64
+}
+
+fn make_big(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> Big =
+  let total: i64 = a + b + c + d + e + f in
+  { a: total, b: e, c: f, d: a }
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&[
+        "emit-object",
+        path(&db),
+        "make_big",
+        "--target",
+        codedb::APPLE_ARM64_TARGET,
+        "--out",
+        path(&object_path),
+    ]);
+    let object_bytes = std::fs::read(&object_path).unwrap();
+    assert_eq!(&object_bytes[..4], &[0xcf, 0xfa, 0xed, 0xfe]);
+    run(&["verify", path(&db)]);
+}
+
+#[test]
 fn indirect_record_parameters_are_callee_owned_by_value() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("record-param-by-value.sqlite");

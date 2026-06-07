@@ -80,7 +80,7 @@ impl ObjectBackend for ElfObjectBackend {
             bail!("{ELF_BACKEND_ID} only supports target {LINUX_X86_64_TARGET}");
         }
 
-        validate_native_ir(input.ir)?;
+        validate_native_ir(input.ir, 6)?;
         let function_symbol = internal_abi_symbol(&input.ir.symbol_hash)?;
         let compiled = compile_x86_64_function(input.ir, &function_symbol)?;
         let bytes = write_elf_object(&function_symbol, &compiled.text, &compiled.relocations);
@@ -138,7 +138,7 @@ impl ObjectBackend for MachOArm64ObjectBackend {
             bail!("{MACHO_BACKEND_ID} only supports target {APPLE_ARM64_TARGET}");
         }
 
-        validate_native_ir(input.ir)?;
+        validate_native_ir(input.ir, 8)?;
         let function_symbol = internal_abi_symbol(&input.ir.symbol_hash)?;
         let object_symbol = macho_symbol_name(&function_symbol);
         let compiled = compile_arm64_function(input.ir, &object_symbol)?;
@@ -620,7 +620,7 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
     }
 }
 
-fn validate_native_ir(ir: &LoweredFunctionIr) -> Result<()> {
+fn validate_native_ir(ir: &LoweredFunctionIr, max_machine_params: usize) -> Result<()> {
     let i64_type = type_hash_for("I64");
     let bool_type = type_hash_for("Bool");
     let unit_type = type_hash_for("Unit");
@@ -636,8 +636,8 @@ fn validate_native_ir(ir: &LoweredFunctionIr) -> Result<()> {
         &type_layouts,
         &ir.return_type_hash,
     )?);
-    if ir.params.len() + hidden_return_count > 6 {
-        bail!("native object backend v0 supports at most 6 parameters");
+    if ir.params.len() + hidden_return_count > max_machine_params {
+        bail!("native object backend v0 supports at most {max_machine_params} machine parameters");
     }
     for param in &ir.params {
         native_supported_type(

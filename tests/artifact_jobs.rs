@@ -179,7 +179,7 @@ fn failed_object_jobs_record_structured_errors_and_retry() {
         .assert()
         .failure();
     let stderr = String::from_utf8(first_assert.get_output().stderr.clone()).unwrap();
-    assert!(stderr.contains("at most 6 parameters"));
+    assert!(stderr.contains("at most 6 machine parameters"));
     let (first_worker, error) = failed_job_error(&db);
     assert_eq!(error["schema"], "codedb/artifact-job-error/v1");
     assert_eq!(error["kind"], "compile_failed");
@@ -187,7 +187,7 @@ fn failed_object_jobs_record_structured_errors_and_retry() {
         error["message"]
             .as_str()
             .unwrap()
-            .contains("at most 6 parameters")
+            .contains("at most 6 machine parameters")
     );
 
     bin()

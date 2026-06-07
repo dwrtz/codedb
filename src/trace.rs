@@ -1549,6 +1549,11 @@ impl CodeDb {
                 let arm = arms
                     .iter()
                     .find(|arm| arm.get("variant").and_then(JsonValue::as_str) == Some(&variant))
+                    .or_else(|| {
+                        arms.iter().find(|arm| {
+                            arm.get("default").and_then(JsonValue::as_bool) == Some(true)
+                        })
+                    })
                     .ok_or_else(|| anyhow!("case missing arm for variant {variant}"))?;
                 let body_hash = arm
                     .get("body")

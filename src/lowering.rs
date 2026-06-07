@@ -2745,12 +2745,9 @@ impl CodeDb {
             .and_then(JsonValue::as_str)
             .ok_or_else(|| anyhow!("case missing expr"))?;
         let scrutinee = self.lower_expr(root, scrutinee_hash, param_types, ctx, locals)?;
-        if !matches!(
-            self.type_spec_in_root(root, &scrutinee.type_hash)?,
-            TypeSpec::Enum(_)
-        ) {
+        let TypeSpec::Enum(variants) = self.type_spec_in_root(root, &scrutinee.type_hash)? else {
             bail!("case lowering requires enum scrutinee");
-        }
+        };
         let arms = payload
             .get("arms")
             .and_then(JsonValue::as_array)
@@ -2758,22 +2755,64 @@ impl CodeDb {
         if arms.is_empty() {
             bail!("case lowering requires at least one arm");
         }
-
-        let locals_boundary = ctx.next_local;
-        let moved_before = ctx.moved.clone();
-        let mut expected_arm_moves: Option<BTreeSet<RootSlot>> = None;
-        let mut lowered_arms = Vec::with_capacity(arms.len());
-        for arm in arms {
-            ctx.moved = moved_before.clone();
+        let mut explicit_variants = BTreeSet::new();
+        let mut expanded_arms: Vec<(String, &JsonValue)> = Vec::new();
+        let mut default_arm = None;
+        for (index, arm) in arms.iter().enumerate() {
+            let is_default = arm.get("default").and_then(JsonValue::as_bool) == Some(true);
+            if is_default {
+                if index + 1 != arms.len() {
+                    bail!("default case arm must be last");
+                }
+                if default_arm.replace(arm).is_some() {
+                    bail!("duplicate default case arm");
+                }
+                if arm.get("variant").is_some() {
+                    bail!("default case arm cannot specify a variant");
+                }
+                if arm
+                    .get("binding_name")
+                    .and_then(JsonValue::as_str)
+                    .is_some()
+                {
+                    bail!("default case arm cannot bind a payload");
+                }
+                continue;
+            }
             let variant = arm
                 .get("variant")
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| anyhow!("case arm missing variant"))?;
+            if !explicit_variants.insert(variant.to_string()) {
+                bail!("duplicate case arm {variant}");
+            }
+            expanded_arms.push((variant.to_string(), arm));
+        }
+        let expected_variants = variants
+            .iter()
+            .map(|variant| variant.name.clone())
+            .collect::<BTreeSet<_>>();
+        if let Some(default_arm) = default_arm {
+            for variant in &variants {
+                if !explicit_variants.contains(&variant.name) {
+                    expanded_arms.push((variant.name.clone(), default_arm));
+                }
+            }
+        } else if explicit_variants != expected_variants {
+            bail!("case expression must cover every enum variant");
+        }
+
+        let locals_boundary = ctx.next_local;
+        let moved_before = ctx.moved.clone();
+        let mut expected_arm_moves: Option<BTreeSet<RootSlot>> = None;
+        let mut lowered_arms = Vec::with_capacity(expanded_arms.len());
+        for (variant, arm) in expanded_arms {
+            ctx.moved = moved_before.clone();
             let variant_info = self.lowered_enum_variant(
                 root,
                 ctx.target_triple(),
                 &scrutinee.type_hash,
-                variant,
+                &variant,
             )?;
             let mut arm_operations = Vec::new();
             if arm
@@ -2798,7 +2837,7 @@ impl CodeDb {
                     id: payload_address.clone(),
                     place: LoweredPlace::EnumPayload {
                         base: scrutinee.value.clone(),
-                        variant: variant.to_string(),
+                        variant: variant.clone(),
                         variant_symbol: variant_info.variant_symbol.clone(),
                         owner_type_hash: scrutinee.type_hash.clone(),
                         tag_value: variant_info.tag_value,
@@ -2844,7 +2883,7 @@ impl CodeDb {
                 }
                 arm_operations.extend(body.operations);
                 lowered_arms.push(LoweredCaseArm {
-                    variant: variant.to_string(),
+                    variant,
                     variant_symbol: variant_info.variant_symbol,
                     tag_value: variant_info.tag_value,
                     payload_type_hash: variant_info.type_hash,
@@ -2865,7 +2904,7 @@ impl CodeDb {
                 }
                 arm_operations.extend(body.operations);
                 lowered_arms.push(LoweredCaseArm {
-                    variant: variant.to_string(),
+                    variant,
                     variant_symbol: variant_info.variant_symbol,
                     tag_value: variant_info.tag_value,
                     payload_type_hash: variant_info.type_hash,

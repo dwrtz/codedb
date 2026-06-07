@@ -924,6 +924,7 @@ fn append_default_arg_to_calls(expr: &RawExpr, target_name: &str, default: &RawE
                 .iter()
                 .map(|arm| crate::expr::RawCaseArm {
                     variant: arm.variant.clone(),
+                    default: arm.default,
                     binding: arm.binding.clone(),
                     body: append_default_arg_to_calls(&arm.body, target_name, default),
                 })
@@ -5113,23 +5114,30 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("case missing arms"))?;
                 let mut rewritten_arms = Vec::new();
                 for arm in arm_payloads {
-                    let old_variant = arm
-                        .get("variant")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("case arm missing variant"))?;
                     let body_hash = arm
                         .get("body")
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("case arm missing body"))?;
-                    let variant = if self.enum_variant_matches_rename(
-                        old_root,
-                        &scrutinee_type,
-                        old_variant,
-                        rename,
-                    )? {
-                        rename.new_name().to_string()
+                    let is_default = arm.get("default").and_then(JsonValue::as_bool) == Some(true);
+                    let variant = if is_default {
+                        None
                     } else {
-                        old_variant.to_string()
+                        let old_variant = arm
+                            .get("variant")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("case arm missing variant"))?;
+                        Some(
+                            if self.enum_variant_matches_rename(
+                                old_root,
+                                &scrutinee_type,
+                                old_variant,
+                                rename,
+                            )? {
+                                rename.new_name().to_string()
+                            } else {
+                                old_variant.to_string()
+                            },
+                        )
                     };
                     let binding = arm
                         .get("binding_name")
@@ -5152,6 +5160,7 @@ impl CodeDb {
                     }
                     rewritten_arms.push(RawCaseArm {
                         variant,
+                        default: is_default,
                         binding,
                         body: body?,
                     });
@@ -6498,6 +6507,7 @@ fn normalize_param_refs_scoped(
                     }
                     crate::expr::RawCaseArm {
                         variant: arm.variant.clone(),
+                        default: arm.default,
                         binding: arm.binding.clone(),
                         body,
                     }

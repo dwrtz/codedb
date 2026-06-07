@@ -3320,43 +3320,75 @@ impl CodeDb {
                 let mut seen = BTreeSet::new();
                 let mut result_type: Option<String> = None;
                 let mut arms_json = Vec::with_capacity(arms.len());
-                for arm in arms {
-                    validate_projection_identifier("enum variant", &arm.variant)?;
-                    if !seen.insert(arm.variant.clone()) {
-                        bail!("duplicate case arm {}", arm.variant);
+                let mut has_default = false;
+                for (index, arm) in arms.iter().enumerate() {
+                    let mut binding_was_pushed = false;
+                    let body;
+                    if arm.default {
+                        if index + 1 != arms.len() {
+                            bail!("default case arm must be last");
+                        }
+                        if has_default {
+                            bail!("duplicate default case arm");
+                        }
+                        if arm.variant.is_some() {
+                            bail!("default case arm cannot specify a variant");
+                        }
+                        if arm.binding.is_some() {
+                            bail!("default case arm cannot bind a payload");
+                        }
+                        has_default = true;
+                        body = self.type_expr_with_locals(
+                            current_module,
+                            &arm.body,
+                            root,
+                            param_names,
+                            param_types,
+                            region_scope,
+                            locals,
+                        )?;
+                    } else {
+                        let variant = arm
+                            .variant
+                            .as_deref()
+                            .ok_or_else(|| anyhow!("case arm missing variant"))?;
+                        validate_projection_identifier("enum variant", variant)?;
+                        if !seen.insert(variant.to_string()) {
+                            bail!("duplicate case arm {variant}");
+                        }
+                        let variant_type = variants
+                            .iter()
+                            .find(|candidate| candidate.name == variant)
+                            .map(|candidate| candidate.type_hash.clone())
+                            .ok_or_else(|| anyhow!("case arm uses unknown variant {variant}"))?;
+                        if let Some(binding) = &arm.binding {
+                            validate_projection_identifier("case binding", binding)?;
+                            locals.push(LocalTypeBinding {
+                                name: binding.clone(),
+                                type_hash: variant_type.clone(),
+                            });
+                            binding_was_pushed = true;
+                        } else if variant_type != type_hash_for("Unit") {
+                            bail!("case arm {variant} must bind its payload");
+                        }
+                        let typed_body = self.type_expr_with_locals(
+                            current_module,
+                            &arm.body,
+                            root,
+                            param_names,
+                            param_types,
+                            region_scope,
+                            locals,
+                        );
+                        if binding_was_pushed {
+                            locals.pop();
+                        }
+                        body = typed_body?;
                     }
-                    let variant_type = variants
-                        .iter()
-                        .find(|variant| variant.name == arm.variant)
-                        .map(|variant| variant.type_hash.clone())
-                        .ok_or_else(|| anyhow!("case arm uses unknown variant {}", arm.variant))?;
-                    if let Some(binding) = &arm.binding {
-                        validate_projection_identifier("case binding", binding)?;
-                        locals.push(LocalTypeBinding {
-                            name: binding.clone(),
-                            type_hash: variant_type.clone(),
-                        });
-                    } else if variant_type != type_hash_for("Unit") {
-                        bail!("case arm {} must bind its payload", arm.variant);
-                    }
-                    let body = self.type_expr_with_locals(
-                        current_module,
-                        &arm.body,
-                        root,
-                        param_names,
-                        param_types,
-                        region_scope,
-                        locals,
-                    );
-                    if arm.binding.is_some() {
-                        locals.pop();
-                    }
-                    let body = body?;
                     if let Some(expected) = &result_type {
                         if expected != &body.type_hash {
                             bail!(
-                                "case arm {} returns {}, expected {}",
-                                arm.variant,
+                                "case arm returns {}, expected {}",
                                 self.type_name(&body.type_hash)?,
                                 self.type_name(expected)?
                             );
@@ -3364,17 +3396,24 @@ impl CodeDb {
                     } else {
                         result_type = Some(body.type_hash.clone());
                     }
-                    arms_json.push(json!({
-                        "variant": arm.variant,
-                        "binding_name": arm.binding,
-                        "body": body.expr_hash,
-                    }));
+                    if arm.default {
+                        arms_json.push(json!({
+                            "default": true,
+                            "body": body.expr_hash,
+                        }));
+                    } else {
+                        arms_json.push(json!({
+                            "variant": arm.variant.as_deref(),
+                            "binding_name": &arm.binding,
+                            "body": body.expr_hash,
+                        }));
+                    }
                 }
                 let expected_variants = variants
                     .iter()
                     .map(|variant| variant.name.clone())
                     .collect::<BTreeSet<_>>();
-                if seen != expected_variants {
+                if !has_default && seen != expected_variants {
                     bail!("case expression must cover every enum variant");
                 }
                 let type_hash =
@@ -6902,26 +6941,46 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("case missing arms"))?;
                 let mut seen = BTreeSet::new();
                 let mut result_type = None;
-                for arm in arms {
-                    let variant = arm
-                        .get("variant")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("case arm missing variant"))?;
-                    validate_projection_identifier("enum variant", variant)?;
-                    if !seen.insert(variant.to_string()) {
-                        bail!("duplicate case arm {variant}");
-                    }
-                    let variant_type = variants
-                        .iter()
-                        .find(|candidate| candidate.name == variant)
-                        .map(|candidate| candidate.type_hash.clone())
-                        .ok_or_else(|| anyhow!("case arm uses unknown variant {variant}"))?;
+                let mut has_default = false;
+                for (index, arm) in arms.iter().enumerate() {
+                    let is_default = arm.get("default").and_then(JsonValue::as_bool) == Some(true);
                     let binding = arm.get("binding_name").and_then(JsonValue::as_str);
-                    if let Some(binding) = binding {
-                        validate_projection_identifier("case binding", binding)?;
-                        locals.push(variant_type.clone());
-                    } else if variant_type != type_hash_for("Unit") {
-                        bail!("case arm {variant} must bind its payload");
+                    let mut binding_was_pushed = false;
+                    if is_default {
+                        if index + 1 != arms.len() {
+                            bail!("default case arm must be last");
+                        }
+                        if has_default {
+                            bail!("duplicate default case arm");
+                        }
+                        if arm.get("variant").is_some() {
+                            bail!("default case arm cannot specify a variant");
+                        }
+                        if binding.is_some() {
+                            bail!("default case arm cannot bind a payload");
+                        }
+                        has_default = true;
+                    } else {
+                        let variant = arm
+                            .get("variant")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("case arm missing variant"))?;
+                        validate_projection_identifier("enum variant", variant)?;
+                        if !seen.insert(variant.to_string()) {
+                            bail!("duplicate case arm {variant}");
+                        }
+                        let variant_type = variants
+                            .iter()
+                            .find(|candidate| candidate.name == variant)
+                            .map(|candidate| candidate.type_hash.clone())
+                            .ok_or_else(|| anyhow!("case arm uses unknown variant {variant}"))?;
+                        if let Some(binding) = binding {
+                            validate_projection_identifier("case binding", binding)?;
+                            locals.push(variant_type.clone());
+                            binding_was_pushed = true;
+                        } else if variant_type != type_hash_for("Unit") {
+                            bail!("case arm {variant} must bind its payload");
+                        }
                     }
                     let body_hash = arm
                         .get("body")
@@ -6934,7 +6993,7 @@ impl CodeDb {
                         allowed_regions,
                         locals,
                     );
-                    if binding.is_some() {
+                    if binding_was_pushed {
                         locals.pop();
                     }
                     let body_type = body_type?;
@@ -6950,7 +7009,7 @@ impl CodeDb {
                     .iter()
                     .map(|variant| variant.name.clone())
                     .collect::<BTreeSet<_>>();
-                if seen != expected_variants {
+                if !has_default && seen != expected_variants {
                     bail!("case expression must cover every enum variant");
                 }
                 result_type.ok_or_else(|| anyhow!("case expression has no arms"))?
