@@ -778,6 +778,14 @@ verify validates control-flow and accumulator types
 
 Goal: combine records, references, enums, arrays/slices, and loops into the first useful native v2 program.
 
+Status: implemented. The `invoice_static.cdb` fixture now combines named
+records, a reference-carrying `Invoice<'a>` record, `Discount` enum payloads,
+fixed arrays, array-backed slices, shared borrows, and a fold-based invoice
+total. The phase acceptance test creates a native-required invoice total test,
+checks trace events for records, enums, references, slices, arrays, and loops,
+checks the native build plan, verifies projection and history round trips, and
+runs the native executable/test harness on supported hosts.
+
 Deliverables:
 
 ```text

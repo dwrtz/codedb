@@ -1,28 +1,46 @@
+record Money {
+  cents: i64
+}
+
 record Line {
+  price: Money
   quantity: i64
-  unit_price: i64
+}
+
+record Invoice<'a> {
+  lines: slice<'a, Line>
+  first: &'a Line
 }
 
 enum Discount {
   NoDiscount: unit
-  Fixed: i64
+  Fixed: Money
 }
 
-fn discount_amount(discount: Discount) -> i64 =
-  case discount of NoDiscount => 0 | Fixed(value) => value
+fn money(cents: i64) -> Money = {cents: cents}
 
-fn invoice_total<'a>(lines: slice<'a, Line>, discount: Discount) -> i64 =
+fn line_total(line: Line) -> i64 = line.quantity * line.price.cents
+
+fn first_line_total<'a>(invoice: Invoice<'a>) -> i64 =
+  invoice.first.quantity * invoice.first.price.cents
+
+fn discount_amount(discount: Discount) -> i64 =
+  case discount of NoDiscount => 0 | Fixed(value) => value.cents
+
+fn invoice_total<'a>(invoice: Invoice<'a>, discount: Discount) -> i64 =
   let subtotal: i64 =
-    fold line in lines with total = 0 do
-      total + line.quantity * line.unit_price
+    fold line in invoice.lines with total = 0 do
+      total + line_total(line)
   in
   subtotal - discount_amount(discount)
 
 fn main<'a>() -> i64 =
   let lines: array<Line, 3> = [
-    {quantity: 2, unit_price: 30},
-    {quantity: 1, unit_price: 75},
-    {quantity: 3, unit_price: 5}
+    {price: money(30), quantity: 2},
+    {price: money(75), quantity: 1},
+    {price: money(5), quantity: 3}
   ] in
   let view: slice<'a, Line> = slice(lines) in
-  invoice_total(view, Discount::Fixed(5))
+  let invoice: Invoice<'a> = {lines: view, first: &'a lines[0]} in
+  let discount: Discount = Discount::Fixed(money(first_line_total(invoice) / 12)) in
+  invoice_total(invoice, discount)
