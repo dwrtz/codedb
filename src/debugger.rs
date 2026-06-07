@@ -1209,6 +1209,34 @@ fn event_view(event_index: usize, event: &TraceEvent) -> DebugEventView {
                 "selected {selected_branch} branch {selected_expr_hash}"
             )),
         },
+        TraceEvent::CaseDecision {
+            frame,
+            symbol_hash,
+            function_def_hash,
+            expr_hash,
+            scrutinee,
+            selected_variant,
+            selected_expr_hash,
+            payload,
+            ..
+        } => DebugEventView {
+            event_index,
+            event: "case_decision".to_string(),
+            frame: Some(*frame),
+            symbol_hash: Some(symbol_hash.clone()),
+            function_name: None,
+            function_def_hash: Some(function_def_hash.clone()),
+            expr_hash: Some(expr_hash.clone()),
+            expr_kind: Some("case".to_string()),
+            type_hash: None,
+            callee_symbol_hash: None,
+            callee_name: None,
+            value: Some(scrutinee.clone()),
+            args: Some(vec![payload.clone()]),
+            message: Some(format!(
+                "selected variant {selected_variant} arm {selected_expr_hash}"
+            )),
+        },
         TraceEvent::LoopIteration {
             frame,
             symbol_hash,
@@ -1321,6 +1349,7 @@ fn event_frame(event: &TraceEvent) -> Option<usize> {
         | TraceEvent::Value { frame, .. }
         | TraceEvent::Call { frame, .. }
         | TraceEvent::BranchDecision { frame, .. }
+        | TraceEvent::CaseDecision { frame, .. }
         | TraceEvent::LoopIteration { frame, .. }
         | TraceEvent::LocalBind { frame, .. }
         | TraceEvent::LocalUnbind { frame, .. }
@@ -1337,6 +1366,7 @@ fn event_expr_hash(event: &TraceEvent) -> Option<&str> {
         | TraceEvent::Value { expr_hash, .. }
         | TraceEvent::Call { expr_hash, .. }
         | TraceEvent::BranchDecision { expr_hash, .. }
+        | TraceEvent::CaseDecision { expr_hash, .. }
         | TraceEvent::LoopIteration { expr_hash, .. }
         | TraceEvent::LocalBind { expr_hash, .. }
         | TraceEvent::LocalUnbind { expr_hash, .. }

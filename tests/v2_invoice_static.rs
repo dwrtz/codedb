@@ -85,6 +85,7 @@ fn invoice_static_acceptance_covers_native_trace_build_verify_and_replay() {
     assert_trace_eval_kind(&trace, "enum_construct");
     assert_trace_eval_kind(&trace, "case");
     assert_trace_eval_kind(&trace, "fold");
+    assert_trace_event(&trace, "case_decision");
     assert_trace_field(&trace, "lines");
     assert_trace_field(&trace, "quantity");
     assert_trace_field(&trace, "cents");
@@ -203,6 +204,17 @@ fn assert_trace_field(trace: &JsonValue, field: &str) {
             event["event"] == "field_access" && event["field"].as_str() == Some(field)
         }),
         "missing field trace {field}"
+    );
+}
+
+fn assert_trace_event(trace: &JsonValue, event_name: &str) {
+    assert!(
+        trace["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event"].as_str() == Some(event_name)),
+        "missing trace event {event_name}"
     );
 }
 

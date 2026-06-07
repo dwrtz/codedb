@@ -65,6 +65,22 @@ fn main() -> i64 = percent_amount() + fixed_amount() + none_amount()
     run(&["init", path(&db)]);
     run(&["import", path(&db), path(&source)]);
     assert_eq!(run(&["eval", path(&db), "main"]).trim(), "2650");
+    let trace = parse_json(&run(&["trace", path(&db), "main", "--json"]));
+    let case_variants = trace["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["event"] == "case_decision")
+        .map(|event| event["selected_variant"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(case_variants.contains(&"percent"));
+    assert!(case_variants.contains(&"fixed"));
+    assert!(case_variants.contains(&"none"));
+    assert!(trace["events"].as_array().unwrap().iter().any(|event| {
+        event["event"] == "case_decision"
+            && event["expr_hash"].as_str().is_some()
+            && event["selected_expr_hash"].as_str().is_some()
+    }));
 
     run(&[
         "emit-ir",

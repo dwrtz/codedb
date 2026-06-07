@@ -357,6 +357,28 @@ fn main<'a>() -> i64 =
         run(&["build", path(&db), "main", "--out", path(&exe_path)]);
         let status = StdCommand::new(&exe_path).status().expect("run native oob");
         assert!(!status.success());
+
+        run(&[
+            "create-test",
+            path(&db),
+            "slice_oob_native_trap",
+            "--entry",
+            "main",
+            "--expect-i64",
+            "0",
+            "--native-required",
+            "--json",
+        ]);
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["tests"][0]["native"]["status"], "failed");
+        let native_location = report["tests"][0]["native"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|diagnostic| diagnostic["kind"] == "native_trap_semantic_location")
+            .expect("native semantic trap diagnostic")["details"]["location"]
+            .clone();
+        assert_eq!(native_location["expr_hash"], bounds_debug["expr_hash"]);
     }
 }
 

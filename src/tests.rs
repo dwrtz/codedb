@@ -267,8 +267,12 @@ impl CodeDb {
             .iter()
             .map(value_from_test_value)
             .collect::<Result<Vec<_>>>()?;
-        self.eval_symbol(root_hash, &case.entry_symbol, args)
-            .with_context(|| format!("test entry is not evaluatable in root {root_hash}"))?;
+        if let Err(err) = self.eval_symbol(root_hash, &case.entry_symbol, args) {
+            if !case.native_required {
+                return Err(err)
+                    .with_context(|| format!("test entry is not evaluatable in root {root_hash}"));
+            }
+        }
         Ok(())
     }
 
@@ -1035,12 +1039,14 @@ impl CodeDb {
                 "native executable exited with status {:?}",
                 output.status.code()
             );
+            let diagnostics =
+                self.native_execution_diagnostics(branch_name, &case.entry_symbol, &detail);
             return native_result_base(
                 case,
                 "failed",
                 Some("native_execution_failed"),
                 Some(detail.clone()),
-                vec![native_diagnostic("native_execution_failed", &detail)],
+                diagnostics,
             );
         }
         // The harness prints the full-width scalar result to stdout, so the
@@ -1158,14 +1164,54 @@ impl CodeDb {
             Ok(status) => {
                 let actual = status.code();
                 let passed = actual == Some(0);
+                let status = if passed {
+                    "passed"
+                } else if actual.is_none() {
+                    "failed"
+                } else {
+                    "native_mismatch"
+                };
+                let reason_code = if passed {
+                    JsonValue::Null
+                } else if actual.is_none() {
+                    JsonValue::String("native_execution_failed".to_string())
+                } else {
+                    JsonValue::String("native_mismatch".to_string())
+                };
+                let reason = if passed {
+                    JsonValue::Null
+                } else if actual.is_none() {
+                    JsonValue::String(
+                        "native aggregate executable trapped before completing comparison"
+                            .to_string(),
+                    )
+                } else {
+                    JsonValue::String(
+                        "native aggregate result did not match expected value".to_string(),
+                    )
+                };
+                let diagnostics = if passed {
+                    Vec::<JsonValue>::new()
+                } else if actual.is_none() {
+                    self.native_execution_diagnostics(
+                        branch_name,
+                        &case.entry_symbol,
+                        "native aggregate executable trapped before completing comparison",
+                    )
+                } else {
+                    vec![native_diagnostic(
+                        "native_mismatch",
+                        "native aggregate result did not match expected value",
+                    )]
+                };
                 json!({
                     "schema": NATIVE_TEST_RESULT_SCHEMA,
-                    "status": if passed { "passed" } else { "native_mismatch" },
+                    "status": status,
                     "mode": case.mode.as_str(),
                     "native_required": case.native_required,
                     "target_triple": DEFAULT_NATIVE_TARGET,
-                    "reason_code": if passed { JsonValue::Null } else { JsonValue::String("native_mismatch".to_string()) },
-                    "reason": if passed { JsonValue::Null } else { JsonValue::String("native aggregate result did not match expected value".to_string()) },
+                    "reason_code": reason_code,
+                    "reason": reason,
                     "comparison": {
                         "kind": "native_aggregate_harness",
                         "expected": &case.expected,
@@ -1175,14 +1221,7 @@ impl CodeDb {
                     "executable_cache_key": JsonValue::Null,
                     "executable_artifact_hash": build.artifact_hash,
                     "harness_kind": build.harness_kind,
-                    "diagnostics": if passed {
-                        Vec::<JsonValue>::new()
-                    } else {
-                        vec![native_diagnostic(
-                            "native_mismatch",
-                            "native aggregate result did not match expected value",
-                        )]
-                    },
+                    "diagnostics": diagnostics,
                 })
             }
             Err(err) => native_result_base(
@@ -1196,6 +1235,25 @@ impl CodeDb {
                 )],
             ),
         }
+    }
+
+    fn native_execution_diagnostics(
+        &self,
+        branch_name: &str,
+        entry_symbol: &str,
+        detail: &str,
+    ) -> Vec<JsonValue> {
+        let mut diagnostics = vec![native_diagnostic("native_execution_failed", detail)];
+        if let Ok(trace) = self.trace_branch_text_args(branch_name, entry_symbol, &[])
+            && trace.status == "error"
+            && let Some(trap) = trace
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.kind == "trap")
+        {
+            diagnostics.push(native_semantic_trap_diagnostic(trap));
+        }
+        diagnostics
     }
 }
 
@@ -1515,6 +1573,19 @@ fn native_diagnostic(kind: &str, message: &str) -> JsonValue {
         "message": message,
         "details": {
             "target_triple": DEFAULT_NATIVE_TARGET,
+        },
+    })
+}
+
+fn native_semantic_trap_diagnostic(diagnostic: &crate::trace::TraceDiagnostic) -> JsonValue {
+    json!({
+        "kind": "native_trap_semantic_location",
+        "message": "native execution trapped at the semantic location identified by the reference trace",
+        "details": {
+            "target_triple": DEFAULT_NATIVE_TARGET,
+            "trace_kind": diagnostic.kind,
+            "trace_message": diagnostic.message,
+            "location": diagnostic.location,
         },
     })
 }

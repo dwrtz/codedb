@@ -217,6 +217,17 @@ pub enum TraceEvent {
         selected_branch: String,
         selected_expr_hash: String,
     },
+    CaseDecision {
+        root_hash: String,
+        frame: usize,
+        symbol_hash: String,
+        function_def_hash: String,
+        expr_hash: String,
+        scrutinee: TraceValue,
+        selected_variant: String,
+        selected_expr_hash: String,
+        payload: TraceValue,
+    },
     LoopIteration {
         root_hash: String,
         frame: usize,
@@ -1527,6 +1538,7 @@ impl CodeDb {
                     args,
                     locals,
                 )?;
+                let scrutinee_trace = TraceValue::from_value(&scrutinee);
                 let Value::Enum { variant, value } = scrutinee else {
                     bail!("case expression evaluated to non-enum {scrutinee}");
                 };
@@ -1542,6 +1554,18 @@ impl CodeDb {
                     .get("body")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("case arm missing body"))?;
+                let payload_trace = TraceValue::from_value(&value.borrow());
+                state.events.push(TraceEvent::CaseDecision {
+                    root_hash: state.root_hash.clone(),
+                    frame,
+                    symbol_hash: symbol_hash.to_string(),
+                    function_def_hash: function_def_hash.to_string(),
+                    expr_hash: expr_hash.to_string(),
+                    scrutinee: scrutinee_trace,
+                    selected_variant: variant.clone(),
+                    selected_expr_hash: body_hash.to_string(),
+                    payload: payload_trace,
+                });
                 let value = if arm
                     .get("binding_name")
                     .and_then(JsonValue::as_str)
