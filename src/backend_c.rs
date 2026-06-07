@@ -293,7 +293,7 @@ impl CodeDb {
                 )
             }
             "borrow_shared" | "borrow_mut" | "slice_from_array" | "slice_len" | "subslice"
-            | "assign" | "record_literal" | "field_access" | "enum_construct" | "case"
+            | "assign" | "record_literal" | "field_access" | "enum_construct" | "case" | "fold"
             | "array_literal" | "array_index" => {
                 bail!(
                     "C projection v0 does not support {other}",

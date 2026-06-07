@@ -952,6 +952,15 @@ fn expr_reachable_from(
             }
             expr_reachable_child_field(db, &payload, "else", target_hash, seen)
         }
+        "fold" => {
+            if expr_reachable_child_field(db, &payload, "target", target_hash, seen)? {
+                return Ok(true);
+            }
+            if expr_reachable_child_field(db, &payload, "init", target_hash, seen)? {
+                return Ok(true);
+            }
+            expr_reachable_child_field(db, &payload, "body", target_hash, seen)
+        }
         other => bail!("unknown expression kind {other}"),
     }
 }
@@ -1200,6 +1209,30 @@ fn event_view(event_index: usize, event: &TraceEvent) -> DebugEventView {
                 "selected {selected_branch} branch {selected_expr_hash}"
             )),
         },
+        TraceEvent::LoopIteration {
+            frame,
+            symbol_hash,
+            function_def_hash,
+            expr_hash,
+            iteration,
+            accumulator_after,
+            ..
+        } => DebugEventView {
+            event_index,
+            event: "loop_iteration".to_string(),
+            frame: Some(*frame),
+            symbol_hash: Some(symbol_hash.clone()),
+            function_name: None,
+            function_def_hash: Some(function_def_hash.clone()),
+            expr_hash: Some(expr_hash.clone()),
+            expr_kind: Some("fold".to_string()),
+            type_hash: None,
+            callee_symbol_hash: None,
+            callee_name: None,
+            value: Some(accumulator_after.clone()),
+            args: None,
+            message: Some(format!("iteration {iteration}")),
+        },
         TraceEvent::LocalBind {
             frame,
             symbol_hash,
@@ -1288,6 +1321,7 @@ fn event_frame(event: &TraceEvent) -> Option<usize> {
         | TraceEvent::Value { frame, .. }
         | TraceEvent::Call { frame, .. }
         | TraceEvent::BranchDecision { frame, .. }
+        | TraceEvent::LoopIteration { frame, .. }
         | TraceEvent::LocalBind { frame, .. }
         | TraceEvent::LocalUnbind { frame, .. }
         | TraceEvent::Trap { frame, .. } => Some(*frame),
@@ -1303,6 +1337,7 @@ fn event_expr_hash(event: &TraceEvent) -> Option<&str> {
         | TraceEvent::Value { expr_hash, .. }
         | TraceEvent::Call { expr_hash, .. }
         | TraceEvent::BranchDecision { expr_hash, .. }
+        | TraceEvent::LoopIteration { expr_hash, .. }
         | TraceEvent::LocalBind { expr_hash, .. }
         | TraceEvent::LocalUnbind { expr_hash, .. }
         | TraceEvent::Trap { expr_hash, .. } => Some(expr_hash),

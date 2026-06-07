@@ -217,6 +217,17 @@ pub enum TraceEvent {
         selected_branch: String,
         selected_expr_hash: String,
     },
+    LoopIteration {
+        root_hash: String,
+        frame: usize,
+        symbol_hash: String,
+        function_def_hash: String,
+        expr_hash: String,
+        iteration: usize,
+        item: TraceValue,
+        accumulator_before: TraceValue,
+        accumulator_after: TraceValue,
+    },
     LocalBind {
         root_hash: String,
         frame: usize,
@@ -1093,6 +1104,144 @@ impl CodeDb {
                 )?;
                 state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
                 Ok(value)
+            }
+            "fold" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing target"))?;
+                let init_hash = payload
+                    .get("init")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing init"))?;
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing body"))?;
+                let item_name = payload
+                    .get("item_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing item_name"))?
+                    .to_string();
+                let acc_name = payload
+                    .get("acc_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing acc_name"))?
+                    .to_string();
+                let element_type = payload
+                    .get("element_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing element_type"))?
+                    .to_string();
+                let acc_type = payload
+                    .get("acc_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing acc_type"))?
+                    .to_string();
+                let target = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    target_hash,
+                    args,
+                    locals,
+                )?;
+                let elements = match target {
+                    Value::Array(elements) | Value::Slice { elements, .. } => elements,
+                    other => bail!("fold target is not an array or slice: {other}"),
+                };
+                let mut accumulator = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    init_hash,
+                    args,
+                    locals,
+                )?;
+                for (iteration, item_cell) in elements.iter().enumerate() {
+                    let item = item_cell.borrow().clone();
+                    locals.push(value_cell(item.clone()));
+                    locals.push(value_cell(accumulator.clone()));
+                    state.events.push(TraceEvent::LocalBind {
+                        root_hash: state.root_hash.clone(),
+                        frame,
+                        symbol_hash: symbol_hash.to_string(),
+                        function_def_hash: function_def_hash.to_string(),
+                        expr_hash: expr_hash.to_string(),
+                        name: item_name.clone(),
+                        type_hash: element_type.clone(),
+                        value: TraceValue::from_value(&item),
+                    });
+                    state.events.push(TraceEvent::LocalBind {
+                        root_hash: state.root_hash.clone(),
+                        frame,
+                        symbol_hash: symbol_hash.to_string(),
+                        function_def_hash: function_def_hash.to_string(),
+                        expr_hash: expr_hash.to_string(),
+                        name: acc_name.clone(),
+                        type_hash: acc_type.clone(),
+                        value: TraceValue::from_value(&accumulator),
+                    });
+                    let before = accumulator.clone();
+                    let body = self.trace_expr(
+                        state,
+                        frame,
+                        symbol_hash,
+                        function_def_hash,
+                        body_hash,
+                        args,
+                        locals,
+                    );
+                    let acc_local = locals.pop();
+                    let item_local = locals.pop();
+                    if let Some(value) = acc_local {
+                        state.events.push(TraceEvent::LocalUnbind {
+                            root_hash: state.root_hash.clone(),
+                            frame,
+                            symbol_hash: symbol_hash.to_string(),
+                            function_def_hash: function_def_hash.to_string(),
+                            expr_hash: expr_hash.to_string(),
+                            name: acc_name.clone(),
+                            type_hash: acc_type.clone(),
+                            value: TraceValue::from_value(&value.borrow()),
+                        });
+                    }
+                    if let Some(value) = item_local {
+                        state.events.push(TraceEvent::LocalUnbind {
+                            root_hash: state.root_hash.clone(),
+                            frame,
+                            symbol_hash: symbol_hash.to_string(),
+                            function_def_hash: function_def_hash.to_string(),
+                            expr_hash: expr_hash.to_string(),
+                            name: item_name.clone(),
+                            type_hash: element_type.clone(),
+                            value: TraceValue::from_value(&value.borrow()),
+                        });
+                    }
+                    let after = body?;
+                    state.events.push(TraceEvent::LoopIteration {
+                        root_hash: state.root_hash.clone(),
+                        frame,
+                        symbol_hash: symbol_hash.to_string(),
+                        function_def_hash: function_def_hash.to_string(),
+                        expr_hash: expr_hash.to_string(),
+                        iteration,
+                        item: TraceValue::from_value(&item),
+                        accumulator_before: TraceValue::from_value(&before),
+                        accumulator_after: TraceValue::from_value(&after),
+                    });
+                    accumulator = after;
+                }
+                state.push_value(
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    expr_hash,
+                    &accumulator,
+                );
+                Ok(accumulator)
             }
             "record_literal" => {
                 let mut values = std::collections::BTreeMap::new();

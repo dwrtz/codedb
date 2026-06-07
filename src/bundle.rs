@@ -1351,6 +1351,14 @@ fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<St
                     push_hash_ref(payload.get("then"), refs);
                     push_hash_ref(payload.get("else"), refs);
                 }
+                Some("fold") => {
+                    push_hash_ref(payload.get("target"), refs);
+                    push_hash_ref(payload.get("target_type"), refs);
+                    push_hash_ref(payload.get("element_type"), refs);
+                    push_hash_ref(payload.get("init"), refs);
+                    push_hash_ref(payload.get("acc_type"), refs);
+                    push_hash_ref(payload.get("body"), refs);
+                }
                 Some("record_literal") => {
                     for field in payload
                         .get("fields")

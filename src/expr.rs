@@ -75,6 +75,13 @@ pub enum RawExpr {
         #[serde(rename = "else")]
         else_expr: Box<RawExpr>,
     },
+    Fold {
+        item: String,
+        target: Box<RawExpr>,
+        acc: String,
+        init: Box<RawExpr>,
+        body: Box<RawExpr>,
+    },
     Array {
         elements: Vec<RawExpr>,
     },
@@ -635,6 +642,36 @@ impl CodeDb {
                     }
                     other => bail!("if condition evaluated to non-bool {other}"),
                 }
+            }
+            "fold" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing target"))?;
+                let init_hash = payload
+                    .get("init")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing init"))?;
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing body"))?;
+                let target = self.eval_expr_with_locals(root_hash, target_hash, args, locals)?;
+                let elements = match target {
+                    Value::Array(elements) | Value::Slice { elements, .. } => elements,
+                    other => bail!("fold target is not an array or slice: {other}"),
+                };
+                let mut accumulator =
+                    self.eval_expr_with_locals(root_hash, init_hash, args, locals)?;
+                for item in elements {
+                    locals.push(value_cell(semantic_clone_value(&item.borrow())));
+                    locals.push(value_cell(accumulator));
+                    let next = self.eval_expr_with_locals(root_hash, body_hash, args, locals);
+                    locals.pop();
+                    locals.pop();
+                    accumulator = next?;
+                }
+                Ok(accumulator)
             }
             "array_literal" => {
                 let mut values = Vec::new();
@@ -1753,6 +1790,68 @@ impl CodeDb {
                     expr
                 }
             }
+            "fold" => {
+                let item_name = payload
+                    .get("item_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing item_name"))?;
+                let acc_name = payload
+                    .get("acc_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing acc_name"))?;
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing target"))?;
+                let init_hash = payload
+                    .get("init")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing init"))?;
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing body"))?;
+                let target = self.expr_to_source_with_locals(
+                    target_hash,
+                    root,
+                    current_module,
+                    local_params,
+                    region_names,
+                    local_names,
+                    0,
+                )?;
+                let init = self.expr_to_source_with_locals(
+                    init_hash,
+                    root,
+                    current_module,
+                    local_params,
+                    region_names,
+                    local_names,
+                    0,
+                )?;
+                local_names.push(item_name.to_string());
+                local_names.push(acc_name.to_string());
+                let body = self.expr_to_source_with_locals(
+                    body_hash,
+                    root,
+                    current_module,
+                    local_params,
+                    region_names,
+                    local_names,
+                    0,
+                );
+                local_names.pop();
+                local_names.pop();
+                let expr = format!(
+                    "fold {item_name} in {target} with {acc_name} = {init} do {}",
+                    body?
+                );
+                if parent_prec > 0 {
+                    format!("({expr})")
+                } else {
+                    expr
+                }
+            }
             "record_literal" => {
                 let fields = payload
                     .get("fields")
@@ -2392,6 +2491,59 @@ impl CodeDb {
                     )?,
                 ),
             }),
+            "fold" => {
+                let item = payload
+                    .get("item_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing item_name"))?
+                    .to_string();
+                let acc = payload
+                    .get("acc_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing acc_name"))?
+                    .to_string();
+                let target = self.typed_expr_to_raw_with_locals(
+                    payload
+                        .get("target")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("fold missing target"))?,
+                    root,
+                    current_module,
+                    region_names,
+                    local_names,
+                )?;
+                let init = self.typed_expr_to_raw_with_locals(
+                    payload
+                        .get("init")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("fold missing init"))?,
+                    root,
+                    current_module,
+                    region_names,
+                    local_names,
+                )?;
+                local_names.push(item.clone());
+                local_names.push(acc.clone());
+                let body = self.typed_expr_to_raw_with_locals(
+                    payload
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("fold missing body"))?,
+                    root,
+                    current_module,
+                    region_names,
+                    local_names,
+                );
+                local_names.pop();
+                local_names.pop();
+                Ok(RawExpr::Fold {
+                    item,
+                    target: Box::new(target),
+                    acc,
+                    init: Box::new(init),
+                    body: Box::new(body?),
+                })
+            }
             "record_literal" => Ok(RawExpr::Record {
                 fields: payload
                     .get("fields")
@@ -2833,6 +2985,15 @@ impl CodeDb {
                     self.collect_expr_deps(root, child, deps)?;
                 }
             }
+            "fold" => {
+                for key in ["target", "init", "body"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("fold missing {key}"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
+            }
             "record_literal" => {
                 for field in payload
                     .get("fields")
@@ -3271,6 +3432,29 @@ impl Parser {
                 cond: Box::new(cond),
                 then_expr: Box::new(then_expr),
                 else_expr: Box::new(else_expr),
+            })
+        } else {
+            self.parse_fold()
+        }
+    }
+
+    fn parse_fold(&mut self) -> Result<RawExpr> {
+        if self.consume_ident_value("fold") {
+            let item = self.expect_ident()?;
+            self.expect_ident_value("in")?;
+            let target = self.parse_expr()?;
+            self.expect_ident_value("with")?;
+            let acc = self.expect_ident()?;
+            self.expect_symbol("=")?;
+            let init = self.parse_expr()?;
+            self.expect_ident_value("do")?;
+            let body = self.parse_expr()?;
+            Ok(RawExpr::Fold {
+                item,
+                target: Box::new(target),
+                acc,
+                init: Box::new(init),
+                body: Box::new(body),
             })
         } else {
             self.parse_case()

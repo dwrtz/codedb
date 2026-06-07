@@ -309,6 +309,29 @@ impl CodeDb {
                         self.check_hash_ref(parent_hash, "then", payload.get("then"), errors)?;
                         self.check_hash_ref(parent_hash, "else", payload.get("else"), errors)?;
                     }
+                    Some("fold") => {
+                        self.check_hash_ref(parent_hash, "target", payload.get("target"), errors)?;
+                        self.check_hash_ref(
+                            parent_hash,
+                            "target_type",
+                            payload.get("target_type"),
+                            errors,
+                        )?;
+                        self.check_hash_ref(
+                            parent_hash,
+                            "element_type",
+                            payload.get("element_type"),
+                            errors,
+                        )?;
+                        self.check_hash_ref(parent_hash, "init", payload.get("init"), errors)?;
+                        self.check_hash_ref(
+                            parent_hash,
+                            "acc_type",
+                            payload.get("acc_type"),
+                            errors,
+                        )?;
+                        self.check_hash_ref(parent_hash, "body", payload.get("body"), errors)?;
+                    }
                     Some("record_literal") => {
                         for (idx, field) in payload
                             .get("fields")
@@ -3867,6 +3890,9 @@ fn collect_lowered_call_targets(
                 for arm in arms {
                     collect_lowered_call_targets(&arm.block.operations, targets)?;
                 }
+            }
+            LoweredOp::Fold { body, .. } => {
+                collect_lowered_call_targets(&body.operations, targets)?;
             }
             LoweredOp::Param { .. }
             | LoweredOp::ConstI64 { .. }

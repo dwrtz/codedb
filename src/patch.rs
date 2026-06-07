@@ -1274,6 +1274,56 @@ impl CodeDb {
                     )?,
                 ),
             }),
+            "fold" => {
+                let item = payload
+                    .get("item_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing item_name"))?
+                    .to_string();
+                let acc = payload
+                    .get("acc_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing acc_name"))?
+                    .to_string();
+                let target = self.patched_raw_expr_inline(
+                    payload
+                        .get("target")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("fold missing target"))?,
+                    root,
+                    inline_exprs,
+                    local_names,
+                )?;
+                let init = self.patched_raw_expr_inline(
+                    payload
+                        .get("init")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("fold missing init"))?,
+                    root,
+                    inline_exprs,
+                    local_names,
+                )?;
+                local_names.push(item.clone());
+                local_names.push(acc.clone());
+                let body = self.patched_raw_expr_inline(
+                    payload
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("fold missing body"))?,
+                    root,
+                    inline_exprs,
+                    local_names,
+                );
+                local_names.pop();
+                local_names.pop();
+                Ok(RawExpr::Fold {
+                    item,
+                    target: Box::new(target),
+                    acc,
+                    init: Box::new(init),
+                    body: Box::new(body?),
+                })
+            }
             other => bail!("unknown expression kind {other}"),
         }
     }
@@ -1629,6 +1679,59 @@ impl CodeDb {
                     )?,
                 ),
             }),
+            "fold" => {
+                let item = payload
+                    .get("item_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing item_name"))?
+                    .to_string();
+                let acc = payload
+                    .get("acc_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing acc_name"))?
+                    .to_string();
+                let target = self.patched_raw_expr(
+                    payload
+                        .get("target")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("fold missing target"))?,
+                    root,
+                    replacements,
+                    replacement,
+                    local_names,
+                )?;
+                let init = self.patched_raw_expr(
+                    payload
+                        .get("init")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("fold missing init"))?,
+                    root,
+                    replacements,
+                    replacement,
+                    local_names,
+                )?;
+                local_names.push(item.clone());
+                local_names.push(acc.clone());
+                let body = self.patched_raw_expr(
+                    payload
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("fold missing body"))?,
+                    root,
+                    replacements,
+                    replacement,
+                    local_names,
+                );
+                local_names.pop();
+                local_names.pop();
+                Ok(RawExpr::Fold {
+                    item,
+                    target: Box::new(target),
+                    acc,
+                    init: Box::new(init),
+                    body: Box::new(body?),
+                })
+            }
             other => bail!("unknown expression kind {other}"),
         }
     }
@@ -1822,6 +1925,56 @@ impl CodeDb {
                     )?,
                 ),
             }),
+            "fold" => {
+                let item = payload
+                    .get("item_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing item_name"))?
+                    .to_string();
+                let acc = payload
+                    .get("acc_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing acc_name"))?
+                    .to_string();
+                let target = self.patched_raw_expr_specific(
+                    payload
+                        .get("target")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("fold missing target"))?,
+                    root,
+                    replacements,
+                    local_names,
+                )?;
+                let init = self.patched_raw_expr_specific(
+                    payload
+                        .get("init")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("fold missing init"))?,
+                    root,
+                    replacements,
+                    local_names,
+                )?;
+                local_names.push(item.clone());
+                local_names.push(acc.clone());
+                let body = self.patched_raw_expr_specific(
+                    payload
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("fold missing body"))?,
+                    root,
+                    replacements,
+                    local_names,
+                );
+                local_names.pop();
+                local_names.pop();
+                Ok(RawExpr::Fold {
+                    item,
+                    target: Box::new(target),
+                    acc,
+                    init: Box::new(init),
+                    body: Box::new(body?),
+                })
+            }
             other => bail!("unknown expression kind {other}"),
         }
     }
@@ -2058,6 +2211,17 @@ fn expression_child_hashes(expr_kind: &str, payload: &JsonValue) -> Result<Vec<S
                         .get(key)
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("if missing {key}"))?
+                        .to_string(),
+                );
+            }
+        }
+        "fold" => {
+            for key in ["target", "init", "body"] {
+                children.push(
+                    payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("fold missing {key}"))?
                         .to_string(),
                 );
             }
@@ -2548,6 +2712,19 @@ fn substitute_param_refs(expr: &RawExpr, args: &[RawExpr]) -> Result<RawExpr> {
             then_expr: Box::new(substitute_param_refs(then_expr, args)?),
             else_expr: Box::new(substitute_param_refs(else_expr, args)?),
         },
+        RawExpr::Fold {
+            item,
+            target,
+            acc,
+            init,
+            body,
+        } => RawExpr::Fold {
+            item: item.clone(),
+            target: Box::new(substitute_param_refs(target, args)?),
+            acc: acc.clone(),
+            init: Box::new(substitute_param_refs(init, args)?),
+            body: Box::new(substitute_param_refs(body, args)?),
+        },
         RawExpr::Array { elements } => RawExpr::Array {
             elements: elements
                 .iter()
@@ -2647,6 +2824,21 @@ fn collect_free_param_names(
             collect_free_param_names(cond, bound_locals, names);
             collect_free_param_names(then_expr, bound_locals, names);
             collect_free_param_names(else_expr, bound_locals, names);
+        }
+        RawExpr::Fold {
+            item,
+            target,
+            acc,
+            init,
+            body,
+        } => {
+            collect_free_param_names(target, bound_locals, names);
+            collect_free_param_names(init, bound_locals, names);
+            bound_locals.push(item.clone());
+            bound_locals.push(acc.clone());
+            collect_free_param_names(body, bound_locals, names);
+            bound_locals.pop();
+            bound_locals.pop();
         }
         RawExpr::Array { elements } => {
             for element in elements {
@@ -2802,6 +2994,32 @@ fn alpha_rename_let_bindings_with_scope(
                 renamed_locals,
             )),
         },
+        RawExpr::Fold {
+            item,
+            target,
+            acc,
+            init,
+            body,
+        } => {
+            let target = alpha_rename_let_bindings_with_scope(target, used_names, renamed_locals);
+            let init = alpha_rename_let_bindings_with_scope(init, used_names, renamed_locals);
+            let renamed_item = unique_inline_local_name(item, used_names);
+            used_names.insert(renamed_item.clone());
+            renamed_locals.push((item.clone(), renamed_item.clone()));
+            let renamed_acc = unique_inline_local_name(acc, used_names);
+            used_names.insert(renamed_acc.clone());
+            renamed_locals.push((acc.clone(), renamed_acc.clone()));
+            let body = alpha_rename_let_bindings_with_scope(body, used_names, renamed_locals);
+            renamed_locals.pop();
+            renamed_locals.pop();
+            RawExpr::Fold {
+                item: renamed_item,
+                target: Box::new(target),
+                acc: renamed_acc,
+                init: Box::new(init),
+                body: Box::new(body),
+            }
+        }
         RawExpr::Array { elements } => RawExpr::Array {
             elements: elements
                 .iter()

@@ -231,6 +231,20 @@ pub(crate) enum LoweredOp {
         arms: Vec<LoweredCaseArm>,
         type_hash: String,
     },
+    Fold {
+        id: String,
+        target_address: String,
+        target_type_hash: String,
+        len: String,
+        init: String,
+        index_slot: usize,
+        acc_slot: usize,
+        item_slot: usize,
+        body: LoweredBlock,
+        element_type_hash: String,
+        acc_type_hash: String,
+        type_hash: String,
+    },
     BorrowShared {
         id: String,
         address: String,
@@ -1282,6 +1296,7 @@ impl CodeDb {
                 locals,
             ),
             "case" => self.lower_case(root, expr_hash, &type_hash, param_types, ctx, locals),
+            "fold" => self.lower_fold(root, expr_hash, &type_hash, param_types, ctx, locals),
             other => bail!("unknown expression kind {other}"),
         }
     }
@@ -2032,6 +2047,164 @@ impl CodeDb {
             operations: lowered.operations,
             address: lowered.value,
             type_hash,
+        })
+    }
+
+    fn lower_fold(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let target_hash = payload
+            .get("target")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("fold missing target"))?;
+        let init_hash = payload
+            .get("init")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("fold missing init"))?;
+        let body_hash = payload
+            .get("body")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("fold missing body"))?;
+        let element_type_hash = payload
+            .get("element_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("fold missing element_type"))?
+            .to_string();
+        let acc_type_hash = payload
+            .get("acc_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("fold missing acc_type"))?
+            .to_string();
+        if acc_type_hash != type_hash {
+            bail!("fold accumulator/result type mismatch while lowering");
+        }
+        if self.type_is_move_only(root, ctx.target_triple(), &element_type_hash)?
+            || self.type_is_move_only(root, ctx.target_triple(), &acc_type_hash)?
+        {
+            bail!("fold lowering requires copyable element and accumulator types in phase 13");
+        }
+
+        let mut operations;
+        let (target_address, target_type_hash, len_value) = match payload
+            .get("target_kind")
+            .and_then(JsonValue::as_str)
+        {
+            Some("fixed_array") => {
+                let target = self.lower_place(root, target_hash, param_types, ctx, locals)?;
+                let array_info =
+                    self.lowered_array_info(root, ctx.target_triple(), &target.type_hash)?;
+                if array_info.element_type_hash != element_type_hash {
+                    bail!("fold array element type mismatch while lowering");
+                }
+                let len_id = ctx.value();
+                ctx.push_debug_op(expr_hash, "const_i64", &len_id);
+                operations = target.operations;
+                operations.push(LoweredOp::ConstI64 {
+                    id: len_id.clone(),
+                    value: array_info.len.to_string(),
+                    type_hash: type_hash_for("I64"),
+                });
+                (target.address, target.type_hash, len_id)
+            }
+            Some("slice") => {
+                let target =
+                    self.lower_slice_address_for_expr(root, target_hash, param_types, ctx, locals)?;
+                match self.type_spec(&target.type_hash)? {
+                    TypeSpec::Slice { element, .. } if element == element_type_hash => {}
+                    _ => bail!("fold slice element type mismatch while lowering"),
+                }
+                let len_id = ctx.value();
+                ctx.push_debug_op(expr_hash, "slice_len", &len_id);
+                operations = target.operations;
+                operations.push(LoweredOp::SliceLen {
+                    id: len_id.clone(),
+                    slice: target.address.clone(),
+                    slice_type_hash: target.type_hash.clone(),
+                    type_hash: type_hash_for("I64"),
+                });
+                (target.address, target.type_hash, len_id)
+            }
+            Some(other) => bail!("unknown fold target_kind {other}"),
+            None => bail!("fold missing target_kind"),
+        };
+
+        let init = self.lower_expr_as(root, init_hash, &acc_type_hash, param_types, ctx, locals)?;
+        if !self.type_assignable_in_root(root, &init.type_hash, &acc_type_hash)? {
+            bail!("fold init type mismatch while lowering");
+        }
+        operations.extend(init.operations);
+
+        let index_slot_size = stack_slot_size_bytes(self.layout_size_bytes(
+            root,
+            ctx.target_triple(),
+            &type_hash_for("I64"),
+        )?);
+        let index_slot = ctx.local_slot(type_hash_for("I64"), index_slot_size);
+        let item_slot_size = stack_slot_size_bytes(self.layout_size_bytes(
+            root,
+            ctx.target_triple(),
+            &element_type_hash,
+        )?);
+        let item_slot = ctx.local_slot(element_type_hash.clone(), item_slot_size);
+        let acc_slot_size = stack_slot_size_bytes(self.layout_size_bytes(
+            root,
+            ctx.target_triple(),
+            &acc_type_hash,
+        )?);
+        let acc_slot = ctx.local_slot(acc_type_hash.clone(), acc_slot_size);
+
+        locals.push(LocalLoweredBinding {
+            slot: item_slot,
+            type_hash: element_type_hash.clone(),
+        });
+        locals.push(LocalLoweredBinding {
+            slot: acc_slot,
+            type_hash: acc_type_hash.clone(),
+        });
+        let moved_before = ctx.moved.clone();
+        let body = self.lower_expr_as(root, body_hash, &acc_type_hash, param_types, ctx, locals);
+        locals.pop();
+        locals.pop();
+        let body = body?;
+        if ctx.moved != moved_before {
+            bail!(
+                "unsupported_move: fold body cannot move owned values in phase 13; loop-aware drop glue is not yet implemented"
+            );
+        }
+        if !self.type_assignable_in_root(root, &body.type_hash, &acc_type_hash)? {
+            bail!("fold body type mismatch while lowering");
+        }
+
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "fold", &id);
+        operations.push(LoweredOp::Fold {
+            id: id.clone(),
+            target_address,
+            target_type_hash,
+            len: len_value,
+            init: init.value,
+            index_slot,
+            acc_slot,
+            item_slot,
+            body: LoweredBlock {
+                operations: body.operations,
+                result: body.value,
+            },
+            element_type_hash,
+            acc_type_hash: acc_type_hash.clone(),
+            type_hash: type_hash.to_string(),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash.to_string(),
         })
     }
 
@@ -3913,6 +4086,76 @@ impl CodeDb {
                         insert_address(addresses, id, type_hash)?;
                     }
                 }
+                LoweredOp::Fold {
+                    id,
+                    target_address,
+                    target_type_hash,
+                    len,
+                    init,
+                    index_slot,
+                    acc_slot,
+                    item_slot,
+                    body,
+                    element_type_hash,
+                    acc_type_hash,
+                    type_hash,
+                } => {
+                    if type_hash != acc_type_hash {
+                        bail!("lowered fold result/accumulator type mismatch");
+                    }
+                    if address_type(addresses, target_address)? != target_type_hash {
+                        bail!("lowered fold target address type mismatch");
+                    }
+                    if value_type(values, len)? != &type_hash_for("I64") {
+                        bail!("lowered fold len must be i64");
+                    }
+                    if value_type(values, init)? != acc_type_hash {
+                        bail!("lowered fold init type mismatch");
+                    }
+                    let index_slot_type = local_slots
+                        .get(*index_slot)
+                        .ok_or_else(|| anyhow!("lowered fold index slot out of bounds"))?
+                        .type_hash
+                        .clone();
+                    let item_slot_type = local_slots
+                        .get(*item_slot)
+                        .ok_or_else(|| anyhow!("lowered fold item slot out of bounds"))?
+                        .type_hash
+                        .clone();
+                    let acc_slot_type = local_slots
+                        .get(*acc_slot)
+                        .ok_or_else(|| anyhow!("lowered fold accumulator slot out of bounds"))?
+                        .type_hash
+                        .clone();
+                    if index_slot_type != type_hash_for("I64")
+                        || item_slot_type != *element_type_hash
+                        || acc_slot_type != *acc_type_hash
+                    {
+                        bail!("lowered fold local slot type mismatch");
+                    }
+                    match self.type_spec_in_root(root, target_type_hash)? {
+                        TypeSpec::FixedArray { element, .. } if element == *element_type_hash => {}
+                        TypeSpec::Slice { element, .. } if element == *element_type_hash => {}
+                        _ => bail!("lowered fold target element type mismatch"),
+                    }
+                    let body_type = self.verify_lowered_block(
+                        root,
+                        body,
+                        target_triple,
+                        param_types,
+                        local_slots,
+                        values,
+                        addresses,
+                        drop_state,
+                    )?;
+                    if body_type != *acc_type_hash {
+                        bail!("lowered fold body result type mismatch");
+                    }
+                    insert_value(values, id, type_hash)?;
+                    if self.type_passes_indirect(root, target_triple, type_hash)? {
+                        insert_address(addresses, id, type_hash)?;
+                    }
+                }
                 LoweredOp::BorrowShared {
                     id,
                     address,
@@ -4622,6 +4865,7 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::Call { id, .. }
         | LoweredOp::If { id, .. }
         | LoweredOp::Case { id, .. }
+        | LoweredOp::Fold { id, .. }
         | LoweredOp::BorrowShared { id, .. }
         | LoweredOp::BorrowMut { id, .. }
         | LoweredOp::DerefShared { id, .. }
@@ -4659,6 +4903,7 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::Call { .. } => "call",
         LoweredOp::If { .. } => "if",
         LoweredOp::Case { .. } => "case",
+        LoweredOp::Fold { .. } => "fold",
         LoweredOp::BorrowShared { .. } => "borrow_shared",
         LoweredOp::BorrowMut { .. } => "borrow_mut",
         LoweredOp::DerefShared { .. } => "deref_shared",
@@ -4746,9 +4991,17 @@ fn collect_lowered_value_debug_infos(
         {
             collect_lowered_value_debug_infos(&then_block.operations, out)?;
             collect_lowered_value_debug_infos(&else_block.operations, out)?;
-        } else if let LoweredOp::Case { arms, .. } = op {
-            for arm in arms {
-                collect_lowered_value_debug_infos(&arm.block.operations, out)?;
+        } else {
+            match op {
+                LoweredOp::Case { arms, .. } => {
+                    for arm in arms {
+                        collect_lowered_value_debug_infos(&arm.block.operations, out)?;
+                    }
+                }
+                LoweredOp::Fold { body, .. } => {
+                    collect_lowered_value_debug_infos(&body.operations, out)?;
+                }
+                _ => {}
             }
         }
     }
@@ -4802,6 +5055,18 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             } => {
                 out.insert(slice_type_hash.clone());
                 out.insert(element_type_hash.clone());
+            }
+            LoweredOp::Fold {
+                target_type_hash,
+                element_type_hash,
+                acc_type_hash,
+                body,
+                ..
+            } => {
+                out.insert(target_type_hash.clone());
+                out.insert(element_type_hash.clone());
+                out.insert(acc_type_hash.clone());
+                collect_op_type_hashes(&body.operations, out);
             }
             LoweredOp::DerefShared {
                 referent_type_hash, ..

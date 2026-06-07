@@ -1,0 +1,28 @@
+record Line {
+  quantity: i64
+  unit_price: i64
+}
+
+enum Discount {
+  NoDiscount: unit
+  Fixed: i64
+}
+
+fn discount_amount(discount: Discount) -> i64 =
+  case discount of NoDiscount => 0 | Fixed(value) => value
+
+fn invoice_total<'a>(lines: slice<'a, Line>, discount: Discount) -> i64 =
+  let subtotal: i64 =
+    fold line in lines with total = 0 do
+      total + line.quantity * line.unit_price
+  in
+  subtotal - discount_amount(discount)
+
+fn main<'a>() -> i64 =
+  let lines: array<Line, 3> = [
+    {quantity: 2, unit_price: 30},
+    {quantity: 1, unit_price: 75},
+    {quantity: 3, unit_price: 5}
+  ] in
+  let view: slice<'a, Line> = slice(lines) in
+  invoice_total(view, Discount::Fixed(5))

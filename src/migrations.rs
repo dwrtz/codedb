@@ -873,6 +873,19 @@ fn append_default_arg_to_calls(expr: &RawExpr, target_name: &str, default: &RawE
             then_expr: Box::new(append_default_arg_to_calls(then_expr, target_name, default)),
             else_expr: Box::new(append_default_arg_to_calls(else_expr, target_name, default)),
         },
+        RawExpr::Fold {
+            item,
+            target,
+            acc,
+            init,
+            body,
+        } => RawExpr::Fold {
+            item: item.clone(),
+            target: Box::new(append_default_arg_to_calls(target, target_name, default)),
+            acc: acc.clone(),
+            init: Box::new(append_default_arg_to_calls(init, target_name, default)),
+            body: Box::new(append_default_arg_to_calls(body, target_name, default)),
+        },
         RawExpr::Array { elements } => RawExpr::Array {
             elements: elements
                 .iter()
@@ -4881,6 +4894,56 @@ impl CodeDb {
                     rename,
                 )?);
             }
+            (
+                RawExpr::Fold {
+                    item,
+                    target,
+                    acc,
+                    init,
+                    body,
+                },
+                "fold",
+            ) => {
+                *target = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "target",
+                    None,
+                    rename,
+                )?);
+                let acc_type = payload
+                    .get("acc_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing acc_type"))?;
+                *init = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "init",
+                    Some(acc_type),
+                    rename,
+                )?);
+                local_names.push(item.clone());
+                local_names.push(acc.clone());
+                let rewritten_body = self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "body",
+                    Some(acc_type),
+                    rename,
+                );
+                local_names.pop();
+                local_names.pop();
+                *body = Box::new(rewritten_body?);
+            }
             (RawExpr::Array { elements }, "array_literal") => {
                 let element_payloads = payload
                     .get("elements")
@@ -6351,6 +6414,28 @@ fn normalize_param_refs_scoped(
                 local_bindings,
             )),
         },
+        RawExpr::Fold {
+            item,
+            target,
+            acc,
+            init,
+            body,
+        } => {
+            let target = normalize_param_refs_scoped(target, local_params, local_bindings);
+            let init = normalize_param_refs_scoped(init, local_params, local_bindings);
+            local_bindings.push(item.clone());
+            local_bindings.push(acc.clone());
+            let body = normalize_param_refs_scoped(body, local_params, local_bindings);
+            local_bindings.pop();
+            local_bindings.pop();
+            RawExpr::Fold {
+                item: item.clone(),
+                target: Box::new(target),
+                acc: acc.clone(),
+                init: Box::new(init),
+                body: Box::new(body),
+            }
+        }
         RawExpr::Array { elements } => RawExpr::Array {
             elements: elements
                 .iter()

@@ -2395,6 +2395,17 @@ fn expression_child_hashes(expr_kind: &str, payload: &JsonValue) -> Result<Vec<S
                 );
             }
         }
+        "fold" => {
+            for key in ["target", "init", "body"] {
+                children.push(
+                    payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("fold missing {key}"))?
+                        .to_string(),
+                );
+            }
+        }
         other => bail!("unknown expression kind {other}"),
     }
     Ok(children)

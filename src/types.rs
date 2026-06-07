@@ -2973,6 +2973,118 @@ impl CodeDb {
                     type_hash: then_expr.type_hash,
                 })
             }
+            RawExpr::Fold {
+                item,
+                target,
+                acc,
+                init,
+                body,
+            } => {
+                validate_projection_identifier("fold item binding", item)?;
+                validate_projection_identifier("fold accumulator binding", acc)?;
+                if item == acc {
+                    bail!("fold item and accumulator bindings must be distinct");
+                }
+                let target = self.type_expr_with_locals(
+                    current_module,
+                    target,
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                let info = self.indexed_element_type_in_root(root, &target.type_hash)?;
+                let (target_kind, element_type, len) = match info {
+                    IndexedElementInfo::FixedArray {
+                        element_type, len, ..
+                    } => {
+                        if !self.typed_expr_is_place(&target.expr_hash)? {
+                            bail!("fold over a fixed array requires an addressable array place");
+                        }
+                        ("fixed_array", element_type, Some(len))
+                    }
+                    IndexedElementInfo::Slice { element_type, .. } => ("slice", element_type, None),
+                };
+                let element_class = self.value_class_in_root(root, &element_type)?;
+                if element_class.copy_kind == ValueCopyKind::MoveOnly {
+                    bail!("fold element type must be copyable in phase 13");
+                }
+                if element_class.contains_reference {
+                    bail!("fold element type must not carry references in phase 13");
+                }
+                let init = self.type_expr_with_locals(
+                    current_module,
+                    init,
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                let acc_class = self.value_class_in_root(root, &init.type_hash)?;
+                if acc_class.copy_kind == ValueCopyKind::MoveOnly {
+                    bail!("fold accumulator type must be copyable in phase 13");
+                }
+                if acc_class.contains_reference {
+                    bail!("fold accumulator type must not carry references in phase 13");
+                }
+                locals.push(LocalTypeBinding {
+                    name: item.clone(),
+                    type_hash: element_type.clone(),
+                });
+                locals.push(LocalTypeBinding {
+                    name: acc.clone(),
+                    type_hash: init.type_hash.clone(),
+                });
+                let body = self.type_expr_with_locals(
+                    current_module,
+                    body,
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                );
+                locals.pop();
+                locals.pop();
+                let body = body?;
+                if !self.type_assignable_in_root(root, &body.type_hash, &init.type_hash)? {
+                    bail!(
+                        "fold body returns {}, expected accumulator type {}",
+                        self.type_name(&body.type_hash)?,
+                        self.type_name(&init.type_hash)?
+                    );
+                }
+                let mut payload = json!({
+                    "expr_kind": "fold",
+                    "item_name": item,
+                    "acc_name": acc,
+                    "target": target.expr_hash,
+                    "target_type": target.type_hash,
+                    "target_kind": target_kind,
+                    "element_type": element_type,
+                    "init": init.expr_hash,
+                    "acc_type": init.type_hash,
+                    "body": body.expr_hash,
+                    "type": init.type_hash,
+                });
+                if let Some(len) = len {
+                    payload["len"] = JsonValue::from(len);
+                }
+                let expr_hash = self.put_object("Expression", &payload)?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": init.type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash: init.type_hash,
+                })
+            }
             RawExpr::Array { elements } => {
                 if elements.is_empty() {
                     bail!("array literal must have at least one element");
@@ -3902,6 +4014,7 @@ impl CodeDb {
                         )?,
                 )
             }
+            "fold" => Ok(false),
             "case" => {
                 let expr = payload
                     .get("expr")
@@ -4591,6 +4704,70 @@ impl CodeDb {
                 }
                 merge_branch_state(state, then_state, else_state);
                 Ok(())
+            }
+            "fold" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing target"))?;
+                let init = payload
+                    .get("init")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing init"))?;
+                let body = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing body"))?;
+                let element_type = payload
+                    .get("element_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing element_type"))?;
+                let acc_type = payload
+                    .get("acc_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing acc_type"))?;
+                if self
+                    .value_class_in_root(root, element_type)?
+                    .contains_reference
+                    || self.value_class_in_root(root, acc_type)?.contains_reference
+                {
+                    bail!(
+                        "fold element and accumulator types must not carry references in phase 13"
+                    );
+                }
+                let target_use = if self.typed_expr_is_place(target)? {
+                    ExprUse::Place
+                } else {
+                    ExprUse::Value
+                };
+                self.verify_expr_borrows(root, target, param_types, state, target_use)?;
+                self.verify_expr_borrows(root, init, param_types, state, ExprUse::Value)?;
+                let item_local = state.next_local;
+                state.next_local += 1;
+                state.locals.push(item_local);
+                let acc_local = state.next_local;
+                state.next_local += 1;
+                state.locals.push(acc_local);
+                let body_result =
+                    self.verify_expr_borrows(root, body, param_types, state, ExprUse::Value);
+                let item_owner = LoanPlace {
+                    root: LoanRoot::Local(item_local),
+                    fields: Vec::new(),
+                };
+                let acc_owner = LoanPlace {
+                    root: LoanRoot::Local(acc_local),
+                    fields: Vec::new(),
+                };
+                state.active.retain(|loan| {
+                    !loan_owner_overlaps(loan, &item_owner)
+                        && !loan_owner_overlaps(loan, &acc_owner)
+                });
+                state.moved.retain(|place| {
+                    !matches!(place.root, LoanRoot::Local(id) if id == item_local || id == acc_local)
+                });
+                state.locals.pop();
+                state.locals.pop();
+                body_result
             }
             "record_literal" => {
                 for field in payload
@@ -5808,6 +5985,11 @@ impl CodeDb {
                         || self.expr_child_requires_state(&payload, "then")?
                         || self.expr_child_requires_state(&payload, "else")?
                 }
+                "fold" => {
+                    self.expr_child_requires_state(&payload, "target")?
+                        || self.expr_child_requires_state(&payload, "init")?
+                        || self.expr_child_requires_state(&payload, "body")?
+                }
                 "record_literal" => {
                     let mut required = false;
                     for field in payload
@@ -6380,6 +6562,108 @@ impl CodeDb {
                     bail!("if branches must have the same type");
                 }
                 then_type
+            }
+            "fold" => {
+                let item_name = payload
+                    .get("item_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing item_name"))?;
+                let acc_name = payload
+                    .get("acc_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing acc_name"))?;
+                validate_projection_identifier("fold item binding", item_name)?;
+                validate_projection_identifier("fold accumulator binding", acc_name)?;
+                if item_name == acc_name {
+                    bail!("fold item and accumulator bindings must be distinct");
+                }
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing target"))?;
+                let init_hash = payload
+                    .get("init")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing init"))?;
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing body"))?;
+                let target_type = self.verify_expr_type_with_locals(
+                    target_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if payload.get("target_type").and_then(JsonValue::as_str)
+                    != Some(target_type.as_str())
+                {
+                    bail!("fold target_type mismatch");
+                }
+                let info = self.indexed_element_type_in_root(root, &target_type)?;
+                let (expected_kind, element_type, fixed_len) = match info {
+                    IndexedElementInfo::FixedArray {
+                        element_type, len, ..
+                    } => {
+                        if !self.typed_expr_is_place(target_hash)? {
+                            bail!("fold over a fixed array requires an addressable array place");
+                        }
+                        ("fixed_array", element_type, Some(len))
+                    }
+                    IndexedElementInfo::Slice { element_type, .. } => ("slice", element_type, None),
+                };
+                if payload.get("target_kind").and_then(JsonValue::as_str) != Some(expected_kind)
+                    || payload.get("element_type").and_then(JsonValue::as_str)
+                        != Some(element_type.as_str())
+                {
+                    bail!("fold target metadata mismatch");
+                }
+                if let Some(len) = fixed_len
+                    && payload.get("len").and_then(JsonValue::as_u64) != Some(len)
+                {
+                    bail!("fold fixed array length metadata mismatch");
+                }
+                let element_class = self.value_class_in_root(root, &element_type)?;
+                if element_class.copy_kind == ValueCopyKind::MoveOnly {
+                    bail!("fold element type must be copyable in phase 13");
+                }
+                if element_class.contains_reference {
+                    bail!("fold element type must not carry references in phase 13");
+                }
+                let init_type = self.verify_expr_type_with_locals(
+                    init_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if payload.get("acc_type").and_then(JsonValue::as_str) != Some(init_type.as_str()) {
+                    bail!("fold acc_type mismatch");
+                }
+                let acc_class = self.value_class_in_root(root, &init_type)?;
+                if acc_class.copy_kind == ValueCopyKind::MoveOnly {
+                    bail!("fold accumulator type must be copyable in phase 13");
+                }
+                if acc_class.contains_reference {
+                    bail!("fold accumulator type must not carry references in phase 13");
+                }
+                locals.push(element_type);
+                locals.push(init_type.clone());
+                let body_type = self.verify_expr_type_with_locals(
+                    body_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                );
+                locals.pop();
+                locals.pop();
+                let body_type = body_type?;
+                if !self.type_assignable_in_root(root, &body_type, &init_type)? {
+                    bail!("fold body type mismatch");
+                }
+                init_type
             }
             "array_literal" => {
                 let elements = payload

@@ -584,6 +584,9 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
                     collect_called_symbols(&arm.block.operations, out);
                 }
             }
+            LoweredOp::Fold { body, .. } => {
+                collect_called_symbols(&body.operations, out);
+            }
             LoweredOp::Param { .. }
             | LoweredOp::ConstI64 { .. }
             | LoweredOp::ConstBool { .. }
@@ -688,6 +691,7 @@ fn validate_native_ops(
             | LoweredOp::Call { type_hash, .. }
             | LoweredOp::If { type_hash, .. }
             | LoweredOp::Case { type_hash, .. }
+            | LoweredOp::Fold { type_hash, .. }
             | LoweredOp::Return { type_hash, .. } => {
                 native_supported_type(type_layouts, type_hash, i64_type, bool_type, unit_type)?;
             }
@@ -800,6 +804,28 @@ fn validate_native_ops(
                     &mut arm_values,
                     &mut arm_addresses,
                 )?;
+            }
+        } else if let LoweredOp::Fold {
+            body,
+            acc_type_hash,
+            ..
+        } = op
+        {
+            let mut body_values = values.clone();
+            let mut body_addresses = addresses.clone();
+            validate_native_ops(
+                &body.operations,
+                params,
+                locals,
+                i64_type,
+                bool_type,
+                unit_type,
+                type_layouts,
+                &mut body_values,
+                &mut body_addresses,
+            )?;
+            if native_value_type(&body_values, &body.result)? != acc_type_hash {
+                bail!("native object backend saw fold body result type mismatch");
             }
         }
     }
@@ -934,6 +960,57 @@ fn validate_native_op_flow(
                     );
                 }
             }
+            native_insert_value(values, id, type_hash)?;
+            if native_passes_indirect(type_layouts, type_hash)? {
+                native_insert_address(addresses, id, type_hash)?;
+            }
+        }
+        LoweredOp::Fold {
+            id,
+            target_address,
+            target_type_hash,
+            len,
+            init,
+            index_slot,
+            acc_slot,
+            item_slot,
+            body,
+            element_type_hash,
+            acc_type_hash,
+            type_hash,
+        } => {
+            if type_hash != acc_type_hash {
+                bail!("native object backend saw fold result/accumulator type mismatch");
+            }
+            if native_address_type(addresses, target_address)? != target_type_hash {
+                bail!("native object backend saw fold target address mismatch");
+            }
+            if native_value_type(values, len)? != &type_hash_for("I64")
+                || native_value_type(values, init)? != acc_type_hash
+            {
+                bail!("native object backend saw fold value type mismatch");
+            }
+            if locals
+                .get(*index_slot)
+                .is_none_or(|local| local.type_hash != type_hash_for("I64"))
+                || locals
+                    .get(*acc_slot)
+                    .is_none_or(|local| local.type_hash != *acc_type_hash)
+                || locals
+                    .get(*item_slot)
+                    .is_none_or(|local| local.type_hash != *element_type_hash)
+            {
+                bail!("native object backend saw fold local slot type mismatch");
+            }
+            match native_type_layout(type_layouts, target_type_hash)?
+                .kind
+                .as_str()
+            {
+                "fixed_array" | "slice" => {}
+                other => bail!("native object backend saw fold over {other}"),
+            }
+            native_type_layout(type_layouts, element_type_hash)?;
+            let _ = body;
             native_insert_value(values, id, type_hash)?;
             if native_passes_indirect(type_layouts, type_hash)? {
                 native_insert_address(addresses, id, type_hash)?;
@@ -1471,6 +1548,20 @@ struct StackParamCopy<T> {
     type_hash: String,
 }
 
+struct FoldEmitSpec<'a> {
+    id: &'a str,
+    target_address: &'a str,
+    target_type_hash: &'a str,
+    len: &'a str,
+    init: &'a str,
+    index_slot: usize,
+    acc_slot: usize,
+    item_slot: usize,
+    body: &'a LoweredBlock,
+    element_type_hash: &'a str,
+    acc_type_hash: &'a str,
+}
+
 fn compile_x86_64_function(
     ir: &LoweredFunctionIr,
     function_symbol: &str,
@@ -1635,6 +1726,10 @@ fn collect_value_ids_inner(
                 for arm in arms {
                     collect_value_ids_inner(&arm.block.operations, ids, seen)?;
                 }
+            }
+            LoweredOp::Fold { id, body, .. } => {
+                push_value_id(ids, seen, id)?;
+                collect_value_ids_inner(&body.operations, ids, seen)?;
             }
             LoweredOp::Store { .. }
             | LoweredOp::StoreEnumTag { .. }
@@ -1804,6 +1899,35 @@ impl FunctionEmitter {
                 ..
             } => {
                 self.emit_case(id, scrutinee, arms)?;
+            }
+            LoweredOp::Fold {
+                id,
+                target_address,
+                target_type_hash,
+                len,
+                init,
+                index_slot,
+                acc_slot,
+                item_slot,
+                body,
+                element_type_hash,
+                acc_type_hash,
+                ..
+            } => {
+                let spec = FoldEmitSpec {
+                    id,
+                    target_address,
+                    target_type_hash,
+                    len,
+                    init,
+                    index_slot: *index_slot,
+                    acc_slot: *acc_slot,
+                    item_slot: *item_slot,
+                    body,
+                    element_type_hash,
+                    acc_type_hash,
+                };
+                self.emit_fold(spec)?;
             }
             LoweredOp::BorrowShared { id, address, .. }
             | LoweredOp::BorrowMut { id, address, .. } => {
@@ -2316,6 +2440,95 @@ impl FunctionEmitter {
         Ok(())
     }
 
+    fn emit_fold(&mut self, spec: FoldEmitSpec<'_>) -> Result<()> {
+        self.store_value_to_local_x86(spec.init, spec.acc_type_hash, spec.acc_slot)?;
+        self.mov_rax_imm32(0);
+        self.mov_stack_rax(self.local_offset(spec.index_slot)?);
+
+        let loop_start = self.text.len();
+        self.mov_rcx_stack(self.local_offset(spec.index_slot)?);
+        self.mov_rdx_stack(self.value_offset(spec.len)?);
+        self.cmp_rcx_rdx();
+        let exit_patch = self.emit_jae_placeholder();
+
+        self.emit_fold_load_item_x86(&spec)?;
+        self.emit_ops(&spec.body.operations)?;
+        self.store_value_to_local_x86(&spec.body.result, spec.acc_type_hash, spec.acc_slot)?;
+
+        self.mov_rax_stack(self.local_offset(spec.index_slot)?);
+        self.add_rax_imm32(1);
+        self.mov_stack_rax(self.local_offset(spec.index_slot)?);
+        self.emit_jmp_to(loop_start)?;
+        self.patch_rel32(exit_patch)?;
+
+        if self.type_passes_indirect(spec.acc_type_hash)? {
+            self.lea_rax_stack(self.local_offset(spec.acc_slot)?);
+        } else {
+            self.mov_rax_stack(self.local_offset(spec.acc_slot)?);
+        }
+        self.mov_stack_rax(self.value_offset(spec.id)?);
+        Ok(())
+    }
+
+    fn emit_fold_load_item_x86(&mut self, spec: &FoldEmitSpec<'_>) -> Result<()> {
+        self.mov_rax_stack(self.value_offset(spec.target_address)?);
+        if native_type_layout(&self.type_layouts, spec.target_type_hash)?.kind == "slice" {
+            self.mov_rax_mem_rax();
+        }
+        self.mov_rcx_stack(self.local_offset(spec.index_slot)?);
+        let stride = native_array_stride(&self.type_layouts, spec.element_type_hash)?;
+        if stride != 1 {
+            self.imul_rcx_imm32(i32::try_from(stride)?);
+        }
+        self.add_rax_rcx();
+        self.store_address_in_rax_to_local_x86(spec.element_type_hash, spec.item_slot)
+    }
+
+    fn store_value_to_local_x86(
+        &mut self,
+        value: &str,
+        type_hash: &str,
+        slot: usize,
+    ) -> Result<()> {
+        let local_offset = self.local_offset(slot)?;
+        if self.type_passes_indirect(type_hash)? {
+            self.copy_memory_from_stack_pointer_to_stack(
+                local_offset,
+                self.value_offset(value)?,
+                self.type_size(type_hash)?,
+            )
+        } else {
+            self.mov_rax_stack(self.value_offset(value)?);
+            self.mov_stack_rax(local_offset);
+            Ok(())
+        }
+    }
+
+    fn store_address_in_rax_to_local_x86(&mut self, type_hash: &str, slot: usize) -> Result<()> {
+        let local_offset = self.local_offset(slot)?;
+        match self.type_size(type_hash)? {
+            0 => Ok(()),
+            1 => {
+                self.movzx_rax_memb_rax();
+                self.mov_stack_rax(local_offset);
+                Ok(())
+            }
+            size @ 2..=7 => {
+                self.lea_rcx_stack(local_offset);
+                self.copy_memory_from_rax_to_rcx(size)
+            }
+            8 => {
+                self.mov_rax_mem_rax();
+                self.mov_stack_rax(local_offset);
+                Ok(())
+            }
+            size => {
+                self.lea_rcx_stack(local_offset);
+                self.copy_memory_from_rax_to_rcx(size)
+            }
+        }
+    }
+
     fn value_offset(&self, id: &str) -> Result<i32> {
         self.layout
             .value_offsets
@@ -2505,6 +2718,13 @@ impl FunctionEmitter {
         patch
     }
 
+    fn emit_jae_placeholder(&mut self) -> usize {
+        self.text.extend_from_slice(&[0x0f, 0x83]);
+        let patch = self.text.len();
+        self.text.extend_from_slice(&[0, 0, 0, 0]);
+        patch
+    }
+
     fn emit_jbe_placeholder(&mut self) -> usize {
         self.text.extend_from_slice(&[0x0f, 0x86]);
         let patch = self.text.len();
@@ -2531,6 +2751,15 @@ impl FunctionEmitter {
         let patch = self.text.len();
         self.text.extend_from_slice(&[0, 0, 0, 0]);
         patch
+    }
+
+    fn emit_jmp_to(&mut self, target_offset: usize) -> Result<()> {
+        self.text.push(0xe9);
+        let next = self.text.len() + 4;
+        let disp = target_offset as i64 - next as i64;
+        let disp = i32::try_from(disp)?;
+        self.text.extend_from_slice(&disp.to_le_bytes());
+        Ok(())
     }
 
     fn emit_ud2(&mut self) {
@@ -2824,6 +3053,35 @@ impl Arm64Emitter {
                 ..
             } => {
                 self.emit_case(id, scrutinee, arms)?;
+            }
+            LoweredOp::Fold {
+                id,
+                target_address,
+                target_type_hash,
+                len,
+                init,
+                index_slot,
+                acc_slot,
+                item_slot,
+                body,
+                element_type_hash,
+                acc_type_hash,
+                ..
+            } => {
+                let spec = FoldEmitSpec {
+                    id,
+                    target_address,
+                    target_type_hash,
+                    len,
+                    init,
+                    index_slot: *index_slot,
+                    acc_slot: *acc_slot,
+                    item_slot: *item_slot,
+                    body,
+                    element_type_hash,
+                    acc_type_hash,
+                };
+                self.emit_fold(spec)?;
             }
             LoweredOp::BorrowShared { id, address, .. }
             | LoweredOp::BorrowMut { id, address, .. } => {
@@ -3329,6 +3587,97 @@ impl Arm64Emitter {
         Ok(())
     }
 
+    fn emit_fold(&mut self, spec: FoldEmitSpec<'_>) -> Result<()> {
+        self.store_value_to_local_arm64(spec.init, spec.acc_type_hash, spec.acc_slot)?;
+        self.mov_u64(0, 0);
+        self.str_stack(0, self.local_offset(spec.index_slot)?)?;
+
+        let loop_start = self.text.len();
+        self.ldr_stack(0, self.local_offset(spec.index_slot)?)?;
+        self.ldr_stack(1, self.value_offset(spec.len)?)?;
+        self.cmp_reg(0, 1);
+        let exit_patch = self.emit_b_cond_placeholder(2);
+
+        self.emit_fold_load_item_arm64(&spec)?;
+        self.emit_ops(&spec.body.operations)?;
+        self.store_value_to_local_arm64(&spec.body.result, spec.acc_type_hash, spec.acc_slot)?;
+
+        self.ldr_stack(0, self.local_offset(spec.index_slot)?)?;
+        self.mov_u64(1, 1);
+        self.add_reg(0, 0, 1);
+        self.str_stack(0, self.local_offset(spec.index_slot)?)?;
+        self.emit_b_to(loop_start)?;
+        self.patch_imm19(exit_patch)?;
+
+        if self.type_passes_indirect(spec.acc_type_hash)? {
+            self.add_reg_sp_imm(0, self.local_offset(spec.acc_slot)?)?;
+        } else {
+            self.ldr_stack(0, self.local_offset(spec.acc_slot)?)?;
+        }
+        self.str_stack(0, self.value_offset(spec.id)?)?;
+        Ok(())
+    }
+
+    fn emit_fold_load_item_arm64(&mut self, spec: &FoldEmitSpec<'_>) -> Result<()> {
+        self.ldr_stack(0, self.value_offset(spec.target_address)?)?;
+        if native_type_layout(&self.type_layouts, spec.target_type_hash)?.kind == "slice" {
+            self.ldr_reg_addr(0, 0)?;
+        }
+        self.ldr_stack(1, self.local_offset(spec.index_slot)?)?;
+        let stride = native_array_stride(&self.type_layouts, spec.element_type_hash)?;
+        if stride != 1 {
+            self.mov_u64(2, stride);
+            self.mul_reg(1, 1, 2);
+        }
+        self.add_reg(0, 0, 1);
+        self.store_address_in_x0_to_local_arm64(spec.element_type_hash, spec.item_slot)
+    }
+
+    fn store_value_to_local_arm64(
+        &mut self,
+        value: &str,
+        type_hash: &str,
+        slot: usize,
+    ) -> Result<()> {
+        let local_offset = self.local_offset(slot)?;
+        if self.type_passes_indirect(type_hash)? {
+            self.copy_memory_from_stack_pointer_to_stack(
+                local_offset,
+                self.value_offset(value)?,
+                self.type_size(type_hash)?,
+            )
+        } else {
+            self.ldr_stack(0, self.value_offset(value)?)?;
+            self.str_stack(0, local_offset)?;
+            Ok(())
+        }
+    }
+
+    fn store_address_in_x0_to_local_arm64(&mut self, type_hash: &str, slot: usize) -> Result<()> {
+        let local_offset = self.local_offset(slot)?;
+        match self.type_size(type_hash)? {
+            0 => Ok(()),
+            1 => {
+                self.ldrb_reg_addr(0, 0)?;
+                self.str_stack(0, local_offset)?;
+                Ok(())
+            }
+            size @ 2..=7 => {
+                self.add_reg_sp_imm(1, local_offset)?;
+                self.copy_memory_from_x0_to_x1(size)
+            }
+            8 => {
+                self.ldr_reg_addr(0, 0)?;
+                self.str_stack(0, local_offset)?;
+                Ok(())
+            }
+            size => {
+                self.add_reg_sp_imm(1, local_offset)?;
+                self.copy_memory_from_x0_to_x1(size)
+            }
+        }
+    }
+
     fn value_offset(&self, id: &str) -> Result<u32> {
         self.layout
             .value_offsets
@@ -3539,6 +3888,21 @@ impl Arm64Emitter {
         let patch = self.text.len();
         self.emit_u32(0x14000000);
         patch
+    }
+
+    fn emit_b_to(&mut self, target_offset: usize) -> Result<()> {
+        let source = self.text.len();
+        let bytes = target_offset as i64 - source as i64;
+        if bytes % 4 != 0 {
+            bail!("arm64 branch target is not instruction-aligned");
+        }
+        let disp = bytes / 4;
+        if !(-(1 << 25)..(1 << 25)).contains(&disp) {
+            bail!("arm64 branch target out of range");
+        }
+        let encoded = (disp as i32 as u32) & 0x03ff_ffff;
+        self.emit_u32(0x14000000 | encoded);
+        Ok(())
     }
 
     fn emit_b_cond_placeholder(&mut self, cond: u8) -> usize {

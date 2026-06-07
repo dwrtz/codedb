@@ -733,6 +733,12 @@ verify validates slice region and element layout
 
 Goal: compile useful iteration over arrays and slices.
 
+Status: implemented for the `fold item in target with acc = init do body`
+expression over fixed arrays and slices. Fold lowering carries explicit loop
+state, emits native loops on supported backends, traces loop iterations, and
+validates accumulator/element types. `break` and `continue` remain reserved and
+unsupported; general `for` syntax is deferred.
+
 Deliverables:
 
 ```text
