@@ -326,6 +326,31 @@ fn main() -> i64 = amount(Discount::percent(10))
         "--out",
         path(&main_object),
     ]);
+
+    // The rename must preserve semantic identity end-to-end: the renamed enum
+    // still compiles and the native executable returns the same result as the
+    // oracle (a stable variant tag survives the rename).
+    if can_build_default_native_target() {
+        run(&[
+            "create-test",
+            path(&db),
+            "renamed_variant_native",
+            "--entry",
+            "main",
+            "--expect-i64",
+            "10",
+            "--native-required",
+            "--json",
+        ]);
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["native_mismatches"], 0);
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+        assert_eq!(
+            report["tests"][0]["native"]["comparison"]["actual"],
+            json!({"kind": "i64", "value": "10"})
+        );
+    }
 }
 
 fn can_build_default_native_target() -> bool {

@@ -220,6 +220,97 @@ fn bad() -> i64 =
         .stderr(predicate::str::contains("out of bounds"));
 }
 
+#[test]
+fn dynamic_array_index_out_of_bounds_traps_natively_with_semantic_location() {
+    // Phase 11 acceptance ("bounds trap maps to semantic expr_hash") for fixed
+    // arrays at runtime. A non-literal (parameter) index cannot be rejected at
+    // import, so it lowers to a real bounds check; out of range it must trap
+    // natively, and the native trap must carry the indexing expression's
+    // expr_hash (the slice analogue is covered in tests/slices.rs).
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("array-dyn-oob.sqlite");
+    let source = temp.path().join("array-dyn-oob.cdb");
+    let at_ir_path = temp.path().join("at.ir.json");
+    let exe_path = temp.path().join("array-dyn-oob");
+
+    std::fs::write(
+        &source,
+        r#"
+fn at(values: array<i64, 2>, i: i64) -> i64 = values[i]
+
+fn main() -> i64 =
+  let values: array<i64, 2> = [1, 2] in
+  at(values, 2)
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+
+    let trace = parse_json(&run(&["trace", path(&db), "main", "--json"]));
+    assert_eq!(trace["status"], "error");
+    assert_eq!(trace["diagnostics"][0]["kind"], "trap");
+
+    run(&["emit-ir", path(&db), "at", "--out", path(&at_ir_path)]);
+    let at_ir = read_json(&at_ir_path);
+    let operations = at_ir["ir"]["operations"].as_array().unwrap();
+    let bounds = operations
+        .iter()
+        .find(|op| op["op"] == "bounds_check")
+        .expect("array bounds check");
+    // Fixed-array length is a compile-time constant, so the check carries a
+    // static `len` (unlike a slice, whose length is dynamic `len_value`).
+    assert_eq!(bounds["len"], 2);
+
+    let debug_ops = at_ir["ir"]["debug_map"]["operations"].as_array().unwrap();
+    let bounds_debug = debug_ops
+        .iter()
+        .find(|op| op["value_id"] == bounds["id"])
+        .expect("bounds debug op");
+    let index_debug = debug_ops
+        .iter()
+        .find(|op| {
+            op["lowered_op_kind"] == "addr_of_index" && op["expr_hash"] == bounds_debug["expr_hash"]
+        })
+        .expect("index debug op");
+    assert_eq!(bounds_debug["expr_hash"], index_debug["expr_hash"]);
+    assert_eq!(
+        trace["diagnostics"][0]["location"]["expr_hash"],
+        bounds_debug["expr_hash"]
+    );
+
+    if can_build_default_native_target() {
+        run(&["build", path(&db), "main", "--out", path(&exe_path)]);
+        let status = StdCommand::new(&exe_path)
+            .status()
+            .expect("run native array oob");
+        assert!(!status.success());
+
+        run(&[
+            "create-test",
+            path(&db),
+            "array_oob_native_trap",
+            "--entry",
+            "main",
+            "--expect-i64",
+            "0",
+            "--native-required",
+            "--json",
+        ]);
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["tests"][0]["native"]["status"], "failed");
+        let native_location = report["tests"][0]["native"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|diagnostic| diagnostic["kind"] == "native_trap_semantic_location")
+            .expect("native semantic trap diagnostic")["details"]["location"]
+            .clone();
+        assert_eq!(native_location["expr_hash"], bounds_debug["expr_hash"]);
+    }
+}
+
 fn op_names(ir: &JsonValue) -> Vec<String> {
     ir["ir"]["operations"]
         .as_array()

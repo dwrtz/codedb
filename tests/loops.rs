@@ -213,6 +213,31 @@ fn mutate_sum<'a>() -> i64 effects[state] =
     assert_eq!(run(&["eval", path(&good_db), "mutate_sum"]).trim(), "3");
     run(&["verify", path(&good_db)]);
 
+    // A fold body that mutates through a mutable slice must compile to native
+    // code and agree with the oracle, and the function must surface the `state`
+    // effect (loop-body mutation is a real store, not just an eval-time effect).
+    if can_build_default_native_target() {
+        run(&[
+            "create-test",
+            path(&good_db),
+            "fold_mutation_native",
+            "--entry",
+            "mutate_sum",
+            "--expect-i64",
+            "3",
+            "--native-required",
+            "--json",
+        ]);
+        let report = parse_json(&run(&["test", path(&good_db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["tests"][0]["entry_effects"], json!(["state"]));
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+        assert_eq!(
+            report["tests"][0]["native"]["comparison"]["actual"],
+            json!({"kind": "i64", "value": "3"})
+        );
+    }
+
     std::fs::write(&bad_source, program.replace(" effects[state]", "")).unwrap();
     run(&["init", path(&bad_db)]);
     bin()
