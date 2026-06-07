@@ -382,6 +382,58 @@ fn main<'a>() -> i64 =
     }
 }
 
+#[test]
+fn storing_through_shared_slice_is_rejected() {
+    // A shared `slice` is read-only: an element store `s[i] = v` (or an
+    // element-field store `s[i].f = v`) through a shared slice would mutate
+    // immutably-aliased memory and must be rejected at import. Regression for a
+    // hole where `array_index` assignment targets skipped the slice-mutability
+    // check that `field_access` already enforced.
+    let temp = tempdir().unwrap();
+
+    let element_db = temp.path().join("shared-slice-store.sqlite");
+    let element_source = temp.path().join("shared-slice-store.cdb");
+    std::fs::write(
+        &element_source,
+        r#"
+fn bad<'a>(s: slice<'a, i64>) -> i64 effects[state] =
+  let _: unit = s[0] = 99 in
+  s[0]
+"#,
+    )
+    .unwrap();
+    run(&["init", path(&element_db)]);
+    bin()
+        .args(["import", path(&element_db), path(&element_source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "assignment target must be a mutable semantic place",
+        ));
+
+    let field_db = temp.path().join("shared-slice-field-store.sqlite");
+    let field_source = temp.path().join("shared-slice-field-store.cdb");
+    std::fs::write(
+        &field_source,
+        r#"
+record Line { amount: i64 }
+
+fn bad<'a>(s: slice<'a, Line>) -> i64 effects[state] =
+  let _: unit = s[0].amount = 9 in
+  s[0].amount
+"#,
+    )
+    .unwrap();
+    run(&["init", path(&field_db)]);
+    bin()
+        .args(["import", path(&field_db), path(&field_source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "assignment target must be a mutable semantic place",
+        ));
+}
+
 fn op_names(ir: &JsonValue) -> Vec<String> {
     ir["ir"]["operations"]
         .as_array()

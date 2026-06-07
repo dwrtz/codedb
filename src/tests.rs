@@ -267,11 +267,11 @@ impl CodeDb {
             .iter()
             .map(value_from_test_value)
             .collect::<Result<Vec<_>>>()?;
-        if let Err(err) = self.eval_symbol(root_hash, &case.entry_symbol, args) {
-            if !case.native_required {
-                return Err(err)
-                    .with_context(|| format!("test entry is not evaluatable in root {root_hash}"));
-            }
+        if let Err(err) = self.eval_symbol(root_hash, &case.entry_symbol, args)
+            && !case.native_required
+        {
+            return Err(err)
+                .with_context(|| format!("test entry is not evaluatable in root {root_hash}"));
         }
         Ok(())
     }

@@ -3703,10 +3703,10 @@ impl CodeDb {
                 element_type,
                 len,
             } => {
-                if let Some(value) = self.typed_literal_i64_value(&index.expr_hash)? {
-                    if value < 0 || value as u64 >= len {
-                        bail!("array index {value} out of bounds for length {len}");
-                    }
+                if let Some(value) = self.typed_literal_i64_value(&index.expr_hash)?
+                    && (value < 0 || value as u64 >= len)
+                {
+                    bail!("array index {value} out of bounds for length {len}");
                 }
                 payload["indexed_kind"] = JsonValue::String("fixed_array".to_string());
                 payload["array_type"] = JsonValue::String(container_type);
@@ -3837,6 +3837,7 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("array_index target missing type"))?;
                 match self.type_spec_in_root(root, target_type)? {
+                    TypeSpec::Slice { mutable, .. } => Ok(mutable),
                     TypeSpec::Reference { mutable, .. } => Ok(mutable),
                     _ => self.typed_expr_is_assignable_place(root, target_hash),
                 }
@@ -4621,17 +4622,36 @@ impl CodeDb {
                     let mut retained = Vec::with_capacity(state.active.len());
                     for loan in state.active.drain(..) {
                         match loan.owner.as_ref() {
-                            Some(owner) if place_is_prefix_of(&target_place, owner) => {
+                            // Owned by the assigned place or a concrete sub-place
+                            // of it: this storage is definitely overwritten, so
+                            // its loan ends. Use EXACT matching — a dynamic `[*]`
+                            // index proves nothing about which element is hit, so
+                            // it must not be treated as overwriting a concrete
+                            // sibling `[N]` here (doing so would end a loan whose
+                            // referent may still be live — an aliasing-&mut hole).
+                            Some(owner) if place_is_prefix_of_exact(&target_place, owner) => {
                                 // Owned by the assigned place or a sub-place: retire.
                             }
                             Some(owner)
-                                if place_is_prefix_of(owner, &target_place)
+                                if place_is_prefix_of_exact(owner, &target_place)
                                     && owner != &target_place =>
                             {
                                 bail!(
                                     "unsupported_assign: cannot reassign reference place {:?}; its loans are tracked at the coarser granularity {:?}. Build the value with a record literal so per-field loans are tracked.",
                                     target_place,
                                     owner
+                                );
+                            }
+                            // Neither place is a provable prefix of the other yet
+                            // they still overlap — only possible through a dynamic
+                            // `[*]` index (e.g. `arr[i] = ...` aliasing a loan
+                            // owned by `arr[1]`). We cannot prove the loan is
+                            // overwritten (so retiring it is unsound) nor that it
+                            // survives, so reject fail-closed rather than guess.
+                            Some(owner) if places_overlap(&target_place, owner) => {
+                                bail!(
+                                    "unsupported_assign: cannot reassign reference place {:?} through a dynamic index; its element loans cannot be tracked precisely. Use a constant index.",
+                                    target_place
                                 );
                             }
                             _ => retained.push(loan),
@@ -6804,10 +6824,10 @@ impl CodeDb {
                         {
                             bail!("array_index metadata mismatch");
                         }
-                        if let Some(value) = self.typed_literal_i64_value(index_hash)? {
-                            if value < 0 || value as u64 >= len {
-                                bail!("array index {value} out of bounds for length {len}");
-                            }
+                        if let Some(value) = self.typed_literal_i64_value(index_hash)?
+                            && (value < 0 || value as u64 >= len)
+                        {
+                            bail!("array index {value} out of bounds for length {len}");
                         }
                         element_type
                     }
@@ -7153,9 +7173,17 @@ fn places_overlap(left: &LoanPlace, right: &LoanPlace) -> bool {
 }
 
 /// True when `prefix` denotes `value` or an ancestor place of it (same root and
-/// a leading field-path prefix). Unlike [`places_overlap`] this is directional.
-fn place_is_prefix_of(prefix: &LoanPlace, value: &LoanPlace) -> bool {
-    prefix.root == value.root && fields_prefix(&prefix.fields, &value.fields)
+/// a leading field-path prefix), with NO `[*]` wildcard matching: every path
+/// segment must be literally equal. Unlike [`places_overlap`] this is
+/// directional, and unlike a wildcard prefix it must *prove* that one place
+/// denotes (or is an ancestor of) another — for example when deciding that an
+/// assignment definitely overwrites the storage a loan refers to. A dynamic
+/// `[*]` index denotes an unknown element and therefore proves nothing, so it
+/// must never satisfy a definite-overwrite test (see the assignment loan
+/// retirement in `verify_expr_borrows`); the wildcard `[*]` ambiguity is handled
+/// separately there via [`places_overlap`].
+fn place_is_prefix_of_exact(prefix: &LoanPlace, value: &LoanPlace) -> bool {
+    prefix.root == value.root && fields_prefix_exact(&prefix.fields, &value.fields)
 }
 
 /// Moved places that refer to storage outliving the current `if` — parameters
@@ -7186,6 +7214,16 @@ fn fields_prefix(prefix: &[String], value: &[String]) -> bool {
             .iter()
             .zip(value.iter())
             .all(|(left, right)| left == right || left == "[*]" || right == "[*]")
+}
+
+/// Exact (wildcard-free) variant of [`fields_prefix`]: a `[*]` segment matches
+/// only another literal `[*]`, never a concrete `[N]`.
+fn fields_prefix_exact(prefix: &[String], value: &[String]) -> bool {
+    prefix.len() <= value.len()
+        && prefix
+            .iter()
+            .zip(value.iter())
+            .all(|(left, right)| left == right)
 }
 
 fn array_index_segment(index: u64) -> String {

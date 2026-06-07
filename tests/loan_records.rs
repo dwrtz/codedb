@@ -149,6 +149,61 @@ fn main<'a>() -> i64 effects[state] =
     );
 }
 
+/// SOUNDNESS: reassigning an element of a fixed array of `&mut` through a
+/// *dynamic* index must not silently end a concrete sibling element's loan.
+/// The assigned place lowers to `arr[*]` (unknown element); treating that as
+/// overwriting `arr[1]` would end its loan and let a fresh `&mut` to that
+/// element's referent be accepted, yielding two live `&mut` to one place. The
+/// array element loans cannot be tracked precisely through a dynamic index, so
+/// this must fail closed. (Regression for the `[*]`-wildcard loan-retirement
+/// hole: `arr[i] = &mut r` then `&mut q` was wrongly accepted and evaluated.)
+#[test]
+fn aliasing_mutable_refs_via_dynamic_array_index_is_rejected() {
+    assert_rejected(
+        "aliasing-mut-array-dynamic-index",
+        r#"
+record Pair { a: i64 b: i64 }
+
+fn zero() -> i64 = 0
+
+fn main<'a>() -> i64 effects[state] =
+  let p: Pair = { a: 1, b: 2 } in
+  let q: Pair = { a: 3, b: 4 } in
+  let r: Pair = { a: 5, b: 6 } in
+  let arr: array<&'a mut Pair, 2> = [&'a mut p, &'a mut q] in
+  let i: i64 = zero() in
+  let _: unit = arr[i] = &'a mut r in
+  let alias_q: &'a mut Pair = &'a mut q in
+  let _: unit = alias_q.a = 1000 in
+  let _: unit = arr[1].a = 7 in
+  alias_q.a + arr[1].a
+"#,
+        &["unsupported_assign"],
+    );
+}
+
+/// Companion to the dynamic-index rejection above: reassigning a fixed-array
+/// element of a *non-reference* type through a dynamic index carries no loans
+/// and must remain accepted (the fail-closed guard is scoped to
+/// reference-carrying aggregates, not all dynamic array stores).
+#[test]
+fn dynamic_array_index_store_without_references_is_accepted() {
+    let (_temp, db) = import_source(
+        "dynamic-array-store-scalar",
+        r#"
+fn pick() -> i64 = 1
+
+fn main() -> i64 effects[state] =
+  let arr: array<i64, 3> = [10, 20, 30] in
+  let i: i64 = pick() in
+  let _: unit = arr[i] = 99 in
+  arr[0] + arr[1] + arr[2]
+"#,
+    );
+    assert_eq!(run(&["verify", path(&db)]).trim(), "verify ok");
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "139");
+}
+
 /// A record with a *single* reference field built by a call carries that loan at
 /// field granularity, so reassigning the field precisely ends the old loan and
 /// the original referent may be borrowed again afterwards.
