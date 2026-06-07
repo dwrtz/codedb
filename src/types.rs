@@ -278,6 +278,19 @@ enum ExprUse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum IndexedElementInfo {
+    FixedArray {
+        container_type: String,
+        element_type: String,
+        len: u64,
+    },
+    Slice {
+        container_type: String,
+        element_type: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TypeFieldSpec {
     pub(crate) name: String,
     pub(crate) type_hash: String,
@@ -298,6 +311,11 @@ pub(crate) enum TypeSpec {
     RawPointer {
         mutable: bool,
         pointee: String,
+    },
+    Slice {
+        region: String,
+        mutable: bool,
+        element: String,
     },
     FixedArray {
         element: String,
@@ -703,6 +721,22 @@ impl CodeDb {
                     Ok(format!("raw_ptr<{pointee}>"))
                 }
             }
+            TypeSpec::Slice {
+                region,
+                mutable,
+                element,
+            } => {
+                let region_name = region_names
+                    .get(&region)
+                    .map(String::as_str)
+                    .unwrap_or(region.as_str());
+                let element = self.type_name_with_regions(&element, region_names)?;
+                if mutable {
+                    Ok(format!("mut_slice<'{region_name}, {element}>"))
+                } else {
+                    Ok(format!("slice<'{region_name}, {element}>"))
+                }
+            }
             TypeSpec::FixedArray { element, len } => Ok(format!(
                 "array<{}, {len}>",
                 self.type_name_with_regions(&element, region_names)?
@@ -816,6 +850,27 @@ impl CodeDb {
                     Ok(format!("raw_mut_ptr<{pointee}>"))
                 } else {
                     Ok(format!("raw_ptr<{pointee}>"))
+                }
+            }
+            TypeSpec::Slice {
+                region,
+                mutable,
+                element,
+            } => {
+                let region_name = region_names
+                    .get(&region)
+                    .map(String::as_str)
+                    .unwrap_or(region.as_str());
+                let element = self.type_name_in_root_with_regions(
+                    root,
+                    current_module,
+                    &element,
+                    region_names,
+                )?;
+                if mutable {
+                    Ok(format!("mut_slice<'{region_name}, {element}>"))
+                } else {
+                    Ok(format!("slice<'{region_name}, {element}>"))
                 }
             }
             TypeSpec::FixedArray { element, len } => {
@@ -1001,6 +1056,18 @@ impl CodeDb {
                 let pointee = self.substitute_type_regions_hash(&pointee, region_substitutions)?;
                 hash_for_type_spec(&TypeSpec::RawPointer { mutable, pointee })
             }
+            TypeSpec::Slice {
+                region,
+                mutable,
+                element,
+            } => {
+                let element = self.substitute_type_regions_hash(&element, region_substitutions)?;
+                hash_for_type_spec(&TypeSpec::Slice {
+                    region: self.substitute_region_hash(region, region_substitutions),
+                    mutable,
+                    element,
+                })
+            }
             TypeSpec::FixedArray { element, len } => {
                 let element = self.substitute_type_regions_hash(&element, region_substitutions)?;
                 hash_for_type_spec(&TypeSpec::FixedArray { element, len })
@@ -1074,6 +1141,18 @@ impl CodeDb {
             TypeSpec::RawPointer { mutable, pointee } => {
                 let pointee = self.put_substituted_type_regions(&pointee, region_substitutions)?;
                 self.put_structural_type(TypeSpec::RawPointer { mutable, pointee })
+            }
+            TypeSpec::Slice {
+                region,
+                mutable,
+                element,
+            } => {
+                let element = self.put_substituted_type_regions(&element, region_substitutions)?;
+                self.put_structural_type(TypeSpec::Slice {
+                    region: self.substitute_region_hash(region, region_substitutions),
+                    mutable,
+                    element,
+                })
             }
             TypeSpec::FixedArray { element, len } => {
                 let element = self.put_substituted_type_regions(&element, region_substitutions)?;
@@ -1223,6 +1302,23 @@ impl CodeDb {
                 self.type_assignable_in_root(root, &actual_referent, &expected_referent)
             }
             (
+                TypeSpec::Slice {
+                    region: actual_region,
+                    mutable: actual_mutable,
+                    element: actual_element,
+                },
+                TypeSpec::Slice {
+                    region: expected_region,
+                    mutable: expected_mutable,
+                    element: expected_element,
+                },
+            ) => {
+                if actual_region != expected_region || actual_mutable != expected_mutable {
+                    return Ok(false);
+                }
+                self.type_assignable_in_root(root, &actual_element, &expected_element)
+            }
+            (
                 TypeSpec::FixedArray {
                     element: actual_element,
                     len: actual_len,
@@ -1306,6 +1402,31 @@ impl CodeDb {
                     root,
                     &actual_referent,
                     &expected_referent,
+                    callee_regions,
+                )
+            }
+            (
+                TypeSpec::Slice {
+                    region: actual_region,
+                    mutable: actual_mutable,
+                    element: actual_element,
+                },
+                TypeSpec::Slice {
+                    region: expected_region,
+                    mutable: expected_mutable,
+                    element: expected_element,
+                },
+            ) => {
+                if actual_mutable != expected_mutable {
+                    return Ok(false);
+                }
+                if actual_region != expected_region && !callee_regions.contains(&expected_region) {
+                    return Ok(false);
+                }
+                self.type_assignable_for_call_in_root(
+                    root,
+                    &actual_element,
+                    &expected_element,
                     callee_regions,
                 )
             }
@@ -1445,6 +1566,35 @@ impl CodeDb {
                 callee_regions,
                 substitutions,
             ),
+            (
+                TypeSpec::Slice {
+                    region: actual_region,
+                    mutable: actual_mutable,
+                    element: actual_element,
+                },
+                TypeSpec::Slice {
+                    region: expected_region,
+                    mutable: expected_mutable,
+                    element: expected_element,
+                },
+            ) => {
+                if actual_mutable != expected_mutable {
+                    return Ok(());
+                }
+                record_call_region_substitution(
+                    expected_region,
+                    actual_region,
+                    callee_regions,
+                    substitutions,
+                )?;
+                self.infer_call_region_substitutions(
+                    root,
+                    &actual_element,
+                    &expected_element,
+                    callee_regions,
+                    substitutions,
+                )
+            }
             (
                 TypeSpec::FixedArray {
                     element: actual,
@@ -1600,6 +1750,15 @@ impl CodeDb {
                     pointee,
                 })
             }
+            ParsedTypeSpec::Slice {
+                region,
+                mutable,
+                element,
+            } => {
+                bail!(
+                    "slice region '{region} requires root-aware resolution before resolving {element:?} as mutable={mutable}"
+                )
+            }
             ParsedTypeSpec::FixedArray { element, len } => {
                 let element = self.put_type_spec(element)?;
                 self.put_structural_type(TypeSpec::FixedArray { element, len: *len })
@@ -1682,6 +1841,20 @@ impl CodeDb {
                 self.put_structural_type(TypeSpec::RawPointer {
                     mutable: *mutable,
                     pointee,
+                })
+            }
+            ParsedTypeSpec::Slice {
+                region,
+                mutable,
+                element,
+            } => {
+                let element =
+                    self.put_type_spec_in_root(current_module, root, element, region_scope)?;
+                let region = resolve_region_arg(region, region_scope)?;
+                self.put_structural_type(TypeSpec::Slice {
+                    region,
+                    mutable: *mutable,
+                    element,
                 })
             }
             ParsedTypeSpec::FixedArray { element, len } => {
@@ -1777,6 +1950,19 @@ impl CodeDb {
                 hash_for_type_spec(&TypeSpec::RawPointer {
                     mutable: *mutable,
                     pointee,
+                })
+            }
+            ParsedTypeSpec::Slice {
+                region,
+                mutable,
+                element,
+            } => {
+                let element =
+                    self.type_hash_for_parsed_in_root(current_module, root, element, region_scope)?;
+                hash_for_type_spec(&TypeSpec::Slice {
+                    region: resolve_region_arg(region, region_scope)?,
+                    mutable: *mutable,
+                    element,
                 })
             }
             ParsedTypeSpec::FixedArray { element, len } => {
@@ -2298,6 +2484,18 @@ impl CodeDb {
                 }
             }
             RawExpr::Call { name, args } => {
+                if matches!(name.as_str(), "slice" | "mut_slice" | "len" | "subslice") {
+                    return self.type_builtin_slice_call(
+                        current_module,
+                        name,
+                        args,
+                        root,
+                        param_names,
+                        param_types,
+                        region_scope,
+                        locals,
+                    );
+                }
                 let symbol = resolve_function_name_in_root(root, current_module, name)
                     .ok_or_else(|| anyhow!("unknown function {name}"))?;
                 let callee = self
@@ -3122,6 +3320,218 @@ impl CodeDb {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn type_builtin_slice_call(
+        &mut self,
+        current_module: &str,
+        name: &str,
+        args: &[RawExpr],
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
+        locals: &mut Vec<LocalTypeBinding>,
+    ) -> Result<TypeCheckResult> {
+        match name {
+            "slice" | "mut_slice" => {
+                if args.len() != 1 {
+                    bail!("{name} expects 1 arg, got {}", args.len());
+                }
+                let target = self.type_expr_with_locals(
+                    current_module,
+                    &args[0],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                if !self.typed_expr_is_place(&target.expr_hash)? {
+                    bail!("{name} target must be an addressable array place");
+                }
+                let mutable = name == "mut_slice";
+                if mutable && !self.typed_expr_is_assignable_place(root, &target.expr_hash)? {
+                    bail!("mut_slice target must be a mutable semantic place");
+                }
+                let (region_name, region_hash) =
+                    self.resolve_single_region_for_builtin(region_scope, name)?;
+                let info = self.indexed_element_type_in_root(root, &target.type_hash)?;
+                let IndexedElementInfo::FixedArray {
+                    container_type,
+                    element_type,
+                    len,
+                } = info
+                else {
+                    bail!("{name} target must be a fixed array");
+                };
+                let type_hash = self.put_structural_type(TypeSpec::Slice {
+                    region: region_hash.clone(),
+                    mutable,
+                    element: element_type.clone(),
+                })?;
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "slice_from_array",
+                        "target": target.expr_hash,
+                        "target_type": target.type_hash,
+                        "array_type": container_type,
+                        "element_type": element_type,
+                        "len": len,
+                        "region": region_hash,
+                        "region_name": region_name,
+                        "mutable": mutable,
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
+            "len" => {
+                if args.len() != 1 {
+                    bail!("len expects 1 arg, got {}", args.len());
+                }
+                let target = self.type_expr_with_locals(
+                    current_module,
+                    &args[0],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                let TypeSpec::Slice { .. } = self.type_spec_in_root(root, &target.type_hash)?
+                else {
+                    bail!("len expects a slice");
+                };
+                let type_hash = type_hash_for("I64");
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "slice_len",
+                        "target": target.expr_hash,
+                        "slice_type": target.type_hash,
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
+            "subslice" => {
+                if args.len() != 3 {
+                    bail!("subslice expects 3 args, got {}", args.len());
+                }
+                let target = self.type_expr_with_locals(
+                    current_module,
+                    &args[0],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                let TypeSpec::Slice { element, .. } =
+                    self.type_spec_in_root(root, &target.type_hash)?
+                else {
+                    bail!("subslice expects a slice");
+                };
+                let start = self.type_expr_with_locals(
+                    current_module,
+                    &args[1],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                let len = self.type_expr_with_locals(
+                    current_module,
+                    &args[2],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                require_type(
+                    &start.type_hash,
+                    &type_hash_for("I64"),
+                    "subslice start",
+                    self,
+                )?;
+                require_type(&len.type_hash, &type_hash_for("I64"), "subslice len", self)?;
+                if matches!(self.typed_literal_i64_value(&start.expr_hash)?, Some(value) if value < 0)
+                {
+                    bail!("subslice start must be non-negative");
+                }
+                if matches!(self.typed_literal_i64_value(&len.expr_hash)?, Some(value) if value < 0)
+                {
+                    bail!("subslice len must be non-negative");
+                }
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "subslice",
+                        "target": target.expr_hash,
+                        "start": start.expr_hash,
+                        "len": len.expr_hash,
+                        "slice_type": target.type_hash,
+                        "element_type": element,
+                        "type": target.type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": target.type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash: target.type_hash,
+                })
+            }
+            _ => bail!("unknown slice builtin {name}"),
+        }
+    }
+
+    fn resolve_single_region_for_builtin(
+        &self,
+        region_scope: &BTreeMap<String, String>,
+        name: &str,
+    ) -> Result<(String, String)> {
+        if region_scope.len() != 1 {
+            bail!(
+                "{name} requires exactly one function region parameter; found {}",
+                region_scope.len()
+            );
+        }
+        let (name, hash) = region_scope
+            .iter()
+            .next()
+            .expect("region_scope length was checked");
+        Ok((name.clone(), hash.clone()))
+    }
+
     fn type_array_index(
         &mut self,
         root: &ProgramRootPayload,
@@ -3129,26 +3539,47 @@ impl CodeDb {
         index: &TypeCheckResult,
     ) -> Result<TypeCheckResult> {
         require_type(&index.type_hash, &type_hash_for("I64"), "array index", self)?;
-        let (array_type, element_type, len) =
-            self.array_element_type_in_root(root, &target.type_hash)?;
-        if let Some(value) = self.typed_literal_i64_value(&index.expr_hash)? {
-            if value < 0 || value as u64 >= len {
-                bail!("array index {value} out of bounds for length {len}");
-            }
-        }
-        let expr_hash = self.put_object(
-            "Expression",
-            &json!({
+        let info = self.indexed_element_type_in_root(root, &target.type_hash)?;
+        let mut payload = json!({
                 "expr_kind": "array_index",
                 "target": target.expr_hash.clone(),
                 "index": index.expr_hash.clone(),
                 "target_type": target.type_hash.clone(),
-                "array_type": array_type,
-                "element_type": element_type.clone(),
-                "len": len,
-                "type": element_type.clone(),
-            }),
-        )?;
+        });
+        let element_type = match info {
+            IndexedElementInfo::FixedArray {
+                container_type,
+                element_type,
+                len,
+            } => {
+                if let Some(value) = self.typed_literal_i64_value(&index.expr_hash)? {
+                    if value < 0 || value as u64 >= len {
+                        bail!("array index {value} out of bounds for length {len}");
+                    }
+                }
+                payload["indexed_kind"] = JsonValue::String("fixed_array".to_string());
+                payload["array_type"] = JsonValue::String(container_type);
+                payload["element_type"] = JsonValue::String(element_type.clone());
+                payload["len"] = JsonValue::from(len);
+                element_type
+            }
+            IndexedElementInfo::Slice {
+                container_type,
+                element_type,
+            } => {
+                if let Some(value) = self.typed_literal_i64_value(&index.expr_hash)?
+                    && value < 0
+                {
+                    bail!("slice index must be non-negative, got {value}");
+                }
+                payload["indexed_kind"] = JsonValue::String("slice".to_string());
+                payload["slice_type"] = JsonValue::String(container_type);
+                payload["element_type"] = JsonValue::String(element_type.clone());
+                element_type
+            }
+        };
+        payload["type"] = JsonValue::String(element_type.clone());
+        let expr_hash = self.put_object("Expression", &payload)?;
         self.write_cache_json(
             &expr_hash,
             "typechecker",
@@ -3162,18 +3593,26 @@ impl CodeDb {
         })
     }
 
-    fn array_element_type_in_root(
+    fn indexed_element_type_in_root(
         &self,
         root: &ProgramRootPayload,
         type_hash: &str,
-    ) -> Result<(String, String, u64)> {
+    ) -> Result<IndexedElementInfo> {
         match self.type_spec_in_root(root, type_hash)? {
             TypeSpec::Reference { referent, .. } => {
-                self.array_element_type_in_root(root, &referent)
+                self.indexed_element_type_in_root(root, &referent)
             }
-            TypeSpec::FixedArray { element, len } => Ok((type_hash.to_string(), element, len)),
+            TypeSpec::Slice { element, .. } => Ok(IndexedElementInfo::Slice {
+                container_type: type_hash.to_string(),
+                element_type: element,
+            }),
+            TypeSpec::FixedArray { element, len } => Ok(IndexedElementInfo::FixedArray {
+                container_type: type_hash.to_string(),
+                element_type: element,
+                len,
+            }),
             other => bail!(
-                "array index requires array type, got {}",
+                "index requires array or slice type, got {}",
                 other.to_source(self)?
             ),
         }
@@ -3231,6 +3670,7 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("field_access target missing type"))?;
                 match self.type_spec_in_root(root, target_type)? {
+                    TypeSpec::Slice { mutable, .. } => Ok(mutable),
                     TypeSpec::Reference { mutable, .. } => Ok(mutable),
                     _ => self.typed_expr_is_assignable_place(root, target_hash),
                 }
@@ -3340,6 +3780,21 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow expression missing target"))?;
                 self.borrow_target_is_local_storage(root, target, locals_with_local_borrows)
+            }
+            "slice_from_array" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("slice_from_array missing target"))?;
+                self.borrow_target_is_local_storage(root, target, locals_with_local_borrows)
+            }
+            "slice_len" => Ok(false),
+            "subslice" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("subslice missing target"))?;
+                self.expr_escapes_local_borrow(root, target, locals_with_local_borrows)
             }
             "assign" => Ok(false),
             "let" => {
@@ -3675,6 +4130,12 @@ impl CodeDb {
             TypeSpec::RawPointer { pointee, .. } => {
                 self.collect_reference_regions_in_type(root, &pointee, regions)
             }
+            TypeSpec::Slice {
+                region, element, ..
+            } => {
+                regions.insert(region);
+                self.collect_reference_regions_in_type(root, &element, regions)
+            }
             TypeSpec::FixedArray { element, .. } => {
                 self.collect_reference_regions_in_type(root, &element, regions)
             }
@@ -3759,6 +4220,14 @@ impl CodeDb {
             }
             TypeSpec::RawPointer { pointee, .. } => {
                 self.validate_type_hash_in_root(root, &pointee, allowed_regions)
+            }
+            TypeSpec::Slice {
+                region, element, ..
+            } => {
+                if !allowed_regions.contains(&region) {
+                    bail!("invalid region reference {region}");
+                }
+                self.validate_type_hash_in_root(root, &element, allowed_regions)
             }
             TypeSpec::FixedArray { element, .. } => {
                 self.validate_type_hash_in_root(root, &element, allowed_regions)
@@ -3921,6 +4390,44 @@ impl CodeDb {
                 self.check_place_not_moved(&place, state)?;
                 self.check_loan_conflicts(&kind, &place, &state.active)?;
                 Ok(())
+            }
+            "slice_from_array" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("slice_from_array missing target"))?;
+                let mutable = payload
+                    .get("mutable")
+                    .and_then(JsonValue::as_bool)
+                    .ok_or_else(|| anyhow!("slice_from_array missing mutable"))?;
+                let kind = if mutable {
+                    LoanKind::Mutable
+                } else {
+                    LoanKind::Shared
+                };
+                self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
+                let place = self.loan_place_for_expr(target, param_types, &state.locals)?;
+                self.check_place_not_moved(&place, state)?;
+                self.check_loan_conflicts(&kind, &place, &state.active)?;
+                Ok(())
+            }
+            "slice_len" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("slice_len missing target"))?;
+                self.verify_expr_borrows(root, target, param_types, state, ExprUse::Value)
+            }
+            "subslice" => {
+                for key in ["target", "start", "len"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("subslice missing {key}"))?;
+                    self.verify_expr_borrows(root, child, param_types, state, ExprUse::Value)?;
+                }
+                let value_loans = self.collect_value_loans(root, expr_hash, param_types, state)?;
+                self.check_loans_point_to_live_storage(&value_loans, state)
             }
             "assign" => {
                 let target = payload
@@ -4337,6 +4844,38 @@ impl CodeDb {
                     place: self.loan_place_for_expr(target, param_types, &state.locals)?,
                     owner: None,
                 });
+            }
+            "slice_from_array" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("slice_from_array missing target"))?;
+                let region = payload
+                    .get("region")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("slice_from_array missing region"))?
+                    .to_string();
+                let mutable = payload
+                    .get("mutable")
+                    .and_then(JsonValue::as_bool)
+                    .ok_or_else(|| anyhow!("slice_from_array missing mutable"))?;
+                out.push(ActiveLoan {
+                    kind: if mutable {
+                        LoanKind::Mutable
+                    } else {
+                        LoanKind::Shared
+                    },
+                    region,
+                    place: self.loan_place_for_expr(target, param_types, &state.locals)?,
+                    owner: None,
+                });
+            }
+            "subslice" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("subslice missing target"))?;
+                out.extend(self.collect_value_loans(root, target, param_types, state)?);
             }
             "call" => {
                 let (args, return_type, _) = self.call_region_context(root, &payload)?;
@@ -4782,7 +5321,7 @@ impl CodeDb {
         resolvable: &mut bool,
     ) -> Result<()> {
         match self.type_spec_in_root(root, type_hash)? {
-            TypeSpec::Reference { .. } => paths.push(prefix.clone()),
+            TypeSpec::Reference { .. } | TypeSpec::Slice { .. } => paths.push(prefix.clone()),
             TypeSpec::Record(fields) => {
                 for field in fields {
                     if self
@@ -4998,6 +5537,13 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("enum_construct missing value"))?;
                 self.move_source_places_for_expr(root, value, param_types, locals)
             }
+            Some("subslice") => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("subslice missing target"))?;
+                self.move_source_places_for_expr(root, target, param_types, locals)
+            }
             _ => Ok(Vec::new()),
         }
     }
@@ -5031,6 +5577,13 @@ impl CodeDb {
                 } else {
                     Ok(Some(source))
                 }
+            }
+            Some("subslice") => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("subslice missing target"))?;
+                self.source_place_for_value_expr(target, param_types, locals)
             }
             _ => Ok(None),
         }
@@ -5237,6 +5790,14 @@ impl CodeDb {
                 "unary" => self.expr_child_requires_state(&payload, "expr")?,
                 "borrow_shared" | "borrow_mut" => {
                     self.expr_child_requires_state(&payload, "target")?
+                }
+                "slice_from_array" | "slice_len" => {
+                    self.expr_child_requires_state(&payload, "target")?
+                }
+                "subslice" => {
+                    self.expr_child_requires_state(&payload, "target")?
+                        || self.expr_child_requires_state(&payload, "start")?
+                        || self.expr_child_requires_state(&payload, "len")?
                 }
                 "let" => {
                     self.expr_child_requires_state(&payload, "value")?
@@ -5574,6 +6135,134 @@ impl CodeDb {
                     referent: target_type,
                 })?
             }
+            "slice_from_array" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("slice_from_array missing target"))?;
+                let target_type = self.verify_expr_type_with_locals(
+                    target,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if payload.get("target_type").and_then(JsonValue::as_str)
+                    != Some(target_type.as_str())
+                {
+                    bail!("slice_from_array target_type mismatch");
+                }
+                let region = payload
+                    .get("region")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("slice_from_array missing region"))?;
+                if !allowed_regions.contains(region) {
+                    bail!("invalid region reference {region}");
+                }
+                let mutable = payload
+                    .get("mutable")
+                    .and_then(JsonValue::as_bool)
+                    .ok_or_else(|| anyhow!("slice_from_array missing mutable"))?;
+                if mutable && !self.typed_expr_is_assignable_place(root, target)? {
+                    bail!("slice_from_array mutable target must be assignable");
+                }
+                let IndexedElementInfo::FixedArray {
+                    container_type,
+                    element_type,
+                    len,
+                } = self.indexed_element_type_in_root(root, &target_type)?
+                else {
+                    bail!("slice_from_array target must be a fixed array");
+                };
+                if payload.get("array_type").and_then(JsonValue::as_str)
+                    != Some(container_type.as_str())
+                    || payload.get("element_type").and_then(JsonValue::as_str)
+                        != Some(element_type.as_str())
+                    || payload.get("len").and_then(JsonValue::as_u64) != Some(len)
+                {
+                    bail!("slice_from_array metadata mismatch");
+                }
+                hash_for_type_spec(&TypeSpec::Slice {
+                    region: region.to_string(),
+                    mutable,
+                    element: element_type,
+                })?
+            }
+            "slice_len" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("slice_len missing target"))?;
+                let target_type = self.verify_expr_type_with_locals(
+                    target,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if payload.get("slice_type").and_then(JsonValue::as_str)
+                    != Some(target_type.as_str())
+                {
+                    bail!("slice_len slice_type mismatch");
+                }
+                if !matches!(
+                    self.type_spec_in_root(root, &target_type)?,
+                    TypeSpec::Slice { .. }
+                ) {
+                    bail!("slice_len target must be slice");
+                }
+                type_hash_for("I64")
+            }
+            "subslice" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("subslice missing target"))?;
+                let start = payload
+                    .get("start")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("subslice missing start"))?;
+                let len = payload
+                    .get("len")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("subslice missing len"))?;
+                let target_type = self.verify_expr_type_with_locals(
+                    target,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                let TypeSpec::Slice { element, .. } = self.type_spec_in_root(root, &target_type)?
+                else {
+                    bail!("subslice target must be slice");
+                };
+                if payload.get("slice_type").and_then(JsonValue::as_str)
+                    != Some(target_type.as_str())
+                    || payload.get("element_type").and_then(JsonValue::as_str)
+                        != Some(element.as_str())
+                {
+                    bail!("subslice metadata mismatch");
+                }
+                if self.verify_expr_type_with_locals(
+                    start,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )? != type_hash_for("I64")
+                    || self.verify_expr_type_with_locals(
+                        len,
+                        root,
+                        param_types,
+                        allowed_regions,
+                        locals,
+                    )? != type_hash_for("I64")
+                {
+                    bail!("subslice start and len must be i64");
+                }
+                target_type
+            }
             "assign" => {
                 let target = payload
                     .get("target")
@@ -5768,22 +6457,49 @@ impl CodeDb {
                 {
                     bail!("array_index target_type mismatch");
                 }
-                let (array_type, element_type, len) =
-                    self.array_element_type_in_root(root, &target_type)?;
-                if payload.get("array_type").and_then(JsonValue::as_str)
-                    != Some(array_type.as_str())
-                    || payload.get("element_type").and_then(JsonValue::as_str)
-                        != Some(element_type.as_str())
-                    || payload.get("len").and_then(JsonValue::as_u64) != Some(len)
-                {
-                    bail!("array_index metadata mismatch");
-                }
-                if let Some(value) = self.typed_literal_i64_value(index_hash)? {
-                    if value < 0 || value as u64 >= len {
-                        bail!("array index {value} out of bounds for length {len}");
+                match self.indexed_element_type_in_root(root, &target_type)? {
+                    IndexedElementInfo::FixedArray {
+                        container_type,
+                        element_type,
+                        len,
+                    } => {
+                        if payload.get("indexed_kind").and_then(JsonValue::as_str)
+                            != Some("fixed_array")
+                            || payload.get("array_type").and_then(JsonValue::as_str)
+                                != Some(container_type.as_str())
+                            || payload.get("element_type").and_then(JsonValue::as_str)
+                                != Some(element_type.as_str())
+                            || payload.get("len").and_then(JsonValue::as_u64) != Some(len)
+                        {
+                            bail!("array_index metadata mismatch");
+                        }
+                        if let Some(value) = self.typed_literal_i64_value(index_hash)? {
+                            if value < 0 || value as u64 >= len {
+                                bail!("array index {value} out of bounds for length {len}");
+                            }
+                        }
+                        element_type
+                    }
+                    IndexedElementInfo::Slice {
+                        container_type,
+                        element_type,
+                    } => {
+                        if payload.get("indexed_kind").and_then(JsonValue::as_str) != Some("slice")
+                            || payload.get("slice_type").and_then(JsonValue::as_str)
+                                != Some(container_type.as_str())
+                            || payload.get("element_type").and_then(JsonValue::as_str)
+                                != Some(element_type.as_str())
+                        {
+                            bail!("slice index metadata mismatch");
+                        }
+                        if let Some(value) = self.typed_literal_i64_value(index_hash)?
+                            && value < 0
+                        {
+                            bail!("slice index must be non-negative, got {value}");
+                        }
+                        element_type
                     }
                 }
-                element_type
             }
             "record_literal" => {
                 let mut names = BTreeSet::new();
@@ -6302,6 +7018,18 @@ impl TypeSpec {
                     Ok(format!("raw_ptr<{pointee}>"))
                 }
             }
+            TypeSpec::Slice {
+                region,
+                mutable,
+                element,
+            } => {
+                let element = db.type_name(element)?;
+                if *mutable {
+                    Ok(format!("mut_slice<'{region}, {element}>"))
+                } else {
+                    Ok(format!("slice<'{region}, {element}>"))
+                }
+            }
             TypeSpec::FixedArray { element, len } => {
                 Ok(format!("array<{}, {len}>", db.type_name(element)?))
             }
@@ -6357,6 +7085,11 @@ enum ParsedTypeSpec {
         mutable: bool,
         pointee: Box<ParsedTypeSpec>,
     },
+    Slice {
+        region: String,
+        mutable: bool,
+        element: Box<ParsedTypeSpec>,
+    },
     FixedArray {
         element: Box<ParsedTypeSpec>,
         len: u64,
@@ -6379,6 +7112,9 @@ impl ParsedTypeSpec {
                 mutable: *mutable,
                 pointee: type_hash_for_spec(pointee)?,
             }),
+            ParsedTypeSpec::Slice { region, .. } => {
+                bail!("slice region '{region} requires root-aware resolution")
+            }
             ParsedTypeSpec::FixedArray { element, len } => Ok(TypeSpec::FixedArray {
                 element: type_hash_for_spec(element)?,
                 len: *len,
@@ -6422,8 +7158,8 @@ fn type_hash_for_spec(spec: &ParsedTypeSpec) -> Result<String> {
         ParsedTypeSpec::Named { name, .. } => {
             bail!("named type {name} requires root-aware resolution")
         }
-        ParsedTypeSpec::Reference { region, .. } => {
-            bail!("reference region '{region} requires root-aware resolution")
+        ParsedTypeSpec::Reference { region, .. } | ParsedTypeSpec::Slice { region, .. } => {
+            bail!("region '{region} requires root-aware resolution")
         }
         ParsedTypeSpec::RawPointer { .. }
         | ParsedTypeSpec::FixedArray { .. }
@@ -6473,6 +7209,20 @@ pub(crate) fn type_payload_for_spec(spec: &TypeSpec) -> Result<JsonValue> {
                 "type_kind": "RawPointer",
                 "mutable": mutable,
                 "pointee": pointee,
+            })
+        }
+        TypeSpec::Slice {
+            region,
+            mutable,
+            element,
+        } => {
+            validate_region_arg(region)?;
+            validate_type_hash("slice element", element)?;
+            json!({
+                "type_kind": "Slice",
+                "region": region,
+                "mutable": mutable,
+                "element": element,
             })
         }
         TypeSpec::FixedArray { element, len } => {
@@ -6575,6 +7325,29 @@ pub(crate) fn type_spec_from_payload(payload: &JsonValue) -> Result<TypeSpec> {
                 .to_string();
             validate_type_hash("raw pointer pointee", &pointee)?;
             Ok(TypeSpec::RawPointer { mutable, pointee })
+        }
+        "Slice" => {
+            let region = payload
+                .get("region")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("Slice Type object missing region"))?
+                .to_string();
+            validate_region_arg(&region)?;
+            let mutable = payload
+                .get("mutable")
+                .and_then(JsonValue::as_bool)
+                .ok_or_else(|| anyhow!("Slice Type object missing mutable"))?;
+            let element = payload
+                .get("element")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("Slice Type object missing element"))?
+                .to_string();
+            validate_type_hash("slice element", &element)?;
+            Ok(TypeSpec::Slice {
+                region,
+                mutable,
+                element,
+            })
         }
         "FixedArray" => {
             let element = payload
@@ -6837,6 +7610,8 @@ impl TypeParser {
                 mutable: true,
                 pointee: Box::new(self.parse_single_type_arg()?),
             }),
+            TypeToken::Ident(value) if value == "slice" => self.parse_slice_type(false),
+            TypeToken::Ident(value) if value == "mut_slice" => self.parse_slice_type(true),
             TypeToken::Ident(value) if value == "array" => self.parse_fixed_array_type(),
             TypeToken::Ident(value) => {
                 let name = self.finish_name_path(value)?;
@@ -6869,6 +7644,21 @@ impl TypeParser {
         let ty = self.parse_type()?;
         self.expect_symbol(">")?;
         Ok(ty)
+    }
+
+    fn parse_slice_type(&mut self, mutable: bool) -> Result<ParsedTypeSpec> {
+        self.expect_symbol("<")?;
+        self.expect_symbol("'")?;
+        let region = self.expect_ident()?;
+        validate_projection_identifier("slice region", &region)?;
+        self.expect_symbol(",")?;
+        let element = self.parse_type()?;
+        self.expect_symbol(">")?;
+        Ok(ParsedTypeSpec::Slice {
+            region,
+            mutable,
+            element: Box::new(element),
+        })
     }
 
     fn parse_fixed_array_type(&mut self) -> Result<ParsedTypeSpec> {

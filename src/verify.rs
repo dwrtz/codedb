@@ -236,6 +236,54 @@ impl CodeDb {
                             errors,
                         )?;
                     }
+                    Some("slice_from_array") => {
+                        self.check_hash_ref(parent_hash, "target", payload.get("target"), errors)?;
+                        self.check_hash_ref(
+                            parent_hash,
+                            "target_type",
+                            payload.get("target_type"),
+                            errors,
+                        )?;
+                        self.check_hash_ref(
+                            parent_hash,
+                            "array_type",
+                            payload.get("array_type"),
+                            errors,
+                        )?;
+                        self.check_hash_ref(
+                            parent_hash,
+                            "element_type",
+                            payload.get("element_type"),
+                            errors,
+                        )?;
+                        self.check_hash_ref(parent_hash, "region", payload.get("region"), errors)?;
+                    }
+                    Some("slice_len") => {
+                        self.check_hash_ref(parent_hash, "target", payload.get("target"), errors)?;
+                        self.check_hash_ref(
+                            parent_hash,
+                            "slice_type",
+                            payload.get("slice_type"),
+                            errors,
+                        )?;
+                    }
+                    Some("subslice") => {
+                        self.check_hash_ref(parent_hash, "target", payload.get("target"), errors)?;
+                        self.check_hash_ref(parent_hash, "start", payload.get("start"), errors)?;
+                        self.check_hash_ref(parent_hash, "len", payload.get("len"), errors)?;
+                        self.check_hash_ref(
+                            parent_hash,
+                            "slice_type",
+                            payload.get("slice_type"),
+                            errors,
+                        )?;
+                        self.check_hash_ref(
+                            parent_hash,
+                            "element_type",
+                            payload.get("element_type"),
+                            errors,
+                        )?;
+                    }
                     Some("assign") => {
                         self.check_hash_ref(parent_hash, "target", payload.get("target"), errors)?;
                         self.check_hash_ref(parent_hash, "value", payload.get("value"), errors)?;
@@ -650,6 +698,10 @@ impl CodeDb {
             Some("RawPointer") => {
                 self.check_hash_ref(parent_hash, "pointee", payload.get("pointee"), errors)?;
             }
+            Some("Slice") => {
+                self.check_hash_ref(parent_hash, "region", payload.get("region"), errors)?;
+                self.check_hash_ref(parent_hash, "element", payload.get("element"), errors)?;
+            }
             Some("FixedArray") => {
                 self.check_hash_ref(parent_hash, "element", payload.get("element"), errors)?;
             }
@@ -780,6 +832,16 @@ impl CodeDb {
             }
             Ok(crate::types::TypeSpec::RawPointer { pointee, .. }) => {
                 self.verify_type_region_args(parent_hash, &pointee, allowed_regions, errors)?;
+            }
+            Ok(crate::types::TypeSpec::Slice {
+                region, element, ..
+            }) => {
+                if !allowed_regions.contains(&region) {
+                    errors.push(format!(
+                        "bad_type_def: {parent_hash}: invalid region reference {region}"
+                    ));
+                }
+                self.verify_type_region_args(parent_hash, &element, allowed_regions, errors)?;
             }
             Ok(crate::types::TypeSpec::FixedArray { element, .. }) => {
                 self.verify_type_region_args(parent_hash, &element, allowed_regions, errors)?;
@@ -3817,7 +3879,11 @@ fn collect_lowered_call_targets(
             | LoweredOp::AddrOfField { .. }
             | LoweredOp::AddrOfEnumPayload { .. }
             | LoweredOp::AddrOfIndex { .. }
+            | LoweredOp::ConstructSlice { .. }
+            | LoweredOp::SliceLen { .. }
+            | LoweredOp::SliceData { .. }
             | LoweredOp::BoundsCheck { .. }
+            | LoweredOp::SliceRangeCheck { .. }
             | LoweredOp::BorrowShared { .. }
             | LoweredOp::BorrowMut { .. }
             | LoweredOp::DerefShared { .. }

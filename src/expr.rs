@@ -166,9 +166,16 @@ pub enum Value {
     Unit,
     SharedRef(ValueCell),
     MutRef(ValueCell),
+    Slice {
+        elements: Vec<ValueCell>,
+        mutable: bool,
+    },
     Array(Vec<ValueCell>),
     Record(BTreeMap<String, ValueCell>),
-    Enum { variant: String, value: ValueCell },
+    Enum {
+        variant: String,
+        value: ValueCell,
+    },
 }
 
 pub type ValueCell = Rc<RefCell<Value>>;
@@ -181,6 +188,23 @@ impl PartialEq for Value {
             (Value::Unit, Value::Unit) => true,
             (Value::SharedRef(left), Value::SharedRef(right))
             | (Value::MutRef(left), Value::MutRef(right)) => *left.borrow() == *right.borrow(),
+            (
+                Value::Slice {
+                    elements: left,
+                    mutable: left_mutable,
+                },
+                Value::Slice {
+                    elements: right,
+                    mutable: right_mutable,
+                },
+            ) => {
+                left_mutable == right_mutable
+                    && left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| *left.borrow() == *right.borrow())
+            }
             (Value::Array(left), Value::Array(right)) => {
                 left.len() == right.len()
                     && left
@@ -221,6 +245,17 @@ impl Display for Value {
             Value::Unit => write!(f, "()"),
             Value::SharedRef(value) => write!(f, "&{}", value.borrow()),
             Value::MutRef(value) => write!(f, "&mut {}", value.borrow()),
+            Value::Slice { elements, mutable } => {
+                let rendered = elements
+                    .iter()
+                    .map(|value| value.borrow().to_string())
+                    .collect::<Vec<_>>();
+                if *mutable {
+                    write!(f, "mut_slice[{}]", rendered.join(", "))
+                } else {
+                    write!(f, "slice[{}]", rendered.join(", "))
+                }
+            }
             Value::Array(elements) => {
                 let rendered = elements
                     .iter()
@@ -331,6 +366,24 @@ impl CodeDb {
                     ..
                 },
             ) => self.value_has_type(root, &value.borrow(), &referent),
+            (
+                Value::Slice { elements, mutable },
+                TypeSpec::Slice {
+                    mutable: expected_mutable,
+                    element,
+                    ..
+                },
+            ) => {
+                if *mutable != expected_mutable {
+                    return Ok(false);
+                }
+                for value in elements {
+                    if !self.value_has_type(root, &value.borrow(), &element)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
             (Value::Array(values), TypeSpec::FixedArray { element, len }) => {
                 if values.len() as u64 != len {
                     return Ok(false);
@@ -486,6 +539,49 @@ impl CodeDb {
                     args,
                     locals,
                 )?))
+            }
+            "slice_from_array" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("slice_from_array missing target"))?;
+                let mutable = payload
+                    .get("mutable")
+                    .and_then(JsonValue::as_bool)
+                    .ok_or_else(|| anyhow!("slice_from_array missing mutable"))?;
+                let target = self.eval_place_cell(root_hash, target_hash, args, locals)?;
+                let elements = slice_cells_from_array_cell(&target)?;
+                Ok(Value::Slice { elements, mutable })
+            }
+            "slice_len" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("slice_len missing target"))?;
+                let target = self.eval_expr_with_locals(root_hash, target_hash, args, locals)?;
+                Ok(Value::I64(slice_len_from_value(&target)? as i64))
+            }
+            "subslice" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("subslice missing target"))?;
+                let start_hash = payload
+                    .get("start")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("subslice missing start"))?;
+                let len_hash = payload
+                    .get("len")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("subslice missing len"))?;
+                let target = self.eval_expr_with_locals(root_hash, target_hash, args, locals)?;
+                let start = eval_index_value(
+                    self.eval_expr_with_locals(root_hash, start_hash, args, locals)?,
+                )?;
+                let len = eval_index_value(
+                    self.eval_expr_with_locals(root_hash, len_hash, args, locals)?,
+                )?;
+                subslice_value(&target, start, len)
             }
             "assign" => {
                 let target_hash = payload
@@ -1436,6 +1532,89 @@ impl CodeDb {
                     expr
                 }
             }
+            "slice_from_array" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("slice_from_array missing target"))?;
+                let mutable = payload
+                    .get("mutable")
+                    .and_then(JsonValue::as_bool)
+                    .ok_or_else(|| anyhow!("slice_from_array missing mutable"))?;
+                let rendered_target = self.expr_to_source_with_locals(
+                    target,
+                    root,
+                    current_module,
+                    local_params,
+                    region_names,
+                    local_names,
+                    0,
+                )?;
+                let name = if mutable { "mut_slice" } else { "slice" };
+                format!("{name}({rendered_target})")
+            }
+            "slice_len" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("slice_len missing target"))?;
+                format!(
+                    "len({})",
+                    self.expr_to_source_with_locals(
+                        target,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
+            "subslice" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("subslice missing target"))?;
+                let start = payload
+                    .get("start")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("subslice missing start"))?;
+                let len = payload
+                    .get("len")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("subslice missing len"))?;
+                format!(
+                    "subslice({}, {}, {})",
+                    self.expr_to_source_with_locals(
+                        target,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?,
+                    self.expr_to_source_with_locals(
+                        start,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?,
+                    self.expr_to_source_with_locals(
+                        len,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
             "assign" => {
                 let target = payload
                     .get("target")
@@ -2028,6 +2207,81 @@ impl CodeDb {
                     )?,
                 ),
             }),
+            "slice_from_array" => {
+                let mutable = payload
+                    .get("mutable")
+                    .and_then(JsonValue::as_bool)
+                    .ok_or_else(|| anyhow!("slice_from_array missing mutable"))?;
+                Ok(RawExpr::Call {
+                    name: if mutable {
+                        "mut_slice".to_string()
+                    } else {
+                        "slice".to_string()
+                    },
+                    args: vec![
+                        self.typed_expr_to_raw_with_locals(
+                            payload
+                                .get("target")
+                                .and_then(JsonValue::as_str)
+                                .ok_or_else(|| anyhow!("slice_from_array missing target"))?,
+                            root,
+                            current_module,
+                            region_names,
+                            local_names,
+                        )?,
+                    ],
+                })
+            }
+            "slice_len" => Ok(RawExpr::Call {
+                name: "len".to_string(),
+                args: vec![
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("target")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("slice_len missing target"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ],
+            }),
+            "subslice" => Ok(RawExpr::Call {
+                name: "subslice".to_string(),
+                args: vec![
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("target")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("subslice missing target"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("start")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("subslice missing start"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("len")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("subslice missing len"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ],
+            }),
             "assign" => Ok(RawExpr::Assign {
                 target: Box::new(
                     self.typed_expr_to_raw_with_locals(
@@ -2463,6 +2717,9 @@ impl CodeDb {
             TypeSpec::RawPointer { pointee, .. } => {
                 self.collect_type_deps(&pointee, deps)?;
             }
+            TypeSpec::Slice { element, .. } => {
+                self.collect_type_deps(&element, deps)?;
+            }
             TypeSpec::FixedArray { element, .. } => {
                 self.collect_type_deps(&element, deps)?;
             }
@@ -2532,6 +2789,22 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow expression missing target"))?;
                 self.collect_expr_deps(root, child, deps)?;
+            }
+            "slice_from_array" | "slice_len" => {
+                let child = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("slice expression missing target"))?;
+                self.collect_expr_deps(root, child, deps)?;
+            }
+            "subslice" => {
+                for key in ["target", "start", "len"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("subslice missing {key}"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
             }
             "assign" => {
                 for key in ["target", "value"] {
@@ -3271,6 +3544,15 @@ impl Parser {
                 self.expect_symbol(">")?;
                 Ok(format!("{name}<{pointee}>"))
             }
+            "slice" | "mut_slice" => {
+                self.expect_symbol("<")?;
+                self.expect_symbol("'")?;
+                let region = self.expect_ident()?;
+                self.expect_symbol(",")?;
+                let element = self.parse_type_source()?;
+                self.expect_symbol(">")?;
+                Ok(format!("{name}<'{region}, {element}>"))
+            }
             "array" => {
                 self.expect_symbol("<")?;
                 let element = self.parse_type_source()?;
@@ -3574,6 +3856,10 @@ fn semantic_clone_value(value: &Value) -> Value {
         Value::Unit => Value::Unit,
         Value::SharedRef(value) => Value::SharedRef(value.clone()),
         Value::MutRef(value) => Value::MutRef(value.clone()),
+        Value::Slice { elements, mutable } => Value::Slice {
+            elements: elements.clone(),
+            mutable: *mutable,
+        },
         Value::Array(elements) => Value::Array(
             elements
                 .iter()
@@ -3608,6 +3894,10 @@ fn eval_index_value(value: Value) -> Result<usize> {
 
 pub(crate) fn array_cell(value: &ValueCell, index: usize) -> Result<ValueCell> {
     match &*value.borrow() {
+        Value::Slice { elements, .. } => elements
+            .get(index)
+            .cloned()
+            .ok_or_else(|| anyhow!("slice index {index} out of bounds")),
         Value::Array(elements) => elements
             .get(index)
             .cloned()
@@ -3619,12 +3909,54 @@ pub(crate) fn array_cell(value: &ValueCell, index: usize) -> Result<ValueCell> {
 
 fn array_cell_from_value(value: &Value, index: usize) -> Result<ValueCell> {
     match value {
+        Value::Slice { elements, .. } => elements
+            .get(index)
+            .cloned()
+            .ok_or_else(|| anyhow!("slice index {index} out of bounds")),
         Value::Array(elements) => elements
             .get(index)
             .cloned()
             .ok_or_else(|| anyhow!("array index {index} out of bounds")),
         Value::SharedRef(referent) | Value::MutRef(referent) => array_cell(referent, index),
         other => bail!("array index target evaluated to non-array {other}"),
+    }
+}
+
+pub(crate) fn slice_cells_from_array_cell(value: &ValueCell) -> Result<Vec<ValueCell>> {
+    match &*value.borrow() {
+        Value::Array(elements) => Ok(elements.clone()),
+        Value::SharedRef(referent) | Value::MutRef(referent) => {
+            slice_cells_from_array_cell(referent)
+        }
+        other => bail!("slice target evaluated to non-array {other}"),
+    }
+}
+
+pub(crate) fn slice_len_from_value(value: &Value) -> Result<usize> {
+    match value {
+        Value::Slice { elements, .. } => Ok(elements.len()),
+        other => bail!("len target evaluated to non-slice {other}"),
+    }
+}
+
+pub(crate) fn subslice_value(value: &Value, start: usize, len: usize) -> Result<Value> {
+    match value {
+        Value::Slice { elements, mutable } => {
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| anyhow!("subslice range overflows"))?;
+            if end > elements.len() {
+                bail!(
+                    "subslice range [{start}, {end}) out of bounds for length {}",
+                    elements.len()
+                );
+            }
+            Ok(Value::Slice {
+                elements: elements[start..end].to_vec(),
+                mutable: *mutable,
+            })
+        }
+        other => bail!("subslice target evaluated to non-slice {other}"),
     }
 }
 

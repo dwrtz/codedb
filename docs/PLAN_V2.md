@@ -689,6 +689,8 @@ verify validates array layout and index operation metadata
 
 Goal: prove references-in-records by implementing slices as native pointer+length views.
 
+Status: implemented for array-backed `slice<'a, T>` and `mut_slice<'a, T>`, including projection syntax, `len`, index/index_mut, subslice, native pointer+length layout, dynamic bounds/range traps, tracing, and verification. Static bytes/string slice construction remains deferred until Phase 17 static data support.
+
 Deliverables:
 
 ```text

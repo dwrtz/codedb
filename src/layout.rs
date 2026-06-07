@@ -365,6 +365,54 @@ impl LayoutComputer<'_> {
                     class,
                 })
             }
+            TypeSpec::Slice {
+                region,
+                mutable,
+                element,
+            } => {
+                let element_layout = self.layout_type(&element)?;
+                let class = if mutable {
+                    LayoutClass::mutable_reference()
+                } else {
+                    LayoutClass::shared_reference()
+                };
+                let size_bytes = align_up(self.target.pointer_size_bytes, 8)?
+                    .checked_add(8)
+                    .ok_or_else(|| anyhow!("slice layout overflows for {type_hash}"))?;
+                let align_bytes = self.target.pointer_align_bytes.max(8);
+                let mut metadata =
+                    self.base_metadata(type_hash, "slice", size_bytes, align_bytes, class);
+                let object = metadata.as_object_mut().unwrap();
+                object.insert("region".to_string(), json!(region));
+                object.insert("mutable".to_string(), json!(mutable));
+                object.insert("element_type_hash".to_string(), json!(element));
+                object.insert("ptr_offset_bytes".to_string(), json!(0));
+                object.insert(
+                    "len_offset_bytes".to_string(),
+                    json!(align_up(self.target.pointer_size_bytes, 8)?),
+                );
+                object.insert(
+                    "element_size_bytes".to_string(),
+                    json!(element_layout.size_bytes),
+                );
+                object.insert(
+                    "element_align_bytes".to_string(),
+                    json!(element_layout.align_bytes),
+                );
+                object.insert(
+                    "element_stride_bytes".to_string(),
+                    json!(align_up(
+                        element_layout.size_bytes,
+                        element_layout.align_bytes
+                    )?),
+                );
+                Ok(ComputedLayout {
+                    metadata,
+                    size_bytes,
+                    align_bytes,
+                    class,
+                })
+            }
             TypeSpec::FixedArray { element, len } => {
                 let element_layout = self.layout_type(&element)?;
                 let stride = align_up(element_layout.size_bytes, element_layout.align_bytes)?;
@@ -581,7 +629,7 @@ fn abi_metadata(kind: &str, size_bytes: u64) -> JsonValue {
             "pass": "by_value",
             "return": "by_value",
         }),
-        ("record" | "enum" | "fixed_array", _) => json!({
+        ("record" | "enum" | "fixed_array" | "slice", _) => json!({
             "pass": "by_indirect",
             "return": "hidden_return_slot",
         }),

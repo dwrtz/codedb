@@ -2,7 +2,10 @@ use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::expr::{Value, ValueCell, array_cell, eval_binary, eval_unary, field_cell, value_cell};
+use crate::expr::{
+    Value, ValueCell, array_cell, eval_binary, eval_unary, field_cell, slice_cells_from_array_cell,
+    slice_len_from_value, subslice_value, value_cell,
+};
 use crate::model::ProgramRootPayload;
 use crate::store::{CodeDb, canonical_json};
 use crate::{MAIN_BRANCH, parse_eval_arg};
@@ -95,6 +98,12 @@ impl TraceValue {
                     name: "mut_ref".to_string(),
                     value: TraceValue::from_value(&value.borrow()),
                 }],
+            },
+            Value::Slice { elements, .. } => TraceValue::Array {
+                elements: elements
+                    .iter()
+                    .map(|value| TraceValue::from_value(&value.borrow()))
+                    .collect(),
             },
             Value::Array(elements) => TraceValue::Array {
                 elements: elements
@@ -1143,6 +1152,97 @@ impl CodeDb {
                 state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
                 Ok(value)
             }
+            "slice_from_array" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("slice_from_array missing target"))?;
+                let mutable = payload
+                    .get("mutable")
+                    .and_then(JsonValue::as_bool)
+                    .ok_or_else(|| anyhow!("slice_from_array missing mutable"))?;
+                let target = self.trace_place_cell(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    target_hash,
+                    args,
+                    locals,
+                )?;
+                let value = Value::Slice {
+                    elements: slice_cells_from_array_cell(&target)?,
+                    mutable,
+                };
+                state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
+                Ok(value)
+            }
+            "slice_len" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("slice_len missing target"))?;
+                let target = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    target_hash,
+                    args,
+                    locals,
+                )?;
+                let value = Value::I64(slice_len_from_value(&target)? as i64);
+                state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
+                Ok(value)
+            }
+            "subslice" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("subslice missing target"))?;
+                let start_hash = payload
+                    .get("start")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("subslice missing start"))?;
+                let len_hash = payload
+                    .get("len")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("subslice missing len"))?;
+                let target = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    target_hash,
+                    args,
+                    locals,
+                )?;
+                let start = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    start_hash,
+                    args,
+                    locals,
+                )?;
+                let len = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    len_hash,
+                    args,
+                    locals,
+                )?;
+                let value = subslice_value(
+                    &target,
+                    trace_index_value(&start)?,
+                    trace_index_value(&len)?,
+                )?;
+                state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
+                Ok(value)
+            }
             "field_access" => {
                 let field = payload
                     .get("field")
@@ -1550,6 +1650,10 @@ fn trace_index_value(value: &Value) -> Result<usize> {
 
 fn trace_array_value_cell(value: &Value, index: usize) -> Result<ValueCell> {
     match value {
+        Value::Slice { elements, .. } => elements
+            .get(index)
+            .cloned()
+            .ok_or_else(|| anyhow!("slice index out of bounds: {index}")),
         Value::Array(elements) => elements
             .get(index)
             .cloned()

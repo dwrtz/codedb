@@ -275,10 +275,39 @@ pub(crate) enum LoweredOp {
         id: String,
         place: LoweredPlace,
     },
+    ConstructSlice {
+        id: String,
+        address: String,
+        data_address: String,
+        len: String,
+        element_type_hash: String,
+        type_hash: String,
+    },
+    SliceLen {
+        id: String,
+        slice: String,
+        slice_type_hash: String,
+        type_hash: String,
+    },
+    SliceData {
+        id: String,
+        slice: String,
+        slice_type_hash: String,
+        element_type_hash: String,
+    },
     BoundsCheck {
         id: String,
         index: String,
         len: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        len_value: Option<String>,
+        type_hash: String,
+    },
+    SliceRangeCheck {
+        id: String,
+        start: String,
+        len: String,
+        source_len: String,
         type_hash: String,
     },
     LoadEnumTag {
@@ -1117,6 +1146,13 @@ impl CodeDb {
                     type_hash,
                 })
             }
+            "slice_from_array" => {
+                self.lower_slice_from_array(root, expr_hash, &type_hash, param_types, ctx, locals)
+            }
+            "slice_len" => self.lower_slice_len(root, expr_hash, param_types, ctx, locals),
+            "subslice" => {
+                self.lower_subslice(root, expr_hash, &type_hash, param_types, ctx, locals)
+            }
             "assign" => {
                 let target_hash = payload
                     .get("target")
@@ -1683,35 +1719,74 @@ impl CodeDb {
                     }
                     _ => self.lower_place(root, target_hash, param_types, ctx, locals)?,
                 };
-                let array_info =
-                    self.lowered_array_info(root, ctx.target_triple(), &target.type_hash)?;
-                if array_info.element_type_hash != type_hash {
-                    bail!("array_index element type mismatch while lowering");
-                }
                 let index = self.lower_expr(root, index_hash, param_types, ctx, locals)?;
                 if index.type_hash != type_hash_for("I64") {
                     bail!("array_index index must lower to i64");
                 }
                 let mut operations = target.operations;
                 operations.extend(index.operations);
-                if self.literal_i64_value(index_hash)?.is_none() {
-                    let check_id = ctx.value();
-                    ctx.push_debug_op(expr_hash, "bounds_check", &check_id);
-                    operations.push(LoweredOp::BoundsCheck {
-                        id: check_id,
-                        index: index.value.clone(),
-                        len: array_info.len,
-                        type_hash: type_hash_for("Unit"),
-                    });
-                }
+                let (base_address, element_type_hash) =
+                    if matches!(self.type_spec(&target.type_hash)?, TypeSpec::Slice { .. }) {
+                        let TypeSpec::Slice { element, .. } = self.type_spec(&target.type_hash)?
+                        else {
+                            unreachable!("slice type was checked");
+                        };
+                        if element != type_hash {
+                            bail!("slice index element type mismatch while lowering");
+                        }
+                        let data_id = ctx.value();
+                        ctx.push_debug_op(expr_hash, "slice_data", &data_id);
+                        operations.push(LoweredOp::SliceData {
+                            id: data_id.clone(),
+                            slice: target.address.clone(),
+                            slice_type_hash: target.type_hash.clone(),
+                            element_type_hash: element.clone(),
+                        });
+                        let len_id = ctx.value();
+                        ctx.push_debug_op(expr_hash, "slice_len", &len_id);
+                        operations.push(LoweredOp::SliceLen {
+                            id: len_id.clone(),
+                            slice: target.address,
+                            slice_type_hash: target.type_hash,
+                            type_hash: type_hash_for("I64"),
+                        });
+                        let check_id = ctx.value();
+                        ctx.push_debug_op(expr_hash, "bounds_check", &check_id);
+                        operations.push(LoweredOp::BoundsCheck {
+                            id: check_id,
+                            index: index.value.clone(),
+                            len: 0,
+                            len_value: Some(len_id),
+                            type_hash: type_hash_for("Unit"),
+                        });
+                        (data_id, element)
+                    } else {
+                        let array_info =
+                            self.lowered_array_info(root, ctx.target_triple(), &target.type_hash)?;
+                        if array_info.element_type_hash != type_hash {
+                            bail!("array_index element type mismatch while lowering");
+                        }
+                        if self.literal_i64_value(index_hash)?.is_none() {
+                            let check_id = ctx.value();
+                            ctx.push_debug_op(expr_hash, "bounds_check", &check_id);
+                            operations.push(LoweredOp::BoundsCheck {
+                                id: check_id,
+                                index: index.value.clone(),
+                                len: array_info.len,
+                                len_value: None,
+                                type_hash: type_hash_for("Unit"),
+                            });
+                        }
+                        (target.address, array_info.element_type_hash)
+                    };
                 let id = ctx.value();
                 ctx.push_debug_op(expr_hash, "addr_of_index", &id);
                 operations.push(LoweredOp::AddrOfIndex {
                     id: id.clone(),
                     place: LoweredPlace::Index {
-                        base: target.address,
+                        base: base_address,
                         index: index.value,
-                        element_type_hash: array_info.element_type_hash,
+                        element_type_hash,
                         type_hash: type_hash.clone(),
                     },
                 });
@@ -1723,6 +1798,241 @@ impl CodeDb {
             }
             other => bail!("expression kind {other} is not an addressable place"),
         }
+    }
+
+    fn lower_slice_from_array(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let target_hash = payload
+            .get("target")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("slice_from_array missing target"))?;
+        let target = self.lower_place(root, target_hash, param_types, ctx, locals)?;
+        let array_info = self.lowered_array_info(root, ctx.target_triple(), &target.type_hash)?;
+        let TypeSpec::Slice {
+            element,
+            mutable: _,
+            ..
+        } = self.type_spec(type_hash)?
+        else {
+            bail!("slice_from_array result must be slice");
+        };
+        if element != array_info.element_type_hash {
+            bail!("slice_from_array element type mismatch while lowering");
+        }
+
+        let len_id = ctx.value();
+        ctx.push_debug_op(expr_hash, "const_i64", &len_id);
+        let slot_size =
+            stack_slot_size_bytes(self.layout_size_bytes(root, ctx.target_triple(), type_hash)?);
+        let slot = ctx.local_slot(type_hash.to_string(), slot_size);
+        let address = ctx.value();
+        ctx.push_debug_op(expr_hash, "addr_of_local", &address);
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "construct_slice", &id);
+        let mut operations = target.operations;
+        operations.push(LoweredOp::ConstI64 {
+            id: len_id.clone(),
+            value: array_info.len.to_string(),
+            type_hash: type_hash_for("I64"),
+        });
+        operations.push(LoweredOp::AddrOfLocal {
+            id: address.clone(),
+            place: LoweredPlace::Local {
+                slot,
+                type_hash: type_hash.to_string(),
+            },
+        });
+        operations.push(LoweredOp::ConstructSlice {
+            id: id.clone(),
+            address: address.clone(),
+            data_address: target.address,
+            len: len_id,
+            element_type_hash: array_info.element_type_hash,
+            type_hash: type_hash.to_string(),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash.to_string(),
+        })
+    }
+
+    fn lower_slice_len(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let target_hash = payload
+            .get("target")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("slice_len missing target"))?;
+        let target =
+            self.lower_slice_address_for_expr(root, target_hash, param_types, ctx, locals)?;
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "slice_len", &id);
+        let mut operations = target.operations;
+        operations.push(LoweredOp::SliceLen {
+            id: id.clone(),
+            slice: target.address,
+            slice_type_hash: target.type_hash,
+            type_hash: type_hash_for("I64"),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash_for("I64"),
+        })
+    }
+
+    fn lower_subslice(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let target_hash = payload
+            .get("target")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("subslice missing target"))?;
+        let start_hash = payload
+            .get("start")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("subslice missing start"))?;
+        let len_hash = payload
+            .get("len")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("subslice missing len"))?;
+        let TypeSpec::Slice { element, .. } = self.type_spec(type_hash)? else {
+            bail!("subslice result must be slice");
+        };
+        let target =
+            self.lower_slice_address_for_expr(root, target_hash, param_types, ctx, locals)?;
+        if target.type_hash != type_hash {
+            bail!("subslice target/result type mismatch while lowering");
+        }
+        let start = self.lower_expr(root, start_hash, param_types, ctx, locals)?;
+        if start.type_hash != type_hash_for("I64") {
+            bail!("subslice start must lower to i64");
+        }
+        let len = self.lower_expr(root, len_hash, param_types, ctx, locals)?;
+        if len.type_hash != type_hash_for("I64") {
+            bail!("subslice len must lower to i64");
+        }
+        let data_id = ctx.value();
+        ctx.push_debug_op(expr_hash, "slice_data", &data_id);
+        let orig_len_id = ctx.value();
+        ctx.push_debug_op(expr_hash, "slice_len", &orig_len_id);
+        let check_id = ctx.value();
+        ctx.push_debug_op(expr_hash, "slice_range_check", &check_id);
+        let element_addr = ctx.value();
+        ctx.push_debug_op(expr_hash, "addr_of_index", &element_addr);
+        let slot_size =
+            stack_slot_size_bytes(self.layout_size_bytes(root, ctx.target_triple(), type_hash)?);
+        let slot = ctx.local_slot(type_hash.to_string(), slot_size);
+        let slice_addr = ctx.value();
+        ctx.push_debug_op(expr_hash, "addr_of_local", &slice_addr);
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "construct_slice", &id);
+        let mut operations = target.operations;
+        operations.extend(start.operations);
+        operations.extend(len.operations);
+        operations.push(LoweredOp::SliceData {
+            id: data_id.clone(),
+            slice: target.address.clone(),
+            slice_type_hash: target.type_hash.clone(),
+            element_type_hash: element.clone(),
+        });
+        operations.push(LoweredOp::SliceLen {
+            id: orig_len_id.clone(),
+            slice: target.address,
+            slice_type_hash: target.type_hash,
+            type_hash: type_hash_for("I64"),
+        });
+        operations.push(LoweredOp::SliceRangeCheck {
+            id: check_id,
+            start: start.value.clone(),
+            len: len.value.clone(),
+            source_len: orig_len_id,
+            type_hash: type_hash_for("Unit"),
+        });
+        operations.push(LoweredOp::AddrOfIndex {
+            id: element_addr.clone(),
+            place: LoweredPlace::Index {
+                base: data_id,
+                index: start.value,
+                element_type_hash: element.clone(),
+                type_hash: element,
+            },
+        });
+        operations.push(LoweredOp::AddrOfLocal {
+            id: slice_addr.clone(),
+            place: LoweredPlace::Local {
+                slot,
+                type_hash: type_hash.to_string(),
+            },
+        });
+        operations.push(LoweredOp::ConstructSlice {
+            id: id.clone(),
+            address: slice_addr,
+            data_address: element_addr,
+            len: len.value,
+            element_type_hash: payload
+                .get("element_type")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("subslice missing element_type"))?
+                .to_string(),
+            type_hash: type_hash.to_string(),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash.to_string(),
+        })
+    }
+
+    fn lower_slice_address_for_expr(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredAddress> {
+        let type_hash = self.expr_declared_type(expr_hash)?;
+        if !matches!(self.type_spec(&type_hash)?, TypeSpec::Slice { .. }) {
+            bail!("slice operation target must be slice");
+        }
+        if self.expr_is_place(expr_hash)? {
+            return self.lower_place(root, expr_hash, param_types, ctx, locals);
+        }
+        let lowered = self.lower_expr(root, expr_hash, param_types, ctx, locals)?;
+        if lowered.type_hash != type_hash {
+            bail!("slice target type mismatch while lowering");
+        }
+        if !self.type_passes_indirect(root, ctx.target_triple(), &type_hash)? {
+            bail!("slice values must lower indirectly");
+        }
+        Ok(LoweredAddress {
+            operations: lowered.operations,
+            address: lowered.value,
+            type_hash,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2987,6 +3297,7 @@ impl CodeDb {
             | TypeSpec::Record(_)
             | TypeSpec::Enum(_)
             | TypeSpec::FixedArray { .. }
+            | TypeSpec::Slice { .. }
             | TypeSpec::Reference { .. } => Ok(()),
             _ => bail!("lowering v1 does not support aggregate return type {type_name}"),
         }
@@ -3000,7 +3311,10 @@ impl CodeDb {
     fn is_aggregate_ir_type(&self, root: &ProgramRootPayload, type_hash: &str) -> Result<bool> {
         Ok(matches!(
             self.type_spec_in_root(root, type_hash)?,
-            TypeSpec::Record(_) | TypeSpec::Enum(_) | TypeSpec::FixedArray { .. }
+            TypeSpec::Record(_)
+                | TypeSpec::Enum(_)
+                | TypeSpec::FixedArray { .. }
+                | TypeSpec::Slice { .. }
         ))
     }
 
@@ -3804,33 +4118,124 @@ impl CodeDb {
                     if value_type(values, index)? != &type_hash_for("I64") {
                         bail!("lowered addr_of_index index must be i64");
                     }
-                    match self.type_spec_in_root(root, base_type)? {
-                        TypeSpec::FixedArray { element, .. } => {
-                            if element != *element_type_hash || element != *type_hash {
-                                bail!("lowered addr_of_index element type mismatch");
-                            }
+                    if base_type == element_type_hash {
+                        if element_type_hash != type_hash {
+                            bail!("lowered addr_of_index slice element type mismatch");
                         }
-                        other => bail!(
-                            "lowered addr_of_index requires array place, got {}",
-                            other.to_source(self)?
-                        ),
+                    } else {
+                        match self.type_spec_in_root(root, base_type)? {
+                            TypeSpec::FixedArray { element, .. } => {
+                                if element != *element_type_hash || element != *type_hash {
+                                    bail!("lowered addr_of_index element type mismatch");
+                                }
+                            }
+                            other => bail!(
+                                "lowered addr_of_index requires array or slice element base, got {}",
+                                other.to_source(self)?
+                            ),
+                        }
                     }
                     insert_address(addresses, id, type_hash)?;
                     if self.is_aggregate_ir_type(root, type_hash)? {
                         insert_value(values, id, type_hash)?;
                     }
                 }
+                LoweredOp::ConstructSlice {
+                    id,
+                    address,
+                    data_address,
+                    len,
+                    element_type_hash,
+                    type_hash,
+                } => {
+                    if address_type(addresses, address)? != type_hash {
+                        bail!("lowered construct_slice address type mismatch");
+                    }
+                    let data_type = address_type(addresses, data_address)?;
+                    if data_type != element_type_hash {
+                        match self.type_spec_in_root(root, data_type)? {
+                            TypeSpec::FixedArray { element, .. }
+                                if element == *element_type_hash => {}
+                            _ => bail!("lowered construct_slice data address type mismatch"),
+                        }
+                    }
+                    if value_type(values, len)? != &type_hash_for("I64") {
+                        bail!("lowered construct_slice len must be i64");
+                    }
+                    match self.type_spec(type_hash)? {
+                        TypeSpec::Slice { element, .. } if element == *element_type_hash => {}
+                        _ => bail!("lowered construct_slice type mismatch"),
+                    }
+                    insert_value(values, id, type_hash)?;
+                    insert_address(addresses, id, type_hash)?;
+                }
+                LoweredOp::SliceLen {
+                    id,
+                    slice,
+                    slice_type_hash,
+                    type_hash,
+                } => {
+                    if address_type(addresses, slice)? != slice_type_hash {
+                        bail!("lowered slice_len address type mismatch");
+                    }
+                    if !matches!(self.type_spec(slice_type_hash)?, TypeSpec::Slice { .. }) {
+                        bail!("lowered slice_len target must be slice");
+                    }
+                    if type_hash != &type_hash_for("I64") {
+                        bail!("lowered slice_len result must be i64");
+                    }
+                    insert_value(values, id, type_hash)?;
+                }
+                LoweredOp::SliceData {
+                    id,
+                    slice,
+                    slice_type_hash,
+                    element_type_hash,
+                } => {
+                    if address_type(addresses, slice)? != slice_type_hash {
+                        bail!("lowered slice_data address type mismatch");
+                    }
+                    match self.type_spec(slice_type_hash)? {
+                        TypeSpec::Slice { element, .. } if element == *element_type_hash => {}
+                        _ => bail!("lowered slice_data type mismatch"),
+                    }
+                    insert_address(addresses, id, element_type_hash)?;
+                }
                 LoweredOp::BoundsCheck {
                     id,
                     index,
                     len: _,
+                    len_value,
                     type_hash,
                 } => {
                     if value_type(values, index)? != &type_hash_for("I64") {
                         bail!("lowered bounds_check index must be i64");
                     }
+                    if let Some(len_value) = len_value
+                        && value_type(values, len_value)? != &type_hash_for("I64")
+                    {
+                        bail!("lowered bounds_check len_value must be i64");
+                    }
                     if type_hash != &type_hash_for("Unit") {
                         bail!("lowered bounds_check type mismatch");
+                    }
+                    insert_value(values, id, type_hash)?;
+                }
+                LoweredOp::SliceRangeCheck {
+                    id,
+                    start,
+                    len,
+                    source_len,
+                    type_hash,
+                } => {
+                    if value_type(values, start)? != &type_hash_for("I64")
+                        || value_type(values, len)? != &type_hash_for("I64")
+                        || value_type(values, source_len)? != &type_hash_for("I64")
+                    {
+                        bail!("lowered slice_range_check values must be i64");
+                    }
+                    if type_hash != &type_hash_for("Unit") {
+                        bail!("lowered slice_range_check type mismatch");
                     }
                     insert_value(values, id, type_hash)?;
                 }
@@ -4226,7 +4631,11 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::AddrOfField { id, .. }
         | LoweredOp::AddrOfEnumPayload { id, .. }
         | LoweredOp::AddrOfIndex { id, .. }
+        | LoweredOp::ConstructSlice { id, .. }
+        | LoweredOp::SliceLen { id, .. }
+        | LoweredOp::SliceData { id, .. }
         | LoweredOp::BoundsCheck { id, .. }
+        | LoweredOp::SliceRangeCheck { id, .. }
         | LoweredOp::LoadEnumTag { id, .. }
         | LoweredOp::Load { id, .. }
         | LoweredOp::Copy { id, .. }
@@ -4259,7 +4668,11 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::AddrOfField { .. } => "addr_of_field",
         LoweredOp::AddrOfEnumPayload { .. } => "addr_of_enum_payload",
         LoweredOp::AddrOfIndex { .. } => "addr_of_index",
+        LoweredOp::ConstructSlice { .. } => "construct_slice",
+        LoweredOp::SliceLen { .. } => "slice_len",
+        LoweredOp::SliceData { .. } => "slice_data",
         LoweredOp::BoundsCheck { .. } => "bounds_check",
+        LoweredOp::SliceRangeCheck { .. } => "slice_range_check",
         LoweredOp::LoadEnumTag { .. } => "load_enum_tag",
         LoweredOp::StoreEnumTag { .. } => "store_enum_tag",
         LoweredOp::Load { .. } => "load",
@@ -4357,6 +4770,7 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::BorrowShared { type_hash, .. }
             | LoweredOp::BorrowMut { type_hash, .. }
             | LoweredOp::BoundsCheck { type_hash, .. }
+            | LoweredOp::SliceRangeCheck { type_hash, .. }
             | LoweredOp::LoadEnumTag { type_hash, .. }
             | LoweredOp::Load { type_hash, .. }
             | LoweredOp::Store { type_hash, .. }
@@ -4367,6 +4781,27 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::BorrowDebug { type_hash, .. }
             | LoweredOp::Return { type_hash, .. } => {
                 out.insert(type_hash.clone());
+            }
+            LoweredOp::ConstructSlice {
+                type_hash,
+                element_type_hash,
+                ..
+            } => {
+                out.insert(type_hash.clone());
+                out.insert(element_type_hash.clone());
+            }
+            LoweredOp::SliceLen {
+                slice_type_hash, ..
+            } => {
+                out.insert(slice_type_hash.clone());
+            }
+            LoweredOp::SliceData {
+                slice_type_hash,
+                element_type_hash,
+                ..
+            } => {
+                out.insert(slice_type_hash.clone());
+                out.insert(element_type_hash.clone());
             }
             LoweredOp::DerefShared {
                 referent_type_hash, ..

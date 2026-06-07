@@ -599,7 +599,11 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::AddrOfField { .. }
             | LoweredOp::AddrOfEnumPayload { .. }
             | LoweredOp::AddrOfIndex { .. }
+            | LoweredOp::ConstructSlice { .. }
+            | LoweredOp::SliceLen { .. }
+            | LoweredOp::SliceData { .. }
             | LoweredOp::BoundsCheck { .. }
+            | LoweredOp::SliceRangeCheck { .. }
             | LoweredOp::LoadEnumTag { .. }
             | LoweredOp::Load { .. }
             | LoweredOp::StoreEnumTag { .. }
@@ -690,7 +694,10 @@ fn validate_native_ops(
             LoweredOp::BorrowShared { .. }
             | LoweredOp::BorrowMut { .. }
             | LoweredOp::DerefShared { .. }
-            | LoweredOp::DerefMut { .. } => {}
+            | LoweredOp::DerefMut { .. }
+            | LoweredOp::ConstructSlice { .. }
+            | LoweredOp::SliceLen { .. }
+            | LoweredOp::SliceData { .. } => {}
             LoweredOp::AddrOfParam { place, .. } => {
                 let LoweredPlace::Param {
                     slot, type_hash, ..
@@ -722,6 +729,11 @@ fn validate_native_ops(
             LoweredOp::BoundsCheck { type_hash, .. } => {
                 if type_hash != unit_type {
                     bail!("native object backend saw bounds_check with non-unit type");
+                }
+            }
+            LoweredOp::SliceRangeCheck { type_hash, .. } => {
+                if type_hash != unit_type {
+                    bail!("native object backend saw slice_range_check with non-unit type");
                 }
             }
             LoweredOp::LoadEnumTag { type_hash, .. } => {
@@ -806,7 +818,7 @@ fn native_supported_type(
     }
     let layout = native_type_layout(type_layouts, type_hash)?;
     match layout.kind.as_str() {
-        "record" | "enum" | "fixed_array" | "reference" | "raw_pointer" => Ok(()),
+        "record" | "enum" | "fixed_array" | "slice" | "reference" | "raw_pointer" => Ok(()),
         other => bail!("native object backend v0 does not support native values of {other} type"),
     }
 }
@@ -1047,7 +1059,9 @@ fn validate_native_op_flow(
                 bail!("addr_of_index must contain an index place");
             };
             let base_type = native_address_type(addresses, base)?;
-            if native_type_layout(type_layouts, base_type)?.kind != "fixed_array" {
+            if base_type == element_type_hash {
+                // Slice indexing passes the already-loaded element base pointer.
+            } else if native_type_layout(type_layouts, base_type)?.kind != "fixed_array" {
                 bail!("native object backend saw addr_of_index for non-array base");
             }
             if native_value_type(values, index)? != &type_hash_for("I64") {
@@ -1063,17 +1077,100 @@ fn validate_native_op_flow(
                 _ => {}
             }
         }
+        LoweredOp::ConstructSlice {
+            id,
+            address,
+            data_address,
+            len,
+            element_type_hash,
+            type_hash,
+        } => {
+            if native_address_type(addresses, address)? != type_hash {
+                bail!("native object backend saw construct_slice address mismatch");
+            }
+            let data_type = native_address_type(addresses, data_address)?;
+            if data_type != element_type_hash
+                && native_type_layout(type_layouts, data_type)?.kind != "fixed_array"
+            {
+                bail!("native object backend saw construct_slice data mismatch");
+            }
+            if native_value_type(values, len)? != &type_hash_for("I64") {
+                bail!("native object backend saw construct_slice with non-i64 len");
+            }
+            if native_type_layout(type_layouts, type_hash)?.kind != "slice" {
+                bail!("native object backend saw construct_slice for non-slice type");
+            }
+            native_type_layout(type_layouts, element_type_hash)?;
+            native_insert_value(values, id, type_hash)?;
+            native_insert_address(addresses, id, type_hash)?;
+        }
+        LoweredOp::SliceLen {
+            id,
+            slice,
+            slice_type_hash,
+            type_hash,
+        } => {
+            if native_address_type(addresses, slice)? != slice_type_hash {
+                bail!("native object backend saw slice_len address mismatch");
+            }
+            if native_type_layout(type_layouts, slice_type_hash)?.kind != "slice" {
+                bail!("native object backend saw slice_len for non-slice type");
+            }
+            if type_hash != &type_hash_for("I64") {
+                bail!("native object backend saw slice_len non-i64 result");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::SliceData {
+            id,
+            slice,
+            slice_type_hash,
+            element_type_hash,
+        } => {
+            if native_address_type(addresses, slice)? != slice_type_hash {
+                bail!("native object backend saw slice_data address mismatch");
+            }
+            if native_type_layout(type_layouts, slice_type_hash)?.kind != "slice" {
+                bail!("native object backend saw slice_data for non-slice type");
+            }
+            native_type_layout(type_layouts, element_type_hash)?;
+            native_insert_address(addresses, id, element_type_hash)?;
+        }
         LoweredOp::BoundsCheck {
             id,
             index,
             len: _,
+            len_value,
             type_hash,
         } => {
             if native_value_type(values, index)? != &type_hash_for("I64") {
                 bail!("native object backend saw bounds_check with non-i64 index");
             }
+            if let Some(len_value) = len_value
+                && native_value_type(values, len_value)? != &type_hash_for("I64")
+            {
+                bail!("native object backend saw bounds_check with non-i64 len_value");
+            }
             if type_hash != &type_hash_for("Unit") {
                 bail!("native object backend saw bounds_check with non-unit type");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::SliceRangeCheck {
+            id,
+            start,
+            len,
+            source_len,
+            type_hash,
+        } => {
+            if native_value_type(values, start)? != &type_hash_for("I64")
+                || native_value_type(values, len)? != &type_hash_for("I64")
+                || native_value_type(values, source_len)? != &type_hash_for("I64")
+            {
+                bail!("native object backend saw slice_range_check with non-i64 value");
+            }
+            if type_hash != &type_hash_for("Unit") {
+                bail!("native object backend saw slice_range_check with non-unit type");
             }
             native_insert_value(values, id, type_hash)?;
         }
@@ -1514,7 +1611,11 @@ fn collect_value_ids_inner(
             | LoweredOp::AddrOfField { id, .. }
             | LoweredOp::AddrOfEnumPayload { id, .. }
             | LoweredOp::AddrOfIndex { id, .. }
+            | LoweredOp::ConstructSlice { id, .. }
+            | LoweredOp::SliceLen { id, .. }
+            | LoweredOp::SliceData { id, .. }
             | LoweredOp::BoundsCheck { id, .. }
+            | LoweredOp::SliceRangeCheck { id, .. }
             | LoweredOp::LoadEnumTag { id, .. }
             | LoweredOp::Load { id, .. }
             | LoweredOp::Copy { id, .. }
@@ -1791,17 +1892,69 @@ impl FunctionEmitter {
                 }
                 self.mov_stack_rax(self.value_offset(id)?);
             }
+            LoweredOp::ConstructSlice {
+                id,
+                address,
+                data_address,
+                len,
+                ..
+            } => {
+                self.mov_rax_stack(self.value_offset(address)?);
+                self.mov_rcx_stack(self.value_offset(data_address)?);
+                self.mov_mem_rax_rcx();
+                self.mov_rcx_stack(self.value_offset(len)?);
+                self.mov_mem_rax_disp_rcx(8);
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::SliceLen { id, slice, .. } => {
+                self.mov_rax_stack(self.value_offset(slice)?);
+                self.mov_rax_mem_rax_disp(8);
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::SliceData { id, slice, .. } => {
+                self.mov_rax_stack(self.value_offset(slice)?);
+                self.mov_rax_mem_rax();
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
             LoweredOp::BoundsCheck {
                 id,
                 index,
                 len,
+                len_value,
                 type_hash: _,
             } => {
                 self.mov_rcx_stack(self.value_offset(index)?);
-                self.cmp_rcx_imm32(i32::try_from(*len)?);
+                if let Some(len_value) = len_value {
+                    self.mov_rdx_stack(self.value_offset(len_value)?);
+                    self.cmp_rcx_rdx();
+                } else {
+                    self.cmp_rcx_imm32(i32::try_from(*len)?);
+                }
                 let ok = self.emit_jb_placeholder();
                 self.emit_ud2();
                 self.patch_rel32(ok)?;
+                self.mov_rax_imm32(0);
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::SliceRangeCheck {
+                id,
+                start,
+                len,
+                source_len,
+                type_hash: _,
+            } => {
+                self.mov_rcx_stack(self.value_offset(start)?);
+                self.mov_rdx_stack(self.value_offset(source_len)?);
+                self.cmp_rcx_rdx();
+                let start_ok = self.emit_jbe_placeholder();
+                self.emit_ud2();
+                self.patch_rel32(start_ok)?;
+                self.sub_rdx_rcx();
+                self.mov_rax_stack(self.value_offset(len)?);
+                self.cmp_rax_rdx();
+                let len_ok = self.emit_jbe_placeholder();
+                self.emit_ud2();
+                self.patch_rel32(len_ok)?;
                 self.mov_rax_imm32(0);
                 self.mov_stack_rax(self.value_offset(id)?);
             }
@@ -2213,6 +2366,11 @@ impl FunctionEmitter {
         self.text.extend_from_slice(&[0x48, 0x8b, 0x00]);
     }
 
+    fn mov_rax_mem_rax_disp(&mut self, offset: i32) {
+        self.text.extend_from_slice(&[0x48, 0x8b, 0x80]);
+        self.push_i32(offset);
+    }
+
     fn movzx_rax_memb_rax(&mut self) {
         self.text.extend_from_slice(&[0x0f, 0xb6, 0x00]);
     }
@@ -2230,6 +2388,11 @@ impl FunctionEmitter {
         self.push_i32(offset);
     }
 
+    fn mov_rdx_stack(&mut self, offset: i32) {
+        self.text.extend_from_slice(&[0x48, 0x8b, 0x95]);
+        self.push_i32(offset);
+    }
+
     fn imul_rcx_imm32(&mut self, value: i32) {
         self.text.extend_from_slice(&[0x48, 0x69, 0xc9]);
         self.push_i32(value);
@@ -2241,6 +2404,11 @@ impl FunctionEmitter {
 
     fn mov_mem_rax_rcx(&mut self) {
         self.text.extend_from_slice(&[0x48, 0x89, 0x08]);
+    }
+
+    fn mov_mem_rax_disp_rcx(&mut self, offset: i32) {
+        self.text.extend_from_slice(&[0x48, 0x89, 0x88]);
+        self.push_i32(offset);
     }
 
     fn mov_memb_rax_cl(&mut self) {
@@ -2318,8 +2486,27 @@ impl FunctionEmitter {
         self.push_i32(value);
     }
 
+    fn cmp_rcx_rdx(&mut self) {
+        self.text.extend_from_slice(&[0x48, 0x39, 0xd1]);
+    }
+
+    fn cmp_rax_rdx(&mut self) {
+        self.text.extend_from_slice(&[0x48, 0x39, 0xd0]);
+    }
+
+    fn sub_rdx_rcx(&mut self) {
+        self.text.extend_from_slice(&[0x48, 0x29, 0xca]);
+    }
+
     fn emit_jb_placeholder(&mut self) -> usize {
         self.text.extend_from_slice(&[0x0f, 0x82]);
+        let patch = self.text.len();
+        self.text.extend_from_slice(&[0, 0, 0, 0]);
+        patch
+    }
+
+    fn emit_jbe_placeholder(&mut self) -> usize {
+        self.text.extend_from_slice(&[0x0f, 0x86]);
         let patch = self.text.len();
         self.text.extend_from_slice(&[0, 0, 0, 0]);
         patch
@@ -2726,18 +2913,69 @@ impl Arm64Emitter {
                 }
                 self.str_stack(0, self.value_offset(id)?)?;
             }
+            LoweredOp::ConstructSlice {
+                id,
+                address,
+                data_address,
+                len,
+                ..
+            } => {
+                self.ldr_stack(0, self.value_offset(address)?)?;
+                self.ldr_stack(1, self.value_offset(data_address)?)?;
+                self.str_reg_addr(1, 0)?;
+                self.ldr_stack(1, self.value_offset(len)?)?;
+                self.str_reg_addr_offset(1, 0, 8)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::SliceLen { id, slice, .. } => {
+                self.ldr_stack(0, self.value_offset(slice)?)?;
+                self.ldr_reg_addr_offset(0, 0, 8)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::SliceData { id, slice, .. } => {
+                self.ldr_stack(0, self.value_offset(slice)?)?;
+                self.ldr_reg_addr(0, 0)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
             LoweredOp::BoundsCheck {
                 id,
                 index,
                 len,
+                len_value,
                 type_hash: _,
             } => {
                 self.ldr_stack(0, self.value_offset(index)?)?;
-                self.mov_u64(1, *len);
+                if let Some(len_value) = len_value {
+                    self.ldr_stack(1, self.value_offset(len_value)?)?;
+                } else {
+                    self.mov_u64(1, *len);
+                }
                 self.cmp_reg(0, 1);
                 let ok = self.emit_b_cond_placeholder(3);
                 self.emit_u32(0xd4200000);
                 self.patch_imm19(ok)?;
+                self.mov_u64(0, 0);
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::SliceRangeCheck {
+                id,
+                start,
+                len,
+                source_len,
+                type_hash: _,
+            } => {
+                self.ldr_stack(0, self.value_offset(start)?)?;
+                self.ldr_stack(1, self.value_offset(source_len)?)?;
+                self.cmp_reg(0, 1);
+                let start_ok = self.emit_b_cond_placeholder(9);
+                self.emit_u32(0xd4200000);
+                self.patch_imm19(start_ok)?;
+                self.sub_reg(1, 1, 0);
+                self.ldr_stack(0, self.value_offset(len)?)?;
+                self.cmp_reg(0, 1);
+                let len_ok = self.emit_b_cond_placeholder(9);
+                self.emit_u32(0xd4200000);
+                self.patch_imm19(len_ok)?;
                 self.mov_u64(0, 0);
                 self.str_stack(0, self.value_offset(id)?)?;
             }
