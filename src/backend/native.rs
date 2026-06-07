@@ -599,6 +599,7 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::AddrOfField { .. }
             | LoweredOp::AddrOfEnumPayload { .. }
             | LoweredOp::AddrOfIndex { .. }
+            | LoweredOp::BoundsCheck { .. }
             | LoweredOp::LoadEnumTag { .. }
             | LoweredOp::Load { .. }
             | LoweredOp::StoreEnumTag { .. }
@@ -717,8 +718,11 @@ fn validate_native_ops(
             }
             LoweredOp::AddrOfField { .. } => {}
             LoweredOp::AddrOfEnumPayload { .. } => {}
-            LoweredOp::AddrOfIndex { .. } => {
-                bail!("native object backend v0 does not support index address operations");
+            LoweredOp::AddrOfIndex { .. } => {}
+            LoweredOp::BoundsCheck { type_hash, .. } => {
+                if type_hash != unit_type {
+                    bail!("native object backend saw bounds_check with non-unit type");
+                }
             }
             LoweredOp::LoadEnumTag { type_hash, .. } => {
                 let layout = native_type_layout(type_layouts, type_hash)?;
@@ -802,7 +806,7 @@ fn native_supported_type(
     }
     let layout = native_type_layout(type_layouts, type_hash)?;
     match layout.kind.as_str() {
-        "record" | "enum" | "reference" | "raw_pointer" => Ok(()),
+        "record" | "enum" | "fixed_array" | "reference" | "raw_pointer" => Ok(()),
         other => bail!("native object backend v0 does not support native values of {other} type"),
     }
 }
@@ -1032,7 +1036,47 @@ fn validate_native_op_flow(
             native_insert_address(addresses, id, type_hash)?;
             native_insert_value(values, id, type_hash)?;
         }
-        LoweredOp::AddrOfIndex { .. } => {}
+        LoweredOp::AddrOfIndex { id, place } => {
+            let LoweredPlace::Index {
+                base,
+                index,
+                element_type_hash,
+                type_hash,
+            } = place
+            else {
+                bail!("addr_of_index must contain an index place");
+            };
+            let base_type = native_address_type(addresses, base)?;
+            if native_type_layout(type_layouts, base_type)?.kind != "fixed_array" {
+                bail!("native object backend saw addr_of_index for non-array base");
+            }
+            if native_value_type(values, index)? != &type_hash_for("I64") {
+                bail!("native object backend saw addr_of_index with non-i64 index");
+            }
+            if element_type_hash != type_hash {
+                bail!("native object backend saw addr_of_index element type mismatch");
+            }
+            native_type_layout(type_layouts, element_type_hash)?;
+            native_insert_address(addresses, id, type_hash)?;
+            match native_type_layout(type_layouts, type_hash)?.kind.as_str() {
+                "record" | "enum" | "fixed_array" => native_insert_value(values, id, type_hash)?,
+                _ => {}
+            }
+        }
+        LoweredOp::BoundsCheck {
+            id,
+            index,
+            len: _,
+            type_hash,
+        } => {
+            if native_value_type(values, index)? != &type_hash_for("I64") {
+                bail!("native object backend saw bounds_check with non-i64 index");
+            }
+            if type_hash != &type_hash_for("Unit") {
+                bail!("native object backend saw bounds_check with non-unit type");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
         LoweredOp::LoadEnumTag {
             id,
             address,
@@ -1216,6 +1260,17 @@ fn native_case_arm_layout(
 
 fn native_type_size(layouts: &BTreeMap<String, LoweredTypeLayout>, type_hash: &str) -> Result<u64> {
     Ok(native_type_layout(layouts, type_hash)?.size_bytes)
+}
+
+fn native_array_stride(
+    layouts: &BTreeMap<String, LoweredTypeLayout>,
+    element_type_hash: &str,
+) -> Result<u64> {
+    let element = native_type_layout(layouts, element_type_hash)?;
+    if element.align_bytes == 0 {
+        bail!("native object backend saw zero element alignment");
+    }
+    Ok(element.size_bytes.div_ceil(element.align_bytes) * element.align_bytes)
 }
 
 fn native_stack_slot_size_bytes(layout_size_bytes: u64) -> u64 {
@@ -1459,6 +1514,7 @@ fn collect_value_ids_inner(
             | LoweredOp::AddrOfField { id, .. }
             | LoweredOp::AddrOfEnumPayload { id, .. }
             | LoweredOp::AddrOfIndex { id, .. }
+            | LoweredOp::BoundsCheck { id, .. }
             | LoweredOp::LoadEnumTag { id, .. }
             | LoweredOp::Load { id, .. }
             | LoweredOp::Copy { id, .. }
@@ -1714,8 +1770,40 @@ impl FunctionEmitter {
                 self.add_rax_imm32(i32::try_from(*payload_offset_bytes)?);
                 self.mov_stack_rax(self.value_offset(id)?);
             }
-            LoweredOp::AddrOfIndex { .. } => {
-                bail!("native x86_64 backend v0 does not support index address operations");
+            LoweredOp::AddrOfIndex { id, place } => {
+                let LoweredPlace::Index {
+                    base,
+                    index,
+                    element_type_hash,
+                    ..
+                } = place
+                else {
+                    bail!("addr_of_index must contain an index place");
+                };
+                self.mov_rax_stack(self.value_offset(base)?);
+                self.mov_rcx_stack(self.value_offset(index)?);
+                let stride = native_array_stride(&self.type_layouts, element_type_hash)?;
+                if stride > 0 {
+                    if stride != 1 {
+                        self.imul_rcx_imm32(i32::try_from(stride)?);
+                    }
+                    self.add_rax_rcx();
+                }
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::BoundsCheck {
+                id,
+                index,
+                len,
+                type_hash: _,
+            } => {
+                self.mov_rcx_stack(self.value_offset(index)?);
+                self.cmp_rcx_imm32(i32::try_from(*len)?);
+                let ok = self.emit_jb_placeholder();
+                self.emit_ud2();
+                self.patch_rel32(ok)?;
+                self.mov_rax_imm32(0);
+                self.mov_stack_rax(self.value_offset(id)?);
             }
             LoweredOp::LoadEnumTag {
                 id,
@@ -2142,6 +2230,15 @@ impl FunctionEmitter {
         self.push_i32(offset);
     }
 
+    fn imul_rcx_imm32(&mut self, value: i32) {
+        self.text.extend_from_slice(&[0x48, 0x69, 0xc9]);
+        self.push_i32(value);
+    }
+
+    fn add_rax_rcx(&mut self) {
+        self.text.extend_from_slice(&[0x48, 0x01, 0xc8]);
+    }
+
     fn mov_mem_rax_rcx(&mut self) {
         self.text.extend_from_slice(&[0x48, 0x89, 0x08]);
     }
@@ -2216,6 +2313,18 @@ impl FunctionEmitter {
         self.push_i32(value);
     }
 
+    fn cmp_rcx_imm32(&mut self, value: i32) {
+        self.text.extend_from_slice(&[0x48, 0x81, 0xf9]);
+        self.push_i32(value);
+    }
+
+    fn emit_jb_placeholder(&mut self) -> usize {
+        self.text.extend_from_slice(&[0x0f, 0x82]);
+        let patch = self.text.len();
+        self.text.extend_from_slice(&[0, 0, 0, 0]);
+        patch
+    }
+
     fn emit_jz_placeholder(&mut self) -> usize {
         self.text.extend_from_slice(&[0x0f, 0x84]);
         let patch = self.text.len();
@@ -2235,6 +2344,10 @@ impl FunctionEmitter {
         let patch = self.text.len();
         self.text.extend_from_slice(&[0, 0, 0, 0]);
         patch
+    }
+
+    fn emit_ud2(&mut self) {
+        self.text.extend_from_slice(&[0x0f, 0x0b]);
     }
 
     fn patch_rel32(&mut self, patch_offset: usize) -> Result<()> {
@@ -2591,8 +2704,42 @@ impl Arm64Emitter {
                 self.add_reg_imm(0, 0, u32::try_from(*payload_offset_bytes)?)?;
                 self.str_stack(0, self.value_offset(id)?)?;
             }
-            LoweredOp::AddrOfIndex { .. } => {
-                bail!("native arm64 backend v0 does not support index address operations");
+            LoweredOp::AddrOfIndex { id, place } => {
+                let LoweredPlace::Index {
+                    base,
+                    index,
+                    element_type_hash,
+                    ..
+                } = place
+                else {
+                    bail!("addr_of_index must contain an index place");
+                };
+                self.ldr_stack(0, self.value_offset(base)?)?;
+                self.ldr_stack(1, self.value_offset(index)?)?;
+                let stride = native_array_stride(&self.type_layouts, element_type_hash)?;
+                if stride > 0 {
+                    if stride != 1 {
+                        self.mov_u64(2, stride);
+                        self.mul_reg(1, 1, 2);
+                    }
+                    self.add_reg(0, 0, 1);
+                }
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::BoundsCheck {
+                id,
+                index,
+                len,
+                type_hash: _,
+            } => {
+                self.ldr_stack(0, self.value_offset(index)?)?;
+                self.mov_u64(1, *len);
+                self.cmp_reg(0, 1);
+                let ok = self.emit_b_cond_placeholder(3);
+                self.emit_u32(0xd4200000);
+                self.patch_imm19(ok)?;
+                self.mov_u64(0, 0);
+                self.str_stack(0, self.value_offset(id)?)?;
             }
             LoweredOp::LoadEnumTag {
                 id,

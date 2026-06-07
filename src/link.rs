@@ -787,14 +787,17 @@ impl CodeDb {
         if !params.is_empty() {
             bail!("native aggregate harness entry must not take parameters");
         }
-        if !matches!(expected, Value::Record(_) | Value::Enum { .. }) {
-            bail!("native aggregate harness requires a record or enum expected value");
+        if !matches!(
+            expected,
+            Value::Array(_) | Value::Record(_) | Value::Enum { .. }
+        ) {
+            bail!("native aggregate harness requires an array, record, or enum expected value");
         }
         if !matches!(
             self.type_spec_in_root(root, &return_type_hash)?,
-            TypeSpec::Record(_) | TypeSpec::Enum(_)
+            TypeSpec::FixedArray { .. } | TypeSpec::Record(_) | TypeSpec::Enum(_)
         ) {
-            bail!("native aggregate harness entry must return a record or enum");
+            bail!("native aggregate harness entry must return an array, record, or enum");
         }
 
         let layout = self
@@ -802,9 +805,9 @@ impl CodeDb {
             .metadata;
         if !matches!(
             layout.get("kind").and_then(JsonValue::as_str),
-            Some("record" | "enum")
+            Some("fixed_array" | "record" | "enum")
         ) {
-            bail!("native aggregate harness expected record or enum layout metadata");
+            bail!("native aggregate harness expected array, record, or enum layout metadata");
         }
         let size_bytes = required_metadata_u64(&layout, "size_bytes")?;
         let align_bytes = required_metadata_u64(&layout, "align_bytes")?;
@@ -923,6 +926,40 @@ impl CodeDb {
                 Ok(())
             }
             (Value::Unit, TypeSpec::Builtin(kind)) if kind == "Unit" => Ok(()),
+            (Value::Array(values), TypeSpec::FixedArray { element, len }) => {
+                if values.len() as u64 != len {
+                    bail!(
+                        "native array comparison expected {} elements, got {}",
+                        len,
+                        values.len()
+                    );
+                }
+                let layout = self
+                    .compute_type_layout(root, type_hash, target_triple)?
+                    .metadata;
+                if layout.get("kind").and_then(JsonValue::as_str) != Some("fixed_array") {
+                    bail!("native array comparison expected fixed_array layout");
+                }
+                if layout.get("element_type_hash").and_then(JsonValue::as_str)
+                    != Some(element.as_str())
+                    || layout.get("len").and_then(JsonValue::as_u64) != Some(len)
+                {
+                    bail!("native array layout metadata mismatch");
+                }
+                let stride_bytes = required_metadata_u64(&layout, "stride_bytes")?;
+                for (idx, value) in values.iter().enumerate() {
+                    self.native_value_comparison(
+                        root,
+                        &element,
+                        &value.borrow(),
+                        offset + stride_bytes * idx as u64,
+                        target_triple,
+                        next_check,
+                        out,
+                    )?;
+                }
+                Ok(())
+            }
             (Value::Record(_), TypeSpec::Record(_)) => {
                 let layout = self
                     .compute_type_layout(root, type_hash, target_triple)?
@@ -969,7 +1006,7 @@ impl CodeDb {
                 )
             }
             _ => bail!(
-                "native aggregate harness direct comparison supports only semantic test values containing i64, bool, unit, nested records, or nested enums; reference-carrying aggregates must be tested through native-required scalar entrypoints"
+                "native aggregate harness direct comparison supports only semantic test values containing i64, bool, unit, nested arrays, nested records, or nested enums; reference-carrying aggregates must be tested through native-required scalar entrypoints"
             ),
         }
     }

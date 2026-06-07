@@ -3817,6 +3817,7 @@ fn collect_lowered_call_targets(
             | LoweredOp::AddrOfField { .. }
             | LoweredOp::AddrOfEnumPayload { .. }
             | LoweredOp::AddrOfIndex { .. }
+            | LoweredOp::BoundsCheck { .. }
             | LoweredOp::BorrowShared { .. }
             | LoweredOp::BorrowMut { .. }
             | LoweredOp::DerefShared { .. }

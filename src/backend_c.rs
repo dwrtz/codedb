@@ -293,7 +293,7 @@ impl CodeDb {
                 )
             }
             "borrow_shared" | "borrow_mut" | "assign" | "record_literal" | "field_access"
-            | "enum_construct" | "case" => {
+            | "enum_construct" | "case" | "array_literal" | "array_index" => {
                 bail!(
                     "C projection v0 does not support {other}",
                     other = payload

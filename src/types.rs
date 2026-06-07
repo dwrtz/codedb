@@ -227,6 +227,12 @@ impl LoanPlace {
         place.fields.push(field.to_string());
         place
     }
+
+    fn with_segment(&self, segment: String) -> Self {
+        let mut place = self.clone();
+        place.fields.push(segment);
+        place
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1216,6 +1222,21 @@ impl CodeDb {
                 }
                 self.type_assignable_in_root(root, &actual_referent, &expected_referent)
             }
+            (
+                TypeSpec::FixedArray {
+                    element: actual_element,
+                    len: actual_len,
+                },
+                TypeSpec::FixedArray {
+                    element: expected_element,
+                    len: expected_len,
+                },
+            ) => {
+                if actual_len != expected_len {
+                    return Ok(false);
+                }
+                self.type_assignable_in_root(root, &actual_element, &expected_element)
+            }
             (TypeSpec::Record(actual_fields), TypeSpec::Record(expected_fields))
             | (TypeSpec::Enum(actual_fields), TypeSpec::Enum(expected_fields)) => {
                 if actual_fields.len() != expected_fields.len() {
@@ -1285,6 +1306,26 @@ impl CodeDb {
                     root,
                     &actual_referent,
                     &expected_referent,
+                    callee_regions,
+                )
+            }
+            (
+                TypeSpec::FixedArray {
+                    element: actual_element,
+                    len: actual_len,
+                },
+                TypeSpec::FixedArray {
+                    element: expected_element,
+                    len: expected_len,
+                },
+            ) => {
+                if actual_len != expected_len {
+                    return Ok(false);
+                }
+                self.type_assignable_for_call_in_root(
+                    root,
+                    &actual_element,
+                    &expected_element,
                     callee_regions,
                 )
             }
@@ -1397,14 +1438,6 @@ impl CodeDb {
                 TypeSpec::RawPointer {
                     pointee: expected, ..
                 },
-            )
-            | (
-                TypeSpec::FixedArray {
-                    element: actual, ..
-                },
-                TypeSpec::FixedArray {
-                    element: expected, ..
-                },
             ) => self.infer_call_region_substitutions(
                 root,
                 &actual,
@@ -1412,6 +1445,27 @@ impl CodeDb {
                 callee_regions,
                 substitutions,
             ),
+            (
+                TypeSpec::FixedArray {
+                    element: actual,
+                    len: actual_len,
+                },
+                TypeSpec::FixedArray {
+                    element: expected,
+                    len: expected_len,
+                },
+            ) => {
+                if actual_len != expected_len {
+                    return Ok(());
+                }
+                self.infer_call_region_substitutions(
+                    root,
+                    &actual,
+                    &expected,
+                    callee_regions,
+                    substitutions,
+                )
+            }
             (TypeSpec::Record(actual_fields), TypeSpec::Record(expected_fields))
             | (TypeSpec::Enum(actual_fields), TypeSpec::Enum(expected_fields)) => {
                 for expected_field in expected_fields {
@@ -2721,6 +2775,92 @@ impl CodeDb {
                     type_hash: then_expr.type_hash,
                 })
             }
+            RawExpr::Array { elements } => {
+                if elements.is_empty() {
+                    bail!("array literal must have at least one element");
+                }
+                let mut typed_elements = Vec::with_capacity(elements.len());
+                for element in elements {
+                    typed_elements.push(self.type_expr_with_locals(
+                        current_module,
+                        element,
+                        root,
+                        param_names,
+                        param_types,
+                        region_scope,
+                        locals,
+                    )?);
+                }
+                let element_type = typed_elements
+                    .first()
+                    .ok_or_else(|| anyhow!("array literal has no elements"))?
+                    .type_hash
+                    .clone();
+                for (idx, typed) in typed_elements.iter().enumerate() {
+                    if !self.type_assignable_in_root(root, &typed.type_hash, &element_type)? {
+                        bail!(
+                            "array element {idx} expected {}, got {}",
+                            self.type_name(&element_type)?,
+                            self.type_name(&typed.type_hash)?
+                        );
+                    }
+                }
+                let type_hash = self.put_structural_type(TypeSpec::FixedArray {
+                    element: element_type.clone(),
+                    len: typed_elements.len() as u64,
+                })?;
+                let elements_json = typed_elements
+                    .iter()
+                    .map(|typed| {
+                        json!({
+                            "value": typed.expr_hash.clone(),
+                            "type": typed.type_hash.clone(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "array_literal",
+                        "elements": elements_json,
+                        "element_type": element_type.clone(),
+                        "len": typed_elements.len() as u64,
+                        "type": type_hash.clone(),
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
+            RawExpr::Index { target, index } => {
+                let target = self.type_expr_with_locals(
+                    current_module,
+                    target,
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                let index = self.type_expr_with_locals(
+                    current_module,
+                    index,
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                self.type_array_index(root, &target, &index)
+            }
             RawExpr::Record { fields } => {
                 if fields.is_empty() {
                     bail!("record literal must have at least one field");
@@ -2982,11 +3122,89 @@ impl CodeDb {
         })
     }
 
+    fn type_array_index(
+        &mut self,
+        root: &ProgramRootPayload,
+        target: &TypeCheckResult,
+        index: &TypeCheckResult,
+    ) -> Result<TypeCheckResult> {
+        require_type(&index.type_hash, &type_hash_for("I64"), "array index", self)?;
+        let (array_type, element_type, len) =
+            self.array_element_type_in_root(root, &target.type_hash)?;
+        if let Some(value) = self.typed_literal_i64_value(&index.expr_hash)? {
+            if value < 0 || value as u64 >= len {
+                bail!("array index {value} out of bounds for length {len}");
+            }
+        }
+        let expr_hash = self.put_object(
+            "Expression",
+            &json!({
+                "expr_kind": "array_index",
+                "target": target.expr_hash.clone(),
+                "index": index.expr_hash.clone(),
+                "target_type": target.type_hash.clone(),
+                "array_type": array_type,
+                "element_type": element_type.clone(),
+                "len": len,
+                "type": element_type.clone(),
+            }),
+        )?;
+        self.write_cache_json(
+            &expr_hash,
+            "typechecker",
+            "typed-dag",
+            ArtifactKind::TypedExpression,
+            &json!({ "type": element_type }),
+        )?;
+        Ok(TypeCheckResult {
+            expr_hash,
+            type_hash: element_type,
+        })
+    }
+
+    fn array_element_type_in_root(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+    ) -> Result<(String, String, u64)> {
+        match self.type_spec_in_root(root, type_hash)? {
+            TypeSpec::Reference { referent, .. } => {
+                self.array_element_type_in_root(root, &referent)
+            }
+            TypeSpec::FixedArray { element, len } => Ok((type_hash.to_string(), element, len)),
+            other => bail!(
+                "array index requires array type, got {}",
+                other.to_source(self)?
+            ),
+        }
+    }
+
+    fn typed_literal_i64_value(&self, expr_hash: &str) -> Result<Option<i64>> {
+        let payload = self.get_payload(expr_hash)?;
+        if payload.get("expr_kind").and_then(JsonValue::as_str) != Some("literal_i64") {
+            return Ok(None);
+        }
+        Ok(Some(
+            payload
+                .get("value")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("literal_i64 missing value"))?
+                .parse::<i64>()?,
+        ))
+    }
+
+    fn array_index_place_segment(&self, index_hash: &str) -> Result<String> {
+        Ok(match self.typed_literal_i64_value(index_hash)? {
+            Some(value) if value >= 0 => array_index_segment(value as u64),
+            _ => "[*]".to_string(),
+        })
+    }
+
     fn typed_expr_is_place(&self, expr_hash: &str) -> Result<bool> {
         let payload = self.get_payload(expr_hash)?;
         Ok(matches!(
             payload.get("expr_kind").and_then(JsonValue::as_str),
-            Some("param_ref" | "local_ref" | "field_access")
+            Some("param_ref" | "local_ref" | "field_access" | "array_index")
         ))
     }
 
@@ -3012,6 +3230,21 @@ impl CodeDb {
                     .get("type")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("field_access target missing type"))?;
+                match self.type_spec_in_root(root, target_type)? {
+                    TypeSpec::Reference { mutable, .. } => Ok(mutable),
+                    _ => self.typed_expr_is_assignable_place(root, target_hash),
+                }
+            }
+            "array_index" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing target"))?;
+                let target_payload = self.get_payload(target_hash)?;
+                let target_type = target_payload
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index target missing type"))?;
                 match self.type_spec_in_root(root, target_type)? {
                     TypeSpec::Reference { mutable, .. } => Ok(mutable),
                     _ => self.typed_expr_is_assignable_place(root, target_hash),
@@ -3147,6 +3380,27 @@ impl CodeDb {
                 }
                 Ok(false)
             }
+            "array_literal" => {
+                for element in payload
+                    .get("elements")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let value_hash = element
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array element missing value"))?;
+                    if self.expr_escapes_local_borrow(
+                        root,
+                        value_hash,
+                        locals_with_local_borrows,
+                    )? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
             "field_access" => {
                 let declared_type = payload
                     .get("type")
@@ -3159,6 +3413,20 @@ impl CodeDb {
                     .get("target")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("field_access missing target"))?;
+                self.expr_escapes_local_borrow(root, target, locals_with_local_borrows)
+            }
+            "array_index" => {
+                let declared_type = payload
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing type"))?;
+                if !self.expr_type_can_escape_borrow(root, declared_type)? {
+                    return Ok(false);
+                }
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing target"))?;
                 self.expr_escapes_local_borrow(root, target, locals_with_local_borrows)
             }
             "if" => {
@@ -3286,6 +3554,21 @@ impl CodeDb {
                     // escape analysis whether the reference value carries a borrow
                     // of a local; a reference *parameter* points to caller storage
                     // and is correctly not local.
+                    self.expr_escapes_local_borrow(root, target, locals_with_local_borrows)
+                } else {
+                    self.borrow_target_is_local_storage(root, target, locals_with_local_borrows)
+                }
+            }
+            "array_index" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing target"))?;
+                let target_type = self.expr_declared_type(target)?;
+                if matches!(
+                    self.type_spec_in_root(root, &target_type)?,
+                    TypeSpec::Reference { .. }
+                ) {
                     self.expr_escapes_local_borrow(root, target, locals_with_local_borrows)
                 } else {
                     self.borrow_target_is_local_storage(root, target, locals_with_local_borrows)
@@ -3833,11 +4116,57 @@ impl CodeDb {
                 self.add_checked_value_loans(&mut active, &value_loans)?;
                 Ok(())
             }
+            "array_literal" => {
+                for element in payload
+                    .get("elements")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("array_literal missing elements"))?
+                {
+                    let child = element
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array element missing value"))?;
+                    self.verify_expr_borrows(root, child, param_types, state, ExprUse::Value)?;
+                }
+                let value_loans = self.collect_value_loans(root, expr_hash, param_types, state)?;
+                self.check_loans_point_to_live_storage(&value_loans, state)?;
+                let transfer_owners =
+                    self.move_source_places_for_expr(root, expr_hash, param_types, &state.locals)?;
+                let mut active = state.active.clone();
+                active.retain(|loan| {
+                    !transfer_owners
+                        .iter()
+                        .any(|owner| loan_owner_overlaps(loan, owner))
+                });
+                self.add_checked_value_loans(&mut active, &value_loans)?;
+                Ok(())
+            }
             "field_access" => {
                 let target = payload
                     .get("target")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("field_access missing target"))?;
+                self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
+                let place = self.loan_place_for_expr(expr_hash, param_types, &state.locals)?;
+                self.check_place_not_moved(&place, state)?;
+                match expr_use {
+                    ExprUse::Place => Ok(()),
+                    ExprUse::Value => {
+                        self.check_shared_read_conflicts(&place, &state.active)?;
+                        self.verify_place_value_use(root, expr_hash, param_types, state)
+                    }
+                }
+            }
+            "array_index" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing target"))?;
+                let index = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing index"))?;
+                self.verify_expr_borrows(root, index, param_types, state, ExprUse::Value)?;
                 self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
                 let place = self.loan_place_for_expr(expr_hash, param_types, &state.locals)?;
                 self.check_place_not_moved(&place, state)?;
@@ -4036,6 +4365,19 @@ impl CodeDb {
                     out.extend(self.collect_value_loans(root, value, param_types, state)?);
                 }
             }
+            "array_literal" => {
+                for element in payload
+                    .get("elements")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("array_literal missing elements"))?
+                {
+                    let value = element
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array element missing value"))?;
+                    out.extend(self.collect_value_loans(root, value, param_types, state)?);
+                }
+            }
             "let" => {
                 let value_hash = payload
                     .get("value")
@@ -4152,7 +4494,7 @@ impl CodeDb {
                     out.extend(body_loans);
                 }
             }
-            "param_ref" | "local_ref" | "field_access" => {
+            "param_ref" | "local_ref" | "field_access" | "array_index" => {
                 let type_hash = self.expr_declared_type(expr_hash)?;
                 let class = self.value_class_in_root(root, &type_hash)?;
                 if class.contains_reference {
@@ -4207,6 +4549,30 @@ impl CodeDb {
                         param_types,
                         state,
                         &field_owner,
+                    )?);
+                }
+                Ok(out)
+            }
+            "array_literal" => {
+                let mut out = Vec::new();
+                for (idx, element) in payload
+                    .get("elements")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("array_literal missing elements"))?
+                    .iter()
+                    .enumerate()
+                {
+                    let value = element
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array element missing value"))?;
+                    let element_owner = target_owner.with_segment(array_index_segment(idx as u64));
+                    out.extend(self.collect_value_loans_for_store(
+                        root,
+                        value,
+                        param_types,
+                        state,
+                        &element_owner,
                     )?);
                 }
                 Ok(out)
@@ -4529,7 +4895,7 @@ impl CodeDb {
     ) -> Result<Vec<LoanPlace>> {
         let payload = self.get_payload(expr_hash)?;
         match payload.get("expr_kind").and_then(JsonValue::as_str) {
-            Some("param_ref" | "local_ref" | "field_access") => {
+            Some("param_ref" | "local_ref" | "field_access" | "array_index") => {
                 let type_hash = self.expr_declared_type(expr_hash)?;
                 let class = self.value_class_in_root(root, &type_hash)?;
                 if class.copy_kind == ValueCopyKind::MoveOnly {
@@ -4604,6 +4970,27 @@ impl CodeDb {
                 }
                 Ok(sources)
             }
+            Some("array_literal") => {
+                let mut sources = Vec::new();
+                for element in payload
+                    .get("elements")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("array_literal missing elements"))?
+                {
+                    let value = element
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array element missing value"))?;
+                    for source in
+                        self.move_source_places_for_expr(root, value, param_types, locals)?
+                    {
+                        if !sources.contains(&source) {
+                            sources.push(source);
+                        }
+                    }
+                }
+                Ok(sources)
+            }
             Some("enum_construct") => {
                 let value = payload
                     .get("value")
@@ -4623,7 +5010,7 @@ impl CodeDb {
     ) -> Result<Option<LoanPlace>> {
         let payload = self.get_payload(expr_hash)?;
         match payload.get("expr_kind").and_then(JsonValue::as_str) {
-            Some("param_ref" | "local_ref" | "field_access") => Ok(Some(
+            Some("param_ref" | "local_ref" | "field_access" | "array_index") => Ok(Some(
                 self.loan_place_for_expr(expr_hash, param_types, locals)?,
             )),
             Some("let") => {
@@ -4732,6 +5119,19 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("field_access missing field"))?;
                 let mut place = self.loan_place_for_expr(target, param_types, locals)?;
                 place.fields.push(field.to_string());
+                Ok(place)
+            }
+            "array_index" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing target"))?;
+                let index = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing index"))?;
+                let mut place = self.loan_place_for_expr(target, param_types, locals)?;
+                place.fields.push(self.array_index_place_segment(index)?);
                 Ok(place)
             }
             other => bail!("borrow target {other} is not an addressable place"),
@@ -4861,6 +5261,25 @@ impl CodeDb {
                         required |= self.expr_requires_state(value)?;
                     }
                     required
+                }
+                "array_literal" => {
+                    let mut required = false;
+                    for element in payload
+                        .get("elements")
+                        .and_then(JsonValue::as_array)
+                        .ok_or_else(|| anyhow!("array_literal missing elements"))?
+                    {
+                        let value = element
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("array element missing value"))?;
+                        required |= self.expr_requires_state(value)?;
+                    }
+                    required
+                }
+                "array_index" => {
+                    self.expr_child_requires_state(&payload, "target")?
+                        || self.expr_child_requires_state(&payload, "index")?
                 }
                 "field_access" => self.expr_child_requires_state(&payload, "target")?,
                 "enum_construct" => self.expr_child_requires_state(&payload, "value")?,
@@ -5273,6 +5692,99 @@ impl CodeDb {
                 }
                 then_type
             }
+            "array_literal" => {
+                let elements = payload
+                    .get("elements")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("array_literal missing elements"))?;
+                if elements.is_empty() {
+                    bail!("array literal must have at least one element");
+                }
+                let element_type = payload
+                    .get("element_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_literal missing element_type"))?
+                    .to_string();
+                let len = payload
+                    .get("len")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("array_literal missing len"))?;
+                if len != elements.len() as u64 {
+                    bail!("array_literal len mismatch");
+                }
+                for (idx, element) in elements.iter().enumerate() {
+                    let value_hash = element
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array element missing value"))?;
+                    let value_type = self.verify_expr_type_with_locals(
+                        value_hash,
+                        root,
+                        param_types,
+                        allowed_regions,
+                        locals,
+                    )?;
+                    if element.get("type").and_then(JsonValue::as_str) != Some(value_type.as_str())
+                    {
+                        bail!("array element type metadata mismatch at index {idx}");
+                    }
+                    if !self.type_assignable_in_root(root, &value_type, &element_type)? {
+                        bail!("array element type mismatch at index {idx}");
+                    }
+                }
+                hash_for_type_spec(&TypeSpec::FixedArray {
+                    element: element_type,
+                    len,
+                })?
+            }
+            "array_index" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing target"))?;
+                let index_hash = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing index"))?;
+                let target_type = self.verify_expr_type_with_locals(
+                    target_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                let index_type = self.verify_expr_type_with_locals(
+                    index_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if index_type != type_hash_for("I64") {
+                    bail!("array index must be i64");
+                }
+                if payload.get("target_type").and_then(JsonValue::as_str)
+                    != Some(target_type.as_str())
+                {
+                    bail!("array_index target_type mismatch");
+                }
+                let (array_type, element_type, len) =
+                    self.array_element_type_in_root(root, &target_type)?;
+                if payload.get("array_type").and_then(JsonValue::as_str)
+                    != Some(array_type.as_str())
+                    || payload.get("element_type").and_then(JsonValue::as_str)
+                        != Some(element_type.as_str())
+                    || payload.get("len").and_then(JsonValue::as_u64) != Some(len)
+                {
+                    bail!("array_index metadata mismatch");
+                }
+                if let Some(value) = self.typed_literal_i64_value(index_hash)? {
+                    if value < 0 || value as u64 >= len {
+                        bail!("array index {value} out of bounds for length {len}");
+                    }
+                }
+                element_type
+            }
             "record_literal" => {
                 let mut names = BTreeSet::new();
                 let mut fields = Vec::new();
@@ -5606,7 +6118,11 @@ fn fields_prefix(prefix: &[String], value: &[String]) -> bool {
         && prefix
             .iter()
             .zip(value.iter())
-            .all(|(left, right)| left == right)
+            .all(|(left, right)| left == right || left == "[*]" || right == "[*]")
+}
+
+fn array_index_segment(index: u64) -> String {
+    format!("[{index}]")
 }
 
 fn named_actual_type_assignable(actual: &TypeSpec, expected: &TypeSpec) -> Option<bool> {

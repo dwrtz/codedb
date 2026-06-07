@@ -873,6 +873,16 @@ fn append_default_arg_to_calls(expr: &RawExpr, target_name: &str, default: &RawE
             then_expr: Box::new(append_default_arg_to_calls(then_expr, target_name, default)),
             else_expr: Box::new(append_default_arg_to_calls(else_expr, target_name, default)),
         },
+        RawExpr::Array { elements } => RawExpr::Array {
+            elements: elements
+                .iter()
+                .map(|element| append_default_arg_to_calls(element, target_name, default))
+                .collect(),
+        },
+        RawExpr::Index { target, index } => RawExpr::Index {
+            target: Box::new(append_default_arg_to_calls(target, target_name, default)),
+            index: Box::new(append_default_arg_to_calls(index, target_name, default)),
+        },
         RawExpr::Record { fields } => RawExpr::Record {
             fields: fields
                 .iter()
@@ -4871,6 +4881,67 @@ impl CodeDb {
                     rename,
                 )?);
             }
+            (RawExpr::Array { elements }, "array_literal") => {
+                let element_payloads = payload
+                    .get("elements")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("array_literal missing elements"))?;
+                if element_payloads.len() != elements.len() {
+                    return Err(anyhow!(
+                        "array literal raw/typed element count mismatch: {} != {}",
+                        elements.len(),
+                        element_payloads.len()
+                    ));
+                }
+                let element_type = payload
+                    .get("element_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_literal missing element_type"))?;
+                *elements = element_payloads
+                    .iter()
+                    .map(|element| {
+                        let value_hash = element
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("array element missing value"))?;
+                        let expected = element
+                            .get("type")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or(element_type);
+                        self.rewrite_typed_expr_for_member_rename(
+                            old_root,
+                            module,
+                            region_names,
+                            local_names,
+                            value_hash,
+                            Some(expected),
+                            rename,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            (RawExpr::Index { target, index }, "array_index") => {
+                *target = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "target",
+                    None,
+                    rename,
+                )?);
+                *index = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "index",
+                    None,
+                    rename,
+                )?);
+            }
             (RawExpr::Record { fields }, "record_literal") => {
                 let expected_fields =
                     expected_type.and_then(|ty| self.record_fields_by_name(old_root, ty).ok());
@@ -6276,6 +6347,24 @@ fn normalize_param_refs_scoped(
             )),
             else_expr: Box::new(normalize_param_refs_scoped(
                 else_expr,
+                local_params,
+                local_bindings,
+            )),
+        },
+        RawExpr::Array { elements } => RawExpr::Array {
+            elements: elements
+                .iter()
+                .map(|element| normalize_param_refs_scoped(element, local_params, local_bindings))
+                .collect(),
+        },
+        RawExpr::Index { target, index } => RawExpr::Index {
+            target: Box::new(normalize_param_refs_scoped(
+                target,
+                local_params,
+                local_bindings,
+            )),
+            index: Box::new(normalize_param_refs_scoped(
+                index,
                 local_params,
                 local_bindings,
             )),

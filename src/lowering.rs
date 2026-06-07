@@ -275,6 +275,12 @@ pub(crate) enum LoweredOp {
         id: String,
         place: LoweredPlace,
     },
+    BoundsCheck {
+        id: String,
+        index: String,
+        len: u64,
+        type_hash: String,
+    },
     LoadEnumTag {
         id: String,
         address: String,
@@ -353,6 +359,11 @@ struct LoweredVariantInfo {
     variant_symbol: Option<String>,
     tag_value: u64,
     payload_offset_bytes: u64,
+}
+
+struct LoweredArrayInfo {
+    element_type_hash: String,
+    len: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -961,6 +972,16 @@ impl CodeDb {
                         ctx,
                         locals,
                     )?);
+                } else if value_kind.as_deref() == Some("array_literal") {
+                    operations.extend(self.lower_array_init_to_address(
+                        root,
+                        value_hash,
+                        &binding_type,
+                        &address,
+                        param_types,
+                        ctx,
+                        locals,
+                    )?);
                 } else if self.type_passes_indirect(root, ctx.target_triple(), &binding_type)?
                     && self.expr_is_place(value_hash)?
                 {
@@ -1137,6 +1158,14 @@ impl CodeDb {
                 ctx,
                 locals,
             ),
+            "array_literal" => self.lower_array_literal_into_slot(
+                root,
+                expr_hash,
+                &type_hash,
+                param_types,
+                ctx,
+                locals,
+            ),
             "if" => {
                 let cond_hash = payload
                     .get("cond")
@@ -1203,6 +1232,9 @@ impl CodeDb {
                 })
             }
             "field_access" => {
+                self.lower_place_value(root, expr_hash, &type_hash, param_types, ctx, locals)
+            }
+            "array_index" => {
                 self.lower_place_value(root, expr_hash, &type_hash, param_types, ctx, locals)
             }
             "enum_construct" => self.lower_enum_construct_into_slot(
@@ -1410,7 +1442,7 @@ impl CodeDb {
         }
         let payload = self.get_payload(expr_hash)?;
         match payload.get("expr_kind").and_then(JsonValue::as_str) {
-            Some("param_ref" | "local_ref" | "field_access") => {
+            Some("param_ref" | "local_ref" | "field_access" | "array_index") => {
                 let lowered = self.lower_place(root, expr_hash, param_types, ctx, locals)?;
                 let id = ctx.value();
                 ctx.push_debug_op(expr_hash, "load", &id);
@@ -1589,6 +1621,106 @@ impl CodeDb {
                     type_hash,
                 })
             }
+            "array_index" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing target"))?;
+                let index_hash = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing index"))?;
+                let target_payload = self.get_payload(target_hash)?;
+                let target_type = expr_type(&target_payload, target_hash)?;
+                let target = match self.type_spec(&target_type)? {
+                    TypeSpec::Reference {
+                        mutable, referent, ..
+                    } => {
+                        let lowered_ref = self.lower_reference_value_for_place(
+                            root,
+                            target_hash,
+                            &target_type,
+                            param_types,
+                            ctx,
+                            locals,
+                        )?;
+                        let id = ctx.value();
+                        let debug_kind = if mutable { "deref_mut" } else { "deref_shared" };
+                        ctx.push_debug_op(expr_hash, debug_kind, &id);
+                        let mut operations = lowered_ref.operations;
+                        if mutable {
+                            operations.push(LoweredOp::DerefMut {
+                                id: id.clone(),
+                                reference: lowered_ref.value,
+                                referent_type_hash: referent.clone(),
+                            });
+                        } else {
+                            operations.push(LoweredOp::DerefShared {
+                                id: id.clone(),
+                                reference: lowered_ref.value,
+                                referent_type_hash: referent.clone(),
+                            });
+                        }
+                        LoweredAddress {
+                            operations,
+                            address: id,
+                            type_hash: referent,
+                        }
+                    }
+                    _ if self.is_aggregate_ir_type(root, &target_type)?
+                        && self.expr_is_place(target_hash)? =>
+                    {
+                        self.lower_place(root, target_hash, param_types, ctx, locals)?
+                    }
+                    _ if self.is_aggregate_ir_type(root, &target_type)? => {
+                        let lowered_value =
+                            self.lower_expr(root, target_hash, param_types, ctx, locals)?;
+                        LoweredAddress {
+                            operations: lowered_value.operations,
+                            address: lowered_value.value,
+                            type_hash: lowered_value.type_hash,
+                        }
+                    }
+                    _ => self.lower_place(root, target_hash, param_types, ctx, locals)?,
+                };
+                let array_info =
+                    self.lowered_array_info(root, ctx.target_triple(), &target.type_hash)?;
+                if array_info.element_type_hash != type_hash {
+                    bail!("array_index element type mismatch while lowering");
+                }
+                let index = self.lower_expr(root, index_hash, param_types, ctx, locals)?;
+                if index.type_hash != type_hash_for("I64") {
+                    bail!("array_index index must lower to i64");
+                }
+                let mut operations = target.operations;
+                operations.extend(index.operations);
+                if self.literal_i64_value(index_hash)?.is_none() {
+                    let check_id = ctx.value();
+                    ctx.push_debug_op(expr_hash, "bounds_check", &check_id);
+                    operations.push(LoweredOp::BoundsCheck {
+                        id: check_id,
+                        index: index.value.clone(),
+                        len: array_info.len,
+                        type_hash: type_hash_for("Unit"),
+                    });
+                }
+                let id = ctx.value();
+                ctx.push_debug_op(expr_hash, "addr_of_index", &id);
+                operations.push(LoweredOp::AddrOfIndex {
+                    id: id.clone(),
+                    place: LoweredPlace::Index {
+                        base: target.address,
+                        index: index.value,
+                        element_type_hash: array_info.element_type_hash,
+                        type_hash: type_hash.clone(),
+                    },
+                });
+                Ok(LoweredAddress {
+                    operations,
+                    address: id,
+                    type_hash,
+                })
+            }
             other => bail!("expression kind {other} is not an addressable place"),
         }
     }
@@ -1658,6 +1790,78 @@ impl CodeDb {
                 address: field_address,
                 value: value.value,
                 type_hash: store_type_hash,
+            });
+        }
+        Ok(operations)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_array_init_to_address(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        target_type: &str,
+        target_address: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<Vec<LoweredOp>> {
+        let payload = self.get_payload(expr_hash)?;
+        if payload.get("expr_kind").and_then(JsonValue::as_str) != Some("array_literal") {
+            bail!("array initializer must be array_literal");
+        }
+        let array_info = self.lowered_array_info(root, ctx.target_triple(), target_type)?;
+        let elements = payload
+            .get("elements")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| anyhow!("array_literal missing elements"))?;
+        if elements.len() as u64 != array_info.len {
+            bail!("array initializer length mismatch while lowering");
+        }
+        let mut operations = Vec::new();
+        for (idx, element) in elements.iter().enumerate() {
+            let value_hash = element
+                .get("value")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("array element missing value"))?;
+            let value = self.lower_expr_as(
+                root,
+                value_hash,
+                &array_info.element_type_hash,
+                param_types,
+                ctx,
+                locals,
+            )?;
+            if !self.type_assignable_in_root(
+                root,
+                &value.type_hash,
+                &array_info.element_type_hash,
+            )? {
+                bail!("array initializer element {idx} type mismatch while lowering");
+            }
+            operations.extend(value.operations);
+            let index_id = ctx.value();
+            ctx.push_debug_op(expr_hash, "const_i64", &index_id);
+            operations.push(LoweredOp::ConstI64 {
+                id: index_id.clone(),
+                value: idx.to_string(),
+                type_hash: type_hash_for("I64"),
+            });
+            let element_address = ctx.value();
+            ctx.push_debug_op(expr_hash, "addr_of_index", &element_address);
+            operations.push(LoweredOp::AddrOfIndex {
+                id: element_address.clone(),
+                place: LoweredPlace::Index {
+                    base: target_address.to_string(),
+                    index: index_id,
+                    element_type_hash: array_info.element_type_hash.clone(),
+                    type_hash: array_info.element_type_hash.clone(),
+                },
+            });
+            operations.push(LoweredOp::Store {
+                address: element_address,
+                value: value.value,
+                type_hash: array_info.element_type_hash.clone(),
             });
         }
         Ok(operations)
@@ -1753,14 +1957,14 @@ impl CodeDb {
         if !self.type_assignable_in_root(root, &source_type, target_type)? {
             bail!("aggregate initializer type mismatch while lowering");
         }
-        if self.type_is_enum(root, target_type)? {
+        if self.type_is_enum(root, target_type)? || self.type_is_fixed_array(root, target_type)? {
             if !self.layouts_blind_copy_compatible(
                 root,
                 ctx.target_triple(),
                 &source_type,
                 target_type,
             )? {
-                bail!("unsupported_aggregate_layout: enum initializer layout mismatch");
+                bail!("unsupported_aggregate_layout: aggregate initializer layout mismatch");
             }
             let source = self.lower_place(root, expr_hash, param_types, ctx, locals)?;
             let mut operations = source.operations;
@@ -1960,6 +2164,58 @@ impl CodeDb {
             },
         }];
         operations.extend(self.lower_enum_init_to_address(
+            root,
+            expr_hash,
+            slot_type,
+            &address,
+            param_types,
+            ctx,
+            locals,
+        )?);
+        if self.type_passes_indirect(root, ctx.target_triple(), slot_type)? {
+            Ok(LoweredExpr {
+                operations,
+                value: address,
+                type_hash: slot_type.to_string(),
+            })
+        } else {
+            let id = ctx.value();
+            ctx.push_debug_op(expr_hash, "load", &id);
+            operations.push(LoweredOp::Load {
+                id: id.clone(),
+                address,
+                type_hash: slot_type.to_string(),
+            });
+            Ok(LoweredExpr {
+                operations,
+                value: id,
+                type_hash: slot_type.to_string(),
+            })
+        }
+    }
+
+    fn lower_array_literal_into_slot(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        slot_type: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let slot_size =
+            stack_slot_size_bytes(self.layout_size_bytes(root, ctx.target_triple(), slot_type)?);
+        let slot = ctx.local_slot(slot_type.to_string(), slot_size);
+        let address = ctx.value();
+        ctx.push_debug_op(expr_hash, "addr_of_local", &address);
+        let mut operations = vec![LoweredOp::AddrOfLocal {
+            id: address.clone(),
+            place: LoweredPlace::Local {
+                slot,
+                type_hash: slot_type.to_string(),
+            },
+        }];
+        operations.extend(self.lower_array_init_to_address(
             root,
             expr_hash,
             slot_type,
@@ -2258,12 +2514,29 @@ impl CodeDb {
                 locals,
             );
         }
+        let is_array_literal = self
+            .get_payload(expr_hash)?
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            == Some("array_literal");
+        if is_array_literal && self.type_is_fixed_array(root, expected_type)? {
+            return self.lower_array_literal_into_slot(
+                root,
+                expr_hash,
+                expected_type,
+                param_types,
+                ctx,
+                locals,
+            );
+        }
         let value = self.lower_expr(root, expr_hash, param_types, ctx, locals)?;
         if value.type_hash != expected_type
             && (self.type_is_record(root, &value.type_hash)?
                 || self.type_is_record(root, expected_type)?
                 || self.type_is_enum(root, &value.type_hash)?
-                || self.type_is_enum(root, expected_type)?)
+                || self.type_is_enum(root, expected_type)?
+                || self.type_is_fixed_array(root, &value.type_hash)?
+                || self.type_is_fixed_array(root, expected_type)?)
             && !self.layouts_blind_copy_compatible(
                 root,
                 ctx.target_triple(),
@@ -2284,6 +2557,13 @@ impl CodeDb {
         Ok(matches!(
             self.type_spec_in_root(root, type_hash)?,
             TypeSpec::Record(_)
+        ))
+    }
+
+    fn type_is_fixed_array(&self, root: &ProgramRootPayload, type_hash: &str) -> Result<bool> {
+        Ok(matches!(
+            self.type_spec_in_root(root, type_hash)?,
+            TypeSpec::FixedArray { .. }
         ))
     }
 
@@ -2375,10 +2655,36 @@ impl CodeDb {
                 Ok(self.layout_size_bytes(root, target_triple, src)?
                     == self.layout_size_bytes(root, target_triple, dst)?)
             }
+            (
+                TypeSpec::FixedArray {
+                    element: src_element,
+                    len: src_len,
+                },
+                TypeSpec::FixedArray {
+                    element: dst_element,
+                    len: dst_len,
+                },
+            ) => {
+                if src_len != dst_len {
+                    return Ok(false);
+                }
+                if !self.layouts_blind_copy_compatible(
+                    root,
+                    target_triple,
+                    &src_element,
+                    &dst_element,
+                )? {
+                    return Ok(false);
+                }
+                Ok(self.layout_size_bytes(root, target_triple, src)?
+                    == self.layout_size_bytes(root, target_triple, dst)?)
+            }
             (TypeSpec::Record(_), _)
             | (_, TypeSpec::Record(_))
             | (TypeSpec::Enum(_), _)
-            | (_, TypeSpec::Enum(_)) => Ok(false),
+            | (_, TypeSpec::Enum(_))
+            | (TypeSpec::FixedArray { .. }, _)
+            | (_, TypeSpec::FixedArray { .. }) => Ok(false),
             _ => self.scalar_layouts_equal(root, target_triple, src, dst),
         }
     }
@@ -2476,6 +2782,56 @@ impl CodeDb {
         }
     }
 
+    fn lowered_array_info(
+        &self,
+        root: &ProgramRootPayload,
+        target_triple: &str,
+        type_hash: &str,
+    ) -> Result<LoweredArrayInfo> {
+        let layout = self
+            .compute_type_layout(root, type_hash, target_triple)?
+            .metadata;
+        let layout_element = layout
+            .get("element_type_hash")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("array layout missing element_type_hash"))?
+            .to_string();
+        let layout_len = required_layout_u64(&layout, "len")?;
+        let stride_bytes = required_layout_u64(&layout, "stride_bytes")?;
+        if stride_bytes == 0 {
+            bail!("array layout stride must be non-zero");
+        }
+        match self.type_spec_in_root(root, type_hash)? {
+            TypeSpec::FixedArray { element, len } => {
+                if element != layout_element || len != layout_len {
+                    bail!("array layout metadata mismatch");
+                }
+                Ok(LoweredArrayInfo {
+                    element_type_hash: element,
+                    len,
+                })
+            }
+            other => bail!(
+                "array index requires array type, got {}",
+                other.to_source(self)?
+            ),
+        }
+    }
+
+    fn literal_i64_value(&self, expr_hash: &str) -> Result<Option<i64>> {
+        let payload = self.get_payload(expr_hash)?;
+        if payload.get("expr_kind").and_then(JsonValue::as_str) != Some("literal_i64") {
+            return Ok(None);
+        }
+        Ok(Some(
+            payload
+                .get("value")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("literal_i64 missing value"))?
+                .parse::<i64>()?,
+        ))
+    }
+
     fn aggregate_record_fields(
         &self,
         root: &ProgramRootPayload,
@@ -2494,7 +2850,7 @@ impl CodeDb {
         let payload = self.get_payload(expr_hash)?;
         Ok(matches!(
             payload.get("expr_kind").and_then(JsonValue::as_str),
-            Some("param_ref" | "local_ref" | "field_access")
+            Some("param_ref" | "local_ref" | "field_access" | "array_index")
         ))
     }
 
@@ -2630,6 +2986,7 @@ impl CodeDb {
             TypeSpec::Builtin(_)
             | TypeSpec::Record(_)
             | TypeSpec::Enum(_)
+            | TypeSpec::FixedArray { .. }
             | TypeSpec::Reference { .. } => Ok(()),
             _ => bail!("lowering v1 does not support aggregate return type {type_name}"),
         }
@@ -3459,6 +3816,23 @@ impl CodeDb {
                         ),
                     }
                     insert_address(addresses, id, type_hash)?;
+                    if self.is_aggregate_ir_type(root, type_hash)? {
+                        insert_value(values, id, type_hash)?;
+                    }
+                }
+                LoweredOp::BoundsCheck {
+                    id,
+                    index,
+                    len: _,
+                    type_hash,
+                } => {
+                    if value_type(values, index)? != &type_hash_for("I64") {
+                        bail!("lowered bounds_check index must be i64");
+                    }
+                    if type_hash != &type_hash_for("Unit") {
+                        bail!("lowered bounds_check type mismatch");
+                    }
+                    insert_value(values, id, type_hash)?;
                 }
                 LoweredOp::LoadEnumTag {
                     id,
@@ -3852,6 +4226,7 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::AddrOfField { id, .. }
         | LoweredOp::AddrOfEnumPayload { id, .. }
         | LoweredOp::AddrOfIndex { id, .. }
+        | LoweredOp::BoundsCheck { id, .. }
         | LoweredOp::LoadEnumTag { id, .. }
         | LoweredOp::Load { id, .. }
         | LoweredOp::Copy { id, .. }
@@ -3884,6 +4259,7 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::AddrOfField { .. } => "addr_of_field",
         LoweredOp::AddrOfEnumPayload { .. } => "addr_of_enum_payload",
         LoweredOp::AddrOfIndex { .. } => "addr_of_index",
+        LoweredOp::BoundsCheck { .. } => "bounds_check",
         LoweredOp::LoadEnumTag { .. } => "load_enum_tag",
         LoweredOp::StoreEnumTag { .. } => "store_enum_tag",
         LoweredOp::Load { .. } => "load",
@@ -3980,6 +4356,7 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::Case { type_hash, .. }
             | LoweredOp::BorrowShared { type_hash, .. }
             | LoweredOp::BorrowMut { type_hash, .. }
+            | LoweredOp::BoundsCheck { type_hash, .. }
             | LoweredOp::LoadEnumTag { type_hash, .. }
             | LoweredOp::Load { type_hash, .. }
             | LoweredOp::Store { type_hash, .. }

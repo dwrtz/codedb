@@ -158,6 +158,9 @@ pub(crate) enum TestValue {
         value: bool,
     },
     Unit,
+    Array {
+        elements: Vec<TestValue>,
+    },
     Record {
         fields: Vec<TestRecordField>,
     },

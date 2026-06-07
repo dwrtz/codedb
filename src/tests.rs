@@ -952,7 +952,7 @@ impl CodeDb {
             Value::I64(_) | Value::Bool(_) => {
                 self.native_scalar_agreement_result(branch_name, case, expected)
             }
-            Value::Record(_) | Value::Enum { .. } => {
+            Value::Array(_) | Value::Record(_) | Value::Enum { .. } => {
                 self.native_record_agreement_result(branch_name, case, expected)
             }
             _ => native_unavailable_result(
@@ -1527,6 +1527,12 @@ pub(crate) fn value_from_test_value(value: &TestValue) -> Result<Value> {
             .with_context(|| format!("invalid i64 test value {value:?}")),
         TestValue::Bool { value } => Ok(Value::Bool(*value)),
         TestValue::Unit => Ok(Value::Unit),
+        TestValue::Array { elements } => Ok(Value::Array(
+            elements
+                .iter()
+                .map(|element| Ok(value_cell(value_from_test_value(element)?)))
+                .collect::<Result<Vec<_>>>()?,
+        )),
         TestValue::Record { fields } => {
             let mut values = BTreeMap::new();
             for field in fields {
@@ -1560,6 +1566,12 @@ pub(crate) fn test_value_from_value(value: &Value) -> Result<TestValue> {
         },
         Value::Bool(value) => TestValue::Bool { value: *value },
         Value::Unit => TestValue::Unit,
+        Value::Array(elements) => TestValue::Array {
+            elements: elements
+                .iter()
+                .map(|value| test_value_from_value(&value.borrow()))
+                .collect::<Result<Vec<_>>>()?,
+        },
         Value::Record(fields) => TestValue::Record {
             fields: fields
                 .iter()
@@ -1613,6 +1625,17 @@ fn test_value_has_type(
         (Value::I64(_), TypeSpec::Builtin(kind)) => Ok(kind == "I64"),
         (Value::Bool(_), TypeSpec::Builtin(kind)) => Ok(kind == "Bool"),
         (Value::Unit, TypeSpec::Builtin(kind)) => Ok(kind == "Unit"),
+        (Value::Array(values), TypeSpec::FixedArray { element, len }) => {
+            if values.len() as u64 != len {
+                return Ok(false);
+            }
+            for value in values {
+                if !test_value_has_type(db, root, &value.borrow(), &element)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
         (Value::Record(values), TypeSpec::Record(fields)) => {
             if values.len() != fields.len() {
                 return Ok(false);
@@ -1710,6 +1733,10 @@ fn display_test_value(value: &TestValue) -> String {
         TestValue::I64 { value } => format!("i64:{value}"),
         TestValue::Bool { value } => format!("bool:{value}"),
         TestValue::Unit => "unit:()".to_string(),
+        TestValue::Array { elements } => {
+            let rendered = elements.iter().map(display_test_value).collect::<Vec<_>>();
+            format!("array[{}]", rendered.join(", "))
+        }
         TestValue::Record { fields } => {
             let rendered = fields
                 .iter()

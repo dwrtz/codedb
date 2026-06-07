@@ -1362,6 +1362,25 @@ fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<St
                         push_hash_ref(field.get("type"), refs);
                     }
                 }
+                Some("array_literal") => {
+                    push_hash_ref(payload.get("element_type"), refs);
+                    for element in payload
+                        .get("elements")
+                        .and_then(JsonValue::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        push_hash_ref(element.get("value"), refs);
+                        push_hash_ref(element.get("type"), refs);
+                    }
+                }
+                Some("array_index") => {
+                    push_hash_ref(payload.get("target"), refs);
+                    push_hash_ref(payload.get("index"), refs);
+                    push_hash_ref(payload.get("target_type"), refs);
+                    push_hash_ref(payload.get("array_type"), refs);
+                    push_hash_ref(payload.get("element_type"), refs);
+                }
                 Some("field_access") => push_hash_ref(payload.get("target"), refs),
                 Some("enum_construct") => {
                     push_hash_ref(payload.get("enum_type"), refs);

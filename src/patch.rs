@@ -2548,6 +2548,16 @@ fn substitute_param_refs(expr: &RawExpr, args: &[RawExpr]) -> Result<RawExpr> {
             then_expr: Box::new(substitute_param_refs(then_expr, args)?),
             else_expr: Box::new(substitute_param_refs(else_expr, args)?),
         },
+        RawExpr::Array { elements } => RawExpr::Array {
+            elements: elements
+                .iter()
+                .map(|element| substitute_param_refs(element, args))
+                .collect::<Result<Vec<_>>>()?,
+        },
+        RawExpr::Index { target, index } => RawExpr::Index {
+            target: Box::new(substitute_param_refs(target, args)?),
+            index: Box::new(substitute_param_refs(index, args)?),
+        },
         RawExpr::Record { fields } => RawExpr::Record {
             fields: fields
                 .iter()
@@ -2637,6 +2647,15 @@ fn collect_free_param_names(
             collect_free_param_names(cond, bound_locals, names);
             collect_free_param_names(then_expr, bound_locals, names);
             collect_free_param_names(else_expr, bound_locals, names);
+        }
+        RawExpr::Array { elements } => {
+            for element in elements {
+                collect_free_param_names(element, bound_locals, names);
+            }
+        }
+        RawExpr::Index { target, index } => {
+            collect_free_param_names(target, bound_locals, names);
+            collect_free_param_names(index, bound_locals, names);
         }
         RawExpr::Record { fields } => {
             for field in fields {
@@ -2779,6 +2798,26 @@ fn alpha_rename_let_bindings_with_scope(
             )),
             else_expr: Box::new(alpha_rename_let_bindings_with_scope(
                 else_expr,
+                used_names,
+                renamed_locals,
+            )),
+        },
+        RawExpr::Array { elements } => RawExpr::Array {
+            elements: elements
+                .iter()
+                .map(|element| {
+                    alpha_rename_let_bindings_with_scope(element, used_names, renamed_locals)
+                })
+                .collect(),
+        },
+        RawExpr::Index { target, index } => RawExpr::Index {
+            target: Box::new(alpha_rename_let_bindings_with_scope(
+                target,
+                used_names,
+                renamed_locals,
+            )),
+            index: Box::new(alpha_rename_let_bindings_with_scope(
+                index,
                 used_names,
                 renamed_locals,
             )),

@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::expr::{Value, ValueCell, eval_binary, eval_unary, field_cell, value_cell};
+use crate::expr::{Value, ValueCell, array_cell, eval_binary, eval_unary, field_cell, value_cell};
 use crate::model::ProgramRootPayload;
 use crate::store::{CodeDb, canonical_json};
 use crate::{MAIN_BRANCH, parse_eval_arg};
@@ -58,6 +58,9 @@ pub enum TraceValue {
         value: bool,
     },
     Unit,
+    Array {
+        elements: Vec<TraceValue>,
+    },
     Record {
         fields: Vec<TraceRecordField>,
     },
@@ -92,6 +95,12 @@ impl TraceValue {
                     name: "mut_ref".to_string(),
                     value: TraceValue::from_value(&value.borrow()),
                 }],
+            },
+            Value::Array(elements) => TraceValue::Array {
+                elements: elements
+                    .iter()
+                    .map(|value| TraceValue::from_value(&value.borrow()))
+                    .collect(),
             },
             Value::Record(fields) => TraceValue::Record {
                 fields: fields
@@ -848,7 +857,15 @@ impl CodeDb {
                     type_hash: type_hash.clone(),
                 });
                 let value = self
-                    .trace_place_cell(target_hash, args, locals)
+                    .trace_place_cell(
+                        state,
+                        frame,
+                        symbol_hash,
+                        function_def_hash,
+                        target_hash,
+                        args,
+                        locals,
+                    )
                     .map(Value::SharedRef);
                 self.finish_current_expr(
                     state,
@@ -886,7 +903,15 @@ impl CodeDb {
                     type_hash: type_hash.clone(),
                 });
                 let value = self
-                    .trace_place_cell(target_hash, args, locals)
+                    .trace_place_cell(
+                        state,
+                        frame,
+                        symbol_hash,
+                        function_def_hash,
+                        target_hash,
+                        args,
+                        locals,
+                    )
                     .map(Value::MutRef);
                 self.finish_current_expr(
                     state,
@@ -916,7 +941,15 @@ impl CodeDb {
                     locals,
                 )?;
                 *self
-                    .trace_place_cell(target_hash, args, locals)?
+                    .trace_place_cell(
+                        state,
+                        frame,
+                        symbol_hash,
+                        function_def_hash,
+                        target_hash,
+                        args,
+                        locals,
+                    )?
                     .borrow_mut() = value;
                 self.finish_current_expr(
                     state,
@@ -1085,6 +1118,31 @@ impl CodeDb {
                 state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
                 Ok(value)
             }
+            "array_literal" => {
+                let mut values = Vec::new();
+                for element in payload
+                    .get("elements")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("array_literal missing elements"))?
+                {
+                    let value_hash = element
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array element missing value"))?;
+                    values.push(value_cell(self.trace_expr(
+                        state,
+                        frame,
+                        symbol_hash,
+                        function_def_hash,
+                        value_hash,
+                        args,
+                        locals,
+                    )?));
+                }
+                let value = Value::Array(values);
+                state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
+                Ok(value)
+            }
             "field_access" => {
                 let field = payload
                     .get("field")
@@ -1102,7 +1160,74 @@ impl CodeDb {
                     type_hash: type_hash.clone(),
                 });
                 let value = self
-                    .trace_place_cell(expr_hash, args, locals)
+                    .trace_place_cell(
+                        state,
+                        frame,
+                        symbol_hash,
+                        function_def_hash,
+                        expr_hash,
+                        args,
+                        locals,
+                    )
+                    .map(|value| value.borrow().clone());
+                self.finish_current_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    expr_hash,
+                    value,
+                )
+            }
+            "array_index" => {
+                let place_value = self
+                    .trace_place_cell(
+                        state,
+                        frame,
+                        symbol_hash,
+                        function_def_hash,
+                        expr_hash,
+                        args,
+                        locals,
+                    )
+                    .map(|value| value.borrow().clone());
+                if place_value.is_ok() {
+                    return self.finish_current_expr(
+                        state,
+                        frame,
+                        symbol_hash,
+                        function_def_hash,
+                        expr_hash,
+                        place_value,
+                    );
+                }
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing target"))?;
+                let index_hash = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing index"))?;
+                let target = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    target_hash,
+                    args,
+                    locals,
+                )?;
+                let index = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    index_hash,
+                    args,
+                    locals,
+                )?;
+                let value = trace_array_value_cell(&target, trace_index_value(&index)?)
                     .map(|value| value.borrow().clone());
                 self.finish_current_expr(
                     state,
@@ -1263,6 +1388,10 @@ impl CodeDb {
 
     fn trace_place_cell(
         &self,
+        state: &mut TraceState,
+        frame: usize,
+        symbol_hash: &str,
+        function_def_hash: &str,
         expr_hash: &str,
         args: &mut Vec<ValueCell>,
         locals: &mut Vec<ValueCell>,
@@ -1302,8 +1431,45 @@ impl CodeDb {
                     .get("field")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("field_access missing field"))?;
-                let target = self.trace_place_cell(target, args, locals)?;
+                let target = self.trace_place_cell(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    target,
+                    args,
+                    locals,
+                )?;
                 field_cell(&target, field)
+            }
+            "array_index" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing target"))?;
+                let index_hash = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing index"))?;
+                let target = self.trace_place_cell(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    target,
+                    args,
+                    locals,
+                )?;
+                let index = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    index_hash,
+                    args,
+                    locals,
+                )?;
+                array_cell(&target, trace_index_value(&index)?)
             }
             other => bail!("expression kind {other} is not an assignable place"),
         }
@@ -1356,9 +1522,55 @@ impl CodeDb {
                 place.path.push(field.to_string());
                 Ok(place)
             }
+            "array_index" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing target"))?;
+                let index = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing index"))?;
+                let mut place = self.trace_place_for_expr(target, locals_len)?;
+                place.path.push(trace_array_index_segment(self, index)?);
+                Ok(place)
+            }
             other => bail!("expression kind {other} is not a semantic place"),
         }
     }
+}
+
+fn trace_index_value(value: &Value) -> Result<usize> {
+    match value {
+        Value::I64(index) if *index >= 0 => Ok(*index as usize),
+        Value::I64(index) => bail!("array index must be non-negative, got {index}"),
+        other => bail!("array index must be i64, got {other}"),
+    }
+}
+
+fn trace_array_value_cell(value: &Value, index: usize) -> Result<ValueCell> {
+    match value {
+        Value::Array(elements) => elements
+            .get(index)
+            .cloned()
+            .ok_or_else(|| anyhow!("array index out of bounds: {index}")),
+        other => bail!("array index target is not an array: {other}"),
+    }
+}
+
+fn trace_array_index_segment(db: &CodeDb, expr_hash: &str) -> Result<String> {
+    let payload = db.get_payload(expr_hash)?;
+    if payload.get("expr_kind").and_then(JsonValue::as_str) == Some("literal_i64") {
+        let value = payload
+            .get("value")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("literal_i64 missing value"))?
+            .parse::<i64>()?;
+        if value >= 0 {
+            return Ok(format!("[{value}]"));
+        }
+    }
+    Ok("[*]".to_string())
 }
 
 fn trace_report(

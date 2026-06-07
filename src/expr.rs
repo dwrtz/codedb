@@ -75,6 +75,13 @@ pub enum RawExpr {
         #[serde(rename = "else")]
         else_expr: Box<RawExpr>,
     },
+    Array {
+        elements: Vec<RawExpr>,
+    },
+    Index {
+        target: Box<RawExpr>,
+        index: Box<RawExpr>,
+    },
     Record {
         fields: Vec<RawRecordField>,
     },
@@ -159,6 +166,7 @@ pub enum Value {
     Unit,
     SharedRef(ValueCell),
     MutRef(ValueCell),
+    Array(Vec<ValueCell>),
     Record(BTreeMap<String, ValueCell>),
     Enum { variant: String, value: ValueCell },
 }
@@ -173,6 +181,13 @@ impl PartialEq for Value {
             (Value::Unit, Value::Unit) => true,
             (Value::SharedRef(left), Value::SharedRef(right))
             | (Value::MutRef(left), Value::MutRef(right)) => *left.borrow() == *right.borrow(),
+            (Value::Array(left), Value::Array(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| *left.borrow() == *right.borrow())
+            }
             (Value::Record(left), Value::Record(right)) => {
                 left.len() == right.len()
                     && left.iter().all(|(name, left)| {
@@ -206,6 +221,13 @@ impl Display for Value {
             Value::Unit => write!(f, "()"),
             Value::SharedRef(value) => write!(f, "&{}", value.borrow()),
             Value::MutRef(value) => write!(f, "&mut {}", value.borrow()),
+            Value::Array(elements) => {
+                let rendered = elements
+                    .iter()
+                    .map(|value| value.borrow().to_string())
+                    .collect::<Vec<_>>();
+                write!(f, "[{}]", rendered.join(", "))
+            }
             Value::Record(fields) => {
                 let rendered = fields
                     .iter()
@@ -309,6 +331,17 @@ impl CodeDb {
                     ..
                 },
             ) => self.value_has_type(root, &value.borrow(), &referent),
+            (Value::Array(values), TypeSpec::FixedArray { element, len }) => {
+                if values.len() as u64 != len {
+                    return Ok(false);
+                }
+                for value in values {
+                    if !self.value_has_type(root, &value.borrow(), &element)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
             (Value::Record(values), TypeSpec::Record(fields)) => {
                 if values.len() != fields.len() {
                     return Ok(false);
@@ -436,6 +469,7 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_shared missing target"))?;
                 Ok(Value::SharedRef(self.eval_place_cell(
+                    root_hash,
                     target_hash,
                     args,
                     locals,
@@ -447,6 +481,7 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_mut missing target"))?;
                 Ok(Value::MutRef(self.eval_place_cell(
+                    root_hash,
                     target_hash,
                     args,
                     locals,
@@ -463,7 +498,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("assign missing value"))?;
                 let value = self.eval_expr_with_locals(root_hash, value_hash, args, locals)?;
                 *self
-                    .eval_place_cell(target_hash, args, locals)?
+                    .eval_place_cell(root_hash, target_hash, args, locals)?
                     .borrow_mut() = value;
                 Ok(Value::Unit)
             }
@@ -505,6 +540,51 @@ impl CodeDb {
                     other => bail!("if condition evaluated to non-bool {other}"),
                 }
             }
+            "array_literal" => {
+                let mut values = Vec::new();
+                for element in payload
+                    .get("elements")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("array_literal missing elements"))?
+                {
+                    let value_hash = element
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array element missing value"))?;
+                    values.push(value_cell(
+                        self.eval_expr_with_locals(root_hash, value_hash, args, locals)?,
+                    ));
+                }
+                Ok(Value::Array(values))
+            }
+            "array_index" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing target"))?;
+                let index_hash = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing index"))?;
+                match self.eval_place_cell(root_hash, target_hash, args, locals) {
+                    Ok(target) => {
+                        let index = eval_index_value(
+                            self.eval_expr_with_locals(root_hash, index_hash, args, locals)?,
+                        )?;
+                        Ok(semantic_clone_value(&array_cell(&target, index)?.borrow()))
+                    }
+                    Err(_) => {
+                        let target =
+                            self.eval_expr_with_locals(root_hash, target_hash, args, locals)?;
+                        let index = eval_index_value(
+                            self.eval_expr_with_locals(root_hash, index_hash, args, locals)?,
+                        )?;
+                        Ok(semantic_clone_value(
+                            &array_cell_from_value(&target, index)?.borrow(),
+                        ))
+                    }
+                }
+            }
             "record_literal" => {
                 let mut values = BTreeMap::new();
                 for field in payload
@@ -531,7 +611,7 @@ impl CodeDb {
                 Ok(Value::Record(values))
             }
             "field_access" => {
-                let value = self.eval_place_cell(expr_hash, args, locals)?;
+                let value = self.eval_place_cell(root_hash, expr_hash, args, locals)?;
                 Ok(semantic_clone_value(&value.borrow()))
             }
             "enum_construct" => {
@@ -591,6 +671,7 @@ impl CodeDb {
 
     fn eval_place_cell(
         &self,
+        root_hash: &str,
         expr_hash: &str,
         args: &mut Vec<ValueCell>,
         locals: &mut Vec<ValueCell>,
@@ -630,8 +711,22 @@ impl CodeDb {
                     .get("field")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("field_access missing field"))?;
-                let target = self.eval_place_cell(target, args, locals)?;
+                let target = self.eval_place_cell(root_hash, target, args, locals)?;
                 field_cell(&target, field)
+            }
+            "array_index" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing target"))?;
+                let index = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing index"))?;
+                let target = self.eval_place_cell(root_hash, target, args, locals)?;
+                let index =
+                    eval_index_value(self.eval_expr_with_locals(root_hash, index, args, locals)?)?;
+                array_cell(&target, index)
             }
             other => bail!("expression kind {other} is not an assignable place"),
         }
@@ -1510,6 +1605,66 @@ impl CodeDb {
                     .collect::<Result<Vec<_>>>()?;
                 format!("{{{}}}", fields.join(", "))
             }
+            "array_literal" => {
+                let elements = payload
+                    .get("elements")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("array_literal missing elements"))?
+                    .iter()
+                    .map(|element| {
+                        let value = element
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("array element missing value"))?;
+                        self.expr_to_source_with_locals(
+                            value,
+                            root,
+                            current_module,
+                            local_params,
+                            region_names,
+                            local_names,
+                            0,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                format!("[{}]", elements.join(", "))
+            }
+            "array_index" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing target"))?;
+                let index = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing index"))?;
+                let expr = format!(
+                    "{}[{}]",
+                    self.expr_to_source_with_locals(
+                        target,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        field_access_precedence(),
+                    )?,
+                    self.expr_to_source_with_locals(
+                        index,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                );
+                if field_access_precedence() < parent_prec {
+                    format!("({expr})")
+                } else {
+                    expr
+                }
+            }
             "field_access" => {
                 let target = payload
                     .get("target")
@@ -2009,6 +2164,52 @@ impl CodeDb {
                     })
                     .collect::<Result<Vec<_>>>()?,
             }),
+            "array_literal" => Ok(RawExpr::Array {
+                elements: payload
+                    .get("elements")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("array_literal missing elements"))?
+                    .iter()
+                    .map(|element| {
+                        self.typed_expr_to_raw_with_locals(
+                            element
+                                .get("value")
+                                .and_then(JsonValue::as_str)
+                                .ok_or_else(|| anyhow!("array element missing value"))?,
+                            root,
+                            current_module,
+                            region_names,
+                            local_names,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            }),
+            "array_index" => Ok(RawExpr::Index {
+                target: Box::new(
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("target")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("array_index missing target"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ),
+                index: Box::new(
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("index")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("array_index missing index"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ),
+            }),
             "field_access" => Ok(RawExpr::FieldAccess {
                 target: Box::new(
                     self.typed_expr_to_raw_with_locals(
@@ -2369,6 +2570,28 @@ impl CodeDb {
                         .get("value")
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("record field missing value"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
+            }
+            "array_literal" => {
+                for element in payload
+                    .get("elements")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("array_literal missing elements"))?
+                {
+                    let child = element
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array element missing value"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
+            }
+            "array_index" => {
+                for key in ["target", "index"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array_index missing {key}"))?;
                     self.collect_expr_deps(root, child, deps)?;
                 }
             }
@@ -2879,8 +3102,33 @@ impl Parser {
                     })
                 }
             }
-            _ => self.parse_primary(),
+            _ => self.parse_postfix(),
         }
+    }
+
+    fn parse_postfix(&mut self) -> Result<RawExpr> {
+        let mut expr = self.parse_primary()?;
+        loop {
+            if self.consume_symbol("[") {
+                let index = self.parse_expr()?;
+                self.expect_symbol("]")?;
+                expr = RawExpr::Index {
+                    target: Box::new(expr),
+                    index: Box::new(index),
+                };
+                continue;
+            }
+            if self.consume_symbol(".") {
+                let field = self.expect_ident()?;
+                expr = RawExpr::FieldAccess {
+                    target: Box::new(expr),
+                    field,
+                };
+                continue;
+            }
+            break;
+        }
+        Ok(expr)
     }
 
     fn parse_primary(&mut self) -> Result<RawExpr> {
@@ -2963,6 +3211,20 @@ impl Parser {
                     self.expect_symbol(",")?;
                 }
                 Ok(RawExpr::Record { fields })
+            }
+            Token::Symbol(symbol) if symbol == "[" => {
+                let mut elements = Vec::new();
+                if self.consume_symbol("]") {
+                    bail!("array literal must have at least one element");
+                }
+                loop {
+                    elements.push(self.parse_expr()?);
+                    if self.consume_symbol("]") {
+                        break;
+                    }
+                    self.expect_symbol(",")?;
+                }
+                Ok(RawExpr::Array { elements })
             }
             other => bail!("unexpected token in expression: {other:?}"),
         }
@@ -3312,6 +3574,12 @@ fn semantic_clone_value(value: &Value) -> Value {
         Value::Unit => Value::Unit,
         Value::SharedRef(value) => Value::SharedRef(value.clone()),
         Value::MutRef(value) => Value::MutRef(value.clone()),
+        Value::Array(elements) => Value::Array(
+            elements
+                .iter()
+                .map(|value| value_cell(semantic_clone_value(&value.borrow())))
+                .collect(),
+        ),
         Value::Record(fields) => Value::Record(
             fields
                 .iter()
@@ -3327,6 +3595,36 @@ fn semantic_clone_value(value: &Value) -> Value {
             variant: variant.clone(),
             value: value_cell(semantic_clone_value(&value.borrow())),
         },
+    }
+}
+
+fn eval_index_value(value: Value) -> Result<usize> {
+    match value {
+        Value::I64(value) if value >= 0 => Ok(value as usize),
+        Value::I64(value) => bail!("array index must be non-negative, got {value}"),
+        other => bail!("array index evaluated to non-i64 {other}"),
+    }
+}
+
+pub(crate) fn array_cell(value: &ValueCell, index: usize) -> Result<ValueCell> {
+    match &*value.borrow() {
+        Value::Array(elements) => elements
+            .get(index)
+            .cloned()
+            .ok_or_else(|| anyhow!("array index {index} out of bounds")),
+        Value::SharedRef(referent) | Value::MutRef(referent) => array_cell(referent, index),
+        other => bail!("array index target evaluated to non-array {other}"),
+    }
+}
+
+fn array_cell_from_value(value: &Value, index: usize) -> Result<ValueCell> {
+    match value {
+        Value::Array(elements) => elements
+            .get(index)
+            .cloned()
+            .ok_or_else(|| anyhow!("array index {index} out of bounds")),
+        Value::SharedRef(referent) | Value::MutRef(referent) => array_cell(referent, index),
+        other => bail!("array index target evaluated to non-array {other}"),
     }
 }
 
