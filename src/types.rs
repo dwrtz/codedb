@@ -4735,12 +4735,20 @@ impl CodeDb {
                         "fold element and accumulator types must not carry references in phase 13"
                     );
                 }
-                let target_use = if self.typed_expr_is_place(target)? {
+                let target_is_place = self.typed_expr_is_place(target)?;
+                let target_use = if target_is_place {
                     ExprUse::Place
                 } else {
                     ExprUse::Value
                 };
                 self.verify_expr_borrows(root, target, param_types, state, target_use)?;
+                if payload.get("target_kind").and_then(JsonValue::as_str) == Some("fixed_array")
+                    && target_is_place
+                {
+                    let target_place =
+                        self.loan_place_for_expr(target, param_types, &state.locals)?;
+                    self.check_shared_read_conflicts(&target_place, &state.active)?;
+                }
                 self.verify_expr_borrows(root, init, param_types, state, ExprUse::Value)?;
                 let item_local = state.next_local;
                 state.next_local += 1;

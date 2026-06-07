@@ -223,6 +223,33 @@ fn mutate_sum<'a>() -> i64 effects[state] =
         .stderr(predicate::str::contains("state"));
 }
 
+#[test]
+fn fold_over_array_conflicts_with_live_mut_slice_loan() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("fold-alias.sqlite");
+    let source = temp.path().join("fold-alias.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+fn bad<'a>() -> i64 =
+  let values: array<i64, 2> = [1, 2] in
+  let s: mut_slice<'a, i64> = mut_slice(values) in
+  fold value in values with total = 0 do total + value
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bad_borrow"))
+        .stderr(predicate::str::contains("shared read"))
+        .stderr(predicate::str::contains("live mutable borrow"));
+}
+
 fn op_names(ir: &JsonValue) -> Vec<String> {
     ir["ir"]["operations"]
         .as_array()

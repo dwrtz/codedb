@@ -651,6 +651,11 @@ trace maps case decision to semantic expression
 
 Goal: support fixed-size aggregate storage before dynamic lists.
 
+Status: implemented. Fixed arrays now have projection syntax, type checking,
+deterministic layout metadata, array literals, array element places, native
+index load/store lowering with bounds checks, record fields, and
+layout-classified parameter/return support.
+
 Deliverables:
 
 ```text
