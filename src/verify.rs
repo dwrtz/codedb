@@ -856,6 +856,9 @@ impl CodeDb {
             Ok(crate::types::TypeSpec::RawPointer { pointee, .. }) => {
                 self.verify_type_region_args(parent_hash, &pointee, allowed_regions, errors)?;
             }
+            Ok(crate::types::TypeSpec::Box { element }) => {
+                self.verify_type_region_args(parent_hash, &element, allowed_regions, errors)?;
+            }
             Ok(crate::types::TypeSpec::Slice {
                 region, element, ..
             }) => {
@@ -3612,6 +3615,7 @@ fn verify_object_relocations_match_dependencies(
     let expected_symbols = dependency_symbols.iter().cloned().collect::<BTreeSet<_>>();
     let actual_symbols = relocations
         .iter()
+        .filter(|relocation| !relocation_is_platform(relocation))
         .filter_map(|relocation| {
             relocation
                 .get("target_symbol_hash")
@@ -3625,10 +3629,14 @@ fn verify_object_relocations_match_dependencies(
         ));
     }
     let actual_target_counts = string_counts(relocations.iter().filter_map(|relocation| {
-        relocation
-            .get("target_symbol_hash")
-            .and_then(JsonValue::as_str)
-            .map(str::to_string)
+        if relocation_is_platform(relocation) {
+            None
+        } else {
+            relocation
+                .get("target_symbol_hash")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+        }
     }));
     let expected_target_counts = string_counts(
         expected_relocation_targets
@@ -3646,6 +3654,10 @@ fn verify_object_relocations_match_dependencies(
         .collect::<BTreeMap<_, _>>();
 
     for relocation in relocations {
+        if relocation_is_platform(relocation) {
+            verify_platform_relocation(errors, cache_key, relocation);
+            continue;
+        }
         let Some(target_symbol) = relocation
             .get("target_symbol_hash")
             .and_then(JsonValue::as_str)
@@ -3677,6 +3689,48 @@ fn verify_object_relocations_match_dependencies(
                     "bad_object_artifact: {cache_key} relocation object symbol mismatch"
                 ));
             }
+        }
+    }
+}
+
+fn relocation_is_platform(relocation: &JsonValue) -> bool {
+    relocation
+        .get("platform")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+}
+
+fn verify_platform_relocation(errors: &mut Vec<String>, cache_key: &str, relocation: &JsonValue) {
+    let symbol = relocation
+        .get("target_symbol_hash")
+        .and_then(JsonValue::as_str);
+    let abi = relocation
+        .get("target_abi_symbol")
+        .and_then(JsonValue::as_str);
+    let expected_abi = match symbol {
+        Some("platform:malloc") => "malloc",
+        Some("platform:free") => "free",
+        _ => {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} unknown platform relocation target"
+            ));
+            return;
+        }
+    };
+    if abi != Some(expected_abi) {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} platform relocation ABI symbol mismatch"
+        ));
+    }
+    if let Some(object_symbol) = relocation
+        .get("target_object_symbol")
+        .and_then(JsonValue::as_str)
+    {
+        let expected_object_symbol = format!("_{expected_abi}");
+        if object_symbol != expected_object_symbol {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} platform relocation object symbol mismatch"
+            ));
         }
     }
 }
@@ -3914,6 +3968,8 @@ fn collect_lowered_call_targets(
             | LoweredOp::BorrowMut { .. }
             | LoweredOp::DerefShared { .. }
             | LoweredOp::DerefMut { .. }
+            | LoweredOp::DerefBox { .. }
+            | LoweredOp::HeapAlloc { .. }
             | LoweredOp::LoadEnumTag { .. }
             | LoweredOp::Load { .. }
             | LoweredOp::StoreEnumTag { .. }

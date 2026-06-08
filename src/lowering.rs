@@ -60,6 +60,8 @@ pub(crate) struct LoweredTypeLayout {
     pub(crate) size_bytes: u64,
     pub(crate) align_bytes: u64,
     pub(crate) abi: LoweredTypeAbi,
+    #[serde(default)]
+    pub(crate) metadata: JsonValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +270,19 @@ pub(crate) enum LoweredOp {
         id: String,
         reference: String,
         referent_type_hash: String,
+    },
+    DerefBox {
+        id: String,
+        box_value: String,
+        box_type_hash: String,
+        element_type_hash: String,
+    },
+    HeapAlloc {
+        id: String,
+        size_bytes: u64,
+        align_bytes: u64,
+        element_type_hash: String,
+        type_hash: String,
     },
     AddrOfParam {
         id: String,
@@ -1093,7 +1108,22 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_shared missing referent_type"))?
                     .to_string();
-                let target = self.lower_place(root, target_hash, param_types, ctx, locals)?;
+                let target_payload = self.get_payload(target_hash)?;
+                let target_type = expr_type(&target_payload, target_hash)?;
+                let target = match self.type_spec(&target_type)? {
+                    TypeSpec::Box { element } if element == referent_type_hash => self
+                        .lower_box_payload_place(
+                            root,
+                            target_hash,
+                            &target_type,
+                            &element,
+                            expr_hash,
+                            param_types,
+                            ctx,
+                            locals,
+                        )?,
+                    _ => self.lower_place(root, target_hash, param_types, ctx, locals)?,
+                };
                 if target.type_hash != referent_type_hash {
                     bail!("borrow_shared referent type mismatch while lowering");
                 }
@@ -1134,7 +1164,22 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_mut missing referent_type"))?
                     .to_string();
-                let target = self.lower_place(root, target_hash, param_types, ctx, locals)?;
+                let target_payload = self.get_payload(target_hash)?;
+                let target_type = expr_type(&target_payload, target_hash)?;
+                let target = match self.type_spec(&target_type)? {
+                    TypeSpec::Box { element } if element == referent_type_hash => self
+                        .lower_box_payload_place(
+                            root,
+                            target_hash,
+                            &target_type,
+                            &element,
+                            expr_hash,
+                            param_types,
+                            ctx,
+                            locals,
+                        )?,
+                    _ => self.lower_place(root, target_hash, param_types, ctx, locals)?,
+                };
                 if target.type_hash != referent_type_hash {
                     bail!("borrow_mut referent type mismatch while lowering");
                 }
@@ -1167,6 +1212,7 @@ impl CodeDb {
             "subslice" => {
                 self.lower_subslice(root, expr_hash, &type_hash, param_types, ctx, locals)
             }
+            "box_new" => self.lower_box_new(root, expr_hash, &type_hash, param_types, ctx, locals),
             "assign" => {
                 let target_hash = payload
                     .get("target")
@@ -1238,8 +1284,14 @@ impl CodeDb {
                         locals,
                     )?);
                 } else {
-                    let value =
-                        self.lower_expr_as(root, value_hash, &target_type, param_types, ctx, locals)?;
+                    let value = self.lower_expr_as(
+                        root,
+                        value_hash,
+                        &target_type,
+                        param_types,
+                        ctx,
+                        locals,
+                    )?;
                     if !self.type_assignable_in_root(root, &value.type_hash, &target_type)? {
                         bail!("assignment type mismatch while lowering");
                     }
@@ -1511,6 +1563,80 @@ impl CodeDb {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn lower_box_payload_place(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        box_type_hash: &str,
+        element_type_hash: &str,
+        debug_expr_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredAddress> {
+        let boxed = self.lower_box_value_for_place(
+            root,
+            expr_hash,
+            box_type_hash,
+            param_types,
+            ctx,
+            locals,
+        )?;
+        let id = ctx.value();
+        ctx.push_debug_op(debug_expr_hash, "deref_box", &id);
+        let mut operations = boxed.operations;
+        operations.push(LoweredOp::DerefBox {
+            id: id.clone(),
+            box_value: boxed.value,
+            box_type_hash: box_type_hash.to_string(),
+            element_type_hash: element_type_hash.to_string(),
+        });
+        Ok(LoweredAddress {
+            operations,
+            address: id,
+            type_hash: element_type_hash.to_string(),
+        })
+    }
+
+    fn lower_box_value_for_place(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        match self.type_spec(type_hash)? {
+            TypeSpec::Box { .. } => {}
+            _ => bail!("box place lowering requires box type"),
+        }
+        let payload = self.get_payload(expr_hash)?;
+        match payload.get("expr_kind").and_then(JsonValue::as_str) {
+            Some("param_ref" | "local_ref" | "field_access" | "array_index") => {
+                let lowered = self.lower_place(root, expr_hash, param_types, ctx, locals)?;
+                if lowered.type_hash != type_hash {
+                    bail!("box place type mismatch while lowering");
+                }
+                let id = ctx.value();
+                ctx.push_debug_op(expr_hash, "load", &id);
+                let mut operations = lowered.operations;
+                operations.push(LoweredOp::Load {
+                    id: id.clone(),
+                    address: lowered.address,
+                    type_hash: type_hash.to_string(),
+                });
+                Ok(LoweredExpr {
+                    operations,
+                    value: id,
+                    type_hash: type_hash.to_string(),
+                })
+            }
+            _ => self.lower_expr(root, expr_hash, param_types, ctx, locals),
+        }
+    }
+
     fn lower_place(
         &self,
         root: &ProgramRootPayload,
@@ -1629,6 +1755,16 @@ impl CodeDb {
                             type_hash: referent,
                         }
                     }
+                    TypeSpec::Box { element } => self.lower_box_payload_place(
+                        root,
+                        target_hash,
+                        &target_type,
+                        &element,
+                        expr_hash,
+                        param_types,
+                        ctx,
+                        locals,
+                    )?,
                     _ if self.is_aggregate_ir_type(root, &target_type)?
                         && self.expr_is_place(target_hash)? =>
                     {
@@ -1716,6 +1852,16 @@ impl CodeDb {
                             type_hash: referent,
                         }
                     }
+                    TypeSpec::Box { element } => self.lower_box_payload_place(
+                        root,
+                        target_hash,
+                        &target_type,
+                        &element,
+                        expr_hash,
+                        param_types,
+                        ctx,
+                        locals,
+                    )?,
                     _ if self.is_aggregate_ir_type(root, &target_type)?
                         && self.expr_is_place(target_hash)? =>
                     {
@@ -1870,6 +2016,74 @@ impl CodeDb {
             len: len_id,
             element_type_hash: array_info.element_type_hash,
             type_hash: type_hash.to_string(),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash.to_string(),
+        })
+    }
+
+    fn lower_box_new(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let value_hash = payload
+            .get("value")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("box_new missing value"))?;
+        let element_type_hash = payload
+            .get("element_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("box_new missing element_type"))?
+            .to_string();
+        match self.type_spec(type_hash)? {
+            TypeSpec::Box { element } if element == element_type_hash => {}
+            _ => bail!("box_new lowered type mismatch"),
+        }
+        let element_layout =
+            self.compute_type_layout(root, &element_type_hash, ctx.target_triple())?;
+        let size_bytes = element_layout
+            .metadata
+            .get("size_bytes")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| anyhow!("box_new element layout missing size"))?;
+        let align_bytes = element_layout
+            .metadata
+            .get("align_bytes")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| anyhow!("box_new element layout missing align"))?;
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "heap_alloc", &id);
+        let mut operations = vec![LoweredOp::HeapAlloc {
+            id: id.clone(),
+            size_bytes,
+            align_bytes,
+            element_type_hash: element_type_hash.clone(),
+            type_hash: type_hash.to_string(),
+        }];
+        let value = self.lower_expr_as(
+            root,
+            value_hash,
+            &element_type_hash,
+            param_types,
+            ctx,
+            locals,
+        )?;
+        if !self.type_assignable_in_root(root, &value.type_hash, &element_type_hash)? {
+            bail!("box_new value type mismatch while lowering");
+        }
+        operations.extend(value.operations);
+        operations.push(LoweredOp::Store {
+            address: id.clone(),
+            value: value.value,
+            type_hash: element_type_hash,
         });
         Ok(LoweredExpr {
             operations,
@@ -2768,10 +2982,12 @@ impl CodeDb {
         // Conditional drop glue is deferred (SPEC_V2 §12, PLAN_V2 Phase 15).
         let locals_boundary = ctx.next_local;
         let moved_before = ctx.moved.clone();
-        let then_expr = self.lower_expr_as(root, then_hash, result_type, param_types, ctx, locals)?;
+        let then_expr =
+            self.lower_expr_as(root, then_hash, result_type, param_types, ctx, locals)?;
         let then_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
         ctx.moved = moved_before.clone();
-        let else_expr = self.lower_expr_as(root, else_hash, result_type, param_types, ctx, locals)?;
+        let else_expr =
+            self.lower_expr_as(root, else_hash, result_type, param_types, ctx, locals)?;
         let else_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
         if then_moved != else_moved {
             bail!(
@@ -2959,7 +3175,8 @@ impl CodeDb {
                 // arm constructs directly in the destination layout (see
                 // `lower_expr_as`). The exact-type assertion below keeps a
                 // non-buildable arm fail-closed.
-                let body = self.lower_expr_as(root, body_hash, result_type, param_types, ctx, locals);
+                let body =
+                    self.lower_expr_as(root, body_hash, result_type, param_types, ctx, locals);
                 locals.pop();
                 let body = body?;
                 if body.type_hash != result_type {
@@ -2982,7 +3199,8 @@ impl CodeDb {
                     .get("body")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("case arm missing body"))?;
-                let body = self.lower_expr_as(root, body_hash, result_type, param_types, ctx, locals)?;
+                let body =
+                    self.lower_expr_as(root, body_hash, result_type, param_types, ctx, locals)?;
                 if body.type_hash != result_type {
                     bail!("case arm {variant} result type mismatch while lowering");
                 }
@@ -3685,6 +3903,15 @@ impl CodeDb {
         type_hashes.insert(return_type.to_string());
         type_hashes.extend(local_slots.iter().map(|local| local.type_hash.clone()));
         collect_op_type_hashes(operations, &mut type_hashes);
+        let mut seen_type_hashes = BTreeSet::new();
+        for type_hash in type_hashes.clone() {
+            self.collect_lowered_layout_type_hashes(
+                root,
+                &type_hash,
+                &mut type_hashes,
+                &mut seen_type_hashes,
+            )?;
+        }
 
         type_hashes
             .into_iter()
@@ -3703,9 +3930,49 @@ impl CodeDb {
                         pass: required_layout_string(abi, "pass")?,
                         return_: required_layout_string(abi, "return")?,
                     },
+                    metadata,
                 })
             })
             .collect()
+    }
+
+    fn collect_lowered_layout_type_hashes(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+        out: &mut BTreeSet<String>,
+        seen: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        if !seen.insert(type_hash.to_string()) {
+            return Ok(());
+        }
+        out.insert(type_hash.to_string());
+        match self.type_spec_in_root(root, type_hash)? {
+            TypeSpec::Box { element } => {
+                self.collect_lowered_layout_type_hashes(root, &element, out, seen)?;
+            }
+            TypeSpec::FixedArray { element, .. } | TypeSpec::Slice { element, .. } => {
+                self.collect_lowered_layout_type_hashes(root, &element, out, seen)?;
+            }
+            TypeSpec::Reference { referent, .. } => {
+                self.collect_lowered_layout_type_hashes(root, &referent, out, seen)?;
+            }
+            TypeSpec::RawPointer { pointee, .. } => {
+                self.collect_lowered_layout_type_hashes(root, &pointee, out, seen)?;
+            }
+            TypeSpec::Record(fields) => {
+                for field in fields {
+                    self.collect_lowered_layout_type_hashes(root, &field.type_hash, out, seen)?;
+                }
+            }
+            TypeSpec::Enum(variants) => {
+                for variant in variants {
+                    self.collect_lowered_layout_type_hashes(root, &variant.type_hash, out, seen)?;
+                }
+            }
+            TypeSpec::Builtin(_) | TypeSpec::Named { .. } => {}
+        }
+        Ok(())
     }
 
     pub(crate) fn verify_lowered_ir_against_index(
@@ -4418,6 +4685,60 @@ impl CodeDb {
                         insert_value(values, id, referent_type_hash)?;
                     }
                 }
+                LoweredOp::DerefBox {
+                    id,
+                    box_value,
+                    box_type_hash,
+                    element_type_hash,
+                } => {
+                    match self.type_spec(value_type(values, box_value)?)? {
+                        TypeSpec::Box { element } if element == *element_type_hash => {}
+                        _ => bail!("lowered deref_box requires box value"),
+                    }
+                    if self.type_spec(box_type_hash)?
+                        != (TypeSpec::Box {
+                            element: element_type_hash.clone(),
+                        })
+                    {
+                        bail!("lowered deref_box box type mismatch");
+                    }
+                    insert_address(addresses, id, element_type_hash)?;
+                    if self.is_aggregate_ir_type(root, element_type_hash)? {
+                        insert_value(values, id, element_type_hash)?;
+                    }
+                }
+                LoweredOp::HeapAlloc {
+                    id,
+                    size_bytes,
+                    align_bytes,
+                    element_type_hash,
+                    type_hash,
+                } => {
+                    if *size_bytes == 0 || *align_bytes == 0 {
+                        bail!("lowered heap_alloc must have nonzero size and align");
+                    }
+                    let element_layout =
+                        self.compute_type_layout(root, element_type_hash, target_triple)?;
+                    if element_layout
+                        .metadata
+                        .get("size_bytes")
+                        .and_then(JsonValue::as_u64)
+                        != Some(*size_bytes)
+                        || element_layout
+                            .metadata
+                            .get("align_bytes")
+                            .and_then(JsonValue::as_u64)
+                            != Some(*align_bytes)
+                    {
+                        bail!("lowered heap_alloc element layout mismatch");
+                    }
+                    match self.type_spec(type_hash)? {
+                        TypeSpec::Box { element } if element == *element_type_hash => {}
+                        _ => bail!("lowered heap_alloc type must be matching box"),
+                    }
+                    insert_value(values, id, type_hash)?;
+                    insert_address(addresses, id, element_type_hash)?;
+                }
                 LoweredOp::AddrOfParam { id, place } => {
                     let LoweredPlace::Param {
                         slot,
@@ -5079,6 +5400,8 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::BorrowMut { id, .. }
         | LoweredOp::DerefShared { id, .. }
         | LoweredOp::DerefMut { id, .. }
+        | LoweredOp::DerefBox { id, .. }
+        | LoweredOp::HeapAlloc { id, .. }
         | LoweredOp::AddrOfParam { id, .. }
         | LoweredOp::AddrOfLocal { id, .. }
         | LoweredOp::AddrOfField { id, .. }
@@ -5117,6 +5440,8 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::BorrowMut { .. } => "borrow_mut",
         LoweredOp::DerefShared { .. } => "deref_shared",
         LoweredOp::DerefMut { .. } => "deref_mut",
+        LoweredOp::DerefBox { .. } => "deref_box",
+        LoweredOp::HeapAlloc { .. } => "heap_alloc",
         LoweredOp::AddrOfParam { .. } => "addr_of_param",
         LoweredOp::AddrOfLocal { .. } => "addr_of_local",
         LoweredOp::AddrOfField { .. } => "addr_of_field",
@@ -5243,6 +5568,22 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::BorrowDebug { type_hash, .. }
             | LoweredOp::Return { type_hash, .. } => {
                 out.insert(type_hash.clone());
+            }
+            LoweredOp::HeapAlloc {
+                type_hash,
+                element_type_hash,
+                ..
+            } => {
+                out.insert(type_hash.clone());
+                out.insert(element_type_hash.clone());
+            }
+            LoweredOp::DerefBox {
+                box_type_hash,
+                element_type_hash,
+                ..
+            } => {
+                out.insert(box_type_hash.clone());
+                out.insert(element_type_hash.clone());
             }
             LoweredOp::ConstructSlice {
                 type_hash,

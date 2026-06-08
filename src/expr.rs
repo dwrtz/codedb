@@ -184,6 +184,7 @@ pub enum Value {
     Unit,
     SharedRef(ValueCell),
     MutRef(ValueCell),
+    Boxed(ValueCell),
     Slice {
         elements: Vec<ValueCell>,
         mutable: bool,
@@ -206,6 +207,7 @@ impl PartialEq for Value {
             (Value::Unit, Value::Unit) => true,
             (Value::SharedRef(left), Value::SharedRef(right))
             | (Value::MutRef(left), Value::MutRef(right)) => *left.borrow() == *right.borrow(),
+            (Value::Boxed(left), Value::Boxed(right)) => *left.borrow() == *right.borrow(),
             (
                 Value::Slice {
                     elements: left,
@@ -263,6 +265,7 @@ impl Display for Value {
             Value::Unit => write!(f, "()"),
             Value::SharedRef(value) => write!(f, "&{}", value.borrow()),
             Value::MutRef(value) => write!(f, "&mut {}", value.borrow()),
+            Value::Boxed(value) => write!(f, "box({})", value.borrow()),
             Value::Slice { elements, mutable } => {
                 let rendered = elements
                     .iter()
@@ -384,6 +387,9 @@ impl CodeDb {
                     ..
                 },
             ) => self.value_has_type(root, &value.borrow(), &referent),
+            (Value::Boxed(value), TypeSpec::Box { element }) => {
+                self.value_has_type(root, &value.borrow(), &element)
+            }
             (
                 Value::Slice { elements, mutable },
                 TypeSpec::Slice {
@@ -539,24 +545,16 @@ impl CodeDb {
                     .get("target")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_shared missing target"))?;
-                Ok(Value::SharedRef(self.eval_place_cell(
-                    root_hash,
-                    target_hash,
-                    args,
-                    locals,
-                )?))
+                let target = self.eval_place_cell(root_hash, target_hash, args, locals)?;
+                Ok(Value::SharedRef(box_payload_cell(&target)))
             }
             "borrow_mut" => {
                 let target_hash = payload
                     .get("target")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_mut missing target"))?;
-                Ok(Value::MutRef(self.eval_place_cell(
-                    root_hash,
-                    target_hash,
-                    args,
-                    locals,
-                )?))
+                let target = self.eval_place_cell(root_hash, target_hash, args, locals)?;
+                Ok(Value::MutRef(box_payload_cell(&target)))
             }
             "slice_from_array" => {
                 let target_hash = payload
@@ -600,6 +598,15 @@ impl CodeDb {
                     self.eval_expr_with_locals(root_hash, len_hash, args, locals)?,
                 )?;
                 subslice_value(&target, start, len)
+            }
+            "box_new" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("box_new missing value"))?;
+                Ok(Value::Boxed(value_cell(self.eval_expr_with_locals(
+                    root_hash, value_hash, args, locals,
+                )?)))
             }
             "assign" => {
                 let target_hash = payload
@@ -857,6 +864,7 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("field_access missing field"))?;
                 let target = self.eval_place_cell(root_hash, target, args, locals)?;
+                let target = box_payload_cell(&target);
                 field_cell(&target, field)
             }
             "array_index" => {
@@ -1664,6 +1672,24 @@ impl CodeDb {
                     )?
                 )
             }
+            "box_new" => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("box_new missing value"))?;
+                format!(
+                    "box_new({})",
+                    self.expr_to_source_with_locals(
+                        value,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
             "assign" => {
                 let target = payload
                     .get("target")
@@ -2414,6 +2440,21 @@ impl CodeDb {
                     )?,
                 ],
             }),
+            "box_new" => Ok(RawExpr::Call {
+                name: "box_new".to_string(),
+                args: vec![
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("box_new missing value"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ],
+            }),
             "assign" => Ok(RawExpr::Assign {
                 target: Box::new(
                     self.typed_expr_to_raw_with_locals(
@@ -2923,6 +2964,9 @@ impl CodeDb {
             TypeSpec::RawPointer { pointee, .. } => {
                 self.collect_type_deps(&pointee, deps)?;
             }
+            TypeSpec::Box { element } => {
+                self.collect_type_deps(&element, deps)?;
+            }
             TypeSpec::Slice { element, .. } => {
                 self.collect_type_deps(&element, deps)?;
             }
@@ -3011,6 +3055,13 @@ impl CodeDb {
                         .ok_or_else(|| anyhow!("subslice missing {key}"))?;
                     self.collect_expr_deps(root, child, deps)?;
                 }
+            }
+            "box_new" => {
+                let child = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("box_new missing value"))?;
+                self.collect_expr_deps(root, child, deps)?;
             }
             "assign" => {
                 for key in ["target", "value"] {
@@ -3798,6 +3849,12 @@ impl Parser {
                 self.expect_symbol(">")?;
                 Ok(format!("{name}<{pointee}>"))
             }
+            "box" => {
+                self.expect_symbol("<")?;
+                let element = self.parse_type_source()?;
+                self.expect_symbol(">")?;
+                Ok(format!("box<{element}>"))
+            }
             "slice" | "mut_slice" => {
                 self.expect_symbol("<")?;
                 self.expect_symbol("'")?;
@@ -4110,6 +4167,7 @@ fn semantic_clone_value(value: &Value) -> Value {
         Value::Unit => Value::Unit,
         Value::SharedRef(value) => Value::SharedRef(value.clone()),
         Value::MutRef(value) => Value::MutRef(value.clone()),
+        Value::Boxed(value) => Value::Boxed(value_cell(semantic_clone_value(&value.borrow()))),
         Value::Slice { elements, mutable } => Value::Slice {
             elements: elements.clone(),
             mutable: *mutable,
@@ -4135,6 +4193,13 @@ fn semantic_clone_value(value: &Value) -> Value {
             variant: variant.clone(),
             value: value_cell(semantic_clone_value(&value.borrow())),
         },
+    }
+}
+
+fn box_payload_cell(value: &ValueCell) -> ValueCell {
+    match &*value.borrow() {
+        Value::Boxed(payload) => payload.clone(),
+        _ => value.clone(),
     }
 }
 

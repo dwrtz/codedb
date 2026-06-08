@@ -261,6 +261,7 @@ struct ValueClass {
     drop_kind: ValueDropKind,
     contains_reference: bool,
     contains_mut_reference: bool,
+    contains_box: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -311,6 +312,9 @@ pub(crate) enum TypeSpec {
     RawPointer {
         mutable: bool,
         pointee: String,
+    },
+    Box {
+        element: String,
     },
     Slice {
         region: String,
@@ -852,6 +856,15 @@ impl CodeDb {
                     Ok(format!("raw_ptr<{pointee}>"))
                 }
             }
+            TypeSpec::Box { element } => {
+                let element = self.type_name_in_root_with_regions(
+                    root,
+                    current_module,
+                    &element,
+                    region_names,
+                )?;
+                Ok(format!("box<{element}>"))
+            }
             TypeSpec::Slice {
                 region,
                 mutable,
@@ -1056,6 +1069,10 @@ impl CodeDb {
                 let pointee = self.substitute_type_regions_hash(&pointee, region_substitutions)?;
                 hash_for_type_spec(&TypeSpec::RawPointer { mutable, pointee })
             }
+            TypeSpec::Box { element } => {
+                let element = self.substitute_type_regions_hash(&element, region_substitutions)?;
+                hash_for_type_spec(&TypeSpec::Box { element })
+            }
             TypeSpec::Slice {
                 region,
                 mutable,
@@ -1141,6 +1158,10 @@ impl CodeDb {
             TypeSpec::RawPointer { mutable, pointee } => {
                 let pointee = self.put_substituted_type_regions(&pointee, region_substitutions)?;
                 self.put_structural_type(TypeSpec::RawPointer { mutable, pointee })
+            }
+            TypeSpec::Box { element } => {
+                let element = self.put_substituted_type_regions(&element, region_substitutions)?;
+                self.put_structural_type(TypeSpec::Box { element })
             }
             TypeSpec::Slice {
                 region,
@@ -1262,6 +1283,7 @@ impl CodeDb {
             TypeSpec::Reference { referent, .. } => {
                 self.record_field_type_in_root(root, &referent, field)
             }
+            TypeSpec::Box { element } => self.record_field_type_in_root(root, &element, field),
             _ => self.record_field_type_in_root(root, type_hash, field),
         }
     }
@@ -1318,6 +1340,14 @@ impl CodeDb {
                 }
                 self.type_assignable_in_root(root, &actual_element, &expected_element)
             }
+            (
+                TypeSpec::Box {
+                    element: actual_element,
+                },
+                TypeSpec::Box {
+                    element: expected_element,
+                },
+            ) => self.type_assignable_in_root(root, &actual_element, &expected_element),
             (
                 TypeSpec::FixedArray {
                     element: actual_element,
@@ -1430,6 +1460,19 @@ impl CodeDb {
                     callee_regions,
                 )
             }
+            (
+                TypeSpec::Box {
+                    element: actual_element,
+                },
+                TypeSpec::Box {
+                    element: expected_element,
+                },
+            ) => self.type_assignable_for_call_in_root(
+                root,
+                &actual_element,
+                &expected_element,
+                callee_regions,
+            ),
             (
                 TypeSpec::FixedArray {
                     element: actual_element,
@@ -1566,6 +1609,14 @@ impl CodeDb {
                 callee_regions,
                 substitutions,
             ),
+            (TypeSpec::Box { element: actual }, TypeSpec::Box { element: expected }) => self
+                .infer_call_region_substitutions(
+                    root,
+                    &actual,
+                    &expected,
+                    callee_regions,
+                    substitutions,
+                ),
             (
                 TypeSpec::Slice {
                     region: actual_region,
@@ -1724,6 +1775,11 @@ impl CodeDb {
                 .ok_or_else(|| {
                     anyhow!("type layout missing contains_mut_reference for {type_hash}")
                 })?,
+            contains_box: layout
+                .metadata
+                .get("contains_box")
+                .and_then(JsonValue::as_bool)
+                .ok_or_else(|| anyhow!("type layout missing contains_box for {type_hash}"))?,
         })
     }
 
@@ -1749,6 +1805,10 @@ impl CodeDb {
                     mutable: *mutable,
                     pointee,
                 })
+            }
+            ParsedTypeSpec::Box { element } => {
+                let element = self.put_type_spec(element)?;
+                self.put_structural_type(TypeSpec::Box { element })
             }
             ParsedTypeSpec::Slice {
                 region,
@@ -1842,6 +1902,11 @@ impl CodeDb {
                     mutable: *mutable,
                     pointee,
                 })
+            }
+            ParsedTypeSpec::Box { element } => {
+                let element =
+                    self.put_type_spec_in_root(current_module, root, element, region_scope)?;
+                self.put_structural_type(TypeSpec::Box { element })
             }
             ParsedTypeSpec::Slice {
                 region,
@@ -1951,6 +2016,11 @@ impl CodeDb {
                     mutable: *mutable,
                     pointee,
                 })
+            }
+            ParsedTypeSpec::Box { element } => {
+                let element =
+                    self.type_hash_for_parsed_in_root(current_module, root, element, region_scope)?;
+                hash_for_type_spec(&TypeSpec::Box { element })
             }
             ParsedTypeSpec::Slice {
                 region,
@@ -2707,6 +2777,17 @@ impl CodeDb {
                         locals,
                     );
                 }
+                if name == "box_new" {
+                    return self.type_builtin_box_new(
+                        current_module,
+                        args,
+                        root,
+                        param_names,
+                        param_types,
+                        region_scope,
+                        locals,
+                    );
+                }
                 let symbol = resolve_function_name_in_root(root, current_module, name)
                     .ok_or_else(|| anyhow!("unknown function {name}"))?;
                 let callee = self
@@ -2926,10 +3007,14 @@ impl CodeDb {
                         region_scope.len()
                     ),
                 };
+                let referent_type = match self.type_spec_in_root(root, &target.type_hash)? {
+                    TypeSpec::Box { element } => element,
+                    _ => target.type_hash.clone(),
+                };
                 let type_hash = self.put_structural_type(TypeSpec::Reference {
                     region: region_hash.clone(),
                     mutable: false,
-                    referent: target.type_hash.clone(),
+                    referent: referent_type.clone(),
                 })?;
                 let expr_hash = self.put_object(
                     "Expression",
@@ -2938,7 +3023,8 @@ impl CodeDb {
                         "target": target.expr_hash,
                         "region": region_hash,
                         "region_name": region_name,
-                        "referent_type": target.type_hash,
+                        "target_type": target.type_hash,
+                        "referent_type": referent_type,
                         "type": type_hash,
                     }),
                 )?;
@@ -2987,10 +3073,14 @@ impl CodeDb {
                         region_scope.len()
                     ),
                 };
+                let referent_type = match self.type_spec_in_root(root, &target.type_hash)? {
+                    TypeSpec::Box { element } => element,
+                    _ => target.type_hash.clone(),
+                };
                 let type_hash = self.put_structural_type(TypeSpec::Reference {
                     region: region_hash.clone(),
                     mutable: true,
-                    referent: target.type_hash.clone(),
+                    referent: referent_type.clone(),
                 })?;
                 let expr_hash = self.put_object(
                     "Expression",
@@ -2999,7 +3089,8 @@ impl CodeDb {
                         "target": target.expr_hash,
                         "region": region_hash,
                         "region_name": region_name,
-                        "referent_type": target.type_hash,
+                        "target_type": target.type_hash,
+                        "referent_type": referent_type,
                         "type": type_hash,
                     }),
                 )?;
@@ -3626,6 +3717,54 @@ impl CodeDb {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn type_builtin_box_new(
+        &mut self,
+        current_module: &str,
+        args: &[RawExpr],
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
+        locals: &mut Vec<LocalTypeBinding>,
+    ) -> Result<TypeCheckResult> {
+        if args.len() != 1 {
+            bail!("box_new expects 1 arg, got {}", args.len());
+        }
+        let value = self.type_expr_with_locals(
+            current_module,
+            &args[0],
+            root,
+            param_names,
+            param_types,
+            region_scope,
+            locals,
+        )?;
+        let type_hash = self.put_structural_type(TypeSpec::Box {
+            element: value.type_hash.clone(),
+        })?;
+        let expr_hash = self.put_object(
+            "Expression",
+            &json!({
+                "expr_kind": "box_new",
+                "value": value.expr_hash,
+                "element_type": value.type_hash,
+                "type": type_hash,
+            }),
+        )?;
+        self.write_cache_json(
+            &expr_hash,
+            "typechecker",
+            "typed-dag",
+            ArtifactKind::TypedExpression,
+            &json!({ "type": type_hash }),
+        )?;
+        Ok(TypeCheckResult {
+            expr_hash,
+            type_hash,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn type_builtin_slice_call(
         &mut self,
         current_module: &str,
@@ -3666,7 +3805,9 @@ impl CodeDb {
                 // directly, so `slice(&array)` would type-check yet have no native
                 // layout (no element_type_hash) and fail only at build. Reject it
                 // here like `subslice`/`len` do, so verify is a sound native gate.
-                if let TypeSpec::Reference { .. } = self.type_spec_in_root(root, &target.type_hash)? {
+                if let TypeSpec::Reference { .. } =
+                    self.type_spec_in_root(root, &target.type_hash)?
+                {
                     bail!("{name} target must be a fixed array, not a reference");
                 }
                 let info = self.indexed_element_type_in_root(root, &target.type_hash)?;
@@ -4111,6 +4252,13 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("subslice missing target"))?;
                 self.expr_escapes_local_borrow(root, target, locals_with_local_borrows)
             }
+            "box_new" => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("box_new missing value"))?;
+                self.expr_escapes_local_borrow(root, value, locals_with_local_borrows)
+            }
             "assign" => Ok(false),
             "let" => {
                 let value_hash = payload
@@ -4446,6 +4594,9 @@ impl CodeDb {
             TypeSpec::RawPointer { pointee, .. } => {
                 self.collect_reference_regions_in_type(root, &pointee, regions)
             }
+            TypeSpec::Box { element } => {
+                self.collect_reference_regions_in_type(root, &element, regions)
+            }
             TypeSpec::Slice {
                 region, element, ..
             } => {
@@ -4537,6 +4688,9 @@ impl CodeDb {
             TypeSpec::RawPointer { pointee, .. } => {
                 self.validate_type_hash_in_root(root, &pointee, allowed_regions)
             }
+            TypeSpec::Box { element } => {
+                self.validate_type_hash_in_root(root, &element, allowed_regions)
+            }
             TypeSpec::Slice {
                 region, element, ..
             } => {
@@ -4573,6 +4727,12 @@ impl CodeDb {
         if self.expr_requires_state(&body)? && !declared.contains(&Effect::State) {
             bail!(
                 "bad_effects: function {} requires undeclared effect state",
+                self.symbol_display(root, &entry.symbol)?
+            );
+        }
+        if self.expr_requires_alloc(&body)? && !declared.contains(&Effect::Alloc) {
+            bail!(
+                "bad_effects: function {} requires undeclared effect alloc",
                 self.symbol_display(root, &entry.symbol)?
             );
         }
@@ -4744,6 +4904,26 @@ impl CodeDb {
                 }
                 let value_loans = self.collect_value_loans(root, expr_hash, param_types, state)?;
                 self.check_loans_point_to_live_storage(&value_loans, state)
+            }
+            "box_new" => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("box_new missing value"))?;
+                let pre_value_state = state.clone();
+                let transfer_owners = self.move_source_places_for_expr(
+                    root,
+                    value,
+                    param_types,
+                    &pre_value_state.locals,
+                )?;
+                self.verify_expr_borrows(root, value, param_types, state, ExprUse::Value)?;
+                state.active.retain(|loan| {
+                    !transfer_owners
+                        .iter()
+                        .any(|owner| loan_owner_overlaps(loan, owner))
+                });
+                Ok(())
             }
             "assign" => {
                 let target = payload
@@ -5284,6 +5464,13 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("subslice missing target"))?;
                 out.extend(self.collect_value_loans(root, target, param_types, state)?);
             }
+            "box_new" => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("box_new missing value"))?;
+                out.extend(self.collect_value_loans(root, value, param_types, state)?);
+            }
             "call" => {
                 let (args, return_type, _) = self.call_region_context(root, &payload)?;
                 let return_regions = self.reference_regions_in_type(root, &return_type)?;
@@ -5764,6 +5951,13 @@ impl CodeDb {
                     *resolvable = false;
                 }
             }
+            TypeSpec::Box { element } => {
+                if self.value_class_in_root(root, &element)?.contains_reference {
+                    // References inside boxes are owned behind an indirection and
+                    // not field-addressable from the containing record.
+                    *resolvable = false;
+                }
+            }
             TypeSpec::Builtin(_) | TypeSpec::RawPointer { .. } | TypeSpec::Named { .. } => {}
         }
         Ok(())
@@ -5942,6 +6136,13 @@ impl CodeDb {
                     .get("value")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("enum_construct missing value"))?;
+                self.move_source_places_for_expr(root, value, param_types, locals)
+            }
+            Some("box_new") => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("box_new missing value"))?;
                 self.move_source_places_for_expr(root, value, param_types, locals)
             }
             Some("subslice") => {
@@ -6218,6 +6419,7 @@ impl CodeDb {
                         || self.expr_child_requires_state(&payload, "start")?
                         || self.expr_child_requires_state(&payload, "len")?
                 }
+                "box_new" => self.expr_child_requires_state(&payload, "value")?,
                 "let" => {
                     self.expr_child_requires_state(&payload, "value")?
                         || self.expr_child_requires_state(&payload, "body")?
@@ -6294,6 +6496,127 @@ impl CodeDb {
             .and_then(JsonValue::as_str)
             .ok_or_else(|| anyhow!("expression missing {key}"))?;
         self.expr_requires_state(child)
+    }
+
+    fn expr_requires_alloc(&self, expr_hash: &str) -> Result<bool> {
+        let payload = self.get_payload(expr_hash)?;
+        Ok(
+            match payload
+                .get("expr_kind")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
+            {
+                "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" | "local_ref" => {
+                    false
+                }
+                "box_new" => true,
+                "assign" => {
+                    self.expr_child_requires_alloc(&payload, "target")?
+                        || self.expr_child_requires_alloc(&payload, "value")?
+                }
+                "call" => {
+                    let mut required = false;
+                    for arg in payload
+                        .get("args")
+                        .and_then(JsonValue::as_array)
+                        .ok_or_else(|| anyhow!("call missing args"))?
+                    {
+                        let arg = arg
+                            .as_str()
+                            .ok_or_else(|| anyhow!("call arg must be hash"))?;
+                        required |= self.expr_requires_alloc(arg)?;
+                    }
+                    required
+                }
+                "binary" => {
+                    self.expr_child_requires_alloc(&payload, "left")?
+                        || self.expr_child_requires_alloc(&payload, "right")?
+                }
+                "unary" => self.expr_child_requires_alloc(&payload, "expr")?,
+                "borrow_shared" | "borrow_mut" | "slice_from_array" | "slice_len" => {
+                    self.expr_child_requires_alloc(&payload, "target")?
+                }
+                "subslice" => {
+                    self.expr_child_requires_alloc(&payload, "target")?
+                        || self.expr_child_requires_alloc(&payload, "start")?
+                        || self.expr_child_requires_alloc(&payload, "len")?
+                }
+                "let" => {
+                    self.expr_child_requires_alloc(&payload, "value")?
+                        || self.expr_child_requires_alloc(&payload, "body")?
+                }
+                "if" => {
+                    self.expr_child_requires_alloc(&payload, "cond")?
+                        || self.expr_child_requires_alloc(&payload, "then")?
+                        || self.expr_child_requires_alloc(&payload, "else")?
+                }
+                "fold" => {
+                    self.expr_child_requires_alloc(&payload, "target")?
+                        || self.expr_child_requires_alloc(&payload, "init")?
+                        || self.expr_child_requires_alloc(&payload, "body")?
+                }
+                "record_literal" => {
+                    let mut required = false;
+                    for field in payload
+                        .get("fields")
+                        .and_then(JsonValue::as_array)
+                        .ok_or_else(|| anyhow!("record_literal missing fields"))?
+                    {
+                        let value = field
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("record field missing value"))?;
+                        required |= self.expr_requires_alloc(value)?;
+                    }
+                    required
+                }
+                "array_literal" => {
+                    let mut required = false;
+                    for element in payload
+                        .get("elements")
+                        .and_then(JsonValue::as_array)
+                        .ok_or_else(|| anyhow!("array_literal missing elements"))?
+                    {
+                        let value = element
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("array element missing value"))?;
+                        required |= self.expr_requires_alloc(value)?;
+                    }
+                    required
+                }
+                "array_index" => {
+                    self.expr_child_requires_alloc(&payload, "target")?
+                        || self.expr_child_requires_alloc(&payload, "index")?
+                }
+                "field_access" => self.expr_child_requires_alloc(&payload, "target")?,
+                "enum_construct" => self.expr_child_requires_alloc(&payload, "value")?,
+                "case" => {
+                    let mut required = self.expr_child_requires_alloc(&payload, "expr")?;
+                    for arm in payload
+                        .get("arms")
+                        .and_then(JsonValue::as_array)
+                        .ok_or_else(|| anyhow!("case missing arms"))?
+                    {
+                        let body = arm
+                            .get("body")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("case arm missing body"))?;
+                        required |= self.expr_requires_alloc(body)?;
+                    }
+                    required
+                }
+                other => bail!("unknown expression kind {other}"),
+            },
+        )
+    }
+
+    fn expr_child_requires_alloc(&self, payload: &JsonValue, key: &str) -> Result<bool> {
+        let child = payload
+            .get(key)
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing {key}"))?;
+        self.expr_requires_alloc(child)
     }
 
     pub(crate) fn verify_expr_type(
@@ -6515,13 +6838,17 @@ impl CodeDb {
                     .get("referent_type")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_shared missing referent_type"))?;
-                if referent_type != target_type {
+                let expected_referent = match self.type_spec_in_root(root, &target_type)? {
+                    TypeSpec::Box { element } => element,
+                    _ => target_type.clone(),
+                };
+                if referent_type != expected_referent {
                     bail!("borrow_shared referent type mismatch");
                 }
                 hash_for_type_spec(&TypeSpec::Reference {
                     region: region.to_string(),
                     mutable: false,
-                    referent: target_type,
+                    referent: expected_referent,
                 })?
             }
             "borrow_mut" => {
@@ -6547,7 +6874,11 @@ impl CodeDb {
                     .get("referent_type")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_mut missing referent_type"))?;
-                if referent_type != target_type {
+                let expected_referent = match self.type_spec_in_root(root, &target_type)? {
+                    TypeSpec::Box { element } => element,
+                    _ => target_type.clone(),
+                };
+                if referent_type != expected_referent {
                     bail!("borrow_mut referent type mismatch");
                 }
                 if !self.typed_expr_is_assignable_place(root, target)? {
@@ -6556,7 +6887,7 @@ impl CodeDb {
                 hash_for_type_spec(&TypeSpec::Reference {
                     region: region.to_string(),
                     mutable: true,
-                    referent: target_type,
+                    referent: expected_referent,
                 })?
             }
             "slice_from_array" => {
@@ -6689,6 +7020,27 @@ impl CodeDb {
                     bail!("subslice start and len must be i64");
                 }
                 target_type
+            }
+            "box_new" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("box_new missing value"))?;
+                let value_type = self.verify_expr_type_with_locals(
+                    value_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if payload.get("element_type").and_then(JsonValue::as_str)
+                    != Some(value_type.as_str())
+                {
+                    bail!("box_new element_type mismatch");
+                }
+                hash_for_type_spec(&TypeSpec::Box {
+                    element: value_type,
+                })?
             }
             "assign" => {
                 let target = payload
@@ -7594,6 +7946,7 @@ impl TypeSpec {
                     Ok(format!("raw_ptr<{pointee}>"))
                 }
             }
+            TypeSpec::Box { element } => Ok(format!("box<{}>", db.type_name(element)?)),
             TypeSpec::Slice {
                 region,
                 mutable,
@@ -7661,6 +8014,9 @@ enum ParsedTypeSpec {
         mutable: bool,
         pointee: Box<ParsedTypeSpec>,
     },
+    Box {
+        element: Box<ParsedTypeSpec>,
+    },
     Slice {
         region: String,
         mutable: bool,
@@ -7687,6 +8043,9 @@ impl ParsedTypeSpec {
             ParsedTypeSpec::RawPointer { mutable, pointee } => Ok(TypeSpec::RawPointer {
                 mutable: *mutable,
                 pointee: type_hash_for_spec(pointee)?,
+            }),
+            ParsedTypeSpec::Box { element } => Ok(TypeSpec::Box {
+                element: type_hash_for_spec(element)?,
             }),
             ParsedTypeSpec::Slice { region, .. } => {
                 bail!("slice region '{region} requires root-aware resolution")
@@ -7738,6 +8097,7 @@ fn type_hash_for_spec(spec: &ParsedTypeSpec) -> Result<String> {
             bail!("region '{region} requires root-aware resolution")
         }
         ParsedTypeSpec::RawPointer { .. }
+        | ParsedTypeSpec::Box { .. }
         | ParsedTypeSpec::FixedArray { .. }
         | ParsedTypeSpec::Record(_)
         | ParsedTypeSpec::Enum(_) => {
@@ -7785,6 +8145,13 @@ pub(crate) fn type_payload_for_spec(spec: &TypeSpec) -> Result<JsonValue> {
                 "type_kind": "RawPointer",
                 "mutable": mutable,
                 "pointee": pointee,
+            })
+        }
+        TypeSpec::Box { element } => {
+            validate_type_hash("box element", element)?;
+            json!({
+                "type_kind": "Box",
+                "element": element,
             })
         }
         TypeSpec::Slice {
@@ -7901,6 +8268,15 @@ pub(crate) fn type_spec_from_payload(payload: &JsonValue) -> Result<TypeSpec> {
                 .to_string();
             validate_type_hash("raw pointer pointee", &pointee)?;
             Ok(TypeSpec::RawPointer { mutable, pointee })
+        }
+        "Box" => {
+            let element = payload
+                .get("element")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("Box Type object missing element"))?
+                .to_string();
+            validate_type_hash("box element", &element)?;
+            Ok(TypeSpec::Box { element })
         }
         "Slice" => {
             let region = payload
@@ -8185,6 +8561,9 @@ impl TypeParser {
             TypeToken::Ident(value) if value == "raw_mut_ptr" => Ok(ParsedTypeSpec::RawPointer {
                 mutable: true,
                 pointee: Box::new(self.parse_single_type_arg()?),
+            }),
+            TypeToken::Ident(value) if value == "box" => Ok(ParsedTypeSpec::Box {
+                element: Box::new(self.parse_single_type_arg()?),
             }),
             TypeToken::Ident(value) if value == "slice" => self.parse_slice_type(false),
             TypeToken::Ident(value) if value == "mut_slice" => self.parse_slice_type(true),

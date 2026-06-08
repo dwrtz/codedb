@@ -105,6 +105,12 @@ impl TraceValue {
                     .map(|value| TraceValue::from_value(&value.borrow()))
                     .collect(),
             },
+            Value::Boxed(value) => TraceValue::Record {
+                fields: vec![TraceRecordField {
+                    name: "box".to_string(),
+                    value: TraceValue::from_value(&value.borrow()),
+                }],
+            },
             Value::Array(elements) => TraceValue::Array {
                 elements: elements
                     .iter()

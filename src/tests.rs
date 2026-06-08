@@ -1661,8 +1661,8 @@ pub(crate) fn test_value_from_value(value: &Value) -> Result<TestValue> {
         // A registered test's expected value is validated against the entry's
         // return type, which cannot be a reference. Return an error rather than
         // panicking if the evaluator ever produces one.
-        Value::SharedRef(_) | Value::MutRef(_) | Value::Slice { .. } => {
-            bail!("semantic test values do not support reference actual values")
+        Value::SharedRef(_) | Value::MutRef(_) | Value::Slice { .. } | Value::Boxed(_) => {
+            bail!("semantic test values do not support reference or heap-owner actual values")
         }
     })
 }

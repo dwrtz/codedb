@@ -863,6 +863,10 @@ recursive Node with option<box<Node>> typechecks and compiles native for basic c
 native-required box tests pass
 ```
 
+Implementation note: Phase 15 is implemented. Allocation lowers through
+`heap_alloc`; freeing is emitted by compiler-generated drop glue for box-owning
+layouts, so there is no user-callable `heap_free` surface.
+
 ## Phase 16 — Raw Pointers, Unsafe, and FFI Boundary
 
 Goal: expose low-level native interop without weakening safe semantic references.

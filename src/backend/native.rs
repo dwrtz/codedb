@@ -30,6 +30,10 @@ const ELF_OBJECT_FORMAT: &str = "elf64-x86-64-relocatable";
 const MACHO_OBJECT_FORMAT: &str = "macho64-arm64-relocatable";
 const R_X86_64_PLT32: u32 = 4;
 const ARM64_RELOC_BRANCH26: u32 = 2;
+const PLATFORM_MALLOC_SYMBOL_HASH: &str = "platform:malloc";
+const PLATFORM_FREE_SYMBOL_HASH: &str = "platform:free";
+const PLATFORM_MALLOC_ABI_SYMBOL: &str = "malloc";
+const PLATFORM_FREE_ABI_SYMBOL: &str = "free";
 
 pub(crate) struct ElfObjectBackend;
 pub(crate) struct MachOArm64ObjectBackend;
@@ -89,17 +93,25 @@ impl ObjectBackend for ElfObjectBackend {
             .relocations
             .iter()
             .map(|relocation| {
-                json!({
+                let mut value = json!({
                     "offset": relocation.offset,
                     "kind": "R_X86_64_PLT32",
                     "target_symbol_hash": &relocation.target_symbol_hash,
                     "target_abi_symbol": &relocation.target_abi_symbol,
-                })
+                });
+                if relocation.platform {
+                    value
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("platform".to_string(), json!(true));
+                }
+                value
             })
             .collect::<Vec<_>>();
         let called_symbols = compiled
             .relocations
             .iter()
+            .filter(|relocation| !relocation.platform)
             .map(|relocation| relocation.target_symbol_hash.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -148,18 +160,26 @@ impl ObjectBackend for MachOArm64ObjectBackend {
             .relocations
             .iter()
             .map(|relocation| {
-                json!({
+                let mut value = json!({
                     "offset": relocation.offset,
                     "kind": "ARM64_RELOC_BRANCH26",
                     "target_symbol_hash": &relocation.target_symbol_hash,
                     "target_abi_symbol": strip_macho_symbol_prefix(&relocation.target_abi_symbol),
                     "target_object_symbol": &relocation.target_abi_symbol,
-                })
+                });
+                if relocation.platform {
+                    value
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("platform".to_string(), json!(true));
+                }
+                value
             })
             .collect::<Vec<_>>();
         let called_symbols = compiled
             .relocations
             .iter()
+            .filter(|relocation| !relocation.platform)
             .map(|relocation| relocation.target_symbol_hash.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -597,6 +617,8 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::BorrowMut { .. }
             | LoweredOp::DerefShared { .. }
             | LoweredOp::DerefMut { .. }
+            | LoweredOp::DerefBox { .. }
+            | LoweredOp::HeapAlloc { .. }
             | LoweredOp::AddrOfParam { .. }
             | LoweredOp::AddrOfLocal { .. }
             | LoweredOp::AddrOfField { .. }
@@ -692,6 +714,7 @@ fn validate_native_ops(
             | LoweredOp::If { type_hash, .. }
             | LoweredOp::Case { type_hash, .. }
             | LoweredOp::Fold { type_hash, .. }
+            | LoweredOp::HeapAlloc { type_hash, .. }
             | LoweredOp::Return { type_hash, .. } => {
                 native_supported_type(type_layouts, type_hash, i64_type, bool_type, unit_type)?;
             }
@@ -699,6 +722,7 @@ fn validate_native_ops(
             | LoweredOp::BorrowMut { .. }
             | LoweredOp::DerefShared { .. }
             | LoweredOp::DerefMut { .. }
+            | LoweredOp::DerefBox { .. }
             | LoweredOp::ConstructSlice { .. }
             | LoweredOp::SliceLen { .. }
             | LoweredOp::SliceData { .. } => {}
@@ -844,7 +868,7 @@ fn native_supported_type(
     }
     let layout = native_type_layout(type_layouts, type_hash)?;
     match layout.kind.as_str() {
-        "record" | "enum" | "fixed_array" | "slice" | "reference" | "raw_pointer" => Ok(()),
+        "record" | "enum" | "fixed_array" | "slice" | "reference" | "raw_pointer" | "box" => Ok(()),
         other => bail!("native object backend v0 does not support native values of {other} type"),
     }
 }
@@ -1048,6 +1072,50 @@ fn validate_native_op_flow(
             native_value_type(values, reference)?;
             native_insert_address(addresses, id, referent_type_hash)?;
             native_insert_value(values, id, referent_type_hash)?;
+        }
+        LoweredOp::DerefBox {
+            id,
+            box_value,
+            box_type_hash,
+            element_type_hash,
+        } => {
+            if native_value_type(values, box_value)? != box_type_hash {
+                bail!("native object backend saw deref_box value type mismatch");
+            }
+            let box_layout = native_type_layout(type_layouts, box_type_hash)?;
+            if box_layout.kind != "box"
+                || native_layout_string(box_layout, "element_type_hash")? != *element_type_hash
+            {
+                bail!("native object backend saw deref_box layout mismatch");
+            }
+            native_type_layout(type_layouts, element_type_hash)?;
+            native_insert_address(addresses, id, element_type_hash)?;
+            native_insert_value(values, id, element_type_hash)?;
+        }
+        LoweredOp::HeapAlloc {
+            id,
+            size_bytes,
+            align_bytes,
+            element_type_hash,
+            type_hash,
+        } => {
+            if *size_bytes == 0 || *align_bytes == 0 {
+                bail!("native object backend saw heap_alloc with zero layout");
+            }
+            let box_layout = native_type_layout(type_layouts, type_hash)?;
+            if box_layout.kind != "box"
+                || native_layout_string(box_layout, "element_type_hash")? != *element_type_hash
+            {
+                bail!("native object backend saw heap_alloc non-box result");
+            }
+            let element_layout = native_type_layout(type_layouts, element_type_hash)?;
+            if element_layout.size_bytes != *size_bytes
+                || element_layout.align_bytes != *align_bytes
+            {
+                bail!("native object backend saw heap_alloc element layout mismatch");
+            }
+            native_insert_value(values, id, type_hash)?;
+            native_insert_address(addresses, id, element_type_hash)?;
         }
         LoweredOp::AddrOfParam { id, place } => {
             let LoweredPlace::Param {
@@ -1481,6 +1549,123 @@ fn native_layout_compatible(
         && actual.abi == expected.abi)
 }
 
+fn native_layout_string(layout: &LoweredTypeLayout, key: &str) -> Result<String> {
+    layout
+        .metadata
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow!(
+                "native type layout {} missing string {key}",
+                layout.type_hash
+            )
+        })
+}
+
+fn native_layout_u64(layout: &LoweredTypeLayout, key: &str) -> Result<u64> {
+    layout
+        .metadata
+        .get(key)
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            anyhow!(
+                "native type layout {} missing integer {key}",
+                layout.type_hash
+            )
+        })
+}
+
+fn native_contains_box(
+    layouts: &BTreeMap<String, LoweredTypeLayout>,
+    type_hash: &str,
+) -> Result<bool> {
+    Ok(native_type_layout(layouts, type_hash)?
+        .metadata
+        .get("contains_box")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false))
+}
+
+fn native_needs_drop(
+    layouts: &BTreeMap<String, LoweredTypeLayout>,
+    type_hash: &str,
+) -> Result<bool> {
+    let layout = native_type_layout(layouts, type_hash)?;
+    Ok(layout.metadata.get("drop_kind").and_then(JsonValue::as_str) == Some("needs_drop"))
+}
+
+#[derive(Debug, Clone)]
+struct NativeFieldLayout {
+    type_hash: String,
+    offset_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct NativeVariantLayout {
+    type_hash: String,
+    tag_value: u64,
+    payload_offset_bytes: u64,
+}
+
+fn native_record_fields(layout: &LoweredTypeLayout) -> Result<Vec<NativeFieldLayout>> {
+    if layout.kind != "record" {
+        bail!("native type layout {} is not a record", layout.type_hash);
+    }
+    layout
+        .metadata
+        .get("fields")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| anyhow!("native record layout {} missing fields", layout.type_hash))?
+        .iter()
+        .map(|field| {
+            Ok(NativeFieldLayout {
+                type_hash: field
+                    .get("type_hash")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("native record layout field missing type_hash"))?
+                    .to_string(),
+                offset_bytes: field
+                    .get("offset_bytes")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("native record layout field missing offset_bytes"))?,
+            })
+        })
+        .collect()
+}
+
+fn native_enum_variants(layout: &LoweredTypeLayout) -> Result<Vec<NativeVariantLayout>> {
+    if layout.kind != "enum" {
+        bail!("native type layout {} is not an enum", layout.type_hash);
+    }
+    layout
+        .metadata
+        .get("variants")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| anyhow!("native enum layout {} missing variants", layout.type_hash))?
+        .iter()
+        .map(|variant| {
+            Ok(NativeVariantLayout {
+                type_hash: variant
+                    .get("type_hash")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("native enum layout variant missing type_hash"))?
+                    .to_string(),
+                tag_value: variant
+                    .get("tag_value")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("native enum layout variant missing tag_value"))?,
+                payload_offset_bytes: variant
+                    .get("payload_offset_bytes")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| {
+                        anyhow!("native enum layout variant missing payload_offset_bytes")
+                    })?,
+            })
+        })
+        .collect()
+}
+
 fn native_debug_metadata(compiled: &CompiledFunction) -> JsonValue {
     json!({
         "schema": NATIVE_DEBUG_METADATA_SCHEMA,
@@ -1529,6 +1714,7 @@ struct TextRelocation {
     offset: u64,
     target_symbol_hash: String,
     target_abi_symbol: String,
+    platform: bool,
 }
 
 #[derive(Debug)]
@@ -1573,6 +1759,7 @@ fn compile_x86_64_function(
         type_layouts,
         text: Vec::new(),
         relocations: Vec::new(),
+        active_drop_types: BTreeSet::new(),
         debug_ops: lowered_value_debug_ops(ir)?,
         debug_ranges: Vec::new(),
         symbol_hash: ir.symbol_hash.clone(),
@@ -1697,6 +1884,8 @@ fn collect_value_ids_inner(
             | LoweredOp::BorrowMut { id, .. }
             | LoweredOp::DerefShared { id, .. }
             | LoweredOp::DerefMut { id, .. }
+            | LoweredOp::DerefBox { id, .. }
+            | LoweredOp::HeapAlloc { id, .. }
             | LoweredOp::AddrOfParam { id, .. }
             | LoweredOp::AddrOfLocal { id, .. }
             | LoweredOp::AddrOfField { id, .. }
@@ -1754,6 +1943,7 @@ struct FunctionEmitter {
     type_layouts: BTreeMap<String, LoweredTypeLayout>,
     text: Vec<u8>,
     relocations: Vec<TextRelocation>,
+    active_drop_types: BTreeSet<String>,
     debug_ops: BTreeMap<String, LoweredDebugOp>,
     debug_ranges: Vec<NativeDebugRange>,
     symbol_hash: String,
@@ -1877,6 +2067,7 @@ impl FunctionEmitter {
                     offset: offset as u64,
                     target_symbol_hash: target_symbol_hash.clone(),
                     target_abi_symbol,
+                    platform: false,
                 });
                 if let Some(return_address) = return_address {
                     self.mov_rax_stack(self.value_offset(return_address)?);
@@ -1938,6 +2129,13 @@ impl FunctionEmitter {
             | LoweredOp::DerefMut { id, reference, .. } => {
                 self.mov_rax_stack(self.value_offset(reference)?);
                 self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::DerefBox { id, box_value, .. } => {
+                self.mov_rax_stack(self.value_offset(box_value)?);
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::HeapAlloc { id, size_bytes, .. } => {
+                self.emit_heap_alloc_x86(id, *size_bytes)?;
             }
             LoweredOp::AddrOfParam { id, place } => {
                 let LoweredPlace::Param { slot, indirect, .. } = place else {
@@ -2141,7 +2339,11 @@ impl FunctionEmitter {
                     self.emit_load_addressed_value_to_stack(id, type_hash, address)?;
                 }
             }
-            LoweredOp::Drop { .. } | LoweredOp::BorrowDebug { .. } => {}
+            LoweredOp::Drop { address, type_hash } => {
+                self.mov_rax_stack(self.value_offset(address)?);
+                self.emit_drop_ptr_x86(type_hash)?;
+            }
+            LoweredOp::BorrowDebug { .. } => {}
             LoweredOp::Return { .. } => {
                 bail!("return is only valid as the final lowered operation");
             }
@@ -2529,6 +2731,143 @@ impl FunctionEmitter {
         }
     }
 
+    fn emit_heap_alloc_x86(&mut self, id: &str, size_bytes: u64) -> Result<()> {
+        self.mov_rax_imm64(i64::try_from(size_bytes.max(1))?);
+        self.mov_rdi_rax();
+        self.emit_platform_call_x86(PLATFORM_MALLOC_SYMBOL_HASH, PLATFORM_MALLOC_ABI_SYMBOL);
+        self.cmp_rax_imm32(0);
+        let ok = self.emit_jne_placeholder();
+        self.emit_ud2();
+        self.patch_rel32(ok)?;
+        self.mov_stack_rax(self.value_offset(id)?);
+        Ok(())
+    }
+
+    fn emit_drop_ptr_x86(&mut self, type_hash: &str) -> Result<()> {
+        if !native_needs_drop(&self.type_layouts, type_hash)? {
+            return Ok(());
+        }
+        if !self.active_drop_types.insert(type_hash.to_string()) {
+            return Ok(());
+        }
+        let layout = native_type_layout(&self.type_layouts, type_hash)?.clone();
+        let result = match layout.kind.as_str() {
+            "box" => self.emit_drop_box_ptr_x86(&layout),
+            "record" => self.emit_drop_record_ptr_x86(&layout),
+            "enum" => self.emit_drop_enum_ptr_x86(&layout),
+            "fixed_array" => self.emit_drop_fixed_array_ptr_x86(&layout),
+            _ => Ok(()),
+        };
+        self.active_drop_types.remove(type_hash);
+        result
+    }
+
+    fn emit_drop_box_ptr_x86(&mut self, layout: &LoweredTypeLayout) -> Result<()> {
+        let element_type = native_layout_string(layout, "element_type_hash")?;
+        self.mov_rax_mem_rax();
+        self.cmp_rax_imm32(0);
+        let done = self.emit_jz_placeholder();
+        self.sub_rsp_imm8(16);
+        self.mov_rsp_rax();
+        if native_needs_drop(&self.type_layouts, &element_type)? {
+            self.mov_rax_rsp();
+            self.emit_drop_ptr_x86(&element_type)?;
+        }
+        self.mov_rdi_rsp();
+        self.add_rsp_imm8(16);
+        self.emit_platform_call_x86(PLATFORM_FREE_SYMBOL_HASH, PLATFORM_FREE_ABI_SYMBOL);
+        self.patch_rel32(done)?;
+        Ok(())
+    }
+
+    fn emit_drop_record_ptr_x86(&mut self, layout: &LoweredTypeLayout) -> Result<()> {
+        if !native_contains_box(&self.type_layouts, &layout.type_hash)? {
+            return Ok(());
+        }
+        let fields = native_record_fields(layout)?;
+        self.sub_rsp_imm8(16);
+        self.mov_rsp_rax();
+        for field in fields {
+            if !native_needs_drop(&self.type_layouts, &field.type_hash)? {
+                continue;
+            }
+            self.mov_rax_rsp();
+            self.add_rax_imm32(i32::try_from(field.offset_bytes)?);
+            self.emit_drop_ptr_x86(&field.type_hash)?;
+        }
+        self.add_rsp_imm8(16);
+        Ok(())
+    }
+
+    fn emit_drop_fixed_array_ptr_x86(&mut self, layout: &LoweredTypeLayout) -> Result<()> {
+        let element_type = native_layout_string(layout, "element_type_hash")?;
+        if !native_needs_drop(&self.type_layouts, &element_type)? {
+            return Ok(());
+        }
+        let len = native_layout_u64(layout, "len")?;
+        let stride = native_layout_u64(layout, "stride_bytes")?;
+        self.sub_rsp_imm8(16);
+        self.mov_rsp_rax();
+        for index in 0..len {
+            self.mov_rax_rsp();
+            self.add_rax_imm32(i32::try_from(
+                index
+                    .checked_mul(stride)
+                    .ok_or_else(|| anyhow!("native x86_64 array drop offset overflow"))?,
+            )?);
+            self.emit_drop_ptr_x86(&element_type)?;
+        }
+        self.add_rsp_imm8(16);
+        Ok(())
+    }
+
+    fn emit_drop_enum_ptr_x86(&mut self, layout: &LoweredTypeLayout) -> Result<()> {
+        if !native_contains_box(&self.type_layouts, &layout.type_hash)? {
+            return Ok(());
+        }
+        let variants = native_enum_variants(layout)?;
+        let mut end_patches = Vec::new();
+        self.sub_rsp_imm8(16);
+        self.mov_rsp_rax();
+        for variant in variants {
+            if !native_needs_drop(&self.type_layouts, &variant.type_hash)? {
+                continue;
+            }
+            if variant.tag_value > i32::MAX as u64 {
+                bail!(
+                    "native x86_64 backend cannot encode enum drop tag {}",
+                    variant.tag_value
+                );
+            }
+            self.mov_rax_rsp();
+            self.mov_rax_mem_rax();
+            self.cmp_rax_imm32(i32::try_from(variant.tag_value)?);
+            let next_patch = self.emit_jne_placeholder();
+            self.mov_rax_rsp();
+            self.add_rax_imm32(i32::try_from(variant.payload_offset_bytes)?);
+            self.emit_drop_ptr_x86(&variant.type_hash)?;
+            end_patches.push(self.emit_jmp_placeholder());
+            self.patch_rel32(next_patch)?;
+        }
+        for patch in end_patches {
+            self.patch_rel32(patch)?;
+        }
+        self.add_rsp_imm8(16);
+        Ok(())
+    }
+
+    fn emit_platform_call_x86(&mut self, target_symbol_hash: &str, target_abi_symbol: &str) {
+        let offset = self.text.len() + 1;
+        self.text.push(0xe8);
+        self.text.extend_from_slice(&[0, 0, 0, 0]);
+        self.relocations.push(TextRelocation {
+            offset: offset as u64,
+            target_symbol_hash: target_symbol_hash.to_string(),
+            target_abi_symbol: target_abi_symbol.to_string(),
+            platform: true,
+        });
+    }
+
     fn value_offset(&self, id: &str) -> Result<i32> {
         self.layout
             .value_offsets
@@ -2651,6 +2990,30 @@ impl FunctionEmitter {
     fn mov_stack_rax(&mut self, offset: i32) {
         self.text.extend_from_slice(&[0x48, 0x89, 0x85]);
         self.push_i32(offset);
+    }
+
+    fn sub_rsp_imm8(&mut self, value: u8) {
+        self.text.extend_from_slice(&[0x48, 0x83, 0xec, value]);
+    }
+
+    fn add_rsp_imm8(&mut self, value: u8) {
+        self.text.extend_from_slice(&[0x48, 0x83, 0xc4, value]);
+    }
+
+    fn mov_rsp_rax(&mut self) {
+        self.text.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]);
+    }
+
+    fn mov_rax_rsp(&mut self) {
+        self.text.extend_from_slice(&[0x48, 0x8b, 0x04, 0x24]);
+    }
+
+    fn mov_rdi_rsp(&mut self) {
+        self.text.extend_from_slice(&[0x48, 0x8b, 0x3c, 0x24]);
+    }
+
+    fn mov_rdi_rax(&mut self) {
+        self.text.extend_from_slice(&[0x48, 0x89, 0xc7]);
     }
 
     fn mov_stack_arg_reg(&mut self, offset: i32, arg_idx: usize) -> Result<()> {
@@ -2801,6 +3164,7 @@ fn compile_arm64_function(
         type_layouts,
         text: Vec::new(),
         relocations: Vec::new(),
+        active_drop_types: BTreeSet::new(),
         debug_ops: lowered_value_debug_ops(ir)?,
         debug_ranges: Vec::new(),
         symbol_hash: ir.symbol_hash.clone(),
@@ -2910,6 +3274,7 @@ struct Arm64Emitter {
     type_layouts: BTreeMap<String, LoweredTypeLayout>,
     text: Vec<u8>,
     relocations: Vec<TextRelocation>,
+    active_drop_types: BTreeSet<String>,
     debug_ops: BTreeMap<String, LoweredDebugOp>,
     debug_ranges: Vec<NativeDebugRange>,
     symbol_hash: String,
@@ -3031,6 +3396,7 @@ impl Arm64Emitter {
                     offset: offset as u64,
                     target_symbol_hash: target_symbol_hash.clone(),
                     target_abi_symbol,
+                    platform: false,
                 });
                 if let Some(return_address) = return_address {
                     self.ldr_stack(0, self.value_offset(return_address)?)?;
@@ -3092,6 +3458,13 @@ impl Arm64Emitter {
             | LoweredOp::DerefMut { id, reference, .. } => {
                 self.ldr_stack(0, self.value_offset(reference)?)?;
                 self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::DerefBox { id, box_value, .. } => {
+                self.ldr_stack(0, self.value_offset(box_value)?)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::HeapAlloc { id, size_bytes, .. } => {
+                self.emit_heap_alloc_arm64(id, *size_bytes)?;
             }
             LoweredOp::AddrOfParam { id, place } => {
                 let LoweredPlace::Param { slot, indirect, .. } = place else {
@@ -3296,7 +3669,11 @@ impl Arm64Emitter {
                     self.emit_load_addressed_value_to_stack(id, type_hash, address)?;
                 }
             }
-            LoweredOp::Drop { .. } | LoweredOp::BorrowDebug { .. } => {}
+            LoweredOp::Drop { address, type_hash } => {
+                self.ldr_stack(0, self.value_offset(address)?)?;
+                self.emit_drop_ptr_arm64(type_hash)?;
+            }
+            LoweredOp::BorrowDebug { .. } => {}
             LoweredOp::Return { .. } => {
                 bail!("return is only valid as the final lowered operation");
             }
@@ -3676,6 +4053,133 @@ impl Arm64Emitter {
                 self.copy_memory_from_x0_to_x1(size)
             }
         }
+    }
+
+    fn emit_heap_alloc_arm64(&mut self, id: &str, size_bytes: u64) -> Result<()> {
+        self.mov_u64(0, size_bytes.max(1));
+        self.emit_platform_call_arm64(PLATFORM_MALLOC_SYMBOL_HASH, PLATFORM_MALLOC_ABI_SYMBOL);
+        let ok = self.emit_cbnz_placeholder(0);
+        self.emit_u32(0xd4200000);
+        self.patch_imm19(ok)?;
+        self.str_stack(0, self.value_offset(id)?)?;
+        Ok(())
+    }
+
+    fn emit_drop_ptr_arm64(&mut self, type_hash: &str) -> Result<()> {
+        if !native_needs_drop(&self.type_layouts, type_hash)? {
+            return Ok(());
+        }
+        if !self.active_drop_types.insert(type_hash.to_string()) {
+            return Ok(());
+        }
+        let layout = native_type_layout(&self.type_layouts, type_hash)?.clone();
+        let result = match layout.kind.as_str() {
+            "box" => self.emit_drop_box_ptr_arm64(&layout),
+            "record" => self.emit_drop_record_ptr_arm64(&layout),
+            "enum" => self.emit_drop_enum_ptr_arm64(&layout),
+            "fixed_array" => self.emit_drop_fixed_array_ptr_arm64(&layout),
+            _ => Ok(()),
+        };
+        self.active_drop_types.remove(type_hash);
+        result
+    }
+
+    fn emit_drop_box_ptr_arm64(&mut self, layout: &LoweredTypeLayout) -> Result<()> {
+        let element_type = native_layout_string(layout, "element_type_hash")?;
+        self.ldr_reg_addr(0, 0)?;
+        let done = self.emit_cbz_placeholder(0);
+        self.sub_sp_imm(16)?;
+        self.str_stack(0, 0)?;
+        if native_needs_drop(&self.type_layouts, &element_type)? {
+            self.ldr_stack(0, 0)?;
+            self.emit_drop_ptr_arm64(&element_type)?;
+        }
+        self.ldr_stack(0, 0)?;
+        self.add_sp_imm(16)?;
+        self.emit_platform_call_arm64(PLATFORM_FREE_SYMBOL_HASH, PLATFORM_FREE_ABI_SYMBOL);
+        self.patch_imm19(done)?;
+        Ok(())
+    }
+
+    fn emit_drop_record_ptr_arm64(&mut self, layout: &LoweredTypeLayout) -> Result<()> {
+        if !native_contains_box(&self.type_layouts, &layout.type_hash)? {
+            return Ok(());
+        }
+        let fields = native_record_fields(layout)?;
+        self.sub_sp_imm(16)?;
+        self.str_stack(0, 0)?;
+        for field in fields {
+            if !native_needs_drop(&self.type_layouts, &field.type_hash)? {
+                continue;
+            }
+            self.ldr_stack(0, 0)?;
+            self.add_reg_imm(0, 0, u32::try_from(field.offset_bytes)?)?;
+            self.emit_drop_ptr_arm64(&field.type_hash)?;
+        }
+        self.add_sp_imm(16)?;
+        Ok(())
+    }
+
+    fn emit_drop_fixed_array_ptr_arm64(&mut self, layout: &LoweredTypeLayout) -> Result<()> {
+        let element_type = native_layout_string(layout, "element_type_hash")?;
+        if !native_needs_drop(&self.type_layouts, &element_type)? {
+            return Ok(());
+        }
+        let len = native_layout_u64(layout, "len")?;
+        let stride = native_layout_u64(layout, "stride_bytes")?;
+        self.sub_sp_imm(16)?;
+        self.str_stack(0, 0)?;
+        for index in 0..len {
+            let offset = index
+                .checked_mul(stride)
+                .ok_or_else(|| anyhow!("native arm64 array drop offset overflow"))?;
+            self.ldr_stack(0, 0)?;
+            self.add_reg_imm(0, 0, u32::try_from(offset)?)?;
+            self.emit_drop_ptr_arm64(&element_type)?;
+        }
+        self.add_sp_imm(16)?;
+        Ok(())
+    }
+
+    fn emit_drop_enum_ptr_arm64(&mut self, layout: &LoweredTypeLayout) -> Result<()> {
+        if !native_contains_box(&self.type_layouts, &layout.type_hash)? {
+            return Ok(());
+        }
+        let variants = native_enum_variants(layout)?;
+        let mut end_patches = Vec::new();
+        self.sub_sp_imm(16)?;
+        self.str_stack(0, 0)?;
+        for variant in variants {
+            if !native_needs_drop(&self.type_layouts, &variant.type_hash)? {
+                continue;
+            }
+            self.ldr_stack(0, 0)?;
+            self.ldr_reg_addr(0, 0)?;
+            self.mov_u64(1, variant.tag_value);
+            self.cmp_reg(0, 1);
+            let next_patch = self.emit_b_cond_placeholder(1);
+            self.ldr_stack(0, 0)?;
+            self.add_reg_imm(0, 0, u32::try_from(variant.payload_offset_bytes)?)?;
+            self.emit_drop_ptr_arm64(&variant.type_hash)?;
+            end_patches.push(self.emit_b_placeholder());
+            self.patch_imm19(next_patch)?;
+        }
+        for patch in end_patches {
+            self.patch_imm26(patch)?;
+        }
+        self.add_sp_imm(16)?;
+        Ok(())
+    }
+
+    fn emit_platform_call_arm64(&mut self, target_symbol_hash: &str, target_abi_symbol: &str) {
+        let offset = self.text.len();
+        self.emit_u32(0x94000000);
+        self.relocations.push(TextRelocation {
+            offset: offset as u64,
+            target_symbol_hash: target_symbol_hash.to_string(),
+            target_abi_symbol: macho_symbol_name(target_abi_symbol),
+            platform: true,
+        });
     }
 
     fn value_offset(&self, id: &str) -> Result<u32> {

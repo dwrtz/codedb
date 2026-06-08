@@ -120,6 +120,15 @@ impl LayoutClass {
         }
     }
 
+    fn boxed() -> Self {
+        Self {
+            copy_kind: CopyKind::MoveOnly,
+            drop_kind: DropKind::NeedsDrop,
+            contains_box: true,
+            ..Self::copy()
+        }
+    }
+
     fn merge(self, other: Self) -> Self {
         Self {
             copy_kind: if self.copy_kind == CopyKind::Copy && other.copy_kind == CopyKind::Copy {
@@ -358,6 +367,25 @@ impl LayoutComputer<'_> {
                 let object = metadata.as_object_mut().unwrap();
                 object.insert("mutable".to_string(), json!(mutable));
                 object.insert("pointee_type_hash".to_string(), json!(pointee));
+                Ok(ComputedLayout {
+                    metadata,
+                    size_bytes: self.target.pointer_size_bytes,
+                    align_bytes: self.target.pointer_align_bytes,
+                    class,
+                })
+            }
+            TypeSpec::Box { element } => {
+                self.db.type_spec(&element)?;
+                let class = LayoutClass::boxed();
+                let mut metadata = self.base_metadata(
+                    type_hash,
+                    "box",
+                    self.target.pointer_size_bytes,
+                    self.target.pointer_align_bytes,
+                    class,
+                );
+                let object = metadata.as_object_mut().unwrap();
+                object.insert("element_type_hash".to_string(), json!(element));
                 Ok(ComputedLayout {
                     metadata,
                     size_bytes: self.target.pointer_size_bytes,
