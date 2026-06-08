@@ -131,6 +131,64 @@ fn main<'a>() -> i64 effects[state, unsafe] =
 }
 
 #[test]
+fn raw_pointer_return_values_compile_and_run_native() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("raw-pointer-return.sqlite");
+    let source = temp.path().join("raw-pointer-return.cdb");
+    let ptr_object = temp.path().join("ptr.o");
+
+    std::fs::write(
+        &source,
+        r#"
+fn ptr<'a>(x: &'a i64) -> raw_ptr<i64> effects[unsafe] =
+  raw_ptr(x)
+
+fn main<'a>() -> i64 effects[unsafe] =
+  let x: i64 = 13 in
+  raw_load(ptr(&'a x))
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&["verify", path(&db)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "13");
+
+    run(&[
+        "emit-object",
+        path(&db),
+        "ptr",
+        "--target",
+        codedb::DEFAULT_NATIVE_TARGET,
+        "--out",
+        path(&ptr_object),
+    ]);
+    assert_native_object_magic(&std::fs::read(&ptr_object).unwrap());
+
+    let created = parse_json(&run(&[
+        "create-test",
+        path(&db),
+        "raw_pointer_return_native",
+        "--entry",
+        "main",
+        "--expect-i64",
+        "13",
+        "--native-required",
+        "--json",
+    ]));
+    assert_eq!(created["status"], "applied");
+    let report = parse_json(&run(&["test", path(&db), "--json"]));
+    if can_build_default_native_target() {
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+    } else {
+        assert_eq!(report["status"], "failed");
+        assert_eq!(report["tests"][0]["native"]["status"], "unsupported");
+    }
+}
+
+#[test]
 fn raw_pointer_operations_require_unsafe_and_store_requires_state() {
     let temp = tempdir().unwrap();
 
@@ -284,6 +342,14 @@ fn assert_trace_eval_kind(trace: &JsonValue, kind: &str) {
         }),
         "missing trace eval kind {kind}"
     );
+}
+
+fn assert_native_object_magic(object_bytes: &[u8]) {
+    if codedb::DEFAULT_NATIVE_TARGET == codedb::LINUX_X86_64_TARGET {
+        assert_eq!(&object_bytes[..4], b"\x7fELF");
+    } else {
+        assert_eq!(&object_bytes[..4], &[0xcf, 0xfa, 0xed, 0xfe]);
+    }
 }
 
 fn can_build_default_native_target() -> bool {

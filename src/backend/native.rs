@@ -2282,7 +2282,11 @@ impl FunctionEmitter {
         }
         for blob in &mut self.static_data {
             blob.offset = Some(self.rodata.len());
-            self.rodata.extend_from_slice(&blob.bytes);
+            if blob.bytes.is_empty() {
+                self.rodata.push(0);
+            } else {
+                self.rodata.extend_from_slice(&blob.bytes);
+            }
         }
         for patch in self.static_data_patches.clone() {
             self.relocations.push(TextRelocation::StaticDataAddress(
@@ -3773,7 +3777,11 @@ impl Arm64Emitter {
         }
         for blob in &mut self.static_data {
             blob.offset = Some(self.rodata.len());
-            self.rodata.extend_from_slice(&blob.bytes);
+            if blob.bytes.is_empty() {
+                self.rodata.push(0);
+            } else {
+                self.rodata.extend_from_slice(&blob.bytes);
+            }
         }
         for patch in self.static_data_patches.clone() {
             self.relocations.push(TextRelocation::StaticDataAddress(
@@ -5241,7 +5249,7 @@ fn write_elf_object(
     }
     NativeObjectImage {
         bytes: out,
-        static_data_section: (!rodata.is_empty()).then_some(StaticDataSectionPlacement {
+        static_data_section: (!static_data.is_empty()).then_some(StaticDataSectionPlacement {
             name: ".rodata",
             file_offset: section_offsets[1],
         }),
@@ -5314,15 +5322,16 @@ fn write_macho_object(
     }
 
     const HEADER_SIZE: u64 = 32;
-    let segment_command_size = if rodata.is_empty() { 152 } else { 232 };
+    let has_const_section = !static_data.is_empty();
+    let segment_command_size = if has_const_section { 232 } else { 152 };
     let sizeofcmds = segment_command_size + 24 + 24 + 80;
     let text_offset = HEADER_SIZE + u64::from(sizeofcmds);
     let const_addr = align_to(text.len() as u64, 16);
     let const_offset = text_offset + const_addr;
-    let section_bytes_end = if rodata.is_empty() {
-        text_offset + text.len() as u64
-    } else {
+    let section_bytes_end = if has_const_section {
         const_offset + rodata.len() as u64
+    } else {
+        text_offset + text.len() as u64
     };
     let reloc_count = macho_relocation_count(relocations);
     let reloc_offset = if reloc_count == 0 {
@@ -5345,7 +5354,7 @@ fn write_macho_object(
     out.extend_from_slice(&macho_segment_command(
         text_offset as u32,
         text.len() as u64,
-        (!rodata.is_empty()).then_some((const_addr, const_offset as u32, rodata.len() as u64)),
+        has_const_section.then_some((const_addr, const_offset as u32, rodata.len() as u64)),
         reloc_offset as u32,
         reloc_count as u32,
     ));
@@ -5365,7 +5374,7 @@ fn write_macho_object(
 
     pad_to(&mut out, text_offset as usize);
     out.extend_from_slice(text);
-    if !rodata.is_empty() {
+    if has_const_section {
         pad_to(&mut out, const_offset as usize);
         out.extend_from_slice(rodata);
     }
@@ -5405,7 +5414,7 @@ fn write_macho_object(
     out.extend_from_slice(&strtab.bytes);
     NativeObjectImage {
         bytes: out,
-        static_data_section: (!rodata.is_empty()).then_some(StaticDataSectionPlacement {
+        static_data_section: has_const_section.then_some(StaticDataSectionPlacement {
             name: "__TEXT,__const",
             file_offset: const_offset,
         }),

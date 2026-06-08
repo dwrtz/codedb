@@ -256,6 +256,65 @@ fn nested_box() -> i64 effects[alloc] =
 }
 
 #[test]
+fn box_return_values_compile_and_run_native() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("box-return.sqlite");
+    let source = temp.path().join("box-return.cdb");
+    let make_box_object = temp.path().join("make-box.o");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+}
+
+fn make_box() -> box<Line> effects[alloc] =
+  box_new({ price_cents: 7 })
+
+fn main() -> i64 effects[alloc] =
+  let b: box<Line> = make_box() in
+  b.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&["verify", path(&db)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "7");
+
+    run(&[
+        "emit-object",
+        path(&db),
+        "make_box",
+        "--target",
+        codedb::DEFAULT_NATIVE_TARGET,
+        "--out",
+        path(&make_box_object),
+    ]);
+    assert_native_object_magic(&std::fs::read(&make_box_object).unwrap());
+
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "box_return_native",
+            "--entry",
+            "main",
+            "--expect-i64",
+            "7",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["native_mismatches"], 0);
+    }
+}
+
+#[test]
 fn assigning_over_box_drops_previous_value() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("box-reassign.sqlite");

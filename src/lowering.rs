@@ -4179,7 +4179,9 @@ impl CodeDb {
             | TypeSpec::Enum(_)
             | TypeSpec::FixedArray { .. }
             | TypeSpec::Slice { .. }
-            | TypeSpec::Reference { .. } => Ok(()),
+            | TypeSpec::Reference { .. }
+            | TypeSpec::RawPointer { .. }
+            | TypeSpec::Box { .. } => Ok(()),
             _ => bail!("lowering v1 does not support aggregate return type {type_name}"),
         }
     }

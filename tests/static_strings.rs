@@ -220,6 +220,73 @@ fn write_static() -> i64 effects[io, ffi, unsafe] =
 }
 
 #[test]
+fn empty_static_strings_and_bytes_emit_native_objects() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("empty-static-strings.sqlite");
+    let source = temp.path().join("empty-static-strings.cdb");
+    let object_path = temp.path().join("empty-total.o");
+
+    std::fs::write(
+        &source,
+        r#"
+fn empty_string_len() -> i64 = len("")
+fn empty_bytes_len() -> i64 = len(b"")
+fn empty_total() -> i64 = len("") + len(b"")
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "empty_total"]).trim(), "0");
+    run(&["verify", path(&db)]);
+
+    run(&[
+        "emit-object",
+        path(&db),
+        "empty_total",
+        "--target",
+        codedb::DEFAULT_NATIVE_TARGET,
+        "--out",
+        path(&object_path),
+    ]);
+    assert_native_object_magic(&std::fs::read(&object_path).unwrap());
+
+    let metadata = latest_object_metadata(&db);
+    let static_data = metadata["static_data"]
+        .as_array()
+        .expect("static data metadata");
+    assert_eq!(static_data.len(), 1);
+    assert_eq!(static_data[0]["bytes_hex"], "");
+    assert_eq!(static_data[0]["len"], 0);
+    let expected_section = match codedb::DEFAULT_NATIVE_TARGET {
+        codedb::LINUX_X86_64_TARGET => ".rodata",
+        codedb::APPLE_ARM64_TARGET => "__TEXT,__const",
+        other => panic!("unexpected native target {other}"),
+    };
+    assert_eq!(static_data[0]["section"], expected_section);
+    run(&["verify", path(&db)]);
+
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "empty_static_total_native",
+            "--entry",
+            "empty_total",
+            "--expect-i64",
+            "0",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+    }
+}
+
+#[test]
 fn verify_rejects_corrupt_native_object_static_data_metadata() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("static-object-metadata.sqlite");
