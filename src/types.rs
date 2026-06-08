@@ -2323,6 +2323,154 @@ impl CodeDb {
         )
     }
 
+    /// Type-check a `fold` expression. When `expected_acc_type` is supplied (the
+    /// declared type of an enclosing `let` binding) and the inferred init type is
+    /// assignable to it, the accumulator is anchored to that named type so the
+    /// fold builds its accumulator directly in the destination layout.
+    ///
+    /// Without this, a bare record-literal init (e.g. `with acc = {b: 0, a: 0}`)
+    /// infers a *structural* (alphabetically ordered) record type. The fold result
+    /// would then need a layout-incompatible blind copy into a non-alphabetical
+    /// named binding, which fails closed at native lowering and forces an explicit
+    /// `let init: T = <literal>` workaround. Anchoring keeps non-alphabetical
+    /// record accumulators native-buildable. With no enclosing annotation
+    /// (`expected_acc_type` = None) the inferred init type is used unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn type_fold_expr(
+        &mut self,
+        current_module: &str,
+        item: &str,
+        target: &RawExpr,
+        acc: &str,
+        init: &RawExpr,
+        body: &RawExpr,
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
+        locals: &mut Vec<LocalTypeBinding>,
+        expected_acc_type: Option<&str>,
+    ) -> Result<TypeCheckResult> {
+        validate_projection_identifier("fold item binding", item)?;
+        validate_projection_identifier("fold accumulator binding", acc)?;
+        if item == acc {
+            bail!("fold item and accumulator bindings must be distinct");
+        }
+        let target = self.type_expr_with_locals(
+            current_module,
+            target,
+            root,
+            param_names,
+            param_types,
+            region_scope,
+            locals,
+        )?;
+        let info = self.indexed_element_type_in_root(root, &target.type_hash)?;
+        let (target_kind, element_type, len) = match info {
+            IndexedElementInfo::FixedArray {
+                element_type, len, ..
+            } => {
+                if !self.typed_expr_is_place(&target.expr_hash)? {
+                    bail!("fold over a fixed array requires an addressable array place");
+                }
+                ("fixed_array", element_type, Some(len))
+            }
+            IndexedElementInfo::Slice { element_type, .. } => ("slice", element_type, None),
+        };
+        let element_class = self.value_class_in_root(root, &element_type)?;
+        if element_class.copy_kind == ValueCopyKind::MoveOnly {
+            bail!("fold element type must be copyable in phase 13");
+        }
+        if element_class.contains_reference {
+            bail!("fold element type must not carry references in phase 13");
+        }
+        let init = self.type_expr_with_locals(
+            current_module,
+            init,
+            root,
+            param_names,
+            param_types,
+            region_scope,
+            locals,
+        )?;
+        // Anchor the accumulator to the enclosing binding's declared type when the
+        // init is assignable to it, so a structural record-literal init builds in
+        // the destination (named, declaration-order) layout instead of its sorted
+        // structural layout. Falls back to the inferred init type otherwise, which
+        // keeps the outer assignability check (and any layout mismatch) intact.
+        let acc_type = match expected_acc_type {
+            Some(expected)
+                if expected != init.type_hash.as_str()
+                    && self.type_assignable_in_root(root, &init.type_hash, expected)? =>
+            {
+                expected.to_string()
+            }
+            _ => init.type_hash.clone(),
+        };
+        let acc_class = self.value_class_in_root(root, &acc_type)?;
+        if acc_class.copy_kind == ValueCopyKind::MoveOnly {
+            bail!("fold accumulator type must be copyable in phase 13");
+        }
+        if acc_class.contains_reference {
+            bail!("fold accumulator type must not carry references in phase 13");
+        }
+        locals.push(LocalTypeBinding {
+            name: item.to_string(),
+            type_hash: element_type.clone(),
+        });
+        locals.push(LocalTypeBinding {
+            name: acc.to_string(),
+            type_hash: acc_type.clone(),
+        });
+        let body = self.type_expr_with_locals(
+            current_module,
+            body,
+            root,
+            param_names,
+            param_types,
+            region_scope,
+            locals,
+        );
+        locals.pop();
+        locals.pop();
+        let body = body?;
+        if !self.type_assignable_in_root(root, &body.type_hash, &acc_type)? {
+            bail!(
+                "fold body returns {}, expected accumulator type {}",
+                self.type_name(&body.type_hash)?,
+                self.type_name(&acc_type)?
+            );
+        }
+        let mut payload = json!({
+            "expr_kind": "fold",
+            "item_name": item,
+            "acc_name": acc,
+            "target": target.expr_hash,
+            "target_type": target.type_hash,
+            "target_kind": target_kind,
+            "element_type": element_type,
+            "init": init.expr_hash,
+            "acc_type": acc_type,
+            "body": body.expr_hash,
+            "type": acc_type,
+        });
+        if let Some(len) = len {
+            payload["len"] = JsonValue::from(len);
+        }
+        let expr_hash = self.put_object("Expression", &payload)?;
+        self.write_cache_json(
+            &expr_hash,
+            "typechecker",
+            "typed-dag",
+            ArtifactKind::TypedExpression,
+            &json!({ "type": acc_type }),
+        )?;
+        Ok(TypeCheckResult {
+            expr_hash,
+            type_hash: acc_type,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn type_expr_with_locals(
         &mut self,
@@ -2860,15 +3008,40 @@ impl CodeDb {
                 validate_projection_identifier("let binding", name)?;
                 let binding_type =
                     self.resolve_type_in_root_with_regions(current_module, root, ty, region_scope)?;
-                let value = self.type_expr_with_locals(
-                    current_module,
-                    value,
-                    root,
-                    param_names,
-                    param_types,
-                    region_scope,
-                    locals,
-                )?;
+                // Pass the declared binding type into a fold value so its
+                // accumulator is anchored to the destination layout (see
+                // `type_fold_expr`); other value forms type without a hint.
+                let value = match value.as_ref() {
+                    RawExpr::Fold {
+                        item,
+                        target,
+                        acc,
+                        init,
+                        body,
+                    } => self.type_fold_expr(
+                        current_module,
+                        item,
+                        target,
+                        acc,
+                        init,
+                        body,
+                        root,
+                        param_names,
+                        param_types,
+                        region_scope,
+                        locals,
+                        Some(&binding_type),
+                    )?,
+                    _ => self.type_expr_with_locals(
+                        current_module,
+                        value,
+                        root,
+                        param_names,
+                        param_types,
+                        region_scope,
+                        locals,
+                    )?,
+                };
                 if !self.type_assignable_in_root(root, &value.type_hash, &binding_type)? {
                     require_type(&value.type_hash, &binding_type, "let binding", self)?;
                 }
@@ -2979,112 +3152,20 @@ impl CodeDb {
                 acc,
                 init,
                 body,
-            } => {
-                validate_projection_identifier("fold item binding", item)?;
-                validate_projection_identifier("fold accumulator binding", acc)?;
-                if item == acc {
-                    bail!("fold item and accumulator bindings must be distinct");
-                }
-                let target = self.type_expr_with_locals(
-                    current_module,
-                    target,
-                    root,
-                    param_names,
-                    param_types,
-                    region_scope,
-                    locals,
-                )?;
-                let info = self.indexed_element_type_in_root(root, &target.type_hash)?;
-                let (target_kind, element_type, len) = match info {
-                    IndexedElementInfo::FixedArray {
-                        element_type, len, ..
-                    } => {
-                        if !self.typed_expr_is_place(&target.expr_hash)? {
-                            bail!("fold over a fixed array requires an addressable array place");
-                        }
-                        ("fixed_array", element_type, Some(len))
-                    }
-                    IndexedElementInfo::Slice { element_type, .. } => ("slice", element_type, None),
-                };
-                let element_class = self.value_class_in_root(root, &element_type)?;
-                if element_class.copy_kind == ValueCopyKind::MoveOnly {
-                    bail!("fold element type must be copyable in phase 13");
-                }
-                if element_class.contains_reference {
-                    bail!("fold element type must not carry references in phase 13");
-                }
-                let init = self.type_expr_with_locals(
-                    current_module,
-                    init,
-                    root,
-                    param_names,
-                    param_types,
-                    region_scope,
-                    locals,
-                )?;
-                let acc_class = self.value_class_in_root(root, &init.type_hash)?;
-                if acc_class.copy_kind == ValueCopyKind::MoveOnly {
-                    bail!("fold accumulator type must be copyable in phase 13");
-                }
-                if acc_class.contains_reference {
-                    bail!("fold accumulator type must not carry references in phase 13");
-                }
-                locals.push(LocalTypeBinding {
-                    name: item.clone(),
-                    type_hash: element_type.clone(),
-                });
-                locals.push(LocalTypeBinding {
-                    name: acc.clone(),
-                    type_hash: init.type_hash.clone(),
-                });
-                let body = self.type_expr_with_locals(
-                    current_module,
-                    body,
-                    root,
-                    param_names,
-                    param_types,
-                    region_scope,
-                    locals,
-                );
-                locals.pop();
-                locals.pop();
-                let body = body?;
-                if !self.type_assignable_in_root(root, &body.type_hash, &init.type_hash)? {
-                    bail!(
-                        "fold body returns {}, expected accumulator type {}",
-                        self.type_name(&body.type_hash)?,
-                        self.type_name(&init.type_hash)?
-                    );
-                }
-                let mut payload = json!({
-                    "expr_kind": "fold",
-                    "item_name": item,
-                    "acc_name": acc,
-                    "target": target.expr_hash,
-                    "target_type": target.type_hash,
-                    "target_kind": target_kind,
-                    "element_type": element_type,
-                    "init": init.expr_hash,
-                    "acc_type": init.type_hash,
-                    "body": body.expr_hash,
-                    "type": init.type_hash,
-                });
-                if let Some(len) = len {
-                    payload["len"] = JsonValue::from(len);
-                }
-                let expr_hash = self.put_object("Expression", &payload)?;
-                self.write_cache_json(
-                    &expr_hash,
-                    "typechecker",
-                    "typed-dag",
-                    ArtifactKind::TypedExpression,
-                    &json!({ "type": init.type_hash }),
-                )?;
-                Ok(TypeCheckResult {
-                    expr_hash,
-                    type_hash: init.type_hash,
-                })
-            }
+            } => self.type_fold_expr(
+                current_module,
+                item,
+                target,
+                acc,
+                init,
+                body,
+                root,
+                param_names,
+                param_types,
+                region_scope,
+                locals,
+                None,
+            ),
             RawExpr::Array { elements } => {
                 if elements.is_empty() {
                     bail!("array literal must have at least one element");
@@ -3506,6 +3587,15 @@ impl CodeDb {
                 }
                 let (region_name, region_hash) =
                     self.resolve_single_region_for_builtin(region_scope, name)?;
+                // Fail closed on a reference target. `indexed_element_type_in_root`
+                // auto-derefs references (correct for indexing, which lowers a
+                // deref), but `lower_slice_from_array` uses the target type
+                // directly, so `slice(&array)` would type-check yet have no native
+                // layout (no element_type_hash) and fail only at build. Reject it
+                // here like `subslice`/`len` do, so verify is a sound native gate.
+                if let TypeSpec::Reference { .. } = self.type_spec_in_root(root, &target.type_hash)? {
+                    bail!("{name} target must be a fixed array, not a reference");
+                }
                 let info = self.indexed_element_type_in_root(root, &target.type_hash)?;
                 let IndexedElementInfo::FixedArray {
                     container_type,
@@ -5857,17 +5947,29 @@ impl CodeDb {
     /// Map a borrow-target expression to the `LoanPlace` (root slot + field
     /// path) it names.
     ///
-    /// LOAD-BEARING INVARIANT for exclusivity: two distinct `LoanPlace`s must
-    /// denote disjoint storage, so that `places_overlap` can decide loan
-    /// conflicts purely structurally. This holds today only because a borrow
-    /// target can be rooted at a `param_ref`/`local_ref` plus `field_access`
-    /// projections — there is NO deref/reborrow place form (`&mut *r`), so a
-    /// borrow can never alias storage reached through another reference's
-    /// pointee. `param_types` is intentionally unused for that reason.
+    /// LOAD-BEARING INVARIANT for exclusivity: `places_overlap` decides loan
+    /// conflicts purely structurally, so two `LoanPlace`s denoting the SAME
+    /// storage must compare as overlapping.
     ///
-    /// If a deref/reborrow place form is ever added, this function MUST resolve
-    /// it to the pointee's recorded loan identity (not the syntactic path), or
-    /// the disjointness invariant breaks and aliasing `&mut` would be accepted.
+    /// Note this is NOT guaranteed by the absence of a deref place form: a borrow
+    /// target CAN traverse a reference field — e.g. `&mut editor.line.x` where
+    /// `editor.line: &mut Line` is accepted, because the `field_access` arm
+    /// recurses through its target unconditionally. The resulting loan place is
+    /// the syntactic path (`{editor,[line,x]}`), NOT the pointee's identity, so it
+    /// does NOT structurally overlap a loan on the pointee (`{line,[]}`).
+    /// Exclusivity nonetheless holds today because of affine `&mut` uniqueness:
+    /// building `editor` consumed a `&mut line`, leaving a covering loan over all
+    /// of `line` that blocks every DIRECT path to `line.x`, while the only other
+    /// path (`editor.line.x`) has a single self-conflicting loan identity — so two
+    /// live aliasing `&mut` cannot be constructed. `param_types` is unused because
+    /// the path, not the pointee type, is what is compared.
+    ///
+    /// If a place form is ever added that reaches a pointee WITHOUT keeping the
+    /// originating `&mut`'s covering loan live (a reborrow that splits a loan,
+    /// moving a `&mut` field out of its record, partial/field-granular loans, or a
+    /// raw-pointer deref), this path-based identity becomes unsound and aliasing
+    /// `&mut` would be accepted. Such a form MUST resolve to the pointee's
+    /// recorded loan identity (not the syntactic path) instead.
     fn loan_place_for_expr(
         &self,
         expr_hash: &str,
@@ -6415,6 +6517,9 @@ impl CodeDb {
                 if mutable && !self.typed_expr_is_assignable_place(root, target)? {
                     bail!("slice_from_array mutable target must be assignable");
                 }
+                if let TypeSpec::Reference { .. } = self.type_spec_in_root(root, &target_type)? {
+                    bail!("slice_from_array target must be a fixed array, not a reference");
+                }
                 let IndexedElementInfo::FixedArray {
                     container_type,
                     element_type,
@@ -6705,10 +6810,19 @@ impl CodeDb {
                     allowed_regions,
                     locals,
                 )?;
-                if payload.get("acc_type").and_then(JsonValue::as_str) != Some(init_type.as_str()) {
+                // `acc_type` may be anchored to an enclosing binding's named type
+                // (see `type_fold_expr`), so require the init to be assignable to
+                // it rather than identical. `acc_type` then governs the accumulator
+                // slot, the body type, and the fold result type.
+                let acc_type = payload
+                    .get("acc_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("fold missing acc_type"))?
+                    .to_string();
+                if !self.type_assignable_in_root(root, &init_type, &acc_type)? {
                     bail!("fold acc_type mismatch");
                 }
-                let acc_class = self.value_class_in_root(root, &init_type)?;
+                let acc_class = self.value_class_in_root(root, &acc_type)?;
                 if acc_class.copy_kind == ValueCopyKind::MoveOnly {
                     bail!("fold accumulator type must be copyable in phase 13");
                 }
@@ -6716,7 +6830,7 @@ impl CodeDb {
                     bail!("fold accumulator type must not carry references in phase 13");
                 }
                 locals.push(element_type);
-                locals.push(init_type.clone());
+                locals.push(acc_type.clone());
                 let body_type = self.verify_expr_type_with_locals(
                     body_hash,
                     root,
@@ -6727,10 +6841,10 @@ impl CodeDb {
                 locals.pop();
                 locals.pop();
                 let body_type = body_type?;
-                if !self.type_assignable_in_root(root, &body_type, &init_type)? {
+                if !self.type_assignable_in_root(root, &body_type, &acc_type)? {
                     bail!("fold body type mismatch");
                 }
-                init_type
+                acc_type
             }
             "array_literal" => {
                 let elements = payload

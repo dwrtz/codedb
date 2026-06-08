@@ -434,6 +434,58 @@ fn bad<'a>(s: slice<'a, Line>) -> i64 effects[state] =
         ));
 }
 
+#[test]
+fn slice_of_reference_target_is_rejected_at_import() {
+    // `slice(r)` / `mut_slice(r)` where `r` is a *reference to* an array must be
+    // rejected at import. The type checker auto-derefs references when resolving
+    // an element type (correct for indexing, which lowers a deref), but slice
+    // construction lowers the target type directly and a reference has no array
+    // element layout — so such a program used to type-check and `verify ok` yet
+    // fail only at native build. Verify must be a sound native gate: fail closed
+    // here, like `subslice`/`len` already do.
+    let temp = tempdir().unwrap();
+
+    let mut_db = temp.path().join("slice-mut-ref.sqlite");
+    let mut_source = temp.path().join("slice-mut-ref.cdb");
+    std::fs::write(
+        &mut_source,
+        r#"
+fn bad<'a>(r: &'a mut array<i64, 3>) -> i64 effects[state] =
+  let s: mut_slice<'a, i64> = mut_slice(r) in
+  s[0]
+"#,
+    )
+    .unwrap();
+    run(&["init", path(&mut_db)]);
+    bin()
+        .args(["import", path(&mut_db), path(&mut_source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "mut_slice target must be a fixed array, not a reference",
+        ));
+
+    let shared_db = temp.path().join("slice-shared-ref.sqlite");
+    let shared_source = temp.path().join("slice-shared-ref.cdb");
+    std::fs::write(
+        &shared_source,
+        r#"
+fn bad<'a>(r: &'a array<i64, 3>) -> i64 =
+  let s: slice<'a, i64> = slice(r) in
+  s[0]
+"#,
+    )
+    .unwrap();
+    run(&["init", path(&shared_db)]);
+    bin()
+        .args(["import", path(&shared_db), path(&shared_source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "slice target must be a fixed array, not a reference",
+        ));
+}
+
 fn op_names(ir: &JsonValue) -> Vec<String> {
     ir["ir"]["operations"]
         .as_array()

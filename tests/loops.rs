@@ -275,6 +275,68 @@ fn bad<'a>() -> i64 =
         .stderr(predicate::str::contains("live mutable borrow"));
 }
 
+#[test]
+fn fold_with_record_literal_accumulator_init_builds_native() {
+    // A fold whose accumulator `init` is a bare record literal infers a
+    // *structural* (alphabetically ordered) record type. When the fold result is
+    // bound to a non-alphabetical named record, the accumulator is anchored to
+    // that named type so init and body build directly in the destination
+    // (declaration-order) layout. Without anchoring, the fold result would need a
+    // layout-incompatible blind copy and lowering failed closed at build, forcing
+    // an explicit `let init: T = <literal>` workaround. Regression: this must now
+    // type-check, verify, and agree native==oracle without the workaround.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("fold-record-acc.sqlite");
+    let source = temp.path().join("fold-record-acc.cdb");
+    std::fs::write(
+        &source,
+        r#"
+record Acc {
+  b: i64
+  a: i64
+}
+
+fn main() -> i64 =
+  let xs: array<i64, 3> = [1, 2, 3] in
+  let r: Acc =
+    fold v in xs with acc = {b: 0, a: 0} do
+      {b: acc.b + v, a: acc.a + 1}
+  in
+  r.b * 100 + r.a
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    // b accumulates the sum (1+2+3 = 6), a the count (3); 6*100 + 3 = 603. A
+    // field-order swap (the layout bug class) would compute 3*100 + 6 = 306.
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "603");
+    run(&["verify", path(&db)]);
+
+    if can_build_default_native_target() {
+        run(&[
+            "create-test",
+            path(&db),
+            "fold_record_acc_native",
+            "--entry",
+            "main",
+            "--expect-i64",
+            "603",
+            "--native-required",
+            "--json",
+        ]);
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["native_mismatches"], 0);
+        assert_eq!(report["tests"][0]["native"]["status"], "passed");
+        assert_eq!(
+            report["tests"][0]["native"]["comparison"]["actual"],
+            json!({"kind": "i64", "value": "603"})
+        );
+    }
+}
+
 fn op_names(ir: &JsonValue) -> Vec<String> {
     ir["ir"]["operations"]
         .as_array()
