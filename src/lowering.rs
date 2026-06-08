@@ -9,7 +9,7 @@ use crate::artifact::CacheKeyInput;
 use crate::backend::ArtifactKind;
 use crate::model::{ProgramRootPayload, RootSymbolPayload, validate_projection_identifier};
 use crate::store::{CodeDb, canonical_json, hash_bytes};
-use crate::types::{TypeDefinition, TypeSpec, type_hash_for};
+use crate::types::{TypeDefinition, TypeSpec, is_static_region, type_hash_for};
 use crate::{BYTES_DOMAIN, DEFAULT_NATIVE_TARGET, MAIN_BRANCH};
 
 pub(crate) const LOWERED_IR_SCHEMA: &str = "codedb/lowered-function-ir/v2";
@@ -316,6 +316,13 @@ pub(crate) enum LoweredOp {
     AddrOfIndex {
         id: String,
         place: LoweredPlace,
+    },
+    StaticDataAddress {
+        id: String,
+        static_data_hash: String,
+        bytes_hex: String,
+        len: u64,
+        element_type_hash: String,
     },
     ConstructSlice {
         id: String,
@@ -842,6 +849,7 @@ impl CodeDb {
                     type_hash,
                 })
             }
+            "static_bytes" => self.lower_static_bytes(root, expr_hash, &type_hash, ctx),
             "param_ref" => {
                 self.lower_place_value(root, expr_hash, &type_hash, param_types, ctx, locals)
             }
@@ -2035,6 +2043,88 @@ impl CodeDb {
             element_type_hash: array_info.element_type_hash,
             type_hash: type_hash.to_string(),
         });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash.to_string(),
+        })
+    }
+
+    fn lower_static_bytes(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        ctx: &mut LowerCtx,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let static_data_hash = payload
+            .get("static_data")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("static_bytes missing static_data"))?
+            .to_string();
+        let bytes_hex = self.static_data_bytes_hex(&static_data_hash)?;
+        let len = u64::try_from(bytes_hex.len() / 2)?;
+        if payload.get("bytes_len").and_then(JsonValue::as_u64) != Some(len) {
+            bail!("static_bytes bytes_len mismatch while lowering");
+        }
+        let element_type_hash = payload
+            .get("element_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("static_bytes missing element_type"))?
+            .to_string();
+        if element_type_hash != type_hash_for("U8") {
+            bail!("static_bytes element_type must be u8 while lowering");
+        }
+        match self.type_spec(type_hash)? {
+            TypeSpec::Slice {
+                region,
+                mutable: false,
+                element,
+            } if is_static_region(&region) && element == element_type_hash => {}
+            _ => bail!("static_bytes result must be slice<'static, u8>"),
+        }
+
+        let data_id = ctx.value();
+        ctx.push_debug_op(expr_hash, "static_data_address", &data_id);
+        let len_id = ctx.value();
+        ctx.push_debug_op(expr_hash, "const_i64", &len_id);
+        let slot_size =
+            stack_slot_size_bytes(self.layout_size_bytes(root, ctx.target_triple(), type_hash)?);
+        let slot = ctx.local_slot(type_hash.to_string(), slot_size);
+        let address = ctx.value();
+        ctx.push_debug_op(expr_hash, "addr_of_local", &address);
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "construct_slice", &id);
+        let operations = vec![
+            LoweredOp::StaticDataAddress {
+                id: data_id.clone(),
+                static_data_hash,
+                bytes_hex,
+                len,
+                element_type_hash: element_type_hash.clone(),
+            },
+            LoweredOp::ConstI64 {
+                id: len_id.clone(),
+                value: len.to_string(),
+                type_hash: type_hash_for("I64"),
+            },
+            LoweredOp::AddrOfLocal {
+                id: address.clone(),
+                place: LoweredPlace::Local {
+                    slot,
+                    type_hash: type_hash.to_string(),
+                },
+            },
+            LoweredOp::ConstructSlice {
+                id: id.clone(),
+                address,
+                data_address: data_id,
+                len: len_id,
+                element_type_hash,
+                type_hash: type_hash.to_string(),
+            },
+        ];
         Ok(LoweredExpr {
             operations,
             value: id,
@@ -5152,6 +5242,25 @@ impl CodeDb {
                         insert_value(values, id, type_hash)?;
                     }
                 }
+                LoweredOp::StaticDataAddress {
+                    id,
+                    static_data_hash,
+                    bytes_hex,
+                    len,
+                    element_type_hash,
+                } => {
+                    if element_type_hash != &type_hash_for("U8") {
+                        bail!("lowered static_data_address element type must be u8");
+                    }
+                    let expected = self.static_data_bytes_hex(static_data_hash)?;
+                    if &expected != bytes_hex {
+                        bail!("lowered static_data_address bytes mismatch");
+                    }
+                    if bytes_hex.len() / 2 != usize::try_from(*len)? {
+                        bail!("lowered static_data_address len mismatch");
+                    }
+                    insert_address(addresses, id, element_type_hash)?;
+                }
                 LoweredOp::ConstructSlice {
                     id,
                     address,
@@ -5677,6 +5786,7 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::AddrOfField { id, .. }
         | LoweredOp::AddrOfEnumPayload { id, .. }
         | LoweredOp::AddrOfIndex { id, .. }
+        | LoweredOp::StaticDataAddress { id, .. }
         | LoweredOp::ConstructSlice { id, .. }
         | LoweredOp::SliceLen { id, .. }
         | LoweredOp::SliceData { id, .. }
@@ -5719,6 +5829,7 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::AddrOfField { .. } => "addr_of_field",
         LoweredOp::AddrOfEnumPayload { .. } => "addr_of_enum_payload",
         LoweredOp::AddrOfIndex { .. } => "addr_of_index",
+        LoweredOp::StaticDataAddress { .. } => "static_data_address",
         LoweredOp::ConstructSlice { .. } => "construct_slice",
         LoweredOp::SliceLen { .. } => "slice_len",
         LoweredOp::SliceData { .. } => "slice_data",
@@ -5879,6 +5990,11 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
                 ..
             } => {
                 out.insert(type_hash.clone());
+                out.insert(element_type_hash.clone());
+            }
+            LoweredOp::StaticDataAddress {
+                element_type_hash, ..
+            } => {
                 out.insert(element_type_hash.clone());
             }
             LoweredOp::SliceLen {

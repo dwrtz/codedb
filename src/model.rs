@@ -154,6 +154,9 @@ pub(crate) enum TestValue {
     I64 {
         value: String,
     },
+    U8 {
+        value: u8,
+    },
     Bool {
         value: bool,
     },

@@ -816,6 +816,12 @@ fn append_default_arg_to_calls(expr: &RawExpr, target_name: &str, default: &RawE
             value: value.clone(),
         },
         RawExpr::LiteralBool { value } => RawExpr::LiteralBool { value: *value },
+        RawExpr::LiteralString { value } => RawExpr::LiteralString {
+            value: value.clone(),
+        },
+        RawExpr::LiteralBytes { bytes_hex } => RawExpr::LiteralBytes {
+            bytes_hex: bytes_hex.clone(),
+        },
         RawExpr::Unit => RawExpr::Unit,
         RawExpr::ParamRef { index } => RawExpr::ParamRef { index: *index },
         RawExpr::ParamName { name } => RawExpr::ParamName { name: name.clone() },
@@ -6321,6 +6327,12 @@ fn normalize_param_refs_scoped(
             value: value.clone(),
         },
         RawExpr::LiteralBool { value } => RawExpr::LiteralBool { value: *value },
+        RawExpr::LiteralString { value } => RawExpr::LiteralString {
+            value: value.clone(),
+        },
+        RawExpr::LiteralBytes { bytes_hex } => RawExpr::LiteralBytes {
+            bytes_hex: bytes_hex.clone(),
+        },
         RawExpr::Unit => RawExpr::Unit,
         RawExpr::ParamRef { index } => RawExpr::ParamRef { index: *index },
         RawExpr::ParamName { name } => {

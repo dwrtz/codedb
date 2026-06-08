@@ -13,6 +13,79 @@ use crate::model::{
 use crate::store::{CodeDb, canonical_json, hash_object_canonical};
 use crate::{ABI_TAG, DEFAULT_NATIVE_TARGET, MAIN_BRANCH, SCHEMA_VERSION};
 
+pub(crate) fn static_region_hash() -> String {
+    hash_object_canonical(
+        "SymbolBirth",
+        SCHEMA_VERSION,
+        &canonical_json(&static_region_payload()),
+    )
+}
+
+pub(crate) fn is_static_region(region: &str) -> bool {
+    region == static_region_hash()
+}
+
+fn static_region_payload() -> JsonValue {
+    json!({
+        "symbol_kind": "region_param",
+        "birth_history_hash": "genesis",
+        "local_nonce": "builtin:static",
+    })
+}
+
+pub(crate) fn static_data_payload(bytes_hex: &str, len: usize) -> Result<JsonValue> {
+    validate_hex_bytes(bytes_hex)?;
+    if bytes_hex.len() != len * 2 {
+        bail!("static data len does not match bytes_hex");
+    }
+    Ok(json!({
+        "schema": "codedb/static-data/v1",
+        "bytes_hex": bytes_hex,
+        "len": len as u64,
+    }))
+}
+
+pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+pub(crate) fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
+    validate_hex_bytes(hex)?;
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let raw = hex.as_bytes();
+    for idx in (0..raw.len()).step_by(2) {
+        bytes.push((hex_value(raw[idx])? << 4) | hex_value(raw[idx + 1])?);
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn validate_hex_bytes(hex: &str) -> Result<()> {
+    if !hex.len().is_multiple_of(2) {
+        bail!("hex byte string must have even length");
+    }
+    for byte in hex.bytes() {
+        let valid = byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
+        if !valid {
+            bail!("hex byte string must use lowercase hex digits");
+        }
+    }
+    Ok(())
+}
+
+fn hex_value(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => bail!("invalid hex digit"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParamSpec {
@@ -216,6 +289,7 @@ enum LoanKind {
 enum LoanRoot {
     Param(usize),
     Local(usize),
+    Static(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,9 +417,10 @@ pub(crate) struct ExternalFunctionMetadata {
 
 impl CodeDb {
     pub(crate) fn insert_builtin_types(&mut self) -> Result<()> {
-        for type_name in ["I64", "Bool", "Unit"] {
+        for type_name in ["I64", "Bool", "Unit", "U8"] {
             self.put_object("Type", &json!({ "type_kind": type_name }))?;
         }
+        self.put_object("SymbolBirth", &static_region_payload())?;
         Ok(())
     }
 
@@ -680,6 +755,8 @@ impl CodeDb {
     pub(crate) fn type_name(&self, hash: &str) -> Result<String> {
         if hash == type_hash_for("I64") {
             Ok("i64".to_string())
+        } else if hash == type_hash_for("U8") {
+            Ok("u8".to_string())
         } else if hash == type_hash_for("Bool") {
             Ok("bool".to_string())
         } else if hash == type_hash_for("Unit") {
@@ -697,6 +774,9 @@ impl CodeDb {
         if hash == type_hash_for("I64") {
             return Ok("i64".to_string());
         }
+        if hash == type_hash_for("U8") {
+            return Ok("u8".to_string());
+        }
         if hash == type_hash_for("Bool") {
             return Ok("bool".to_string());
         }
@@ -712,6 +792,7 @@ impl CodeDb {
                 let region_name = region_names
                     .get(&region)
                     .map(String::as_str)
+                    .or_else(|| is_static_region(&region).then_some("static"))
                     .unwrap_or(region.as_str());
                 let referent = self.type_name_with_regions(&referent, region_names)?;
                 if mutable {
@@ -736,6 +817,7 @@ impl CodeDb {
                 let region_name = region_names
                     .get(&region)
                     .map(String::as_str)
+                    .or_else(|| is_static_region(&region).then_some("static"))
                     .unwrap_or(region.as_str());
                 let element = self.type_name_with_regions(&element, region_names)?;
                 if mutable {
@@ -798,6 +880,9 @@ impl CodeDb {
         if hash == type_hash_for("I64") {
             return Ok("i64".to_string());
         }
+        if hash == type_hash_for("U8") {
+            return Ok("u8".to_string());
+        }
         if hash == type_hash_for("Bool") {
             return Ok("bool".to_string());
         }
@@ -833,6 +918,7 @@ impl CodeDb {
                 let region_name = region_names
                     .get(&region)
                     .map(String::as_str)
+                    .or_else(|| is_static_region(&region).then_some("static"))
                     .unwrap_or(region.as_str());
                 let referent = self.type_name_in_root_with_regions(
                     root,
@@ -876,6 +962,7 @@ impl CodeDb {
                 let region_name = region_names
                     .get(&region)
                     .map(String::as_str)
+                    .or_else(|| is_static_region(&region).then_some("static"))
                     .unwrap_or(region.as_str());
                 let element = self.type_name_in_root_with_regions(
                     root,
@@ -941,6 +1028,9 @@ impl CodeDb {
     pub(crate) fn type_spec(&self, hash: &str) -> Result<TypeSpec> {
         if hash == type_hash_for("I64") {
             return Ok(TypeSpec::Builtin("I64".to_string()));
+        }
+        if hash == type_hash_for("U8") {
+            return Ok(TypeSpec::Builtin("U8".to_string()));
         }
         if hash == type_hash_for("Bool") {
             return Ok(TypeSpec::Builtin("Bool".to_string()));
@@ -2700,6 +2790,14 @@ impl CodeDb {
                     type_hash,
                 })
             }
+            RawExpr::LiteralString { value } => {
+                let bytes_hex = bytes_to_hex(value.as_bytes());
+                self.type_static_bytes_literal(bytes_hex, "string")
+            }
+            RawExpr::LiteralBytes { bytes_hex } => {
+                let bytes = hex_to_bytes(bytes_hex)?;
+                self.type_static_bytes_literal(bytes_to_hex(&bytes), "bytes")
+            }
             RawExpr::Unit => {
                 let type_hash = type_hash_for("Unit");
                 let expr_hash = self.put_object(
@@ -3040,6 +3138,7 @@ impl CodeDb {
                     bail!("shared borrow target must be an addressable place");
                 }
                 let (region_name, region_hash) = match region {
+                    Some(name) if name == "static" => ("static".to_string(), static_region_hash()),
                     Some(name) => (
                         name.clone(),
                         region_scope
@@ -3106,6 +3205,7 @@ impl CodeDb {
                     bail!("mutable borrow target must be a mutable semantic place");
                 }
                 let (region_name, region_hash) = match region {
+                    Some(name) if name == "static" => bail!("mutable borrow cannot use 'static"),
                     Some(name) => (
                         name.clone(),
                         region_scope
@@ -3963,6 +4063,54 @@ impl CodeDb {
         }
     }
 
+    fn type_static_bytes_literal(
+        &mut self,
+        bytes_hex: String,
+        literal_kind: &str,
+    ) -> Result<TypeCheckResult> {
+        validate_hex_bytes(&bytes_hex)?;
+        let len = bytes_hex.len() / 2;
+        if literal_kind == "string" {
+            String::from_utf8(hex_to_bytes(&bytes_hex)?)
+                .map_err(|_| anyhow!("string literal bytes must be utf8"))?;
+        } else if literal_kind != "bytes" {
+            bail!("unknown static literal kind {literal_kind}");
+        }
+
+        let data_hash = self.put_object("StaticData", &static_data_payload(&bytes_hex, len)?)?;
+        let element_type = type_hash_for("U8");
+        let region = static_region_hash();
+        let type_hash = self.put_structural_type(TypeSpec::Slice {
+            region: region.clone(),
+            mutable: false,
+            element: element_type.clone(),
+        })?;
+        let expr_hash = self.put_object(
+            "Expression",
+            &json!({
+                "expr_kind": "static_bytes",
+                "static_data": data_hash,
+                "literal_kind": literal_kind,
+                "bytes_len": len as u64,
+                "region": region,
+                "region_name": "static",
+                "element_type": element_type,
+                "type": type_hash,
+            }),
+        )?;
+        self.write_cache_json(
+            &expr_hash,
+            "typechecker",
+            "typed-dag",
+            ArtifactKind::TypedExpression,
+            &json!({ "type": type_hash }),
+        )?;
+        Ok(TypeCheckResult {
+            expr_hash,
+            type_hash,
+        })
+    }
+
     fn type_builtin_box_new(
         &mut self,
         current_module: &str,
@@ -4467,7 +4615,9 @@ impl CodeDb {
             .and_then(JsonValue::as_str)
             .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?;
         match expr_kind {
-            "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" => Ok(false),
+            "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref" => {
+                Ok(false)
+            }
             "local_ref" => {
                 let depth = payload
                     .get("depth")
@@ -4926,7 +5076,7 @@ impl CodeDb {
                     );
                 }
                 for region in region_args {
-                    if !allowed_regions.contains(&region) {
+                    if !allowed_regions.contains(&region) && !is_static_region(&region) {
                         bail!("invalid region reference {region}");
                     }
                 }
@@ -4935,7 +5085,7 @@ impl CodeDb {
             TypeSpec::Reference {
                 region, referent, ..
             } => {
-                if !allowed_regions.contains(&region) {
+                if !allowed_regions.contains(&region) && !is_static_region(&region) {
                     bail!("invalid region reference {region}");
                 }
                 self.validate_type_hash_in_root(root, &referent, allowed_regions)
@@ -4949,7 +5099,7 @@ impl CodeDb {
             TypeSpec::Slice {
                 region, element, ..
             } => {
-                if !allowed_regions.contains(&region) {
+                if !allowed_regions.contains(&region) && !is_static_region(&region) {
                     bail!("invalid region reference {region}");
                 }
                 self.validate_type_hash_in_root(root, &element, allowed_regions)
@@ -5053,7 +5203,7 @@ impl CodeDb {
             .and_then(JsonValue::as_str)
             .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
         {
-            "literal_i64" | "literal_bool" | "literal_unit" => Ok(()),
+            "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" => Ok(()),
             "param_ref" | "local_ref" => match expr_use {
                 ExprUse::Place => {
                     let place = self.loan_place_for_expr(expr_hash, param_types, &state.locals)?;
@@ -6592,6 +6742,16 @@ impl CodeDb {
                 place.fields.push(self.array_index_place_segment(index)?);
                 Ok(place)
             }
+            "static_bytes" => {
+                let static_data = payload
+                    .get("static_data")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("static_bytes missing static_data"))?;
+                Ok(LoanPlace {
+                    root: LoanRoot::Static(static_data.to_string()),
+                    fields: Vec::new(),
+                })
+            }
             other => bail!("borrow target {other} is not an addressable place"),
         }
     }
@@ -6670,9 +6830,8 @@ impl CodeDb {
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
             {
-                "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" | "local_ref" => {
-                    false
-                }
+                "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref"
+                | "local_ref" => false,
                 "assign" => true,
                 "call" => {
                     let mut required = false;
@@ -6794,9 +6953,8 @@ impl CodeDb {
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
             {
-                "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" | "local_ref" => {
-                    false
-                }
+                "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref"
+                | "local_ref" => false,
                 "box_new" => true,
                 "assign" => {
                     self.expr_child_requires_alloc(&payload, "target")?
@@ -6921,9 +7079,8 @@ impl CodeDb {
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
             {
-                "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" | "local_ref" => {
-                    false
-                }
+                "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref"
+                | "local_ref" => false,
                 "raw_ptr_cast" | "raw_load" | "raw_store" => true,
                 "assign" => {
                     self.expr_child_requires_unsafe(&payload, "target")?
@@ -7076,6 +7233,48 @@ impl CodeDb {
             "literal_i64" => type_hash_for("I64"),
             "literal_bool" => type_hash_for("Bool"),
             "literal_unit" => type_hash_for("Unit"),
+            "static_bytes" => {
+                let data_hash = payload
+                    .get("static_data")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("static_bytes missing static_data"))?;
+                let bytes_hex = self.static_data_bytes_hex(data_hash)?;
+                let len = u64::try_from(bytes_hex.len() / 2)?;
+                if payload.get("bytes_len").and_then(JsonValue::as_u64) != Some(len) {
+                    bail!("static_bytes bytes_len mismatch");
+                }
+                let literal_kind = payload
+                    .get("literal_kind")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("static_bytes missing literal_kind"))?;
+                match literal_kind {
+                    "string" => {
+                        String::from_utf8(hex_to_bytes(&bytes_hex)?)
+                            .map_err(|_| anyhow!("string literal static data is not utf8"))?;
+                    }
+                    "bytes" => {}
+                    other => bail!("unknown static literal kind {other}"),
+                }
+                let region = payload
+                    .get("region")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("static_bytes missing region"))?;
+                if !is_static_region(region) {
+                    bail!("static_bytes region must be 'static");
+                }
+                let element_type = payload
+                    .get("element_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("static_bytes missing element_type"))?;
+                if element_type != type_hash_for("U8") {
+                    bail!("static_bytes element_type must be u8");
+                }
+                hash_for_type_spec(&TypeSpec::Slice {
+                    region: region.to_string(),
+                    mutable: false,
+                    element: element_type.to_string(),
+                })?
+            }
             "param_ref" => {
                 let index = payload
                     .get("index")
@@ -7247,7 +7446,7 @@ impl CodeDb {
                     .get("region")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_shared missing region"))?;
-                if !allowed_regions.contains(region) {
+                if !allowed_regions.contains(region) && !is_static_region(region) {
                     bail!("invalid region reference {region}");
                 }
                 let referent_type = payload
@@ -7283,7 +7482,7 @@ impl CodeDb {
                     .get("region")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("borrow_mut missing region"))?;
-                if !allowed_regions.contains(region) {
+                if !allowed_regions.contains(region) && !is_static_region(region) {
                     bail!("invalid region reference {region}");
                 }
                 let referent_type = payload
@@ -7327,7 +7526,7 @@ impl CodeDb {
                     .get("region")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("slice_from_array missing region"))?;
-                if !allowed_regions.contains(region) {
+                if !allowed_regions.contains(region) && !is_static_region(region) {
                     bail!("invalid region reference {region}");
                 }
                 let mutable = payload
@@ -8299,6 +8498,7 @@ fn outer_branch_moves(state: &MoveBorrowState, boundary: usize) -> Vec<LoanPlace
         .filter(|place| match place.root {
             LoanRoot::Local(id) => id < boundary,
             LoanRoot::Param(_) => true,
+            LoanRoot::Static(_) => false,
         })
         .cloned()
         .collect()
@@ -8476,6 +8676,7 @@ impl TypeSpec {
         match self {
             TypeSpec::Builtin(kind) => match kind.as_str() {
                 "I64" => Ok("i64".to_string()),
+                "U8" => Ok("u8".to_string()),
                 "Bool" => Ok("bool".to_string()),
                 "Unit" => Ok("unit".to_string()),
                 other => bail!("unknown builtin type kind {other}"),
@@ -8770,6 +8971,7 @@ pub(crate) fn type_spec_from_payload(payload: &JsonValue) -> Result<TypeSpec> {
         .ok_or_else(|| anyhow!("Type object missing type_kind"))?
     {
         "I64" => Ok(TypeSpec::Builtin("I64".to_string())),
+        "U8" => Ok(TypeSpec::Builtin("U8".to_string())),
         "Bool" => Ok(TypeSpec::Builtin("Bool".to_string())),
         "Unit" => Ok(TypeSpec::Builtin("Unit".to_string())),
         "Named" => {
@@ -8986,6 +9188,14 @@ fn validate_region_arg(arg: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_region_name(label: &str, name: &str) -> Result<()> {
+    if name == "static" {
+        Ok(())
+    } else {
+        validate_projection_identifier(label, name)
+    }
+}
+
 fn validate_type_hash(label: &str, hash: &str) -> Result<()> {
     if !hash.starts_with("sha256:") {
         bail!("{label} type must be a hash");
@@ -9064,6 +9274,9 @@ fn resolve_region_args(
 }
 
 fn resolve_region_arg(arg: &str, region_scope: &BTreeMap<String, String>) -> Result<String> {
+    if arg == "static" {
+        return Ok(static_region_hash());
+    }
     region_scope
         .get(arg)
         .cloned()
@@ -9105,6 +9318,9 @@ impl TypeParser {
             TypeToken::Symbol(value) if value == "&" => self.parse_reference_type(),
             TypeToken::Ident(value) if value == "i64" || value == "I64" => {
                 Ok(ParsedTypeSpec::Builtin("I64".to_string()))
+            }
+            TypeToken::Ident(value) if value == "u8" || value == "U8" => {
+                Ok(ParsedTypeSpec::Builtin("U8".to_string()))
             }
             TypeToken::Ident(value) if value == "bool" || value == "Bool" => {
                 Ok(ParsedTypeSpec::Builtin("Bool".to_string()))
@@ -9148,7 +9364,7 @@ impl TypeParser {
     fn parse_reference_type(&mut self) -> Result<ParsedTypeSpec> {
         self.expect_symbol("'")?;
         let region = self.expect_ident()?;
-        validate_projection_identifier("reference region", &region)?;
+        validate_region_name("reference region", &region)?;
         let mutable = self.consume_ident_value("mut");
         let referent = self.parse_type()?;
         Ok(ParsedTypeSpec::Reference {
@@ -9169,7 +9385,7 @@ impl TypeParser {
         self.expect_symbol("<")?;
         self.expect_symbol("'")?;
         let region = self.expect_ident()?;
-        validate_projection_identifier("slice region", &region)?;
+        validate_region_name("slice region", &region)?;
         self.expect_symbol(",")?;
         let element = self.parse_type()?;
         self.expect_symbol(">")?;
@@ -9223,7 +9439,7 @@ impl TypeParser {
         loop {
             self.expect_symbol("'")?;
             let name = self.expect_ident()?;
-            validate_projection_identifier("region argument", &name)?;
+            validate_region_name("region argument", &name)?;
             args.push(name);
             if self.consume_symbol(">") {
                 break;

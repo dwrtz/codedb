@@ -1071,6 +1071,15 @@ impl CodeDb {
                     value: actual_i64.to_string(),
                 },
             ),
+            Value::U8(value) => {
+                let actual_u8 = u8::try_from(actual_i64).ok();
+                (
+                    actual_u8 == Some(*value),
+                    TestValue::U8 {
+                        value: actual_u8.unwrap_or(0),
+                    },
+                )
+            }
             Value::Bool(value) => {
                 let actual_bool = actual_i64 != 0;
                 (
@@ -1078,7 +1087,7 @@ impl CodeDb {
                     TestValue::Bool { value: actual_bool },
                 )
             }
-            _ => unreachable!("native_scalar_agreement_result only handles i64/bool"),
+            _ => unreachable!("native_scalar_agreement_result only handles i64/u8/bool"),
         };
         json!({
             "schema": NATIVE_TEST_RESULT_SCHEMA,
@@ -1596,6 +1605,7 @@ pub(crate) fn value_from_test_value(value: &TestValue) -> Result<Value> {
             .parse::<i64>()
             .map(Value::I64)
             .with_context(|| format!("invalid i64 test value {value:?}")),
+        TestValue::U8 { value } => Ok(Value::U8(*value)),
         TestValue::Bool { value } => Ok(Value::Bool(*value)),
         TestValue::Unit => Ok(Value::Unit),
         TestValue::Array { elements } => Ok(Value::Array(
@@ -1635,6 +1645,7 @@ pub(crate) fn test_value_from_value(value: &Value) -> Result<TestValue> {
         Value::I64(value) => TestValue::I64 {
             value: value.to_string(),
         },
+        Value::U8(value) => TestValue::U8 { value: *value },
         Value::Bool(value) => TestValue::Bool { value: *value },
         Value::Unit => TestValue::Unit,
         Value::Array(elements) => TestValue::Array {
@@ -1698,6 +1709,7 @@ fn test_value_has_type(
 ) -> Result<bool> {
     match (value, db.type_spec_in_root(root, type_hash)?) {
         (Value::I64(_), TypeSpec::Builtin(kind)) => Ok(kind == "I64"),
+        (Value::U8(_), TypeSpec::Builtin(kind)) => Ok(kind == "U8"),
         (Value::Bool(_), TypeSpec::Builtin(kind)) => Ok(kind == "Bool"),
         (Value::Unit, TypeSpec::Builtin(kind)) => Ok(kind == "Unit"),
         (Value::Array(values), TypeSpec::FixedArray { element, len }) => {
@@ -1790,6 +1802,12 @@ fn parse_test_value_arg(arg: &str, type_name: &str, idx: usize) -> Result<TestVa
                 value: arg.to_string(),
             })
         }
+        "u8" => {
+            let value = arg
+                .parse::<u8>()
+                .with_context(|| format!("argument {idx} must be u8, got {arg:?}"))?;
+            Ok(TestValue::U8 { value })
+        }
         "bool" => match arg {
             "true" => Ok(TestValue::Bool { value: true }),
             "false" => Ok(TestValue::Bool { value: false }),
@@ -1806,6 +1824,7 @@ fn parse_test_value_arg(arg: &str, type_name: &str, idx: usize) -> Result<TestVa
 fn display_test_value(value: &TestValue) -> String {
     match value {
         TestValue::I64 { value } => format!("i64:{value}"),
+        TestValue::U8 { value } => format!("u8:{value}"),
         TestValue::Bool { value } => format!("bool:{value}"),
         TestValue::Unit => "unit:()".to_string(),
         TestValue::Array { elements } => {

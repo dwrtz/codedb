@@ -85,6 +85,9 @@ impl TraceValue {
             Value::I64(value) => TraceValue::I64 {
                 value: value.to_string(),
             },
+            Value::U8(value) => TraceValue::I64 {
+                value: value.to_string(),
+            },
             Value::Bool(value) => TraceValue::Bool { value: *value },
             Value::Unit => TraceValue::Unit,
             Value::SharedRef(value) => TraceValue::Record {
@@ -704,6 +707,24 @@ impl CodeDb {
                     function_def_hash,
                     expr_hash,
                     value,
+                )
+            }
+            "static_bytes" => {
+                let data_hash = payload
+                    .get("static_data")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("static_bytes missing static_data"))?;
+                let data = self.static_data_bytes(data_hash)?;
+                self.finish_current_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    expr_hash,
+                    Ok(Value::Slice {
+                        elements: data.into_iter().map(Value::U8).map(value_cell).collect(),
+                        mutable: false,
+                    }),
                 )
             }
             "literal_unit" => self.finish_current_expr(

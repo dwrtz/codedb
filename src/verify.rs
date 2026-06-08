@@ -28,9 +28,10 @@ use crate::store::{
     hash_bytes, hash_object_canonical,
 };
 use crate::types::{
-    effect_names, member_defs_from_payload, region_params_from_payload, type_payload_for_spec,
-    type_spec_from_payload, validate_external_abi_tag, validate_external_library_name,
-    validate_external_link_name, validate_member_defs, validate_region_params,
+    effect_names, is_static_region, member_defs_from_payload, region_params_from_payload,
+    static_data_payload, type_payload_for_spec, type_spec_from_payload, validate_external_abi_tag,
+    validate_external_library_name, validate_external_link_name, validate_hex_bytes,
+    validate_member_defs, validate_region_params,
 };
 use crate::{BYTES_DOMAIN, SCHEMA_VERSION};
 
@@ -124,6 +125,9 @@ impl CodeDb {
             "Type" => {
                 self.verify_type_object_references(parent_hash, payload, errors)?;
             }
+            "StaticData" => {
+                self.verify_static_data_payload(parent_hash, payload, errors)?;
+            }
             "SymbolBirth" => {}
             "TypeDef" => {
                 self.check_hash_ref(
@@ -210,6 +214,21 @@ impl CodeDb {
                     Some(
                         "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" | "local_ref",
                     ) => {}
+                    Some("static_bytes") => {
+                        self.check_hash_ref(
+                            parent_hash,
+                            "static_data",
+                            payload.get("static_data"),
+                            errors,
+                        )?;
+                        self.check_hash_ref(parent_hash, "region", payload.get("region"), errors)?;
+                        self.check_hash_ref(
+                            parent_hash,
+                            "element_type",
+                            payload.get("element_type"),
+                            errors,
+                        )?;
+                    }
                     Some("call") => {
                         self.check_hash_ref(parent_hash, "symbol", payload.get("symbol"), errors)?;
                         self.check_hash_array_refs(
@@ -615,6 +634,42 @@ impl CodeDb {
         Ok(())
     }
 
+    fn verify_static_data_payload(
+        &self,
+        parent_hash: &str,
+        payload: &JsonValue,
+        errors: &mut Vec<String>,
+    ) -> Result<()> {
+        if payload.get("schema").and_then(JsonValue::as_str) != Some("codedb/static-data/v1") {
+            errors.push(format!("bad_static_data: {parent_hash} unsupported schema"));
+            return Ok(());
+        }
+        let Some(bytes_hex) = payload.get("bytes_hex").and_then(JsonValue::as_str) else {
+            errors.push(format!("bad_static_data: {parent_hash} missing bytes_hex"));
+            return Ok(());
+        };
+        if let Err(err) = validate_hex_bytes(bytes_hex) {
+            errors.push(format!("bad_static_data: {parent_hash}: {err:#}"));
+            return Ok(());
+        }
+        let Some(len) = payload.get("len").and_then(JsonValue::as_u64) else {
+            errors.push(format!("bad_static_data: {parent_hash} missing len"));
+            return Ok(());
+        };
+        if bytes_hex.len() != (len as usize).saturating_mul(2) {
+            errors.push(format!("bad_static_data: {parent_hash} len mismatch"));
+            return Ok(());
+        }
+        match static_data_payload(bytes_hex, len as usize) {
+            Ok(expected) if canonical_json(&expected) == canonical_json(payload) => {}
+            Ok(_) => errors.push(format!(
+                "bad_static_data: {parent_hash} payload is not canonical"
+            )),
+            Err(err) => errors.push(format!("bad_static_data: {parent_hash}: {err:#}")),
+        }
+        Ok(())
+    }
+
     fn check_signature_effects(
         &self,
         parent_hash: &str,
@@ -695,7 +750,7 @@ impl CodeDb {
         errors: &mut Vec<String>,
     ) -> Result<()> {
         match payload.get("type_kind").and_then(JsonValue::as_str) {
-            Some("I64" | "Bool" | "Unit") => {}
+            Some("I64" | "Bool" | "Unit" | "U8") => {}
             Some("Named") => {
                 self.check_hash_ref(
                     parent_hash,
@@ -836,7 +891,7 @@ impl CodeDb {
         match type_spec_from_payload(&payload) {
             Ok(crate::types::TypeSpec::Named { region_args, .. }) => {
                 for region in region_args {
-                    if !allowed_regions.contains(&region) {
+                    if !allowed_regions.contains(&region) && !is_static_region(&region) {
                         errors.push(format!(
                             "bad_type_def: {parent_hash}: invalid region reference {region}"
                         ));
@@ -846,7 +901,7 @@ impl CodeDb {
             Ok(crate::types::TypeSpec::Reference {
                 region, referent, ..
             }) => {
-                if !allowed_regions.contains(&region) {
+                if !allowed_regions.contains(&region) && !is_static_region(&region) {
                     errors.push(format!(
                         "bad_type_def: {parent_hash}: invalid region reference {region}"
                     ));
@@ -862,7 +917,7 @@ impl CodeDb {
             Ok(crate::types::TypeSpec::Slice {
                 region, element, ..
             }) => {
-                if !allowed_regions.contains(&region) {
+                if !allowed_regions.contains(&region) && !is_static_region(&region) {
                     errors.push(format!(
                         "bad_type_def: {parent_hash}: invalid region reference {region}"
                     ));
@@ -3959,6 +4014,7 @@ fn collect_lowered_call_targets(
             | LoweredOp::AddrOfField { .. }
             | LoweredOp::AddrOfEnumPayload { .. }
             | LoweredOp::AddrOfIndex { .. }
+            | LoweredOp::StaticDataAddress { .. }
             | LoweredOp::ConstructSlice { .. }
             | LoweredOp::SliceLen { .. }
             | LoweredOp::SliceData { .. }

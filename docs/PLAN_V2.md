@@ -922,6 +922,11 @@ native link succeeds against platform capsule on supported hosts
 
 Goal: support native string/byte literals as read-only static data plus slice/string views.
 
+Status: implemented for string and byte literal parsing/export, `StaticData`
+objects, `slice<'static, u8>` views, `len`, native static data emission and
+metadata, verifier coverage, and FFI write-wrapper usage. Equality/compare stays
+deferred until a richer string abstraction needs it.
+
 Deliverables:
 
 ```text

@@ -15,7 +15,8 @@ use crate::model::{
 use crate::store::{CodeDb, canonical_json};
 use crate::types::{
     Effect, ParamSpec, RegionParamDef, SymbolBirthSpec, TypeDefinition, TypeDefinitionIdentity,
-    TypeDefinitionKind, TypeMemberSpec, TypeSpec, normalize_effects, visible_effects,
+    TypeDefinitionKind, TypeMemberSpec, TypeSpec, bytes_to_hex, hex_to_bytes, normalize_effects,
+    static_data_payload, visible_effects,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +27,12 @@ pub enum RawExpr {
     },
     LiteralBool {
         value: bool,
+    },
+    LiteralString {
+        value: String,
+    },
+    LiteralBytes {
+        bytes_hex: String,
     },
     Unit,
     ParamRef {
@@ -180,6 +187,7 @@ pub struct TypeDefinitionSource {
 #[derive(Debug, Clone)]
 pub enum Value {
     I64(i64),
+    U8(u8),
     Bool(bool),
     Unit,
     SharedRef(ValueCell),
@@ -207,6 +215,7 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::I64(left), Value::I64(right)) => left == right,
+            (Value::U8(left), Value::U8(right)) => left == right,
             (Value::Bool(left), Value::Bool(right)) => left == right,
             (Value::Unit, Value::Unit) => true,
             (Value::SharedRef(left), Value::SharedRef(right))
@@ -275,6 +284,7 @@ impl Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::I64(value) => write!(f, "{value}"),
+            Value::U8(value) => write!(f, "{value}"),
             Value::Bool(value) => write!(f, "{value}"),
             Value::Unit => write!(f, "()"),
             Value::SharedRef(value) => write!(f, "&{}", value.borrow()),
@@ -382,6 +392,34 @@ impl CodeDb {
         self.eval_expr_with_locals(root_hash, expr_hash, args, &mut Vec::new())
     }
 
+    pub(crate) fn static_data_bytes_hex(&self, data_hash: &str) -> Result<String> {
+        if self.get_kind(data_hash)? != "StaticData" {
+            bail!("static data hash points to non-StaticData object {data_hash}");
+        }
+        let payload = self.get_payload(data_hash)?;
+        if payload.get("schema").and_then(JsonValue::as_str) != Some("codedb/static-data/v1") {
+            bail!("static data object has unsupported schema");
+        }
+        let bytes_hex = payload
+            .get("bytes_hex")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("StaticData missing bytes_hex"))?
+            .to_string();
+        let len = payload
+            .get("len")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| anyhow!("StaticData missing len"))? as usize;
+        let expected = static_data_payload(&bytes_hex, len)?;
+        if canonical_json(&expected) != canonical_json(&payload) {
+            bail!("StaticData payload is not canonical");
+        }
+        Ok(bytes_hex)
+    }
+
+    pub(crate) fn static_data_bytes(&self, data_hash: &str) -> Result<Vec<u8>> {
+        hex_to_bytes(&self.static_data_bytes_hex(data_hash)?)
+    }
+
     pub(crate) fn value_has_type(
         &self,
         root: &ProgramRootPayload,
@@ -390,6 +428,7 @@ impl CodeDb {
     ) -> Result<bool> {
         match (value, self.type_spec_in_root(root, type_hash)?) {
             (Value::I64(_), TypeSpec::Builtin(kind)) => Ok(kind == "I64"),
+            (Value::U8(_), TypeSpec::Builtin(kind)) => Ok(kind == "U8"),
             (Value::Bool(_), TypeSpec::Builtin(kind)) => Ok(kind == "Bool"),
             (Value::Unit, TypeSpec::Builtin(kind)) => Ok(kind == "Unit"),
             (
@@ -500,6 +539,17 @@ impl CodeDb {
                     .and_then(JsonValue::as_bool)
                     .ok_or_else(|| anyhow!("literal_bool missing value"))?;
                 Ok(Value::Bool(value))
+            }
+            "static_bytes" => {
+                let data_hash = payload
+                    .get("static_data")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("static_bytes missing static_data"))?;
+                let data = self.static_data_bytes(data_hash)?;
+                Ok(Value::Slice {
+                    elements: data.into_iter().map(Value::U8).map(value_cell).collect(),
+                    mutable: false,
+                })
             }
             "literal_unit" => Ok(Value::Unit),
             "param_ref" => {
@@ -1503,6 +1553,27 @@ impl CodeDb {
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| anyhow!("literal_i64 missing value"))?
                 .to_string(),
+            "static_bytes" => {
+                let literal_kind = payload
+                    .get("literal_kind")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("static_bytes missing literal_kind"))?;
+                let bytes = self.static_data_bytes(
+                    payload
+                        .get("static_data")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("static_bytes missing static_data"))?,
+                )?;
+                match literal_kind {
+                    "string" => {
+                        let value = String::from_utf8(bytes)
+                            .map_err(|_| anyhow!("string literal static data is not utf8"))?;
+                        format!("\"{}\"", source_string_literal(&value))
+                    }
+                    "bytes" => format!("b\"{}\"", source_bytes_literal(&bytes)),
+                    other => bail!("unknown static literal kind {other}"),
+                }
+            }
             "literal_bool" => payload
                 .get("value")
                 .and_then(JsonValue::as_bool)
@@ -2396,6 +2467,26 @@ impl CodeDb {
                     .and_then(JsonValue::as_bool)
                     .ok_or_else(|| anyhow!("literal_bool missing value"))?,
             }),
+            "static_bytes" => {
+                let bytes_hex = self.static_data_bytes_hex(
+                    payload
+                        .get("static_data")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("static_bytes missing static_data"))?,
+                )?;
+                match payload
+                    .get("literal_kind")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("static_bytes missing literal_kind"))?
+                {
+                    "string" => Ok(RawExpr::LiteralString {
+                        value: String::from_utf8(hex_to_bytes(&bytes_hex)?)
+                            .map_err(|_| anyhow!("string literal static data is not utf8"))?,
+                    }),
+                    "bytes" => Ok(RawExpr::LiteralBytes { bytes_hex }),
+                    other => bail!("unknown static literal kind {other}"),
+                }
+            }
             "literal_unit" => Ok(RawExpr::Unit),
             "param_ref" => Ok(RawExpr::ParamRef {
                 index: payload
@@ -3145,6 +3236,22 @@ fn source_string_literal(value: &str) -> String {
         .collect()
 }
 
+fn source_bytes_literal(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for byte in bytes {
+        match *byte {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\t' => out.push_str("\\t"),
+            0 => out.push_str("\\0"),
+            0x20..=0x7e => out.push(*byte as char),
+            other => out.push_str(&format!("\\x{other:02x}")),
+        }
+    }
+    out
+}
+
 impl CodeDb {
     pub(crate) fn dependencies_for_definition(
         &self,
@@ -3224,7 +3331,8 @@ impl CodeDb {
             .and_then(JsonValue::as_str)
             .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
         {
-            "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" | "local_ref" => {}
+            "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref"
+            | "local_ref" => {}
             "call" => {
                 let symbol = payload
                     .get("symbol")
@@ -3430,6 +3538,7 @@ enum Token {
     Ident(String),
     Number(String),
     String(String),
+    ByteString(Vec<u8>),
     Comment(String),
     Symbol(String),
     Eof,
@@ -3965,6 +4074,10 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<RawExpr> {
         match self.next() {
             Token::Number(value) => Ok(RawExpr::LiteralI64 { value }),
+            Token::String(value) => Ok(RawExpr::LiteralString { value }),
+            Token::ByteString(bytes) => Ok(RawExpr::LiteralBytes {
+                bytes_hex: bytes_to_hex(&bytes),
+            }),
             Token::Ident(name) if name == "true" => Ok(RawExpr::LiteralBool { value: true }),
             Token::Ident(name) if name == "false" => Ok(RawExpr::LiteralBool { value: false }),
             Token::Ident(name) => {
@@ -4086,6 +4199,7 @@ impl Parser {
     fn parse_type_source_after_ident(&mut self, name: String) -> Result<String> {
         match name.as_str() {
             "i64" | "I64" => Ok("i64".to_string()),
+            "u8" | "U8" => Ok("u8".to_string()),
             "bool" | "Bool" => Ok("bool".to_string()),
             "unit" | "Unit" => Ok("unit".to_string()),
             "record" => {
@@ -4317,6 +4431,10 @@ fn lex(source: &str) -> Result<Vec<Token>> {
         let ch = chars[i];
         if ch.is_whitespace() {
             i += 1;
+        } else if ch == 'b' && i + 1 < chars.len() && chars[i + 1] == '"' {
+            let (bytes, next) = lex_byte_string(&chars, i + 1)?;
+            tokens.push(Token::ByteString(bytes));
+            i = next;
         } else if ch.is_ascii_alphabetic() || ch == '_' {
             let start = i;
             i += 1;
@@ -4332,34 +4450,9 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             }
             tokens.push(Token::Number(chars[start..i].iter().collect()));
         } else if ch == '"' {
-            i += 1;
-            let mut value = String::new();
-            while i < chars.len() {
-                match chars[i] {
-                    '"' => {
-                        i += 1;
-                        break;
-                    }
-                    '\\' if i + 1 < chars.len() => {
-                        let escaped = chars[i + 1];
-                        match escaped {
-                            '"' | '\\' => value.push(escaped),
-                            'n' => value.push('\n'),
-                            't' => value.push('\t'),
-                            other => bail!("unsupported string escape \\{other}"),
-                        }
-                        i += 2;
-                    }
-                    ch => {
-                        value.push(ch);
-                        i += 1;
-                    }
-                }
-            }
-            if i > chars.len() || chars.get(i.saturating_sub(1)) != Some(&'"') {
-                bail!("unterminated string literal");
-            }
+            let (value, next) = lex_string(&chars, i)?;
             tokens.push(Token::String(value));
+            i = next;
         } else if ch == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
             i += 2;
             let start = i;
@@ -4386,6 +4479,76 @@ fn lex(source: &str) -> Result<Vec<Token>> {
     }
     tokens.push(Token::Eof);
     Ok(tokens)
+}
+
+fn lex_string(chars: &[char], quote: usize) -> Result<(String, usize)> {
+    let mut i = quote + 1;
+    let mut value = String::new();
+    while i < chars.len() {
+        match chars[i] {
+            '"' => return Ok((value, i + 1)),
+            '\\' if i + 1 < chars.len() => {
+                let escaped = chars[i + 1];
+                match escaped {
+                    '"' | '\\' => value.push(escaped),
+                    'n' => value.push('\n'),
+                    't' => value.push('\t'),
+                    other => bail!("unsupported string escape \\{other}"),
+                }
+                i += 2;
+            }
+            ch => {
+                value.push(ch);
+                i += 1;
+            }
+        }
+    }
+    bail!("unterminated string literal")
+}
+
+fn lex_byte_string(chars: &[char], quote: usize) -> Result<(Vec<u8>, usize)> {
+    let mut i = quote + 1;
+    let mut value = Vec::new();
+    while i < chars.len() {
+        match chars[i] {
+            '"' => return Ok((value, i + 1)),
+            '\\' if i + 1 < chars.len() => {
+                let escaped = chars[i + 1];
+                match escaped {
+                    '"' => value.push(b'"'),
+                    '\\' => value.push(b'\\'),
+                    'n' => value.push(b'\n'),
+                    't' => value.push(b'\t'),
+                    '0' => value.push(0),
+                    'x' if i + 3 < chars.len() => {
+                        let hi = chars[i + 2];
+                        let lo = chars[i + 3];
+                        value.push((projection_hex_value(hi)? << 4) | projection_hex_value(lo)?);
+                        i += 4;
+                        continue;
+                    }
+                    'x' => bail!("byte escape \\x requires two hex digits"),
+                    other => bail!("unsupported byte escape \\{other}"),
+                }
+                i += 2;
+            }
+            ch if ch.is_ascii() => {
+                value.push(ch as u8);
+                i += 1;
+            }
+            ch => bail!("byte string contains non-ascii character {ch:?}; use \\xNN escapes"),
+        }
+    }
+    bail!("unterminated byte string literal")
+}
+
+fn projection_hex_value(ch: char) -> Result<u8> {
+    match ch {
+        '0'..='9' => Ok((ch as u8) - b'0'),
+        'a'..='f' => Ok((ch as u8) - b'a' + 10),
+        'A'..='F' => Ok((ch as u8) - b'A' + 10),
+        _ => bail!("invalid hex digit {ch:?}"),
+    }
 }
 
 fn is_binary_op(op: &str) -> bool {
@@ -4416,6 +4579,7 @@ pub(crate) fn value_cell(value: Value) -> ValueCell {
 fn semantic_clone_value(value: &Value) -> Value {
     match value {
         Value::I64(value) => Value::I64(*value),
+        Value::U8(value) => Value::U8(*value),
         Value::Bool(value) => Value::Bool(*value),
         Value::Unit => Value::Unit,
         Value::SharedRef(value) => Value::SharedRef(value.clone()),

@@ -19,7 +19,7 @@ use crate::model::ProgramRootPayload;
 use crate::store::{
     CodeDb, cache_key_for_input, canonical_json, function_interface_metadata, hash_bytes,
 };
-use crate::types::type_hash_for;
+use crate::types::{hex_to_bytes, type_hash_for};
 use crate::{APPLE_ARM64_TARGET, BYTES_DOMAIN, LINUX_X86_64_TARGET, MAIN_BRANCH};
 
 pub(crate) const ELF_BACKEND_ID: &str = "native-elf-x86_64-v0";
@@ -130,6 +130,7 @@ impl ObjectBackend for ElfObjectBackend {
             "called_symbols": called_symbols,
             "relocations": relocations,
             "debug_metadata": native_debug_metadata(&compiled),
+            "static_data": static_data_metadata(&compiled),
         });
 
         Ok(ObjectBackendArtifact {
@@ -199,6 +200,7 @@ impl ObjectBackend for MachOArm64ObjectBackend {
             "called_symbols": called_symbols,
             "relocations": relocations,
             "debug_metadata": native_debug_metadata(&compiled),
+            "static_data": static_data_metadata(&compiled),
         });
 
         Ok(ObjectBackendArtifact {
@@ -626,6 +628,7 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::AddrOfField { .. }
             | LoweredOp::AddrOfEnumPayload { .. }
             | LoweredOp::AddrOfIndex { .. }
+            | LoweredOp::StaticDataAddress { .. }
             | LoweredOp::ConstructSlice { .. }
             | LoweredOp::SliceLen { .. }
             | LoweredOp::SliceData { .. }
@@ -758,6 +761,18 @@ fn validate_native_ops(
             LoweredOp::AddrOfField { .. } => {}
             LoweredOp::AddrOfEnumPayload { .. } => {}
             LoweredOp::AddrOfIndex { .. } => {}
+            LoweredOp::StaticDataAddress {
+                bytes_hex,
+                len,
+                element_type_hash,
+                ..
+            } => {
+                let bytes = hex_to_bytes(bytes_hex)?;
+                if bytes.len() != usize::try_from(*len)? {
+                    bail!("native object backend saw static_data_address len mismatch");
+                }
+                native_type_layout(type_layouts, element_type_hash)?;
+            }
             LoweredOp::BoundsCheck { type_hash, .. } => {
                 if type_hash != unit_type {
                     bail!("native object backend saw bounds_check with non-unit type");
@@ -872,7 +887,8 @@ fn native_supported_type(
     }
     let layout = native_type_layout(type_layouts, type_hash)?;
     match layout.kind.as_str() {
-        "record" | "enum" | "fixed_array" | "slice" | "reference" | "raw_pointer" | "box" => Ok(()),
+        "scalar" | "record" | "enum" | "fixed_array" | "slice" | "reference" | "raw_pointer"
+        | "box" => Ok(()),
         other => bail!("native object backend v0 does not support native values of {other} type"),
     }
 }
@@ -1310,6 +1326,21 @@ fn validate_native_op_flow(
                 "record" | "enum" | "fixed_array" => native_insert_value(values, id, type_hash)?,
                 _ => {}
             }
+        }
+        LoweredOp::StaticDataAddress {
+            id,
+            bytes_hex,
+            len,
+            element_type_hash,
+            ..
+        } => {
+            let bytes = hex_to_bytes(bytes_hex)?;
+            if bytes.len() != usize::try_from(*len)? {
+                bail!("native object backend saw static_data_address len mismatch");
+            }
+            native_type_layout(type_layouts, element_type_hash)?;
+            native_insert_address(addresses, id, element_type_hash)?;
+            native_insert_value(values, id, element_type_hash)?;
         }
         LoweredOp::ConstructSlice {
             id,
@@ -1779,11 +1810,49 @@ fn native_debug_metadata(compiled: &CompiledFunction) -> JsonValue {
     })
 }
 
+fn static_data_metadata(compiled: &CompiledFunction) -> Vec<JsonValue> {
+    compiled
+        .static_data
+        .iter()
+        .map(|entry| {
+            json!({
+                "static_data_hash": &entry.static_data_hash,
+                "bytes_hex": &entry.bytes_hex,
+                "offset": entry.offset,
+                "len": entry.len,
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 struct CompiledFunction {
     text: Vec<u8>,
     relocations: Vec<TextRelocation>,
+    static_data: Vec<StaticDataEntry>,
     debug_ranges: Vec<NativeDebugRange>,
+}
+
+#[derive(Debug, Clone)]
+struct StaticDataEntry {
+    static_data_hash: String,
+    bytes_hex: String,
+    offset: u64,
+    len: u64,
+}
+
+#[derive(Debug, Clone)]
+struct StaticDataBlob {
+    static_data_hash: String,
+    bytes_hex: String,
+    bytes: Vec<u8>,
+    offset: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct StaticDataPatch {
+    static_data_hash: String,
+    patch_offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1848,6 +1917,8 @@ fn compile_x86_64_function(
         type_layouts,
         text: Vec::new(),
         relocations: Vec::new(),
+        static_data: Vec::new(),
+        static_data_patches: Vec::new(),
         active_drop_types: BTreeSet::new(),
         debug_ops: lowered_value_debug_ops(ir)?,
         debug_ranges: Vec::new(),
@@ -1870,6 +1941,7 @@ fn compile_x86_64_function(
                 emitter.mov_rax_stack(offset);
             }
             emitter.emit_epilogue();
+            emitter.finish_static_data_x86()?;
         }
         _ => bail!("lowered function must end with return"),
     }
@@ -1878,9 +1950,11 @@ fn compile_x86_64_function(
         bail!("native object function symbol is empty");
     }
 
+    let static_data = emitter.static_data_entries()?;
     Ok(CompiledFunction {
         text: emitter.text,
         relocations: emitter.relocations,
+        static_data,
         debug_ranges: emitter.debug_ranges,
     })
 }
@@ -1982,6 +2056,7 @@ fn collect_value_ids_inner(
             | LoweredOp::AddrOfField { id, .. }
             | LoweredOp::AddrOfEnumPayload { id, .. }
             | LoweredOp::AddrOfIndex { id, .. }
+            | LoweredOp::StaticDataAddress { id, .. }
             | LoweredOp::ConstructSlice { id, .. }
             | LoweredOp::SliceLen { id, .. }
             | LoweredOp::SliceData { id, .. }
@@ -2034,6 +2109,8 @@ struct FunctionEmitter {
     type_layouts: BTreeMap<String, LoweredTypeLayout>,
     text: Vec<u8>,
     relocations: Vec<TextRelocation>,
+    static_data: Vec<StaticDataBlob>,
+    static_data_patches: Vec<StaticDataPatch>,
     active_drop_types: BTreeSet<String>,
     debug_ops: BTreeMap<String, LoweredDebugOp>,
     debug_ranges: Vec<NativeDebugRange>,
@@ -2078,6 +2155,96 @@ impl FunctionEmitter {
 
     fn emit_epilogue(&mut self) {
         self.text.extend_from_slice(&[0xc9, 0xc3]);
+    }
+
+    fn emit_static_data_address_x86(
+        &mut self,
+        id: &str,
+        static_data_hash: &str,
+        bytes_hex: &str,
+        len: u64,
+    ) -> Result<()> {
+        let bytes = hex_to_bytes(bytes_hex)?;
+        if bytes.len() != usize::try_from(len)? {
+            bail!("native x86_64 static data length mismatch");
+        }
+        self.intern_static_data(static_data_hash, bytes_hex, bytes);
+        self.text.extend_from_slice(&[0x48, 0x8d, 0x05]);
+        let patch_offset = self.text.len();
+        self.text.extend_from_slice(&[0, 0, 0, 0]);
+        self.static_data_patches.push(StaticDataPatch {
+            static_data_hash: static_data_hash.to_string(),
+            patch_offset,
+        });
+        self.mov_stack_rax(self.value_offset(id)?);
+        Ok(())
+    }
+
+    fn intern_static_data(&mut self, static_data_hash: &str, bytes_hex: &str, bytes: Vec<u8>) {
+        if self
+            .static_data
+            .iter()
+            .any(|blob| blob.static_data_hash == static_data_hash)
+        {
+            return;
+        }
+        self.static_data.push(StaticDataBlob {
+            static_data_hash: static_data_hash.to_string(),
+            bytes_hex: bytes_hex.to_string(),
+            bytes,
+            offset: None,
+        });
+    }
+
+    fn finish_static_data_x86(&mut self) -> Result<()> {
+        if self.static_data.is_empty() {
+            return Ok(());
+        }
+        while !self.text.len().is_multiple_of(16) {
+            self.text.push(0x90);
+        }
+        for blob in &mut self.static_data {
+            blob.offset = Some(self.text.len());
+            self.text.extend_from_slice(&blob.bytes);
+        }
+        let offsets = self
+            .static_data
+            .iter()
+            .map(|blob| {
+                Ok((
+                    blob.static_data_hash.clone(),
+                    blob.offset
+                        .ok_or_else(|| anyhow!("static data offset was not assigned"))?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        for patch in self.static_data_patches.clone() {
+            let target = *offsets
+                .get(&patch.static_data_hash)
+                .ok_or_else(|| anyhow!("missing static data patch target"))?;
+            let next = patch.patch_offset + 4;
+            let disp = i32::try_from(target as i64 - next as i64)?;
+            self.text[patch.patch_offset..patch.patch_offset + 4]
+                .copy_from_slice(&disp.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    fn static_data_entries(&self) -> Result<Vec<StaticDataEntry>> {
+        self.static_data
+            .iter()
+            .map(|blob| {
+                Ok(StaticDataEntry {
+                    static_data_hash: blob.static_data_hash.clone(),
+                    bytes_hex: blob.bytes_hex.clone(),
+                    offset: blob
+                        .offset
+                        .ok_or_else(|| anyhow!("static data offset was not assigned"))?
+                        as u64,
+                    len: blob.bytes.len() as u64,
+                })
+            })
+            .collect()
     }
 
     fn emit_ops(&mut self, operations: &[LoweredOp]) -> Result<()> {
@@ -2312,6 +2479,15 @@ impl FunctionEmitter {
                     self.add_rax_rcx();
                 }
                 self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::StaticDataAddress {
+                id,
+                static_data_hash,
+                bytes_hex,
+                len,
+                ..
+            } => {
+                self.emit_static_data_address_x86(id, static_data_hash, bytes_hex, *len)?;
             }
             LoweredOp::ConstructSlice {
                 id,
@@ -3263,6 +3439,8 @@ fn compile_arm64_function(
         type_layouts,
         text: Vec::new(),
         relocations: Vec::new(),
+        static_data: Vec::new(),
+        static_data_patches: Vec::new(),
         active_drop_types: BTreeSet::new(),
         debug_ops: lowered_value_debug_ops(ir)?,
         debug_ranges: Vec::new(),
@@ -3285,6 +3463,7 @@ fn compile_arm64_function(
                 emitter.ldr_stack(0, offset)?;
             }
             emitter.emit_epilogue()?;
+            emitter.finish_static_data_arm64()?;
         }
         _ => bail!("lowered function must end with return"),
     }
@@ -3293,9 +3472,11 @@ fn compile_arm64_function(
         bail!("native object function symbol is empty");
     }
 
+    let static_data = emitter.static_data_entries()?;
     Ok(CompiledFunction {
         text: emitter.text,
         relocations: emitter.relocations,
+        static_data,
         debug_ranges: emitter.debug_ranges,
     })
 }
@@ -3373,6 +3554,8 @@ struct Arm64Emitter {
     type_layouts: BTreeMap<String, LoweredTypeLayout>,
     text: Vec<u8>,
     relocations: Vec<TextRelocation>,
+    static_data: Vec<StaticDataBlob>,
+    static_data_patches: Vec<StaticDataPatch>,
     active_drop_types: BTreeSet<String>,
     debug_ops: BTreeMap<String, LoweredDebugOp>,
     debug_ranges: Vec<NativeDebugRange>,
@@ -3416,6 +3599,92 @@ impl Arm64Emitter {
         self.emit_u32(0xa8c17bfd);
         self.emit_u32(0xd65f03c0);
         Ok(())
+    }
+
+    fn emit_static_data_address_arm64(
+        &mut self,
+        id: &str,
+        static_data_hash: &str,
+        bytes_hex: &str,
+        len: u64,
+    ) -> Result<()> {
+        let bytes = hex_to_bytes(bytes_hex)?;
+        if bytes.len() != usize::try_from(len)? {
+            bail!("native arm64 static data length mismatch");
+        }
+        self.intern_static_data(static_data_hash, bytes_hex, bytes);
+        let patch_offset = self.text.len();
+        self.emit_u32(0x10000000);
+        self.static_data_patches.push(StaticDataPatch {
+            static_data_hash: static_data_hash.to_string(),
+            patch_offset,
+        });
+        self.str_stack(0, self.value_offset(id)?)?;
+        Ok(())
+    }
+
+    fn intern_static_data(&mut self, static_data_hash: &str, bytes_hex: &str, bytes: Vec<u8>) {
+        if self
+            .static_data
+            .iter()
+            .any(|blob| blob.static_data_hash == static_data_hash)
+        {
+            return;
+        }
+        self.static_data.push(StaticDataBlob {
+            static_data_hash: static_data_hash.to_string(),
+            bytes_hex: bytes_hex.to_string(),
+            bytes,
+            offset: None,
+        });
+    }
+
+    fn finish_static_data_arm64(&mut self) -> Result<()> {
+        if self.static_data.is_empty() {
+            return Ok(());
+        }
+        while !self.text.len().is_multiple_of(16) {
+            self.emit_u32(0xd503201f);
+        }
+        for blob in &mut self.static_data {
+            blob.offset = Some(self.text.len());
+            self.text.extend_from_slice(&blob.bytes);
+        }
+        let offsets = self
+            .static_data
+            .iter()
+            .map(|blob| {
+                Ok((
+                    blob.static_data_hash.clone(),
+                    blob.offset
+                        .ok_or_else(|| anyhow!("static data offset was not assigned"))?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        for patch in self.static_data_patches.clone() {
+            let target = *offsets
+                .get(&patch.static_data_hash)
+                .ok_or_else(|| anyhow!("missing static data patch target"))?;
+            self.patch_adr(patch.patch_offset, target)?;
+        }
+        Ok(())
+    }
+
+    fn static_data_entries(&self) -> Result<Vec<StaticDataEntry>> {
+        self.static_data
+            .iter()
+            .map(|blob| {
+                Ok(StaticDataEntry {
+                    static_data_hash: blob.static_data_hash.clone(),
+                    bytes_hex: blob.bytes_hex.clone(),
+                    offset: blob
+                        .offset
+                        .ok_or_else(|| anyhow!("static data offset was not assigned"))?
+                        as u64,
+                    len: blob.bytes.len() as u64,
+                })
+            })
+            .collect()
     }
 
     fn emit_ops(&mut self, operations: &[LoweredOp]) -> Result<()> {
@@ -3650,6 +3919,15 @@ impl Arm64Emitter {
                     self.add_reg(0, 0, 1);
                 }
                 self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::StaticDataAddress {
+                id,
+                static_data_hash,
+                bytes_hex,
+                len,
+                ..
+            } => {
+                self.emit_static_data_address_arm64(id, static_data_hash, bytes_hex, *len)?;
             }
             LoweredOp::ConstructSlice {
                 id,
@@ -4551,6 +4829,25 @@ impl Arm64Emitter {
         );
         instruction = (instruction & !0x03ff_ffff) | encoded;
         self.text[patch_offset..patch_offset + 4].copy_from_slice(&instruction.to_le_bytes());
+        Ok(())
+    }
+
+    fn patch_adr(&mut self, patch_offset: usize, target_offset: usize) -> Result<()> {
+        let imm = target_offset as i64 - patch_offset as i64;
+        if !(-(1 << 20)..(1 << 20)).contains(&imm) {
+            bail!("arm64 static data address is out of adr range");
+        }
+        let imm21 = (imm as i32 as u32) & 0x1f_ffff;
+        let immlo = imm21 & 0x3;
+        let immhi = (imm21 >> 2) & 0x7ffff;
+        let instruction = u32::from_le_bytes(
+            self.text[patch_offset..patch_offset + 4]
+                .try_into()
+                .expect("instruction bytes"),
+        );
+        let rd = instruction & 0x1f;
+        let patched = 0x10000000 | (immlo << 29) | (immhi << 5) | rd;
+        self.text[patch_offset..patch_offset + 4].copy_from_slice(&patched.to_le_bytes());
         Ok(())
     }
 

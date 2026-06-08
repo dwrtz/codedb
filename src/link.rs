@@ -330,11 +330,11 @@ impl CodeDb {
         })
     }
 
-    /// Build an executable whose `main` prints the scalar (i64/bool) result of
-    /// the entry to stdout as a full-width decimal integer, then exits 0. The
-    /// caller parses and compares the printed value, so the comparison is exact
-    /// over the whole i64 range and never aliases through the 8-bit process exit
-    /// status (unlike encoding the result in the exit code).
+    /// Build an executable whose `main` prints the scalar (i64/u8/bool) result
+    /// of the entry to stdout as a full-width decimal integer, then exits 0.
+    /// The caller parses and compares the printed value, so the comparison is
+    /// exact over the whole i64 range and never aliases through the 8-bit
+    /// process exit status (unlike encoding the result in the exit code).
     pub(crate) fn build_native_scalar_test_harness_branch(
         &mut self,
         branch_name: &str,
@@ -354,8 +354,8 @@ impl CodeDb {
             bail!("native scalar harness entry must not take parameters");
         }
         match self.type_spec_in_root(&root, &return_type_hash)? {
-            TypeSpec::Builtin(kind) if kind == "I64" || kind == "Bool" => {}
-            _ => bail!("native scalar harness entry must return i64 or bool"),
+            TypeSpec::Builtin(kind) if kind == "I64" || kind == "U8" || kind == "Bool" => {}
+            _ => bail!("native scalar harness entry must return i64, u8, or bool"),
         }
         let entry_abi_symbol = prepared
             .plan
@@ -768,8 +768,11 @@ impl CodeDb {
         if !params.is_empty() {
             bail!("native executable entry must not take parameters");
         }
-        if return_type != type_hash_for("I64") && return_type != type_hash_for("Bool") {
-            bail!("native executable entry must return i64 or bool");
+        if return_type != type_hash_for("I64")
+            && return_type != type_hash_for("U8")
+            && return_type != type_hash_for("Bool")
+        {
+            bail!("native executable entry must return i64, u8, or bool");
         }
         Ok(())
     }
@@ -1392,6 +1395,8 @@ fn plan_object_for_symbol<'a>(plan: &'a JsonValue, symbol: &str) -> Result<&'a J
 fn native_harness_c_type(type_hash: &str) -> Result<&'static str> {
     if type_hash == type_hash_for("I64") || type_hash == type_hash_for("Bool") {
         Ok("long")
+    } else if type_hash == type_hash_for("U8") {
+        Ok("unsigned char")
     } else if type_hash == type_hash_for("Unit") {
         Ok("void")
     } else {

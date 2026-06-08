@@ -2655,6 +2655,12 @@ fn substitute_param_refs(expr: &RawExpr, args: &[RawExpr]) -> Result<RawExpr> {
             value: value.clone(),
         },
         RawExpr::LiteralBool { value } => RawExpr::LiteralBool { value: *value },
+        RawExpr::LiteralString { value } => RawExpr::LiteralString {
+            value: value.clone(),
+        },
+        RawExpr::LiteralBytes { bytes_hex } => RawExpr::LiteralBytes {
+            bytes_hex: bytes_hex.clone(),
+        },
         RawExpr::Unit => RawExpr::Unit,
         RawExpr::ParamRef { index } => args
             .get(*index)
@@ -2783,6 +2789,8 @@ fn collect_free_param_names(
 ) {
     match expr {
         RawExpr::LiteralI64 { .. }
+        | RawExpr::LiteralString { .. }
+        | RawExpr::LiteralBytes { .. }
         | RawExpr::LiteralBool { .. }
         | RawExpr::Unit
         | RawExpr::ParamRef { .. } => {}
@@ -2890,6 +2898,12 @@ fn alpha_rename_let_bindings_with_scope(
             value: value.clone(),
         },
         RawExpr::LiteralBool { value } => RawExpr::LiteralBool { value: *value },
+        RawExpr::LiteralString { value } => RawExpr::LiteralString {
+            value: value.clone(),
+        },
+        RawExpr::LiteralBytes { bytes_hex } => RawExpr::LiteralBytes {
+            bytes_hex: bytes_hex.clone(),
+        },
         RawExpr::Unit => RawExpr::Unit,
         RawExpr::ParamRef { index } => RawExpr::ParamRef { index: *index },
         RawExpr::ParamName { name } => RawExpr::ParamName {
