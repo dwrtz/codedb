@@ -35,54 +35,15 @@ fn read_json(path: &Path) -> JsonValue {
 fn box_values_typecheck_lower_verify_and_run_native() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("box-values.sqlite");
-    let source = temp.path().join("box-values.cdb");
+    let source = Path::new("examples/v2/box_heap.cdb");
     let projection = temp.path().join("box-values.export.cdb");
     let boxed_total_ir_path = temp.path().join("boxed-total.ir.json");
     let boxed_borrow_ir_path = temp.path().join("boxed-borrow.ir.json");
     let layout_path = temp.path().join("box-line.layout.json");
     let object_path = temp.path().join("boxed-total.o");
 
-    std::fs::write(
-        &source,
-        r#"
-record Line {
-  price_cents: i64
-  qty: i64
-}
-
-enum Node {
-  empty: unit
-  next: box<Node>
-}
-
-fn line_total<'a>(line: &'a Line) -> i64 = line.price_cents * line.qty
-
-fn boxed_total() -> i64 effects[alloc] =
-  let b: box<Line> = box_new({ price_cents: 7, qty: 6 }) in
-  b.price_cents * b.qty
-
-fn boxed_borrow<'a>() -> i64 effects[alloc] =
-  let b: box<Line> = box_new({ price_cents: 8, qty: 5 }) in
-  line_total(&'a b)
-
-fn move_box() -> i64 effects[alloc] =
-  let b: box<Line> = box_new({ price_cents: 9, qty: 3 }) in
-  let c: box<Line> = b in
-  c.price_cents * c.qty
-
-fn recursive_node() -> i64 effects[alloc] =
-  let n: box<Node> = box_new(Node::empty(())) in
-  let moved: box<Node> = n in
-  5
-
-fn main<'a>() -> i64 effects[alloc] =
-  boxed_total() + boxed_borrow() + move_box() + recursive_node()
-"#,
-    )
-    .unwrap();
-
     run(&["init", path(&db)]);
-    run(&["import", path(&db), path(&source)]);
+    run(&["import", path(&db), path(source)]);
     assert_eq!(run(&["eval", path(&db), "main"]).trim(), "114");
     run(&["verify", path(&db)]);
 

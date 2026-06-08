@@ -28,7 +28,10 @@ const OBJECT_METADATA_SCHEMA: &str = "codedb/native-object/v1";
 const NATIVE_DEBUG_METADATA_SCHEMA: &str = "codedb/native-debug-metadata/v1";
 const ELF_OBJECT_FORMAT: &str = "elf64-x86-64-relocatable";
 const MACHO_OBJECT_FORMAT: &str = "macho64-arm64-relocatable";
+const R_X86_64_PC32: u32 = 2;
 const R_X86_64_PLT32: u32 = 4;
+const ARM64_RELOC_PAGE21: u32 = 3;
+const ARM64_RELOC_PAGEOFF12: u32 = 4;
 const ARM64_RELOC_BRANCH26: u32 = 2;
 const PLATFORM_MALLOC_SYMBOL_HASH: &str = "platform:malloc";
 const PLATFORM_FREE_SYMBOL_HASH: &str = "platform:free";
@@ -87,17 +90,25 @@ impl ObjectBackend for ElfObjectBackend {
         validate_native_ir(input.ir, 6)?;
         let function_symbol = internal_abi_symbol(&input.ir.symbol_hash)?;
         let compiled = compile_x86_64_function(input.ir, &function_symbol)?;
-        let bytes = write_elf_object(&function_symbol, &compiled.text, &compiled.relocations);
-        let artifact_hash = hash_bytes(BYTES_DOMAIN, &bytes);
+        let object = write_elf_object(
+            &function_symbol,
+            &compiled.text,
+            &compiled.rodata,
+            &compiled.static_data,
+            &compiled.relocations,
+        );
+        let artifact_hash = hash_bytes(BYTES_DOMAIN, &object.bytes);
+        let static_data = static_data_metadata(&compiled, object.static_data_section.as_ref())?;
         let relocations = compiled
             .relocations
             .iter()
+            .filter_map(TextRelocation::as_call)
             .map(|relocation| {
                 let mut value = json!({
                     "offset": relocation.offset,
-                    "kind": "R_X86_64_PLT32",
-                    "target_symbol_hash": &relocation.target_symbol_hash,
-                    "target_abi_symbol": &relocation.target_abi_symbol,
+                    "kind": relocation.elf_kind(),
+                    "target_symbol_hash": relocation.target_symbol_hash,
+                    "target_abi_symbol": relocation.target_abi_symbol,
                 });
                 if relocation.platform {
                     value
@@ -111,8 +122,9 @@ impl ObjectBackend for ElfObjectBackend {
         let called_symbols = compiled
             .relocations
             .iter()
+            .filter_map(TextRelocation::as_call)
             .filter(|relocation| !relocation.platform)
-            .map(|relocation| relocation.target_symbol_hash.clone())
+            .map(|relocation| relocation.target_symbol_hash.to_string())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -130,13 +142,13 @@ impl ObjectBackend for ElfObjectBackend {
             "called_symbols": called_symbols,
             "relocations": relocations,
             "debug_metadata": native_debug_metadata(&compiled),
-            "static_data": static_data_metadata(&compiled),
+            "static_data": static_data,
         });
 
         Ok(ObjectBackendArtifact {
             artifact_hash,
             metadata,
-            bytes,
+            bytes: object.bytes,
         })
     }
 }
@@ -155,18 +167,26 @@ impl ObjectBackend for MachOArm64ObjectBackend {
         let function_symbol = internal_abi_symbol(&input.ir.symbol_hash)?;
         let object_symbol = macho_symbol_name(&function_symbol);
         let compiled = compile_arm64_function(input.ir, &object_symbol)?;
-        let bytes = write_macho_object(&object_symbol, &compiled.text, &compiled.relocations);
-        let artifact_hash = hash_bytes(BYTES_DOMAIN, &bytes);
+        let object = write_macho_object(
+            &object_symbol,
+            &compiled.text,
+            &compiled.rodata,
+            &compiled.static_data,
+            &compiled.relocations,
+        );
+        let artifact_hash = hash_bytes(BYTES_DOMAIN, &object.bytes);
+        let static_data = static_data_metadata(&compiled, object.static_data_section.as_ref())?;
         let relocations = compiled
             .relocations
             .iter()
+            .filter_map(TextRelocation::as_call)
             .map(|relocation| {
                 let mut value = json!({
                     "offset": relocation.offset,
-                    "kind": "ARM64_RELOC_BRANCH26",
-                    "target_symbol_hash": &relocation.target_symbol_hash,
+                    "kind": relocation.macho_kind(),
+                    "target_symbol_hash": relocation.target_symbol_hash,
                     "target_abi_symbol": strip_macho_symbol_prefix(&relocation.target_abi_symbol),
-                    "target_object_symbol": &relocation.target_abi_symbol,
+                    "target_object_symbol": relocation.target_abi_symbol,
                 });
                 if relocation.platform {
                     value
@@ -180,8 +200,9 @@ impl ObjectBackend for MachOArm64ObjectBackend {
         let called_symbols = compiled
             .relocations
             .iter()
+            .filter_map(TextRelocation::as_call)
             .filter(|relocation| !relocation.platform)
-            .map(|relocation| relocation.target_symbol_hash.clone())
+            .map(|relocation| relocation.target_symbol_hash.to_string())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -200,13 +221,13 @@ impl ObjectBackend for MachOArm64ObjectBackend {
             "called_symbols": called_symbols,
             "relocations": relocations,
             "debug_metadata": native_debug_metadata(&compiled),
-            "static_data": static_data_metadata(&compiled),
+            "static_data": static_data,
         });
 
         Ok(ObjectBackendArtifact {
             artifact_hash,
             metadata,
-            bytes,
+            bytes: object.bytes,
         })
     }
 }
@@ -1810,17 +1831,27 @@ fn native_debug_metadata(compiled: &CompiledFunction) -> JsonValue {
     })
 }
 
-fn static_data_metadata(compiled: &CompiledFunction) -> Vec<JsonValue> {
+fn static_data_metadata(
+    compiled: &CompiledFunction,
+    section: Option<&StaticDataSectionPlacement>,
+) -> Result<Vec<JsonValue>> {
     compiled
         .static_data
         .iter()
         .map(|entry| {
-            json!({
+            let section =
+                section.ok_or_else(|| anyhow!("static data metadata is missing object section"))?;
+            Ok(json!({
                 "static_data_hash": &entry.static_data_hash,
                 "bytes_hex": &entry.bytes_hex,
-                "offset": entry.offset,
+                "section": section.name,
+                "section_offset": entry.offset,
+                "offset": section
+                    .file_offset
+                    .checked_add(entry.offset)
+                    .ok_or_else(|| anyhow!("static data metadata object offset overflow"))?,
                 "len": entry.len,
-            })
+            }))
         })
         .collect()
 }
@@ -1828,6 +1859,7 @@ fn static_data_metadata(compiled: &CompiledFunction) -> Vec<JsonValue> {
 #[derive(Debug, Clone)]
 struct CompiledFunction {
     text: Vec<u8>,
+    rodata: Vec<u8>,
     relocations: Vec<TextRelocation>,
     static_data: Vec<StaticDataEntry>,
     debug_ranges: Vec<NativeDebugRange>,
@@ -1868,11 +1900,42 @@ struct NativeDebugRange {
 }
 
 #[derive(Debug, Clone)]
-struct TextRelocation {
+enum TextRelocation {
+    Call(CallRelocation),
+    StaticDataAddress(StaticDataAddressRelocation),
+}
+
+#[derive(Debug, Clone)]
+struct CallRelocation {
     offset: u64,
     target_symbol_hash: String,
     target_abi_symbol: String,
     platform: bool,
+}
+
+impl CallRelocation {
+    fn elf_kind(&self) -> &'static str {
+        "R_X86_64_PLT32"
+    }
+
+    fn macho_kind(&self) -> &'static str {
+        "ARM64_RELOC_BRANCH26"
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StaticDataAddressRelocation {
+    offset: u64,
+    static_data_hash: String,
+}
+
+impl TextRelocation {
+    fn as_call(&self) -> Option<&CallRelocation> {
+        match self {
+            TextRelocation::Call(relocation) => Some(relocation),
+            TextRelocation::StaticDataAddress(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1922,6 +1985,7 @@ fn compile_x86_64_function(
         layout,
         type_layouts,
         text: Vec::new(),
+        rodata: Vec::new(),
         relocations: Vec::new(),
         static_data: Vec::new(),
         static_data_patches: Vec::new(),
@@ -1962,6 +2026,7 @@ fn compile_x86_64_function(
     let static_data = emitter.static_data_entries()?;
     Ok(CompiledFunction {
         text: emitter.text,
+        rodata: emitter.rodata,
         relocations: emitter.relocations,
         static_data,
         debug_ranges: emitter.debug_ranges,
@@ -2117,6 +2182,7 @@ struct FunctionEmitter {
     layout: StackLayout,
     type_layouts: BTreeMap<String, LoweredTypeLayout>,
     text: Vec<u8>,
+    rodata: Vec<u8>,
     relocations: Vec<TextRelocation>,
     static_data: Vec<StaticDataBlob>,
     static_data_patches: Vec<StaticDataPatch>,
@@ -2211,32 +2277,20 @@ impl FunctionEmitter {
         if self.static_data.is_empty() {
             return Ok(());
         }
-        while !self.text.len().is_multiple_of(16) {
-            self.text.push(0x90);
+        while !self.rodata.len().is_multiple_of(16) {
+            self.rodata.push(0);
         }
         for blob in &mut self.static_data {
-            blob.offset = Some(self.text.len());
-            self.text.extend_from_slice(&blob.bytes);
+            blob.offset = Some(self.rodata.len());
+            self.rodata.extend_from_slice(&blob.bytes);
         }
-        let offsets = self
-            .static_data
-            .iter()
-            .map(|blob| {
-                Ok((
-                    blob.static_data_hash.clone(),
-                    blob.offset
-                        .ok_or_else(|| anyhow!("static data offset was not assigned"))?,
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
         for patch in self.static_data_patches.clone() {
-            let target = *offsets
-                .get(&patch.static_data_hash)
-                .ok_or_else(|| anyhow!("missing static data patch target"))?;
-            let next = patch.patch_offset + 4;
-            let disp = i32::try_from(target as i64 - next as i64)?;
-            self.text[patch.patch_offset..patch.patch_offset + 4]
-                .copy_from_slice(&disp.to_le_bytes());
+            self.relocations.push(TextRelocation::StaticDataAddress(
+                StaticDataAddressRelocation {
+                    offset: patch.patch_offset as u64,
+                    static_data_hash: patch.static_data_hash,
+                },
+            ));
         }
         Ok(())
     }
@@ -2332,12 +2386,12 @@ impl FunctionEmitter {
                 let offset = self.text.len() + 1;
                 self.text.push(0xe8);
                 self.text.extend_from_slice(&[0, 0, 0, 0]);
-                self.relocations.push(TextRelocation {
+                self.relocations.push(TextRelocation::Call(CallRelocation {
                     offset: offset as u64,
                     target_symbol_hash: target_symbol_hash.clone(),
                     target_abi_symbol,
                     platform: false,
-                });
+                }));
                 if let Some(return_address) = return_address {
                     self.mov_rax_stack(self.value_offset(return_address)?);
                 }
@@ -3188,12 +3242,12 @@ impl FunctionEmitter {
         let offset = self.text.len() + 1;
         self.text.push(0xe8);
         self.text.extend_from_slice(&[0, 0, 0, 0]);
-        self.relocations.push(TextRelocation {
+        self.relocations.push(TextRelocation::Call(CallRelocation {
             offset: offset as u64,
             target_symbol_hash: target_symbol_hash.to_string(),
             target_abi_symbol: target_abi_symbol.to_string(),
             platform: true,
-        });
+        }));
     }
 
     fn value_offset(&self, id: &str) -> Result<i32> {
@@ -3500,6 +3554,7 @@ fn compile_arm64_function(
         layout,
         type_layouts,
         text: Vec::new(),
+        rodata: Vec::new(),
         relocations: Vec::new(),
         static_data: Vec::new(),
         static_data_patches: Vec::new(),
@@ -3540,6 +3595,7 @@ fn compile_arm64_function(
     let static_data = emitter.static_data_entries()?;
     Ok(CompiledFunction {
         text: emitter.text,
+        rodata: emitter.rodata,
         relocations: emitter.relocations,
         static_data,
         debug_ranges: emitter.debug_ranges,
@@ -3618,6 +3674,7 @@ struct Arm64Emitter {
     layout: Arm64StackLayout,
     type_layouts: BTreeMap<String, LoweredTypeLayout>,
     text: Vec<u8>,
+    rodata: Vec<u8>,
     relocations: Vec<TextRelocation>,
     static_data: Vec<StaticDataBlob>,
     static_data_patches: Vec<StaticDataPatch>,
@@ -3681,7 +3738,8 @@ impl Arm64Emitter {
         }
         self.intern_static_data(static_data_hash, bytes_hex, bytes);
         let patch_offset = self.text.len();
-        self.emit_u32(0x10000000);
+        self.emit_u32(0x90000000);
+        self.emit_u32(0x91000000);
         self.static_data_patches.push(StaticDataPatch {
             static_data_hash: static_data_hash.to_string(),
             patch_offset,
@@ -3710,29 +3768,20 @@ impl Arm64Emitter {
         if self.static_data.is_empty() {
             return Ok(());
         }
-        while !self.text.len().is_multiple_of(16) {
-            self.emit_u32(0xd503201f);
+        while !self.rodata.len().is_multiple_of(16) {
+            self.rodata.push(0);
         }
         for blob in &mut self.static_data {
-            blob.offset = Some(self.text.len());
-            self.text.extend_from_slice(&blob.bytes);
+            blob.offset = Some(self.rodata.len());
+            self.rodata.extend_from_slice(&blob.bytes);
         }
-        let offsets = self
-            .static_data
-            .iter()
-            .map(|blob| {
-                Ok((
-                    blob.static_data_hash.clone(),
-                    blob.offset
-                        .ok_or_else(|| anyhow!("static data offset was not assigned"))?,
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
         for patch in self.static_data_patches.clone() {
-            let target = *offsets
-                .get(&patch.static_data_hash)
-                .ok_or_else(|| anyhow!("missing static data patch target"))?;
-            self.patch_adr(patch.patch_offset, target)?;
+            self.relocations.push(TextRelocation::StaticDataAddress(
+                StaticDataAddressRelocation {
+                    offset: patch.patch_offset as u64,
+                    static_data_hash: patch.static_data_hash,
+                },
+            ));
         }
         Ok(())
     }
@@ -3827,12 +3876,12 @@ impl Arm64Emitter {
                 );
                 let offset = self.text.len();
                 self.emit_u32(0x94000000);
-                self.relocations.push(TextRelocation {
+                self.relocations.push(TextRelocation::Call(CallRelocation {
                     offset: offset as u64,
                     target_symbol_hash: target_symbol_hash.clone(),
                     target_abi_symbol,
                     platform: false,
-                });
+                }));
                 if let Some(return_address) = return_address {
                     self.ldr_stack(0, self.value_offset(return_address)?)?;
                 }
@@ -4669,12 +4718,12 @@ impl Arm64Emitter {
     fn emit_platform_call_arm64(&mut self, target_symbol_hash: &str, target_abi_symbol: &str) {
         let offset = self.text.len();
         self.emit_u32(0x94000000);
-        self.relocations.push(TextRelocation {
+        self.relocations.push(TextRelocation::Call(CallRelocation {
             offset: offset as u64,
             target_symbol_hash: target_symbol_hash.to_string(),
             target_abi_symbol: macho_symbol_name(target_abi_symbol),
             platform: true,
-        });
+        }));
     }
 
     fn value_offset(&self, id: &str) -> Result<u32> {
@@ -4962,25 +5011,6 @@ impl Arm64Emitter {
         Ok(())
     }
 
-    fn patch_adr(&mut self, patch_offset: usize, target_offset: usize) -> Result<()> {
-        let imm = target_offset as i64 - patch_offset as i64;
-        if !(-(1 << 20)..(1 << 20)).contains(&imm) {
-            bail!("arm64 static data address is out of adr range");
-        }
-        let imm21 = (imm as i32 as u32) & 0x1f_ffff;
-        let immlo = imm21 & 0x3;
-        let immhi = (imm21 >> 2) & 0x7ffff;
-        let instruction = u32::from_le_bytes(
-            self.text[patch_offset..patch_offset + 4]
-                .try_into()
-                .expect("instruction bytes"),
-        );
-        let rd = instruction & 0x1f;
-        let patched = 0x10000000 | (immlo << 29) | (immhi << 5) | rd;
-        self.text[patch_offset..patch_offset + 4].copy_from_slice(&patched.to_le_bytes());
-        Ok(())
-    }
-
     fn branch_disp_words(&self, patch_offset: usize) -> Result<i64> {
         let target = self.text.len() as i64;
         let source = patch_offset as i64;
@@ -5008,14 +5038,41 @@ struct Section {
     data: Vec<u8>,
 }
 
-fn write_elf_object(function_symbol: &str, text: &[u8], relocations: &[TextRelocation]) -> Vec<u8> {
+struct NativeObjectImage {
+    bytes: Vec<u8>,
+    static_data_section: Option<StaticDataSectionPlacement>,
+}
+
+struct StaticDataSectionPlacement {
+    name: &'static str,
+    file_offset: u64,
+}
+
+fn write_elf_object(
+    function_symbol: &str,
+    text: &[u8],
+    rodata: &[u8],
+    static_data: &[StaticDataEntry],
+    relocations: &[TextRelocation],
+) -> NativeObjectImage {
     let mut strtab = StringTable::default();
     let function_name = strtab.insert(function_symbol);
     let external_symbols = relocations
         .iter()
+        .filter_map(TextRelocation::as_call)
         .map(|relocation| relocation.target_abi_symbol.clone())
         .filter(|symbol| symbol != function_symbol)
         .collect::<BTreeSet<_>>();
+    let static_symbol_names = static_data
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            (
+                entry.static_data_hash.clone(),
+                format!(".Lcodedb_static_{idx}"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut symbols = Vec::new();
     symbols.push(SymbolEntry::null());
     symbols.push(SymbolEntry {
@@ -5026,6 +5083,27 @@ fn write_elf_object(function_symbol: &str, text: &[u8], relocations: &[TextReloc
         size: 0,
     });
     symbols.push(SymbolEntry {
+        name: 0,
+        info: 3,
+        shndx: 2,
+        value: 0,
+        size: 0,
+    });
+    let mut static_symbol_indexes = BTreeMap::new();
+    for entry in static_data {
+        let name = strtab.insert(&static_symbol_names[&entry.static_data_hash]);
+        let idx = symbols.len() as u32;
+        symbols.push(SymbolEntry {
+            name,
+            info: 0,
+            shndx: 2,
+            value: entry.offset,
+            size: entry.len,
+        });
+        static_symbol_indexes.insert(entry.static_data_hash.clone(), idx);
+    }
+    let first_global_symbol = symbols.len() as u32;
+    symbols.push(SymbolEntry {
         name: function_name,
         info: 0x12,
         shndx: 1,
@@ -5033,7 +5111,7 @@ fn write_elf_object(function_symbol: &str, text: &[u8], relocations: &[TextReloc
         size: text.len() as u64,
     });
     let mut symbol_indexes = BTreeMap::new();
-    symbol_indexes.insert(function_symbol.to_string(), 2_u32);
+    symbol_indexes.insert(function_symbol.to_string(), first_global_symbol);
     for external in &external_symbols {
         let name = strtab.insert(external);
         let idx = symbols.len() as u32;
@@ -5052,10 +5130,17 @@ fn write_elf_object(function_symbol: &str, text: &[u8], relocations: &[TextReloc
         .collect::<Vec<_>>();
     let rela = relocations
         .iter()
-        .flat_map(|relocation| {
-            let symbol_index = symbol_indexes[&relocation.target_abi_symbol];
-            let info = ((symbol_index as u64) << 32) | R_X86_64_PLT32 as u64;
-            rela_entry(relocation.offset, info, -4)
+        .flat_map(|relocation| match relocation {
+            TextRelocation::Call(relocation) => {
+                let symbol_index = symbol_indexes[&relocation.target_abi_symbol];
+                let info = ((symbol_index as u64) << 32) | R_X86_64_PLT32 as u64;
+                rela_entry(relocation.offset, info, -4)
+            }
+            TextRelocation::StaticDataAddress(relocation) => {
+                let symbol_index = static_symbol_indexes[&relocation.static_data_hash];
+                let info = ((symbol_index as u64) << 32) | R_X86_64_PC32 as u64;
+                rela_entry(relocation.offset, info, -4)
+            }
         })
         .collect::<Vec<_>>();
 
@@ -5071,10 +5156,20 @@ fn write_elf_object(function_symbol: &str, text: &[u8], relocations: &[TextReloc
             data: text.to_vec(),
         },
         Section {
+            name: ".rodata",
+            section_type: 1,
+            flags: 0x2,
+            link: 0,
+            info: 0,
+            align: 16,
+            entsize: 0,
+            data: rodata.to_vec(),
+        },
+        Section {
             name: ".rela.text",
             section_type: 4,
             flags: 0x40,
-            link: 3,
+            link: 4,
             info: 1,
             align: 8,
             entsize: 24,
@@ -5084,8 +5179,8 @@ fn write_elf_object(function_symbol: &str, text: &[u8], relocations: &[TextReloc
             name: ".symtab",
             section_type: 2,
             flags: 0,
-            link: 4,
-            info: 2,
+            link: 5,
+            info: first_global_symbol,
             align: 8,
             entsize: 24,
             data: symtab,
@@ -5144,24 +5239,58 @@ fn write_elf_object(function_symbol: &str, text: &[u8], relocations: &[TextReloc
             section.entsize,
         ));
     }
-    out
+    NativeObjectImage {
+        bytes: out,
+        static_data_section: (!rodata.is_empty()).then_some(StaticDataSectionPlacement {
+            name: ".rodata",
+            file_offset: section_offsets[1],
+        }),
+    }
 }
 
 fn write_macho_object(
     function_symbol: &str,
     text: &[u8],
+    rodata: &[u8],
+    static_data: &[StaticDataEntry],
     relocations: &[TextRelocation],
-) -> Vec<u8> {
+) -> NativeObjectImage {
     let mut strtab = StringTable::default();
     let function_name = strtab.insert(function_symbol);
     let external_symbols = relocations
         .iter()
+        .filter_map(TextRelocation::as_call)
         .map(|relocation| relocation.target_abi_symbol.clone())
         .filter(|symbol| symbol != function_symbol)
         .collect::<BTreeSet<_>>();
+    let static_symbol_names = static_data
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            (
+                entry.static_data_hash.clone(),
+                format!("ltmp_codedb_static_{idx}"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let mut symbols = Vec::new();
     let mut symbol_indexes = BTreeMap::new();
+    let mut static_symbol_indexes = BTreeMap::new();
+    for entry in static_data {
+        let name = strtab.insert(&static_symbol_names[&entry.static_data_hash]);
+        let idx = symbols.len() as u32;
+        symbols.push(MachOSymbolEntry {
+            name,
+            ty: 0x0e,
+            sect: 2,
+            desc: 0,
+            value: align_to(text.len() as u64, 16) + entry.offset,
+        });
+        static_symbol_indexes.insert(entry.static_data_hash.clone(), idx);
+    }
+    let local_symbol_count = symbols.len() as u32;
+    let function_symbol_index = symbols.len() as u32;
     symbols.push(MachOSymbolEntry {
         name: function_name,
         ty: 0x0f,
@@ -5169,7 +5298,8 @@ fn write_macho_object(
         desc: 0,
         value: 0,
     });
-    symbol_indexes.insert(function_symbol.to_string(), 0_u32);
+    symbol_indexes.insert(function_symbol.to_string(), function_symbol_index);
+    let first_undefined_symbol = symbols.len() as u32;
     for external in &external_symbols {
         let name = strtab.insert(external);
         let idx = symbols.len() as u32;
@@ -5184,18 +5314,26 @@ fn write_macho_object(
     }
 
     const HEADER_SIZE: u64 = 32;
-    const SIZEOF_CMDS: u32 = 280;
-    let text_offset = HEADER_SIZE + u64::from(SIZEOF_CMDS);
-    let text_end = text_offset + text.len() as u64;
-    let reloc_offset = if relocations.is_empty() {
+    let segment_command_size = if rodata.is_empty() { 152 } else { 232 };
+    let sizeofcmds = segment_command_size + 24 + 24 + 80;
+    let text_offset = HEADER_SIZE + u64::from(sizeofcmds);
+    let const_addr = align_to(text.len() as u64, 16);
+    let const_offset = text_offset + const_addr;
+    let section_bytes_end = if rodata.is_empty() {
+        text_offset + text.len() as u64
+    } else {
+        const_offset + rodata.len() as u64
+    };
+    let reloc_count = macho_relocation_count(relocations);
+    let reloc_offset = if reloc_count == 0 {
         0
     } else {
-        align_to(text_end, 4)
+        align_to(section_bytes_end, 4)
     };
-    let reloc_size = relocations.len() as u64 * 8;
+    let reloc_size = reloc_count as u64 * 8;
     let symoff = align_to(
-        if relocations.is_empty() {
-            text_end
+        if reloc_count == 0 {
+            section_bytes_end
         } else {
             reloc_offset + reloc_size
         },
@@ -5203,12 +5341,13 @@ fn write_macho_object(
     );
     let stroff = symoff + symbols.len() as u64 * 16;
 
-    let mut out = macho_header(SIZEOF_CMDS);
+    let mut out = macho_header(sizeofcmds);
     out.extend_from_slice(&macho_segment_command(
         text_offset as u32,
         text.len() as u64,
+        (!rodata.is_empty()).then_some((const_addr, const_offset as u32, rodata.len() as u64)),
         reloc_offset as u32,
-        relocations.len() as u32,
+        reloc_count as u32,
     ));
     out.extend_from_slice(&macho_build_version_command());
     out.extend_from_slice(&macho_symtab_command(
@@ -5217,18 +5356,45 @@ fn write_macho_object(
         stroff as u32,
         strtab.bytes.len() as u32,
     ));
-    out.extend_from_slice(&macho_dysymtab_command(1, external_symbols.len() as u32));
+    out.extend_from_slice(&macho_dysymtab_command(
+        local_symbol_count,
+        function_symbol_index,
+        first_undefined_symbol,
+        external_symbols.len() as u32,
+    ));
 
     pad_to(&mut out, text_offset as usize);
     out.extend_from_slice(text);
-    if !relocations.is_empty() {
+    if !rodata.is_empty() {
+        pad_to(&mut out, const_offset as usize);
+        out.extend_from_slice(rodata);
+    }
+    if reloc_count != 0 {
         pad_to(&mut out, reloc_offset as usize);
         for relocation in relocations {
-            let symbol_index = symbol_indexes[&relocation.target_abi_symbol];
-            out.extend_from_slice(&(relocation.offset as i32).to_le_bytes());
-            let info =
-                symbol_index | (1 << 24) | (2 << 25) | (1 << 27) | (ARM64_RELOC_BRANCH26 << 28);
-            put_u32(&mut out, info);
+            match relocation {
+                TextRelocation::Call(relocation) => {
+                    let symbol_index = symbol_indexes[&relocation.target_abi_symbol];
+                    out.extend_from_slice(&(relocation.offset as i32).to_le_bytes());
+                    put_u32(
+                        &mut out,
+                        macho_relocation_info(symbol_index, true, ARM64_RELOC_BRANCH26),
+                    );
+                }
+                TextRelocation::StaticDataAddress(relocation) => {
+                    let symbol_index = static_symbol_indexes[&relocation.static_data_hash];
+                    out.extend_from_slice(&(relocation.offset as i32).to_le_bytes());
+                    put_u32(
+                        &mut out,
+                        macho_relocation_info(symbol_index, true, ARM64_RELOC_PAGE21),
+                    );
+                    out.extend_from_slice(&((relocation.offset + 4) as i32).to_le_bytes());
+                    put_u32(
+                        &mut out,
+                        macho_relocation_info(symbol_index, false, ARM64_RELOC_PAGEOFF12),
+                    );
+                }
+            }
         }
     }
     pad_to(&mut out, symoff as usize);
@@ -5237,7 +5403,13 @@ fn write_macho_object(
     }
     pad_to(&mut out, stroff as usize);
     out.extend_from_slice(&strtab.bytes);
-    out
+    NativeObjectImage {
+        bytes: out,
+        static_data_section: (!rodata.is_empty()).then_some(StaticDataSectionPlacement {
+            name: "__TEXT,__const",
+            file_offset: const_offset,
+        }),
+    }
 }
 
 fn macho_header(sizeofcmds: u32) -> Vec<u8> {
@@ -5257,20 +5429,26 @@ fn macho_header(sizeofcmds: u32) -> Vec<u8> {
 fn macho_segment_command(
     text_offset: u32,
     text_size: u64,
+    const_section: Option<(u64, u32, u64)>,
     reloc_offset: u32,
     reloc_count: u32,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(152);
+    let command_size = 72 + if const_section.is_some() { 160 } else { 80 };
+    let vmsize = const_section
+        .map(|(addr, _, size)| addr + size)
+        .unwrap_or(text_size);
+    let file_size = vmsize;
+    let mut out = Vec::with_capacity(command_size);
     put_u32(&mut out, 0x19);
-    put_u32(&mut out, 152);
+    put_u32(&mut out, command_size as u32);
     put_fixed_name(&mut out, "");
     put_u64(&mut out, 0);
-    put_u64(&mut out, text_size);
+    put_u64(&mut out, vmsize);
     put_u64(&mut out, u64::from(text_offset));
-    put_u64(&mut out, text_size);
+    put_u64(&mut out, file_size);
     put_u32(&mut out, 7);
-    put_u32(&mut out, 7);
-    put_u32(&mut out, 1);
+    put_u32(&mut out, 5);
+    put_u32(&mut out, if const_section.is_some() { 2 } else { 1 });
     put_u32(&mut out, 0);
 
     put_fixed_name(&mut out, "__text");
@@ -5285,8 +5463,36 @@ fn macho_segment_command(
     put_u32(&mut out, 0);
     put_u32(&mut out, 0);
     put_u32(&mut out, 0);
-    debug_assert_eq!(out.len(), 152);
+    if let Some((const_addr, const_offset, const_size)) = const_section {
+        put_fixed_name(&mut out, "__const");
+        put_fixed_name(&mut out, "__TEXT");
+        put_u64(&mut out, const_addr);
+        put_u64(&mut out, const_size);
+        put_u32(&mut out, const_offset);
+        put_u32(&mut out, 4);
+        put_u32(&mut out, 0);
+        put_u32(&mut out, 0);
+        put_u32(&mut out, 0);
+        put_u32(&mut out, 0);
+        put_u32(&mut out, 0);
+        put_u32(&mut out, 0);
+    }
+    debug_assert_eq!(out.len(), command_size);
     out
+}
+
+fn macho_relocation_count(relocations: &[TextRelocation]) -> usize {
+    relocations
+        .iter()
+        .map(|relocation| match relocation {
+            TextRelocation::Call(_) => 1,
+            TextRelocation::StaticDataAddress(_) => 2,
+        })
+        .sum()
+}
+
+fn macho_relocation_info(symbol_index: u32, pc_relative: bool, relocation_type: u32) -> u32 {
+    symbol_index | (u32::from(pc_relative) << 24) | (2 << 25) | (1 << 27) | (relocation_type << 28)
 }
 
 fn macho_build_version_command() -> Vec<u8> {
@@ -5311,12 +5517,17 @@ fn macho_symtab_command(symoff: u32, nsyms: u32, stroff: u32, strsize: u32) -> V
     out
 }
 
-fn macho_dysymtab_command(iundefsym: u32, nundefsym: u32) -> Vec<u8> {
+fn macho_dysymtab_command(
+    nlocalsym: u32,
+    iextdefsym: u32,
+    iundefsym: u32,
+    nundefsym: u32,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(80);
     put_u32(&mut out, 0xb);
     put_u32(&mut out, 80);
     for value in [
-        0, 0, 0, 1, iundefsym, nundefsym, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, nlocalsym, iextdefsym, 1, iundefsym, nundefsym, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ] {
         put_u32(&mut out, value);
     }
@@ -5389,7 +5600,14 @@ impl StringTable {
 
 fn section_name_table() -> StringTable {
     let mut table = StringTable::default();
-    for name in [".text", ".rela.text", ".symtab", ".strtab", ".shstrtab"] {
+    for name in [
+        ".text",
+        ".rodata",
+        ".rela.text",
+        ".symtab",
+        ".strtab",
+        ".shstrtab",
+    ] {
         table.insert(name);
     }
     table

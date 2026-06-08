@@ -14,6 +14,8 @@ The required acceptance programs are:
 | `line_view_refs.cdb` | Shared references stored in records. | Records containing shared references compile natively and pass semantic tests. |
 | `mutable_cursor.cdb` | Mutable references stored in records plus state effects. | Exclusive mutable access compiles to native stores and rejects aliasing. |
 | `invoice_static.cdb` | Records, enums, fixed arrays or slices, references, and loops or folds. | Structured static data compiles natively with deterministic layouts. |
+| `box_heap.cdb` | Move-only `box<T>` values, compiler-owned allocation, drop glue, and recursive boxed enums. | Box allocation, moves, borrows, and recursive construction compile natively. |
+| `static_write.cdb` | Static string data passed through minimal `std.platform` and `std.io` modules. | Read-only static data links through an unsafe FFI write wrapper and prints bytes. |
 | `parser_or_word_count.cdb` | Byte or string slices, bounds checks, loops, and later I/O. | Slice-heavy parsing or counting compiles natively without interpreter fallback. |
 | `todo_cli.cdb` | Capstone CLI with args, stdout, files, strings, dynamic allocation, and result handling. | Useful stateful CLI behavior passes native-required integration tests. |
 

@@ -403,10 +403,12 @@ Lowered functions use `codedb/lowered-function-ir/v2`:
 }
 ```
 
-Operations include `param`, `const_i64`, `const_bool`, `const_unit`, `unary`,
-`binary`, `call`, `if`, `addr_of_param`, `addr_of_local`, `addr_of_field`,
-`addr_of_index`, `load`, `store`, `copy`, `move`, `drop`, `borrow_debug`, and
-`return`. Calls target `target_symbol_hash`; they do not target display names.
+Operations include `param`, `const_i64`, `const_u8`, `const_bool`, `const_unit`,
+`static_data_address`, `construct_slice`, `unary`, `binary`, `call`, `if`,
+`fold`, `heap_alloc`, `deref_box`, `addr_of_param`, `addr_of_local`,
+`addr_of_field`, `addr_of_index`, `load`, `store`, `copy`, `move`, `drop`,
+`borrow_debug`, and `return`. Calls target `target_symbol_hash`; they do not
+target display names.
 `debug_map` records stable lowered operation IDs for value-producing operations,
 including address and load/copy/move operations, and maps expression hashes back
 to those IDs.
@@ -449,6 +451,16 @@ Metadata for native objects uses `codedb/native-object/v1`:
       "target_abi_symbol": "codedb_fedcba9876543210"
     }
   ],
+  "static_data": [
+    {
+      "static_data_hash": "sha256:static-data",
+      "bytes_hex": "68656c6c6f",
+      "section": ".rodata",
+      "section_offset": 0,
+      "offset": 320,
+      "len": 5
+    }
+  ],
   "debug_metadata": {
     "schema": "codedb/native-debug-metadata/v1",
     "text_section": ".text",
@@ -470,7 +482,8 @@ Metadata for native objects uses `codedb/native-object/v1`:
 ```
 
 Apple Mach-O metadata also includes `object_symbols` with underscore-prefixed
-Mach-O symbol names, and branch relocations use `ARM64_RELOC_BRANCH26`.
+Mach-O symbol names, branch relocations use `ARM64_RELOC_BRANCH26`, and static
+data entries report section `__TEXT,__const` instead of `.rodata`.
 
 Internal ABI symbols are derived only from symbol identity:
 
@@ -498,6 +511,16 @@ and object bytes.
       "symbol_hash": "sha256:symbol",
       "object_cache_key": "sha256:cache-key",
       "object_artifact_hash": "sha256:bytes",
+      "static_data": [
+        {
+          "static_data_hash": "sha256:static-data",
+          "bytes_hex": "68656c6c6f",
+          "section": ".rodata",
+          "section_offset": 0,
+          "offset": 320,
+          "len": 5
+        }
+      ],
       "debug_metadata": {
         "schema": "codedb/native-debug-metadata/v1",
         "text_section": ".text",

@@ -1,0 +1,11 @@
+module std.platform {
+extern fn write(fd: i64, ptr: raw_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "write" library "c"
+}
+
+module std.io {
+fn write_stdout(s: slice<'static, u8>) -> i64 effects[io, ffi, unsafe] =
+  std.platform.write(1, raw_ptr(&'static s[0]), len(s))
+}
+
+fn main() -> i64 effects[io, ffi, unsafe] =
+  std.io.write_stdout("hello")

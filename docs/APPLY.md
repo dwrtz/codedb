@@ -218,12 +218,21 @@ JSON operations accept these type strings:
 
 ```text
 i64
+u8
 bool
 unit
 record {amount: i64, tax: i64}
 enum {none: unit, some: i64}
 Money
 views.LineView<'a>
+&'a Money
+&'a mut Money
+raw_ptr<u8>
+raw_mut_ptr<u8>
+box<Money>
+slice<'static, u8>
+mut_slice<'a, Money>
+array<i64, 4>
 ```
 
 Record fields and enum variants are projection-safe identifiers. Record and enum
@@ -281,14 +290,17 @@ io
 state
 alloc
 ffi
+unsafe
 concurrent
 ```
 
 `pure` cannot be combined with other effects. The current scaffold validates
 call propagation: a function that calls an `io`, `ffi`, or otherwise effectful
 function must declare those effects itself. Assignment requires the `state`
-effect, including when the assignment is nested inside another expression.
-Built-in arithmetic is still treated as pure in this phase.
+effect, including when the assignment is nested inside another expression. Raw
+pointer operations and extern declarations with raw pointer arguments or returns
+require `unsafe` in addition to `ffi` where applicable. Built-in arithmetic is
+still treated as pure in this phase.
 
 ## External Functions
 
@@ -328,10 +340,15 @@ Bodies use structural `RawExpr` JSON:
 ```json
 { "kind": "literal_i64", "value": "100" }
 { "kind": "literal_bool", "value": true }
+{ "kind": "literal_string", "value": "hello" }
+{ "kind": "literal_bytes", "bytes_hex": "68656c6c6f" }
 { "kind": "unit" }
 { "kind": "param_name", "name": "subtotal" }
 { "kind": "param_ref", "index": 0 }
 { "kind": "call", "name": "tax", "args": [] }
+{ "kind": "call", "name": "box_new", "args": [{}] }
+{ "kind": "call", "name": "len", "args": [{}] }
+{ "kind": "call", "name": "raw_ptr", "args": [{}] }
 { "kind": "binary", "op": "+", "left": {}, "right": {} }
 { "kind": "unary", "op": "!", "expr": {} }
 { "kind": "borrow_shared", "region": "a", "target": {} }
@@ -339,6 +356,9 @@ Bodies use structural `RawExpr` JSON:
 { "kind": "assign", "target": {}, "value": {} }
 { "kind": "let", "name": "x", "type": "i64", "value": {}, "body": {} }
 { "kind": "if", "cond": {}, "then": {}, "else": {} }
+{ "kind": "array", "elements": [{ "kind": "literal_i64", "value": "1" }] }
+{ "kind": "index", "target": {}, "index": { "kind": "literal_i64", "value": "0" } }
+{ "kind": "fold", "item": "x", "target": {}, "acc": "total", "init": {}, "body": {} }
 { "kind": "record", "fields": [{ "name": "amount", "value": {} }] }
 { "kind": "field_access", "target": {}, "field": "amount" }
 { "kind": "enum_construct", "type": "enum {none: unit, some: i64}", "variant": "some", "value": {} }
@@ -360,6 +380,11 @@ order.amount
 &'a order
 &'a mut order
 order.amount = 120
+[1, 2, 3][0]
+fold line in lines with total = 0 do total + line.amount
+box_new({amount: 100, tax: 20})
+"hello"
+b"hello"
 enum {none: unit, some: i64}::some(41)
 case maybe_value() of none => 0 | some(x) => x + 1
 ```

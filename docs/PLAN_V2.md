@@ -833,9 +833,10 @@ box dereference place
 move-only ownership for boxes
 drop glue for boxes
 recursive type support through box
-allocator interface
-heap_alloc / heap_free lowered ops
-minimal platform allocation externs
+compiler-owned allocation boundary
+heap_alloc lowered op
+drop glue emits platform free calls
+minimal platform allocation capsule
 ```
 
 Files likely touched:
@@ -848,7 +849,6 @@ src/lowering.rs
 src/backend/native.rs
 src/verify.rs
 src/tests.rs
-new std/alloc or examples/std/alloc package
 tests/box.rs
 ```
 
@@ -859,13 +859,15 @@ box<Line> compiles native
 borrowing from box works
 moving box prevents use-after-move
 drop frees exactly once
-recursive Node with option<box<Node>> typechecks and compiles native for basic construction/use
+recursive Node with box<Node> typechecks and compiles native for basic construction/use
 native-required box tests pass
 ```
 
 Implementation note: Phase 15 is implemented. Allocation lowers through
 `heap_alloc`; freeing is emitted by compiler-generated drop glue for box-owning
-layouts, so there is no user-callable `heap_free` surface.
+layouts through the platform allocation capsule, so there is no user-callable
+`heap_free` surface. A general allocator interface and `std.alloc` wrapper are
+deferred to Phase 18.
 
 ## Phase 16 — Raw Pointers, Unsafe, and FFI Boundary
 
@@ -923,9 +925,10 @@ native link succeeds against platform capsule on supported hosts
 Goal: support native string/byte literals as read-only static data plus slice/string views.
 
 Status: implemented for string and byte literal parsing/export, `StaticData`
-objects, `slice<'static, u8>` views, `len`, native static data emission and
-metadata, verifier coverage, and FFI write-wrapper usage. Equality/compare stays
-deferred until a richer string abstraction needs it.
+objects, `slice<'static, u8>` views, `len`, native static data emission into
+read-only object sections (`.rodata` on ELF and `__TEXT,__const` on Mach-O),
+metadata, verifier coverage, and FFI write-wrapper usage. Equality/compare
+stays deferred until a richer string abstraction needs it.
 
 Deliverables:
 
@@ -960,6 +963,7 @@ Acceptance checks:
 b"hello" emits native read-only data
 slice/string length works natively
 static string can be passed to std.io/std.platform write wrapper
+checked-in `examples/v2/static_write.cdb` fixture builds and prints static bytes
 verify validates static data artifacts and source maps
 ```
 

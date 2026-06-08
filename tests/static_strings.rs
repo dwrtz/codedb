@@ -135,6 +135,16 @@ fn write_static() -> i64 effects[io, ffi, unsafe] =
         .as_array()
         .expect("static data metadata");
     assert_eq!(static_data.len(), 2);
+    let expected_section = match codedb::DEFAULT_NATIVE_TARGET {
+        codedb::LINUX_X86_64_TARGET => ".rodata",
+        codedb::APPLE_ARM64_TARGET => "__TEXT,__const",
+        other => panic!("unexpected native target {other}"),
+    };
+    assert!(static_data.iter().all(|entry| {
+        entry["section"] == expected_section
+            && entry["section_offset"].is_u64()
+            && entry["offset"].is_u64()
+    }));
     assert!(static_data.iter().any(|entry| {
         entry["bytes_hex"] == "68656c6c6f" && entry["len"] == 5 && entry["offset"].is_u64()
     }));
@@ -241,6 +251,50 @@ fn literal_total() -> i64 = len("hello") + len(b"hi")
         .assert()
         .failure()
         .stderr(predicate::str::contains("static data"));
+}
+
+#[test]
+fn static_write_fixture_uses_std_platform_and_io_wrapper() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("static-write-fixture.sqlite");
+    let projection = temp.path().join("static-write.export.cdb");
+    let source = Path::new("examples/v2/static_write.cdb");
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(source)]);
+    run(&["verify", path(&db)]);
+
+    run(&[
+        "export",
+        path(&db),
+        "--branch",
+        "main",
+        "--out",
+        path(&projection),
+    ]);
+    let exported = std::fs::read_to_string(&projection).unwrap();
+    assert!(exported.contains("module std.platform"));
+    assert!(exported.contains("module std.io"));
+    assert!(exported.contains("std.platform.write"));
+    assert!(exported.contains("std.io.write_stdout(\"hello\")"));
+
+    let build_plan = parse_json(&run(&["build-plan", path(&db), "main", "--json"]));
+    assert_eq!(build_plan["entry_effects"], json!(["io", "ffi", "unsafe"]));
+    assert!(
+        build_plan["external_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["link_name"] == "write")
+    );
+
+    if can_build_default_native_target() {
+        let exe = temp.path().join("static-write");
+        run(&["build", path(&db), "main", "--out", path(&exe)]);
+        let output = StdCommand::new(&exe).output().expect("run static_write");
+        assert_eq!(output.status.code(), Some(5));
+        assert_eq!(output.stdout, b"hello");
+    }
 }
 
 fn op_names(ir: &JsonValue) -> Vec<String> {

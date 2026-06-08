@@ -4124,12 +4124,34 @@ fn verify_native_static_data_metadata_shape(
                 "bad_object_artifact: {cache_key} static data len does not match bytes_hex"
             ));
         }
+        let Some(section) = entry.get("section").and_then(JsonValue::as_str) else {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} static data entry missing section"
+            ));
+            continue;
+        };
+        if !matches!(section, ".rodata" | "__TEXT,__const") {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} static data entry has unexpected section"
+            ));
+        }
+        let Some(section_offset) = entry.get("section_offset").and_then(JsonValue::as_u64) else {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} static data entry missing section_offset"
+            ));
+            continue;
+        };
         let Some(offset) = entry.get("offset").and_then(JsonValue::as_u64) else {
             errors.push(format!(
                 "bad_object_artifact: {cache_key} static data entry missing offset"
             ));
             continue;
         };
+        if offset < section_offset {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} static data object offset precedes section offset"
+            ));
+        }
         if let Some(bytes) = bytes {
             let Ok(offset) = usize::try_from(offset) else {
                 errors.push(format!(
