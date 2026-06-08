@@ -1,6 +1,9 @@
 module std.platform {
 extern fn write(fd: i64, ptr: raw_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "write" library "c"
 extern fn read(fd: i64, ptr: raw_mut_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "read" library "c"
+extern fn open(path: raw_ptr<u8>, flags: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "open" library "c"
+extern fn creat(path: raw_ptr<u8>, mode: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "creat" library "c"
+extern fn close(fd: i64) -> i64 abi[c] effects[io, ffi] link_name "close" library "c"
 extern fn malloc(size: i64, align: i64) -> raw_mut_ptr<u8> abi[c] effects[alloc, ffi, unsafe] link_name "malloc" library "c"
 extern fn free(ptr: raw_mut_ptr<u8>) -> unit abi[c] effects[alloc, ffi, unsafe] link_name "free" library "c"
 extern fn exit(code: i64) -> unit abi[c] effects[ffi] link_name "exit" library "c"

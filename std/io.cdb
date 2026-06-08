@@ -1,4 +1,28 @@
 module std.io {
 fn write_stdout(s: slice<'static, u8>) -> i64 effects[io, ffi, unsafe] =
   std.platform.write(1, raw_ptr(&'static s[0]), len(s))
+
+fn read_file(path: slice<'static, u8>, ptr: raw_mut_ptr<u8>, len: i64) -> std.result.IoResult effects[io, ffi, unsafe] =
+  let fd: i64 = std.platform.open(raw_ptr(&'static path[0]), 0) in
+  let bytes: i64 =
+    if fd < 0 then
+      fd
+    else
+      let read_bytes: i64 = std.platform.read(fd, ptr, len) in
+      let closed: i64 = std.platform.close(fd) in
+      read_bytes
+  in
+  std.result.io_result(bytes)
+
+fn write_file(path: slice<'static, u8>, ptr: raw_ptr<u8>, len: i64) -> std.result.IoResult effects[io, ffi, unsafe] =
+  let fd: i64 = std.platform.creat(raw_ptr(&'static path[0]), 420) in
+  let bytes: i64 =
+    if fd < 0 then
+      fd
+    else
+      let written: i64 = std.platform.write(fd, ptr, len) in
+      let closed: i64 = std.platform.close(fd) in
+      written
+  in
+  std.result.io_result(bytes)
 }

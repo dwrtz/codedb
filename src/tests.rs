@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -525,6 +525,7 @@ impl CodeDb {
         target_triple: &str,
         expected_stdout: &str,
         expected_exit_code: i32,
+        cwd: Option<&Path>,
     ) -> Result<String> {
         self.ensure_initialized()?;
         let branch = self.branch(MAIN_BRANCH)?;
@@ -617,7 +618,11 @@ impl CodeDb {
                 ))
             ));
         }
-        let output = ProcessCommand::new(&exe).output();
+        let mut command = ProcessCommand::new(&exe);
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        let output = command.output();
         let _ = std::fs::remove_file(&exe);
         let output = match output {
             Ok(output) => output,
@@ -667,6 +672,7 @@ impl CodeDb {
             "entry_name": entry_name,
             "entry_symbol": entry_symbol,
             "entry_point": build_plan.get("entry_point").cloned().unwrap_or(JsonValue::Null),
+            "cwd": cwd.map(|path| path.display().to_string()),
             "expected": {
                 "stdout": String::from_utf8_lossy(expected_stdout_bytes).to_string(),
                 "stdout_hex": hex::encode(expected_stdout_bytes),

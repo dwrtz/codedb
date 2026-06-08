@@ -19,7 +19,7 @@ The required acceptance programs are:
 | `std_minimal.cdb` | Minimal stdlib skeleton with `std.core`, `std.mem`, `std.platform`, `std.io`, and `std.alloc`. | Stdlib wrappers compile as CodeDB code, build plans expose platform externs and capabilities, and native execution prints bytes. |
 | `hello_invoice.cdb` | Simple CLI-style stdout program with invoice-domain computation and explicit exit status. | Native CLI harness captures stdout and exit code, and build/link plans expose process entry metadata. |
 | `word_count.cdb` | Byte/string slice processing, whitespace checks, fold-based counting, and bounds traps. | Slice-heavy word counting compiles natively without interpreter fallback. |
-| `todo_cli.cdb` | Capstone CLI with args, stdout, files, strings, dynamic allocation, and result handling. | Useful stateful CLI behavior passes native-required integration tests. |
+| `todo_cli.cdb` | Capstone CLI with stdout, sandbox file I/O, string allocation, byte buffers, and result handling. | Useful stateful CLI behavior passes native-required integration tests; argv remains deferred. |
 
 Each acceptance program should eventually include:
 

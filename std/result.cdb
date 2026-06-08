@@ -1,0 +1,12 @@
+module std.result {
+enum IoResult {
+  ok: i64
+  err: i64
+}
+
+fn io_result(value: i64) -> IoResult =
+  if value < 0 then IoResult::err(value) else IoResult::ok(value)
+
+fn unwrap_or(result: IoResult, fallback: i64) -> i64 =
+  case result of ok(value) => value | err(code) => fallback
+}

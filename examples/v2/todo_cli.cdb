@@ -1,0 +1,87 @@
+module std.platform {
+extern fn write(fd: i64, ptr: raw_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "write" library "c"
+extern fn read(fd: i64, ptr: raw_mut_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "read" library "c"
+extern fn open(path: raw_ptr<u8>, flags: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "open" library "c"
+extern fn creat(path: raw_ptr<u8>, mode: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "creat" library "c"
+extern fn close(fd: i64) -> i64 abi[c] effects[io, ffi] link_name "close" library "c"
+extern fn malloc(size: i64, align: i64) -> raw_mut_ptr<u8> abi[c] effects[alloc, ffi, unsafe] link_name "malloc" library "c"
+extern fn free(ptr: raw_mut_ptr<u8>) -> unit abi[c] effects[alloc, ffi, unsafe] link_name "free" library "c"
+}
+
+module std.result {
+enum IoResult {
+  ok: i64
+  err: i64
+}
+
+fn io_result(value: i64) -> IoResult =
+  if value < 0 then IoResult::err(value) else IoResult::ok(value)
+
+fn unwrap_or(result: IoResult, fallback: i64) -> i64 =
+  case result of ok(value) => value | err(code) => fallback
+}
+
+module std.io {
+fn write_stdout(s: slice<'static, u8>) -> i64 effects[io, ffi, unsafe] =
+  std.platform.write(1, raw_ptr(&'static s[0]), len(s))
+
+fn read_file(path: slice<'static, u8>, ptr: raw_mut_ptr<u8>, len: i64) -> std.result.IoResult effects[io, ffi, unsafe] =
+  let fd: i64 = std.platform.open(raw_ptr(&'static path[0]), 0) in
+  let bytes: i64 =
+    if fd < 0 then
+      fd
+    else
+      let read_bytes: i64 = std.platform.read(fd, ptr, len) in
+      let closed: i64 = std.platform.close(fd) in
+      read_bytes
+  in
+  std.result.io_result(bytes)
+
+fn write_file(path: slice<'static, u8>, ptr: raw_ptr<u8>, len: i64) -> std.result.IoResult effects[io, ffi, unsafe] =
+  let fd: i64 = std.platform.creat(raw_ptr(&'static path[0]), 420) in
+  let bytes: i64 =
+    if fd < 0 then
+      fd
+    else
+      let written: i64 = std.platform.write(fd, ptr, len) in
+      let closed: i64 = std.platform.close(fd) in
+      written
+  in
+  std.result.io_result(bytes)
+}
+
+fn zero() -> u8 = b"\0"[0]
+
+fn input_path() -> slice<'static, u8> = b"codedb_todo_input.txt\0"
+
+fn output_path() -> slice<'static, u8> = b"codedb_todo_output.txt\0"
+
+fn expected_input_len() -> i64 = 11
+
+fn buffer_capacity() -> i64 = 32
+
+fn make_buffer() -> array<u8, 32> =
+  [
+    zero(), zero(), zero(), zero(), zero(), zero(), zero(), zero(),
+    zero(), zero(), zero(), zero(), zero(), zero(), zero(), zero(),
+    zero(), zero(), zero(), zero(), zero(), zero(), zero(), zero(),
+    zero(), zero(), zero(), zero(), zero(), zero(), zero(), zero()
+  ]
+
+fn dynamic_label_len() -> i64 effects[alloc] =
+  let label: string = string_new("todo") in
+  string_len(label)
+
+fn copy_todos<'a>() -> i64 effects[io, ffi, unsafe] =
+  let buffer: array<u8, 32> = make_buffer() in
+  let data: raw_mut_ptr<u8> = raw_mut_ptr(&'a mut buffer[0]) in
+  let read_result: std.result.IoResult = std.io.read_file(input_path(), data, buffer_capacity()) in
+  let read_len: i64 = std.result.unwrap_or(read_result, 0) in
+  let write_result: std.result.IoResult = std.io.write_file(output_path(), raw_ptr(data), read_len) in
+  std.result.unwrap_or(write_result, 0)
+
+fn main<'a>() -> i64 effects[io, alloc, ffi, unsafe] =
+  let written: i64 = copy_todos() in
+  let label_len: i64 = dynamic_label_len() in
+  let printed: i64 = std.io.write_stdout("todo_cli copied\n") in
+  if written == expected_input_len() && label_len == 4 then 0 else 2

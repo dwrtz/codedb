@@ -1290,7 +1290,11 @@ fn collect_compiler_platform_usage_from_ops(
 ) {
     for op in ops {
         match op {
-            LoweredOp::HeapAlloc { .. } => usage.uses_malloc = true,
+            LoweredOp::HeapAlloc { .. }
+            | LoweredOp::VecNew { .. }
+            | LoweredOp::StringNew { .. } => {
+                usage.uses_malloc = true;
+            }
             LoweredOp::Drop { type_hash, .. } => {
                 if lowered_layout_contains_box(ir, type_hash) {
                     usage.uses_free = true;
@@ -1341,6 +1345,10 @@ fn collect_symbol_capabilities(
     };
     let capability_name = if source == "std.io.write_stdout" {
         Some("stdout")
+    } else if source == "std.io.read_file" {
+        Some("read_file")
+    } else if source == "std.io.write_file" {
+        Some("write_file")
     } else if source.starts_with("std.alloc.") {
         Some("alloc")
     } else {
@@ -1364,7 +1372,7 @@ fn collect_symbol_capabilities(
 fn is_minimal_platform_extern(link_name: &str) -> bool {
     matches!(
         link_name,
-        "write" | "read" | "malloc" | "free" | "trap" | "exit"
+        "write" | "read" | "open" | "creat" | "close" | "malloc" | "free" | "trap" | "exit"
     )
 }
 

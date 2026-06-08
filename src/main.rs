@@ -75,6 +75,8 @@ enum Command {
         #[arg(long)]
         expect_exit_code: i32,
         #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
         json: bool,
     },
     #[command(about = "Create a semantic test object for an entry function")]
@@ -624,6 +626,7 @@ fn main() -> Result<()> {
             target,
             expect_stdout,
             expect_exit_code,
+            cwd,
             json,
         } => {
             let mut codedb = codedb::CodeDb::open(db)?;
@@ -632,6 +635,7 @@ fn main() -> Result<()> {
                 &target,
                 &expect_stdout,
                 expect_exit_code,
+                cwd.as_deref(),
             )?;
             if json {
                 print!("{report}");

@@ -1170,6 +1170,17 @@ verify passes after replay/export/import
 
 Goal: compile a useful stateful native tool.
 
+Status: implemented with `examples/v2/todo_cli.cdb`. The fixture links minimal
+file platform externs (`open`, `creat`, `read`, `write`, `close`) through
+compiled `std.io` wrappers, uses `std.result.IoResult` helpers for file-call
+success/error handling, reads a sandbox input file into an addressable byte
+buffer, writes the bytes to a sandbox output file, prints stdout, and exercises
+dynamic string allocation/drop in the same native process. Build/link plans now
+expose the file platform externs, and build plans report `read_file` and
+`write_file` capabilities. Process argv remains deferred from Phase 19; this
+capstone uses deterministic sandbox file names so the native test can run
+without an interpreter or dispatcher.
+
 Deliverables:
 
 ```text
