@@ -158,6 +158,92 @@ fn bundle_export_import_preserves_v2_type_closure() {
 }
 
 #[test]
+fn bundle_export_import_preserves_phase_15_17_object_closures() {
+    let temp = tempdir().unwrap();
+
+    for (case, source_text, entry, expected) in [
+        (
+            "box",
+            r#"
+record Line {
+  price_cents: i64
+}
+
+fn main() -> i64 effects[alloc] =
+  let b: box<Line> = box_new({ price_cents: 7 }) in
+  b.price_cents
+"#,
+            "main",
+            "7\n",
+        ),
+        (
+            "static",
+            r#"
+fn main() -> i64 = len("hello")
+"#,
+            "main",
+            "5\n",
+        ),
+        (
+            "slice",
+            r#"
+fn main<'a>() -> i64 =
+  let values: array<i64, 4> = [10, 20, 30, 40] in
+  let s: slice<'a, i64> = slice(values) in
+  let tail: slice<'a, i64> = subslice(s, 1, 2) in
+  len(s) + tail[1]
+"#,
+            "main",
+            "34\n",
+        ),
+        (
+            "raw",
+            r#"
+fn main<'a>() -> i64 effects[state, unsafe] =
+  let x: i64 = 2 in
+  let p: raw_mut_ptr<i64> = raw_mut_ptr(&'a mut x) in
+  let q: raw_ptr<i64> = raw_ptr(p) in
+  let ignored: unit = raw_store(p, 11) in
+  raw_load(q)
+"#,
+            "main",
+            "11\n",
+        ),
+    ] {
+        let source_db = temp.path().join(format!("{case}-source.sqlite"));
+        let imported_db = temp.path().join(format!("{case}-imported.sqlite"));
+        let source = temp.path().join(format!("{case}.cdb"));
+        let bundle = temp.path().join(format!("{case}.codedb.bundle"));
+
+        std::fs::write(&source, source_text).unwrap();
+        run(&["init", path(&source_db)]);
+        run(&["import", path(&source_db), path(&source)]);
+        let source_branch = branch_state(&source_db);
+
+        run(&[
+            "bundle",
+            "export",
+            path(&source_db),
+            "--root",
+            &source_branch.0,
+            "--out",
+            path(&bundle),
+        ]);
+
+        run(&["init", path(&imported_db)]);
+        let import_report = run(&["bundle", "import", path(&imported_db), path(&bundle)]);
+        assert!(import_report.contains("imported bundle"));
+        assert_eq!(branch_state(&imported_db), source_branch);
+        assert_eq!(run(&["eval", path(&imported_db), entry]), expected);
+        bin()
+            .args(["verify", path(&imported_db)])
+            .assert()
+            .success()
+            .stdout("verify ok\n");
+    }
+}
+
+#[test]
 fn bundle_artifact_cache_is_optional_and_can_be_regenerated() {
     let temp = tempdir().unwrap();
     let source_db = temp.path().join("source-artifacts.sqlite");

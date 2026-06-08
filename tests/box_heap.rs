@@ -215,6 +215,37 @@ fn bad() -> i64 effects[alloc] =
 }
 
 #[test]
+fn moving_box_with_inner_mutable_borrow_keeps_loan_live() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("box-inner-mut-loan.sqlite");
+    let source = temp.path().join("box-inner-mut-loan.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Editor<'a> {
+  r: &'a mut i64
+}
+
+fn bad<'a>() -> i64 effects[alloc, state] =
+  let y: i64 = 0 in
+  let b: box<Editor<'a>> = box_new({ r: &'a mut y }) in
+  let c: box<Editor<'a>> = b in
+  let write_y: unit = y = 5 in
+  y
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    let stderr = run_fail(&["import", path(&db), path(&source)]);
+    assert!(
+        stderr.contains("bad_borrow") || stderr.contains("live mutable borrow"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn box_new_builds_named_record_value_in_destination_layout() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("box-named-record-layout.sqlite");

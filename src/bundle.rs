@@ -1281,6 +1281,13 @@ fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<St
             Some("RawPointer") => {
                 push_hash_ref(payload.get("pointee"), refs);
             }
+            Some("Box") => {
+                push_hash_ref(payload.get("element"), refs);
+            }
+            Some("Slice") => {
+                push_hash_ref(payload.get("region"), refs);
+                push_hash_ref(payload.get("element"), refs);
+            }
             Some("FixedArray") => {
                 push_hash_ref(payload.get("element"), refs);
             }
@@ -1322,6 +1329,11 @@ fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<St
         "Expression" => {
             push_hash_ref(payload.get("type"), refs);
             match payload.get("expr_kind").and_then(JsonValue::as_str) {
+                Some("static_bytes") => {
+                    push_hash_ref(payload.get("static_data"), refs);
+                    push_hash_ref(payload.get("region"), refs);
+                    push_hash_ref(payload.get("element_type"), refs);
+                }
                 Some("call") => {
                     push_hash_ref(payload.get("symbol"), refs);
                     push_hash_array_refs(payload.get("args"), refs);
@@ -1335,6 +1347,44 @@ fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<St
                     push_hash_ref(payload.get("target"), refs);
                     push_hash_ref(payload.get("region"), refs);
                     push_hash_ref(payload.get("referent_type"), refs);
+                }
+                Some("slice_from_array") => {
+                    push_hash_ref(payload.get("target"), refs);
+                    push_hash_ref(payload.get("target_type"), refs);
+                    push_hash_ref(payload.get("array_type"), refs);
+                    push_hash_ref(payload.get("element_type"), refs);
+                    push_hash_ref(payload.get("region"), refs);
+                }
+                Some("slice_len") => {
+                    push_hash_ref(payload.get("target"), refs);
+                    push_hash_ref(payload.get("slice_type"), refs);
+                }
+                Some("subslice") => {
+                    push_hash_ref(payload.get("target"), refs);
+                    push_hash_ref(payload.get("start"), refs);
+                    push_hash_ref(payload.get("len"), refs);
+                    push_hash_ref(payload.get("slice_type"), refs);
+                    push_hash_ref(payload.get("element_type"), refs);
+                }
+                Some("box_new") => {
+                    push_hash_ref(payload.get("value"), refs);
+                    push_hash_ref(payload.get("element_type"), refs);
+                }
+                Some("raw_ptr_cast") => {
+                    push_hash_ref(payload.get("value"), refs);
+                    push_hash_ref(payload.get("source_type"), refs);
+                    push_hash_ref(payload.get("pointee_type"), refs);
+                }
+                Some("raw_load") => {
+                    push_hash_ref(payload.get("pointer"), refs);
+                    push_hash_ref(payload.get("pointer_type"), refs);
+                    push_hash_ref(payload.get("pointee_type"), refs);
+                }
+                Some("raw_store") => {
+                    push_hash_ref(payload.get("pointer"), refs);
+                    push_hash_ref(payload.get("value"), refs);
+                    push_hash_ref(payload.get("pointer_type"), refs);
+                    push_hash_ref(payload.get("pointee_type"), refs);
                 }
                 Some("assign") => {
                     push_hash_ref(payload.get("target"), refs);

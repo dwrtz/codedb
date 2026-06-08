@@ -120,12 +120,15 @@ impl LayoutClass {
         }
     }
 
-    fn boxed() -> Self {
+    fn boxed(payload: Self) -> Self {
         Self {
             copy_kind: CopyKind::MoveOnly,
             drop_kind: DropKind::NeedsDrop,
+            contains_reference: payload.contains_reference,
+            contains_mut_reference: payload.contains_mut_reference,
+            contains_raw_pointer: payload.contains_raw_pointer,
             contains_box: true,
-            ..Self::copy()
+            contains_capability_handle: payload.contains_capability_handle,
         }
     }
 
@@ -376,7 +379,9 @@ impl LayoutComputer<'_> {
             }
             TypeSpec::Box { element } => {
                 self.db.type_spec(&element)?;
-                let class = LayoutClass::boxed();
+                let payload_class =
+                    self.layout_class_flags_for_type(&element, &mut BTreeSet::new())?;
+                let class = LayoutClass::boxed(payload_class);
                 let mut metadata = self.base_metadata(
                     type_hash,
                     "box",
@@ -622,6 +627,63 @@ impl LayoutComputer<'_> {
             align_bytes,
             class,
         })
+    }
+
+    fn layout_class_flags_for_type(
+        &mut self,
+        type_hash: &str,
+        active_types: &mut BTreeSet<String>,
+    ) -> Result<LayoutClass> {
+        if !active_types.insert(type_hash.to_string()) {
+            return Ok(LayoutClass::copy());
+        }
+        let result = self.layout_class_flags_for_type_inner(type_hash, active_types);
+        active_types.remove(type_hash);
+        result
+    }
+
+    fn layout_class_flags_for_type_inner(
+        &mut self,
+        type_hash: &str,
+        active_types: &mut BTreeSet<String>,
+    ) -> Result<LayoutClass> {
+        match self.db.type_spec_in_root(self.root, type_hash)? {
+            TypeSpec::Builtin(_) => Ok(LayoutClass::copy()),
+            TypeSpec::Named { .. } => Ok(LayoutClass::copy()),
+            TypeSpec::Reference { mutable, .. } => {
+                if mutable {
+                    Ok(LayoutClass::mutable_reference())
+                } else {
+                    Ok(LayoutClass::shared_reference())
+                }
+            }
+            TypeSpec::RawPointer { .. } => Ok(LayoutClass::raw_pointer()),
+            TypeSpec::Box { element } => {
+                let payload = self.layout_class_flags_for_type(&element, active_types)?;
+                Ok(LayoutClass::boxed(payload))
+            }
+            TypeSpec::Slice {
+                mutable, element, ..
+            } => {
+                let base = if mutable {
+                    LayoutClass::mutable_reference()
+                } else {
+                    LayoutClass::shared_reference()
+                };
+                Ok(base.merge(self.layout_class_flags_for_type(&element, active_types)?))
+            }
+            TypeSpec::FixedArray { element, .. } => {
+                self.layout_class_flags_for_type(&element, active_types)
+            }
+            TypeSpec::Record(fields) | TypeSpec::Enum(fields) => {
+                let mut class = LayoutClass::copy();
+                for field in fields {
+                    class = class
+                        .merge(self.layout_class_flags_for_type(&field.type_hash, active_types)?);
+                }
+                Ok(class)
+            }
+        }
     }
 
     fn base_metadata(
