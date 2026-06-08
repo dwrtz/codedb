@@ -284,14 +284,14 @@ enum, reference, raw pointer, and fixed-array metadata with target-specific
 size/alignment, ABI classification, copy/move/drop scaffold classification,
 layout cache keys, and verification that recomputes cached layout artifacts.
 
-The remaining SPEC §8 layout kinds — `box`, `slice`, and
-`static_string_or_bytes_view` — are deferred to the phases that introduce those
-types (Phases 12, 15, 17). The `contains_box` and `contains_capability_handle`
-classification flags are emitted but always `false` until those types exist; no
-type the current language can express sets them. The layout cache key versions
-on the backend id tag (`type-layout:v2`); `LAYOUT_VERSION` carries the same tag,
-guarded by `layout_cache_key_is_versioned` so a layout-format bump invalidates
-cached layouts.
+Layout metadata now keeps `contains_box` literal to `box<T>` and propagated
+box-containing aggregates, while `contains_owned_resource` identifies layouts
+whose drop path may release owned native resources such as boxes, vec buffers,
+and strings. The `contains_capability_handle` classification flag is emitted but
+remains `false` until capability-handle types exist. The layout cache key
+versions on the backend id tag (`type-layout:v2`); `LAYOUT_VERSION` carries the
+same tag, guarded by `layout_cache_key_is_versioned` so a layout-format bump
+invalidates cached layouts.
 
 Deliverables:
 
@@ -1089,6 +1089,15 @@ no interpreter/runtime dispatcher participates
 
 Goal: build dynamic data structures on top of box/allocator/raw-pointer platform boundary.
 
+Status: implemented for the initial compiler-owned buffer surface. The current
+native-lowerable surface supports `vec<T>` for Copy, non-reference,
+trivially-droppable 1- and 8-byte elements, fixed literal capacities,
+`vec_new`/`vec_push`/`vec_get`/`vec_len`, owned `string` construction from
+static string/byte slices, `string_len`, native buffer allocation/drop, and
+native-required tests. General `std.vec` / `std.string` packages, runtime
+capacity growth, dynamic string construction from non-static slices, and vectors
+of owned/drop or reference-containing elements are deferred.
+
 Deliverables:
 
 ```text
@@ -1120,8 +1129,9 @@ Acceptance checks:
 ```text
 vec<i64> append/read compiles native
 owned string construction compiles native
-drop frees buffers exactly once
-stdlib implementation is mostly CodeDB code
+drop frees accepted buffers exactly once
+stdlib implementation is mostly CodeDB code for wrappers available in this phase;
+general std.vec/std.string implementations are deferred
 native-required tests pass
 ```
 

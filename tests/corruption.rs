@@ -1300,6 +1300,53 @@ fn verify_rejects_cached_link_plan_metadata_mismatch() {
 }
 
 #[test]
+fn verify_rejects_cached_link_plan_platform_metadata_mismatch() {
+    let temp = tempdir().unwrap();
+    let db = temp
+        .path()
+        .join("link-plan-platform-metadata-mismatch.sqlite");
+    let plan_path = temp.path().join("main.link.json");
+    run(&["init", db.to_str().unwrap()]);
+    run(&[
+        "import",
+        db.to_str().unwrap(),
+        "examples/v2/std_minimal.cdb",
+    ]);
+    run(&[
+        "link-native",
+        db.to_str().unwrap(),
+        "main",
+        "--target",
+        codedb::LINUX_X86_64_TARGET,
+        "--out",
+        plan_path.to_str().unwrap(),
+    ]);
+
+    let conn = Connection::open(&db).unwrap();
+    let (cache_key, artifact_json): (String, String) = conn
+        .query_row(
+            "SELECT cache_key, artifact_json FROM compile_cache
+             WHERE artifact_kind = 'link_plan'
+             ORDER BY cache_key LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut value: JsonValue = serde_json::from_str(&artifact_json).unwrap();
+    value["metadata"]["platform_external_symbols"][0]["source"] =
+        JsonValue::String("std.platform.not_write".to_string());
+    conn.execute(
+        "UPDATE compile_cache SET artifact_json = ?1 WHERE cache_key = ?2",
+        (test_canonical_json(&value), cache_key),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", db.to_str().unwrap()]);
+    assert!(stderr.contains("bad_link_plan"));
+    assert!(stderr.contains("platform_external_symbols") || stderr.contains("link input"));
+}
+
+#[test]
 fn verify_rejects_link_plan_object_metadata_that_disagrees_with_cached_object() {
     let temp = tempdir().unwrap();
     let db = temp

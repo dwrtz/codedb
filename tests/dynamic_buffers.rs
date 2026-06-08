@@ -70,6 +70,8 @@ fn owned_string_len() -> i64 effects[alloc] =
     assert_eq!(vec_layout["kind"], "vec");
     assert_eq!(vec_layout["copy_kind"], "move_only");
     assert_eq!(vec_layout["drop_kind"], "needs_drop");
+    assert_eq!(vec_layout["contains_box"], false);
+    assert_eq!(vec_layout["contains_owned_resource"], true);
     assert_eq!(vec_layout["abi"]["pass"], "by_indirect");
 
     run(&[
@@ -83,6 +85,8 @@ fn owned_string_len() -> i64 effects[alloc] =
     assert_eq!(string_layout["kind"], "string");
     assert_eq!(string_layout["copy_kind"], "move_only");
     assert_eq!(string_layout["drop_kind"], "needs_drop");
+    assert_eq!(string_layout["contains_box"], false);
+    assert_eq!(string_layout["contains_owned_resource"], true);
     assert_eq!(string_layout["abi"]["pass"], "by_indirect");
 
     run(&[

@@ -114,6 +114,78 @@ fn build_plan_reports_compiler_generated_allocation_capsule() {
     assert_eq!(build_plan["capabilities"], json!([]));
 }
 
+#[test]
+fn platform_metadata_and_capabilities_survive_std_symbol_renames() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("stdlib-rename-metadata.sqlite");
+    let first_plan_path = temp.path().join("stdlib-before.link.json");
+    let second_plan_path = temp.path().join("stdlib-after.link.json");
+    let rename_platform = temp.path().join("rename-platform.json");
+    let rename_stdout = temp.path().join("rename-stdout.json");
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), "examples/v2/std_minimal.cdb"]);
+    run(&[
+        "link-native",
+        path(&db),
+        "main",
+        "--out",
+        path(&first_plan_path),
+    ]);
+
+    let platform_write = parse_json(&run(&["show", path(&db), "std.platform.write", "--json"]));
+    let write_stdout = parse_json(&run(&["show", path(&db), "std.io.write_stdout", "--json"]));
+    std::fs::write(
+        &rename_platform,
+        format!(
+            "{{\"kind\":\"rename_symbol\",\"module\":\"std.platform\",\"symbol\":\"{}\",\"old_name\":\"write\",\"new_name\":\"write2\"}}\n",
+            platform_write["symbol_hash"].as_str().unwrap()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &rename_stdout,
+        format!(
+            "{{\"kind\":\"rename_symbol\",\"module\":\"std.io\",\"symbol\":\"{}\",\"old_name\":\"write_stdout\",\"new_name\":\"write_out\"}}\n",
+            write_stdout["symbol_hash"].as_str().unwrap()
+        ),
+    )
+    .unwrap();
+    run(&["apply", path(&db), "--json", path(&rename_platform)]);
+    run(&["apply", path(&db), "--json", path(&rename_stdout)]);
+
+    run(&[
+        "link-native",
+        path(&db),
+        "main",
+        "--out",
+        path(&second_plan_path),
+    ]);
+    let plan = parse_json(&std::fs::read_to_string(&second_plan_path).unwrap());
+    assert_platform_externs(
+        &plan["platform_external_symbols"],
+        &[("std.platform.write2", "write")],
+    );
+
+    let build_plan = parse_json(&run(&["build-plan", path(&db), "main", "--json"]));
+    assert_platform_externs(
+        &build_plan["platform_external_symbols"],
+        &[("std.platform.write2", "write")],
+    );
+    assert_capability_names(&build_plan["capabilities"], &["alloc", "stdout"]);
+    assert!(
+        build_plan["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["name"].as_str() == Some("stdout")
+                    && entry["source"].as_str() == Some("std.io.write_out")
+            })
+    );
+    run(&["verify", path(&db)]);
+}
+
 fn assert_json_array_contains_all(value: &JsonValue, expected: &[&str]) {
     let actual = value
         .as_array()

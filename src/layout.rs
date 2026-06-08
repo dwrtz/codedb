@@ -81,6 +81,7 @@ struct LayoutClass {
     contains_mut_reference: bool,
     contains_raw_pointer: bool,
     contains_box: bool,
+    contains_owned_resource: bool,
     contains_capability_handle: bool,
 }
 
@@ -93,6 +94,7 @@ impl LayoutClass {
             contains_mut_reference: false,
             contains_raw_pointer: false,
             contains_box: false,
+            contains_owned_resource: false,
             contains_capability_handle: false,
         }
     }
@@ -128,6 +130,7 @@ impl LayoutClass {
             contains_mut_reference: payload.contains_mut_reference,
             contains_raw_pointer: payload.contains_raw_pointer,
             contains_box: true,
+            contains_owned_resource: true,
             contains_capability_handle: payload.contains_capability_handle,
         }
     }
@@ -139,9 +142,8 @@ impl LayoutClass {
             contains_reference: payload.contains_reference,
             contains_mut_reference: payload.contains_mut_reference,
             contains_raw_pointer: payload.contains_raw_pointer,
-            // Existing native drop helpers use this as the recursive owned-drop
-            // fast path, not only for the literal `box<T>` type.
-            contains_box: true,
+            contains_box: payload.contains_box,
+            contains_owned_resource: true,
             contains_capability_handle: payload.contains_capability_handle,
         }
     }
@@ -164,6 +166,7 @@ impl LayoutClass {
             contains_mut_reference: self.contains_mut_reference || other.contains_mut_reference,
             contains_raw_pointer: self.contains_raw_pointer || other.contains_raw_pointer,
             contains_box: self.contains_box || other.contains_box,
+            contains_owned_resource: self.contains_owned_resource || other.contains_owned_resource,
             contains_capability_handle: self.contains_capability_handle
                 || other.contains_capability_handle,
         }
@@ -815,6 +818,7 @@ impl LayoutComputer<'_> {
             "contains_mut_reference": class.contains_mut_reference,
             "contains_raw_pointer": class.contains_raw_pointer,
             "contains_box": class.contains_box,
+            "contains_owned_resource": class.contains_owned_resource,
             "contains_capability_handle": class.contains_capability_handle,
             "abi": abi_metadata(kind, size_bytes),
         })

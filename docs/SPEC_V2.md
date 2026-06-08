@@ -282,6 +282,7 @@ contains_reference
 contains_mut_reference
 contains_raw_pointer
 contains_box
+contains_owned_resource
 contains_capability_handle
 ```
 

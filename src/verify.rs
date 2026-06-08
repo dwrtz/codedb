@@ -21,8 +21,8 @@ use crate::lowering::{
 };
 use crate::migrations::{Operation, history_hash, migration_hash};
 use crate::model::{
-    ProgramRootPayload, ROOT_MODULES_METADATA_KEY, preferred_names, validate_module_path,
-    validate_projection_identifier,
+    ProgramRootPayload, ROOT_MODULES_METADATA_KEY, preferred_names, qualified_symbol_display,
+    validate_module_path, validate_projection_identifier,
 };
 use crate::store::{
     CodeDb, cache_key_for_input, canonical_json, extract_hash_strings, function_interface_metadata,
@@ -3100,6 +3100,41 @@ impl CodeDb {
                 ));
             }
         }
+        for external in plan
+            .get("platform_external_symbols")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if external.get("platform").and_then(JsonValue::as_bool) != Some(true) {
+                errors.push(format!(
+                    "bad_link_plan: {cache_key} platform external missing platform=true"
+                ));
+            }
+            if external
+                .get("symbol_hash")
+                .and_then(JsonValue::as_str)
+                .is_none()
+            {
+                errors.push(format!(
+                    "bad_link_plan: {cache_key} platform external missing symbol"
+                ));
+            }
+            if external
+                .get("link_name")
+                .and_then(JsonValue::as_str)
+                .is_none_or(|link_name| validate_external_link_name(link_name).is_err())
+            {
+                errors.push(format!(
+                    "bad_link_plan: {cache_key} platform external has invalid link_name"
+                ));
+            }
+            if external.get("source").and_then(JsonValue::as_str).is_none() {
+                errors.push(format!(
+                    "bad_link_plan: {cache_key} platform external missing source"
+                ));
+            }
+        }
         let object_hashes = plan
             .get("objects")
             .and_then(JsonValue::as_array)
@@ -3155,6 +3190,8 @@ impl CodeDb {
                     || input.get("entry_abi_symbol") != plan.get("entry_abi_symbol")
                     || input.get("entry_point") != plan.get("entry_point")
                     || input.get("external_symbols") != plan.get("external_symbols")
+                    || input.get("platform_external_symbols")
+                        != plan.get("platform_external_symbols")
                     || input.get("export_map") != plan.get("export_map")
                     || input.get("output_kind") != plan.get("output_kind")
                     || input.get("link_options") != plan.get("link_options")
@@ -3377,6 +3414,13 @@ impl CodeDb {
         {
             return Ok(false);
         }
+        let expected_platform_external_symbols =
+            self.expected_platform_external_symbols_for_plan(&root, plan)?;
+        if json_value_set(plan.get("platform_external_symbols"))
+            != json_value_set(Some(&json!(expected_platform_external_symbols)))
+        {
+            return Ok(false);
+        }
 
         let linked_symbols = planned_symbols.into_iter().collect::<BTreeSet<_>>();
         let expected_exports = export_map(&root)?
@@ -3391,6 +3435,91 @@ impl CodeDb {
             })
             .collect::<Vec<_>>();
         Ok(plan.get("export_map") == Some(&json!(expected_exports)))
+    }
+
+    fn expected_platform_external_symbols_for_plan(
+        &self,
+        root: &ProgramRootPayload,
+        plan: &JsonValue,
+    ) -> Result<Vec<JsonValue>> {
+        let mut symbols = BTreeMap::new();
+        for object in plan
+            .get("objects")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for relocation in object
+                .get("relocations")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if relocation.get("platform").and_then(JsonValue::as_bool) != Some(true) {
+                    continue;
+                }
+                let Some(symbol_hash) = relocation
+                    .get("target_symbol_hash")
+                    .and_then(JsonValue::as_str)
+                else {
+                    continue;
+                };
+                let Some(link_name) = relocation
+                    .get("target_abi_symbol")
+                    .and_then(JsonValue::as_str)
+                else {
+                    continue;
+                };
+                if let Some(source) = compiler_platform_external_source(symbol_hash) {
+                    symbols.insert(
+                        symbol_hash.to_string(),
+                        json!({
+                            "symbol_hash": symbol_hash,
+                            "link_name": link_name,
+                            "platform": true,
+                            "source": source,
+                        }),
+                    );
+                } else {
+                    symbols.entry(symbol_hash.to_string()).or_insert_with(|| {
+                        json!({
+                            "symbol_hash": symbol_hash,
+                            "link_name": link_name,
+                            "platform": true,
+                        })
+                    });
+                }
+            }
+        }
+        for external in plan
+            .get("external_symbols")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(symbol_hash) = external.get("symbol_hash").and_then(JsonValue::as_str) else {
+                continue;
+            };
+            let Some(link_name) = external.get("link_name").and_then(JsonValue::as_str) else {
+                continue;
+            };
+            let Some(source) = qualified_symbol_display(root, symbol_hash) else {
+                continue;
+            };
+            if !source.starts_with("std.platform.") || !is_minimal_platform_extern(link_name) {
+                continue;
+            }
+            symbols.insert(
+                symbol_hash.to_string(),
+                json!({
+                    "symbol_hash": symbol_hash,
+                    "link_name": link_name,
+                    "platform": true,
+                    "source": source,
+                }),
+            );
+        }
+        Ok(symbols.into_values().collect())
     }
 
     fn verify_executable_artifact(
@@ -4566,6 +4695,21 @@ fn link_plan_external_symbols(plan: &JsonValue) -> BTreeSet<String> {
         .filter_map(|object| object.get("symbol_hash").and_then(JsonValue::as_str))
         .map(str::to_string)
         .collect()
+}
+
+fn compiler_platform_external_source(symbol_hash: &str) -> Option<&'static str> {
+    match symbol_hash {
+        "platform:malloc" => Some("compiler.heap_alloc"),
+        "platform:free" => Some("compiler.drop"),
+        _ => None,
+    }
+}
+
+fn is_minimal_platform_extern(link_name: &str) -> bool {
+    matches!(
+        link_name,
+        "write" | "read" | "open" | "creat" | "close" | "malloc" | "free" | "trap" | "exit"
+    )
 }
 
 fn json_array_contains_str(value: Option<&JsonValue>, needle: &str) -> bool {

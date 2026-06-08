@@ -59,6 +59,7 @@ fn box_values_typecheck_lower_verify_and_run_native() {
     assert_eq!(layout["copy_kind"], "move_only");
     assert_eq!(layout["drop_kind"], "needs_drop");
     assert_eq!(layout["contains_box"], true);
+    assert_eq!(layout["contains_owned_resource"], true);
     assert_eq!(layout["abi"]["pass"], "by_value");
     assert_eq!(layout["abi"]["return"], "by_value");
 

@@ -12,7 +12,7 @@ use crate::backend::native::{NativeObjectArtifact, backend_id_for_target};
 use crate::expr::Value;
 use crate::jobs::{ArtifactJobClaim, artifact_job_error, new_worker_id};
 use crate::lowering::{LoweredFunctionIr, LoweredOp};
-use crate::model::{ProgramRootPayload, qualified_symbol_display};
+use crate::model::{ProgramRootPayload, RootSymbolPayload, qualified_symbol_display};
 use crate::store::{
     CodeDb, cache_key_for_input, canonical_json, function_interface_metadata, hash_bytes,
     hash_object_canonical,
@@ -124,6 +124,15 @@ struct PlannedCapability {
     effects: Vec<String>,
 }
 
+fn planned_platform_external_symbol_entry(symbol: &PlannedPlatformExternalSymbol) -> JsonValue {
+    json!({
+        "symbol_hash": &symbol.symbol_hash,
+        "link_name": &symbol.link_name,
+        "platform": true,
+        "source": &symbol.source,
+    })
+}
+
 impl PlannedLink {
     fn job_cache_keys(&self) -> Vec<String> {
         self.objects
@@ -173,14 +182,7 @@ impl PlannedLink {
     fn platform_external_symbol_entries(&self) -> Vec<JsonValue> {
         self.platform_external_symbols
             .iter()
-            .map(|symbol| {
-                json!({
-                    "symbol_hash": &symbol.symbol_hash,
-                    "link_name": &symbol.link_name,
-                    "platform": true,
-                    "source": &symbol.source,
-                })
-            })
+            .map(planned_platform_external_symbol_entry)
             .collect()
     }
 
@@ -622,7 +624,13 @@ impl CodeDb {
             let (param_type_hashes, return_type_hash) =
                 self.signature_parts(&root_entry.signature)?;
             let effects = self.signature_effect_names(&root_entry.signature)?;
-            collect_symbol_capabilities(root, &symbol, &effects, &mut capabilities)?;
+            self.collect_symbol_capabilities(
+                root,
+                &symbol,
+                root_entry,
+                &effects,
+                &mut capabilities,
+            )?;
             if self.definition_is_external(&root_entry.definition)? {
                 let external = self.external_function_metadata(&root_entry.definition)?;
                 collect_semantic_platform_external(
@@ -722,6 +730,10 @@ impl CodeDb {
                 })
             })
             .collect::<Vec<_>>();
+        let platform_external_symbol_entries = platform_external_symbols
+            .values()
+            .map(planned_platform_external_symbol_entry)
+            .collect::<Vec<_>>();
         let entry = root
             .symbols
             .iter()
@@ -751,6 +763,7 @@ impl CodeDb {
             "entry_point": &entry_point,
             "object_cache_keys": &object_cache_keys,
             "external_symbols": &external_symbol_entries,
+            "platform_external_symbols": &platform_external_symbol_entries,
             "export_map": &export_map,
             "output_kind": "executable",
             "link_options": &link_options,
@@ -783,6 +796,78 @@ impl CodeDb {
             export_map,
             link_options,
         })
+    }
+
+    fn collect_symbol_capabilities(
+        &self,
+        root: &ProgramRootPayload,
+        symbol_hash: &str,
+        entry: &RootSymbolPayload,
+        effects: &[String],
+        out: &mut BTreeMap<String, PlannedCapability>,
+    ) -> Result<()> {
+        if self.definition_is_external(&entry.definition)? {
+            return Ok(());
+        }
+        let Some(source) = qualified_symbol_display(root, symbol_hash) else {
+            return Ok(());
+        };
+        let dependency_link_names =
+            self.external_link_names_for_direct_dependencies(root, &entry.definition)?;
+        let has_io = effects.iter().any(|effect| effect == "io");
+        let has_alloc = effects.iter().any(|effect| effect == "alloc");
+        let capability_name = if has_io
+            && dependency_link_names.contains("open")
+            && dependency_link_names.contains("read")
+        {
+            Some("read_file")
+        } else if has_io
+            && dependency_link_names.contains("creat")
+            && dependency_link_names.contains("write")
+        {
+            Some("write_file")
+        } else if has_io && dependency_link_names.contains("write") {
+            Some("stdout")
+        } else if has_alloc
+            && (dependency_link_names.contains("malloc") || dependency_link_names.contains("free"))
+        {
+            Some("alloc")
+        } else {
+            None
+        };
+        let Some(name) = capability_name else {
+            return Ok(());
+        };
+        out.insert(
+            format!("{name}:{symbol_hash}"),
+            PlannedCapability {
+                name: name.to_string(),
+                source,
+                symbol_hash: symbol_hash.to_string(),
+                effects: effects.to_vec(),
+            },
+        );
+        Ok(())
+    }
+
+    fn external_link_names_for_direct_dependencies(
+        &self,
+        root: &ProgramRootPayload,
+        definition_hash: &str,
+    ) -> Result<BTreeSet<String>> {
+        let mut link_names = BTreeSet::new();
+        for dependency in self.dependencies_for_definition(root, definition_hash)? {
+            let Some(entry) = self.root_symbol(root, &dependency) else {
+                continue;
+            };
+            if self.definition_is_external(&entry.definition)? {
+                link_names.insert(
+                    self.external_function_metadata(&entry.definition)?
+                        .link_name,
+                );
+            }
+        }
+        Ok(link_names)
     }
 
     fn ensure_planned_artifact_jobs(&mut self, planned: &PlannedLink) -> Result<()> {
@@ -1296,7 +1381,7 @@ fn collect_compiler_platform_usage_from_ops(
                 usage.uses_malloc = true;
             }
             LoweredOp::Drop { type_hash, .. } => {
-                if lowered_layout_contains_box(ir, type_hash) {
+                if lowered_layout_contains_owned_resource(ir, type_hash) {
                     usage.uses_free = true;
                 }
             }
@@ -1321,52 +1406,17 @@ fn collect_compiler_platform_usage_from_ops(
     }
 }
 
-fn lowered_layout_contains_box(ir: &LoweredFunctionIr, type_hash: &str) -> bool {
+fn lowered_layout_contains_owned_resource(ir: &LoweredFunctionIr, type_hash: &str) -> bool {
     ir.type_layouts
         .iter()
         .find(|layout| layout.type_hash == type_hash)
         .and_then(|layout| {
             layout
                 .metadata
-                .get("contains_box")
+                .get("contains_owned_resource")
                 .and_then(JsonValue::as_bool)
         })
         .unwrap_or(false)
-}
-
-fn collect_symbol_capabilities(
-    root: &ProgramRootPayload,
-    symbol_hash: &str,
-    effects: &[String],
-    out: &mut BTreeMap<String, PlannedCapability>,
-) -> Result<()> {
-    let Some(source) = qualified_symbol_display(root, symbol_hash) else {
-        return Ok(());
-    };
-    let capability_name = if source == "std.io.write_stdout" {
-        Some("stdout")
-    } else if source == "std.io.read_file" {
-        Some("read_file")
-    } else if source == "std.io.write_file" {
-        Some("write_file")
-    } else if source.starts_with("std.alloc.") {
-        Some("alloc")
-    } else {
-        None
-    };
-    let Some(name) = capability_name else {
-        return Ok(());
-    };
-    out.insert(
-        format!("{name}:{symbol_hash}"),
-        PlannedCapability {
-            name: name.to_string(),
-            source,
-            symbol_hash: symbol_hash.to_string(),
-            effects: effects.to_vec(),
-        },
-    );
-    Ok(())
 }
 
 fn is_minimal_platform_extern(link_name: &str) -> bool {

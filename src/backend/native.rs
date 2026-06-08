@@ -1892,13 +1892,13 @@ fn native_layout_u64(layout: &LoweredTypeLayout, key: &str) -> Result<u64> {
         })
 }
 
-fn native_contains_box(
+fn native_contains_owned_resource(
     layouts: &BTreeMap<String, LoweredTypeLayout>,
     type_hash: &str,
 ) -> Result<bool> {
     Ok(native_type_layout(layouts, type_hash)?
         .metadata
-        .get("contains_box")
+        .get("contains_owned_resource")
         .and_then(JsonValue::as_bool)
         .unwrap_or(false))
 }
@@ -3568,7 +3568,7 @@ impl FunctionEmitter {
     }
 
     fn emit_drop_record_ptr_x86(&mut self, layout: &LoweredTypeLayout) -> Result<()> {
-        if !native_contains_box(&self.type_layouts, &layout.type_hash)? {
+        if !native_contains_owned_resource(&self.type_layouts, &layout.type_hash)? {
             return Ok(());
         }
         let fields = native_record_fields(layout)?;
@@ -3609,7 +3609,7 @@ impl FunctionEmitter {
     }
 
     fn emit_drop_enum_ptr_x86(&mut self, layout: &LoweredTypeLayout) -> Result<()> {
-        if !native_contains_box(&self.type_layouts, &layout.type_hash)? {
+        if !native_contains_owned_resource(&self.type_layouts, &layout.type_hash)? {
             return Ok(());
         }
         let variants = native_enum_variants(layout)?;
@@ -5289,7 +5289,7 @@ impl Arm64Emitter {
     }
 
     fn emit_drop_record_ptr_arm64(&mut self, layout: &LoweredTypeLayout) -> Result<()> {
-        if !native_contains_box(&self.type_layouts, &layout.type_hash)? {
+        if !native_contains_owned_resource(&self.type_layouts, &layout.type_hash)? {
             return Ok(());
         }
         let fields = native_record_fields(layout)?;
@@ -5329,7 +5329,7 @@ impl Arm64Emitter {
     }
 
     fn emit_drop_enum_ptr_arm64(&mut self, layout: &LoweredTypeLayout) -> Result<()> {
-        if !native_contains_box(&self.type_layouts, &layout.type_hash)? {
+        if !native_contains_owned_resource(&self.type_layouts, &layout.type_hash)? {
             return Ok(());
         }
         let variants = native_enum_variants(layout)?;
