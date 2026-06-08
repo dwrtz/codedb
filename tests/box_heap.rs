@@ -469,3 +469,81 @@ fn can_build_default_native_target() -> bool {
         || (std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64");
     native_target && StdCommand::new("cc").arg("--version").output().is_ok()
 }
+
+fn object_references_symbol(object: &[u8], symbol: &[u8]) -> bool {
+    object.windows(symbol.len()).any(|window| window == symbol)
+}
+
+/// Leak-regression guard (static / structural). The value oracle and the
+/// runtime double-free abort exercised by the other box tests catch wrong
+/// values and double-frees, but neither catches a pure *leak* — an allocation
+/// with no matching free, which is the shape a future skipped-drop regression
+/// would take. This guard asserts, for every owned-box shape, that (a) lowering
+/// still SCHEDULES a `drop` for the owned slot and (b) the emitted native object
+/// is still WIRED to `malloc` and `free` (drop glue reaches the platform free
+/// symbol). A regression that drops the drop op, misclassifies the box as Copy,
+/// or no-ops the drop glue removes the `free` reference and trips this test. The
+/// no-box control proves the guard discriminates rather than always passing.
+/// (emit-ir/emit-object are pure codegen, so this runs without a host linker.)
+#[test]
+fn box_owning_functions_schedule_drops_and_emit_free() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("box-leak-guard.sqlite");
+    let source = Path::new("examples/v2/box_heap.cdb");
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(source)]);
+
+    // (entry, owns_heap)
+    for (entry, owns_heap) in [
+        ("boxed_total", true),    // single box dropped at scope end
+        ("boxed_borrow", true),   // box borrowed then dropped
+        ("move_box", true),       // box moved; exactly the new owner is freed
+        ("recursive_node", true), // recursive enum Node: drop must recurse and free every node
+        ("line_total", false),    // no box: must not drop and must not reference malloc/free
+    ] {
+        let ir_path = temp.path().join(format!("{entry}.ir.json"));
+        run(&["emit-ir", path(&db), entry, "--out", path(&ir_path)]);
+        let drops = op_names(&read_json(&ir_path))
+            .iter()
+            .filter(|op| op.as_str() == "drop")
+            .count();
+
+        let object_path = temp.path().join(format!("{entry}.o"));
+        run(&[
+            "emit-object",
+            path(&db),
+            entry,
+            "--target",
+            codedb::DEFAULT_NATIVE_TARGET,
+            "--out",
+            path(&object_path),
+        ]);
+        let object = std::fs::read(&object_path).unwrap();
+        let references_malloc = object_references_symbol(&object, b"malloc");
+        let references_free = object_references_symbol(&object, b"free");
+
+        if owns_heap {
+            assert!(
+                drops >= 1,
+                "{entry}: expected a scheduled drop for the owned box slot, found none (would leak)"
+            );
+            assert!(
+                references_malloc,
+                "{entry}: emitted object does not reference malloc (allocation lost)"
+            );
+            assert!(
+                references_free,
+                "{entry}: emitted object does not reference free (drop glue would leak)"
+            );
+        } else {
+            assert_eq!(
+                drops, 0,
+                "{entry}: no-box control unexpectedly scheduled a drop"
+            );
+            assert!(
+                !references_malloc && !references_free,
+                "{entry}: no-box control unexpectedly references malloc/free"
+            );
+        }
+    }
+}

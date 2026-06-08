@@ -1404,8 +1404,9 @@ impl CodeDb {
     /// a partial move that leaves the enclosing aggregate with a moved-out hole;
     /// because the drop scaffold drops whole slots only, the aggregate's later
     /// drop would double-drop the moved field. Reject partial moves of owned
-    /// aggregates fail-closed until field-granular drop glue lands (SPEC_V2 §12,
-    /// PLAN_V2 Phase 15). Every move-lowering path routes through here so the
+    /// aggregates fail-closed until field-granular drop glue lands (SPEC_V2 §12;
+    /// a deferred post-Phase-15 extension — Phase 15 shipped whole-slot box drop
+    /// glue only). Every move-lowering path routes through here so the
     /// guard cannot drift between sites; `verify_lowered_ir`'s `Move` check is
     /// the independent backstop.
     fn require_whole_slot_move(
@@ -1416,7 +1417,7 @@ impl CodeDb {
         self.place_whole_root_slot(expr_hash, locals)?
             .ok_or_else(|| {
                 anyhow!(
-                    "unsupported_move: lowering does not support moving a move-only value out of a field or element projection (partial move of an owned aggregate); field-granular drop glue is not yet implemented (SPEC_V2 §12, PLAN_V2 Phase 15)"
+                    "unsupported_move: lowering does not support moving a move-only value out of a field or element projection (partial move of an owned aggregate); field-granular drop glue is not yet implemented (SPEC_V2 §12; deferred post-Phase-15 extension)"
                 )
             })
     }
@@ -1438,7 +1439,7 @@ impl CodeDb {
             // with a moved-out hole; because the drop scaffold drops whole slots
             // only, the aggregate's later drop would double-drop the moved
             // field. Reject partial moves of owned aggregates fail-closed until
-            // field-granular drop glue lands (SPEC_V2 §12, PLAN_V2 Phase 15).
+            // field-granular drop glue lands (SPEC_V2 §12; deferred post-Phase-15 extension).
             let root_slot = self.require_whole_slot_move(expr_hash, locals)?;
             let id = ctx.value();
             ctx.push_debug_op(expr_hash, "move", &id);
@@ -3257,7 +3258,7 @@ impl CodeDb {
         // before the `if`). Track moves per branch and reject an asymmetric
         // conditional move of an outer slot fail-closed; symmetric moves (both
         // branches, or neither) and moves of branch-local temporaries are fine.
-        // Conditional drop glue is deferred (SPEC_V2 §12, PLAN_V2 Phase 15).
+        // Conditional drop glue is deferred (SPEC_V2 §12; deferred post-Phase-15 extension).
         let locals_boundary = ctx.next_local;
         let moved_before = ctx.moved.clone();
         let then_expr =
@@ -3269,7 +3270,7 @@ impl CodeDb {
         let else_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
         if then_moved != else_moved {
             bail!(
-                "unsupported_move: lowering does not support moving an owned value in only one branch of an `if` (asymmetric conditional move); move it in both branches or neither — conditional drop glue is not yet implemented (SPEC_V2 §12, PLAN_V2 Phase 15)"
+                "unsupported_move: lowering does not support moving an owned value in only one branch of an `if` (asymmetric conditional move); move it in both branches or neither — conditional drop glue is not yet implemented (SPEC_V2 §12; deferred post-Phase-15 extension)"
             );
         }
         // The outer-slot moves match, so `ctx.moved` (now moved_before ∪
@@ -3396,7 +3397,7 @@ impl CodeDb {
             {
                 if self.type_is_move_only(root, ctx.target_triple(), &variant_info.type_hash)? {
                     bail!(
-                        "unsupported_move: lowering does not support moving a move-only enum payload out of a case arm; field-granular drop glue is not yet implemented (SPEC_V2 §12, PLAN_V2 Phase 15)"
+                        "unsupported_move: lowering does not support moving a move-only enum payload out of a case arm; field-granular drop glue is not yet implemented (SPEC_V2 §12; deferred post-Phase-15 extension)"
                     );
                 }
                 let slot_size = stack_slot_size_bytes(self.layout_size_bytes(
@@ -3500,7 +3501,7 @@ impl CodeDb {
             match &expected_arm_moves {
                 Some(expected) if expected != &arm_moves => {
                     bail!(
-                        "unsupported_move: lowering does not support moving an owned value in only some arms of a `case`; move it in every arm or none — conditional drop glue is not yet implemented (SPEC_V2 §12, PLAN_V2 Phase 15)"
+                        "unsupported_move: lowering does not support moving an owned value in only some arms of a `case`; move it in every arm or none — conditional drop glue is not yet implemented (SPEC_V2 §12; deferred post-Phase-15 extension)"
                     );
                 }
                 None => expected_arm_moves = Some(arm_moves),
@@ -5484,7 +5485,8 @@ impl CodeDb {
                     // enclosing aggregate with a moved-out hole the whole-slot
                     // drop scaffold cannot track, so a later whole-slot drop of
                     // the aggregate would double-drop the moved field. Reject it
-                    // until field-granular drop glue lands (PLAN_V2 Phase 15).
+                    // until field-granular drop glue lands (a deferred
+                    // post-Phase-15 extension; SPEC_V2 §12).
                     // This is the independent backstop for the lowering guard in
                     // `require_whole_slot_move`. `addr_roots` holds every
                     // AddrOfParam/AddrOfLocal id (drop-relevant or not), so a

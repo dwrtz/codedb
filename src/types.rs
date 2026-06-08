@@ -2351,6 +2351,22 @@ impl CodeDb {
         self.put_object("ExternalFunction", &JsonValue::Object(payload))
     }
 
+    /// Validate that an extern's declared effects cover its signature: every
+    /// extern needs `ffi`, and any raw pointer reachable through an argument or
+    /// return additionally needs `unsafe`.
+    ///
+    /// Two-tier by design. The creation-time call (`put_external_function`,
+    /// `root = None`) is a best-effort fast check: without a root it can only
+    /// resolve *structural* types, so a raw pointer hidden inside a `Named`
+    /// record/enum is invisible there (`type_contains_raw_pointer`'s `Named`
+    /// arm returns `false`). The AUTHORITATIVE check runs at every commit and at
+    /// `verify` from inside `type_check_root` with `root = Some(..)`, which
+    /// resolves `Named` → `Record`/`Enum` and so sees raw pointers nested behind
+    /// named types. No extern reaches a committed root without passing the
+    /// authoritative tier, so the creation-time gap cannot admit an
+    /// effect-underdeclared extern; it only makes the early diagnostic less
+    /// eager for named pointees. (Regression-locked by the named-pointee extern
+    /// tests in `tests/raw_pointers.rs`.)
     fn validate_external_signature_effects(
         &self,
         root: Option<&ProgramRootPayload>,
@@ -2419,6 +2435,12 @@ impl CodeDb {
                 }
                 Ok(contains)
             }
+            // A `Named` type is only reachable here when `root` is `None`
+            // (creation-time best-effort tier): with a root, `type_spec_in_root`
+            // already expanded it to `Record`/`Enum` above. Returning `false`
+            // here is safe because the authoritative root-aware tier in
+            // `type_check_root` re-runs this check with the name resolved — see
+            // `validate_external_signature_effects`.
             TypeSpec::Builtin(_) | TypeSpec::Named { .. } => Ok(false),
         };
         active_types.remove(type_hash);
@@ -6477,9 +6499,9 @@ impl CodeDb {
         if class.copy_kind == ValueCopyKind::MoveOnly {
             // Moving a move-only value out of a record field or array element is
             // a partial move; the whole-slot drop scaffold cannot express it, so
-            // lowering rejects it fail-closed (deferred to Phase 15). Reject here
-            // too so `verify` is a faithful safety gate rather than deferring the
-            // decision to codegen.
+            // lowering rejects it fail-closed (field-granular drop glue is a
+            // deferred post-Phase-15 extension). Reject here too so `verify` is a
+            // faithful safety gate rather than deferring the decision to codegen.
             if !place.fields.is_empty() {
                 bail!(
                     "unsupported_move: partial move of an owned aggregate at {:?}; moving a move-only value out of a record field or array element is not yet supported",

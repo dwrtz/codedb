@@ -869,6 +869,17 @@ layouts through the platform allocation capsule, so there is no user-callable
 `heap_free` surface. A general allocator interface and `std.alloc` wrapper are
 deferred to Phase 18.
 
+Drop-glue scope: Phase 15 implements whole-slot drop glue (a `let`/parameter
+slot is dropped once at end of scope, with the drop body recursing into record
+fields, array elements, enum payloads, and nested boxes). The harder dataflow
+cases the Phase 8 note anticipated for Phase 15 — *conditional* drop glue (an
+owned value moved in only some `if`/`case` branches) and *field-granular* drop
+glue (a partial move of a move-only value out of a record field or array
+element) — remain rejected fail-closed at both the semantic borrow gate and
+lowering. They are a deferred post-Phase-15 extension, not required by any
+Phase 15 acceptance check ("drop frees exactly once" holds for every accepted
+program).
+
 ## Phase 16 — Raw Pointers, Unsafe, and FFI Boundary
 
 Goal: expose low-level native interop without weakening safe semantic references.

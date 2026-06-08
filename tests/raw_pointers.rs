@@ -357,3 +357,89 @@ fn can_build_default_native_target() -> bool {
         || (std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64");
     native_target && StdCommand::new("cc").arg("--version").output().is_ok()
 }
+
+/// A raw pointer hidden inside a NAMED record/enum used by an extern still
+/// requires the `unsafe` effect. The creation-time effect check is a structural
+/// best-effort that cannot see through `Named` types; the authoritative
+/// root-aware check runs at commit/`verify` inside `type_check_root`. This locks
+/// in that authoritative tier so a future refactor that drops it fails CI. See
+/// `validate_external_signature_effects` in `src/types.rs`.
+#[test]
+fn extern_with_raw_pointer_behind_named_type_requires_unsafe() {
+    // (source, declares_unsafe, accepted) — each pointee is reachable only
+    // through a Named record/enum, so only the root-aware tier can find it.
+    let cases = [
+        (
+            "named record field",
+            r#"
+record RawSlot { p: raw_ptr<u8>  n: i64 }
+extern fn sink(slot: RawSlot) -> i64 abi[c] effects[ffi] link_name "sink" library "c"
+"#,
+            false,
+        ),
+        (
+            "named record field with unsafe",
+            r#"
+record RawSlot { p: raw_ptr<u8>  n: i64 }
+extern fn sink(slot: RawSlot) -> i64 abi[c] effects[ffi, unsafe] link_name "sink" library "c"
+"#,
+            true,
+        ),
+        (
+            "named enum variant payload",
+            r#"
+enum Handle { null: unit  ptr: raw_ptr<u8> }
+extern fn use_handle(h: Handle) -> i64 abi[c] effects[ffi] link_name "use_handle" library "c"
+"#,
+            false,
+        ),
+        (
+            "named enum variant payload with unsafe",
+            r#"
+enum Handle { null: unit  ptr: raw_ptr<u8> }
+extern fn use_handle(h: Handle) -> i64 abi[c] effects[ffi, unsafe] link_name "use_handle" library "c"
+"#,
+            true,
+        ),
+        (
+            "raw pointer nested two named types deep",
+            r#"
+record Inner { p: raw_ptr<u8> }
+record Outer { inner: Inner  tag: i64 }
+extern fn host(o: Outer) -> i64 abi[c] effects[ffi] link_name "host" library "c"
+"#,
+            false,
+        ),
+        (
+            "named record as extern return",
+            r#"
+record RawSlot { p: raw_mut_ptr<u8>  n: i64 }
+extern fn make() -> RawSlot abi[c] effects[ffi] link_name "make" library "c"
+"#,
+            false,
+        ),
+    ];
+
+    for (label, source_text, accepted) in cases {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("named-raw-ffi.sqlite");
+        let source = temp.path().join("named-raw-ffi.cdb");
+        std::fs::write(&source, source_text).unwrap();
+        run(&["init", path(&db)]);
+        if accepted {
+            run(&["import", path(&db), path(&source)]);
+            // The authoritative tier also runs at `verify`; it must stay clean.
+            bin()
+                .args(["verify", path(&db)])
+                .assert()
+                .success()
+                .stdout("verify ok\n");
+        } else {
+            let stderr = run_fail(&["import", path(&db), path(&source)]);
+            assert!(
+                stderr.contains("unsafe"),
+                "{label}: expected the named-pointee extern to be rejected for missing the unsafe effect, got: {stderr}"
+            );
+        }
+    }
+}
