@@ -1,0 +1,7 @@
+module std.alloc {
+fn alloc_raw(size: i64, align: i64) -> raw_mut_ptr<u8> effects[alloc, ffi, unsafe] =
+  std.platform.malloc(size, align)
+
+fn free_raw(ptr: raw_mut_ptr<u8>) -> unit effects[alloc, ffi, unsafe] =
+  std.platform.free(ptr)
+}

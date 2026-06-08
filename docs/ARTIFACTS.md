@@ -538,9 +538,10 @@ and object bytes.
 
 `build-plan --json` emits `codedb/native-build-plan/v1`, which is a command
 inspection artifact showing the planned artifact jobs, link plan cache key,
-reachable object list, export map, external symbols, and link options. It does
-not compile artifacts; `link_plan_hash` is `null` until the link plan is
-materialized by `link-native` or `build`.
+reachable object list, export map, external symbols, platform capsule externs,
+stdlib capability metadata, and link options. It does not compile artifacts;
+`link_plan_hash` is `null` until the link plan is materialized by `link-native`
+or `build`.
 
 `build` invokes the host `cc` linker when the requested target can be linked by
 the host. Executable cache entries use `codedb/executable/v1` metadata and store

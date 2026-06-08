@@ -1,0 +1,4 @@
+module std.io {
+fn write_stdout(s: slice<'static, u8>) -> i64 effects[io, ffi, unsafe] =
+  std.platform.write(1, raw_ptr(&'static s[0]), len(s))
+}

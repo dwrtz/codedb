@@ -11,7 +11,8 @@ use crate::backend::ArtifactKind;
 use crate::backend::native::{NativeObjectArtifact, backend_id_for_target};
 use crate::expr::Value;
 use crate::jobs::{ArtifactJobClaim, artifact_job_error, new_worker_id};
-use crate::model::ProgramRootPayload;
+use crate::lowering::{LoweredFunctionIr, LoweredOp};
+use crate::model::{ProgramRootPayload, qualified_symbol_display};
 use crate::store::{
     CodeDb, cache_key_for_input, canonical_json, function_interface_metadata, hash_bytes,
     hash_object_canonical,
@@ -76,6 +77,8 @@ struct PlannedLink {
     entry_effects: Vec<String>,
     objects: Vec<PlannedObject>,
     external_symbols: Vec<PlannedExternalSymbol>,
+    platform_external_symbols: Vec<PlannedPlatformExternalSymbol>,
+    capabilities: Vec<PlannedCapability>,
     export_map: Vec<JsonValue>,
     link_options: JsonValue,
 }
@@ -102,6 +105,21 @@ struct PlannedExternalSymbol {
     abi: String,
     link_name: String,
     library: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedPlatformExternalSymbol {
+    symbol_hash: String,
+    link_name: String,
+    source: String,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedCapability {
+    name: String,
+    source: String,
+    symbol_hash: String,
+    effects: Vec<String>,
 }
 
 impl PlannedLink {
@@ -145,6 +163,34 @@ impl PlannedLink {
                     "abi": &symbol.abi,
                     "link_name": &symbol.link_name,
                     "library": &symbol.library,
+                })
+            })
+            .collect()
+    }
+
+    fn platform_external_symbol_entries(&self) -> Vec<JsonValue> {
+        self.platform_external_symbols
+            .iter()
+            .map(|symbol| {
+                json!({
+                    "symbol_hash": &symbol.symbol_hash,
+                    "link_name": &symbol.link_name,
+                    "platform": true,
+                    "source": &symbol.source,
+                })
+            })
+            .collect()
+    }
+
+    fn capability_entries(&self) -> Vec<JsonValue> {
+        self.capabilities
+            .iter()
+            .map(|capability| {
+                json!({
+                    "name": &capability.name,
+                    "source": &capability.source,
+                    "symbol_hash": &capability.symbol_hash,
+                    "effects": &capability.effects,
                 })
             })
             .collect()
@@ -201,6 +247,8 @@ impl CodeDb {
             "objects": planned.object_job_entries(),
             "export_map": &planned.export_map,
             "external_symbols": planned.external_symbol_entries(),
+            "platform_external_symbols": planned.platform_external_symbol_entries(),
+            "capabilities": planned.capability_entries(),
             "link_options": &planned.link_options,
         });
         Ok(format!("{}\n", canonical_json(&payload)))
@@ -460,7 +508,10 @@ impl CodeDb {
         if input_hash != planned.input_hash {
             bail!("computed link input hash does not match planned link input hash");
         }
-        let platform_external_symbols = platform_external_symbols_from_objects(&object_entries)?;
+        let platform_external_symbols = merge_platform_external_symbol_entries(
+            platform_external_symbols_from_objects(&object_entries)?,
+            planned.platform_external_symbol_entries(),
+        );
         let mut plan = json!({
             "schema": LINK_PLAN_SCHEMA,
             "input_hash": &input_hash,
@@ -557,6 +608,8 @@ impl CodeDb {
         let backend_id = backend_id_for_target(target_triple)?;
         let mut objects = Vec::new();
         let mut external_symbols = Vec::new();
+        let mut platform_external_symbols = BTreeMap::new();
+        let mut capabilities = BTreeMap::new();
         for symbol in symbols {
             let root_entry = self
                 .root_symbol(root, &symbol)
@@ -564,8 +617,15 @@ impl CodeDb {
             let (param_type_hashes, return_type_hash) =
                 self.signature_parts(&root_entry.signature)?;
             let effects = self.signature_effect_names(&root_entry.signature)?;
+            collect_symbol_capabilities(root, &symbol, &effects, &mut capabilities)?;
             if self.definition_is_external(&root_entry.definition)? {
                 let external = self.external_function_metadata(&root_entry.definition)?;
+                collect_semantic_platform_external(
+                    root,
+                    &symbol,
+                    &external.link_name,
+                    &mut platform_external_symbols,
+                )?;
                 external_symbols.push(PlannedExternalSymbol {
                     symbol_hash: symbol.clone(),
                     definition_hash: root_entry.definition.clone(),
@@ -596,6 +656,7 @@ impl CodeDb {
             dependency_interface_hashes.sort();
             dependency_interface_hashes.dedup();
             let lowered = self.build_lowered_function_ir(root, root_entry, target_triple)?;
+            collect_compiler_platform_externals(&lowered, &mut platform_external_symbols);
             let dependency_implementation_hashes =
                 self.native_object_type_dependency_hashes(root, &lowered, target_triple)?;
             let object_key_input = CacheKeyInput::new(
@@ -694,6 +755,8 @@ impl CodeDb {
             entry_effects: self.signature_effect_names(&entry.signature)?,
             objects,
             external_symbols,
+            platform_external_symbols: platform_external_symbols.into_values().collect(),
+            capabilities: capabilities.into_values().collect(),
             export_map,
             link_options,
         })
@@ -1077,6 +1140,171 @@ fn platform_external_symbols_from_objects(objects: &[JsonValue]) -> Result<Vec<J
         }
     }
     Ok(symbols.into_values().collect())
+}
+
+fn merge_platform_external_symbol_entries(
+    mut first: Vec<JsonValue>,
+    second: Vec<JsonValue>,
+) -> Vec<JsonValue> {
+    let mut symbols = BTreeMap::new();
+    for entry in first.drain(..).chain(second) {
+        let key = entry
+            .get("symbol_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
+        symbols.insert(key, entry);
+    }
+    symbols.into_values().collect()
+}
+
+fn collect_semantic_platform_external(
+    root: &ProgramRootPayload,
+    symbol_hash: &str,
+    link_name: &str,
+    out: &mut BTreeMap<String, PlannedPlatformExternalSymbol>,
+) -> Result<()> {
+    let Some(source) = qualified_symbol_display(root, symbol_hash) else {
+        return Ok(());
+    };
+    if !source.starts_with("std.platform.") || !is_minimal_platform_extern(link_name) {
+        return Ok(());
+    }
+    out.insert(
+        symbol_hash.to_string(),
+        PlannedPlatformExternalSymbol {
+            symbol_hash: symbol_hash.to_string(),
+            link_name: link_name.to_string(),
+            source,
+        },
+    );
+    Ok(())
+}
+
+fn collect_compiler_platform_externals(
+    ir: &LoweredFunctionIr,
+    out: &mut BTreeMap<String, PlannedPlatformExternalSymbol>,
+) {
+    let usage = compiler_platform_usage_for_ir(ir);
+    if usage.uses_malloc {
+        insert_compiler_platform_external(out, "platform:malloc", "malloc", "compiler.heap_alloc");
+    }
+    if usage.uses_free {
+        insert_compiler_platform_external(out, "platform:free", "free", "compiler.drop");
+    }
+}
+
+fn insert_compiler_platform_external(
+    out: &mut BTreeMap<String, PlannedPlatformExternalSymbol>,
+    symbol_hash: &str,
+    link_name: &str,
+    source: &str,
+) {
+    out.insert(
+        symbol_hash.to_string(),
+        PlannedPlatformExternalSymbol {
+            symbol_hash: symbol_hash.to_string(),
+            link_name: link_name.to_string(),
+            source: source.to_string(),
+        },
+    );
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CompilerPlatformUsage {
+    uses_malloc: bool,
+    uses_free: bool,
+}
+
+fn compiler_platform_usage_for_ir(ir: &LoweredFunctionIr) -> CompilerPlatformUsage {
+    let mut usage = CompilerPlatformUsage::default();
+    collect_compiler_platform_usage_from_ops(ir, &ir.operations, &mut usage);
+    usage
+}
+
+fn collect_compiler_platform_usage_from_ops(
+    ir: &LoweredFunctionIr,
+    ops: &[LoweredOp],
+    usage: &mut CompilerPlatformUsage,
+) {
+    for op in ops {
+        match op {
+            LoweredOp::HeapAlloc { .. } => usage.uses_malloc = true,
+            LoweredOp::Drop { type_hash, .. } => {
+                if lowered_layout_contains_box(ir, type_hash) {
+                    usage.uses_free = true;
+                }
+            }
+            LoweredOp::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                collect_compiler_platform_usage_from_ops(ir, &then_block.operations, usage);
+                collect_compiler_platform_usage_from_ops(ir, &else_block.operations, usage);
+            }
+            LoweredOp::Case { arms, .. } => {
+                for arm in arms {
+                    collect_compiler_platform_usage_from_ops(ir, &arm.block.operations, usage);
+                }
+            }
+            LoweredOp::Fold { body, .. } => {
+                collect_compiler_platform_usage_from_ops(ir, &body.operations, usage);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn lowered_layout_contains_box(ir: &LoweredFunctionIr, type_hash: &str) -> bool {
+    ir.type_layouts
+        .iter()
+        .find(|layout| layout.type_hash == type_hash)
+        .and_then(|layout| {
+            layout
+                .metadata
+                .get("contains_box")
+                .and_then(JsonValue::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn collect_symbol_capabilities(
+    root: &ProgramRootPayload,
+    symbol_hash: &str,
+    effects: &[String],
+    out: &mut BTreeMap<String, PlannedCapability>,
+) -> Result<()> {
+    let Some(source) = qualified_symbol_display(root, symbol_hash) else {
+        return Ok(());
+    };
+    let capability_name = if source == "std.io.write_stdout" {
+        Some("stdout")
+    } else if source.starts_with("std.alloc.") {
+        Some("alloc")
+    } else {
+        None
+    };
+    let Some(name) = capability_name else {
+        return Ok(());
+    };
+    out.insert(
+        format!("{name}:{symbol_hash}"),
+        PlannedCapability {
+            name: name.to_string(),
+            source,
+            symbol_hash: symbol_hash.to_string(),
+            effects: effects.to_vec(),
+        },
+    );
+    Ok(())
+}
+
+fn is_minimal_platform_extern(link_name: &str) -> bool {
+    matches!(
+        link_name,
+        "write" | "read" | "malloc" | "free" | "trap" | "exit"
+    )
 }
 
 fn native_record_field_layouts(

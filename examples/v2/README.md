@@ -16,6 +16,7 @@ The required acceptance programs are:
 | `invoice_static.cdb` | Records, enums, fixed arrays or slices, references, and loops or folds. | Structured static data compiles natively with deterministic layouts. |
 | `box_heap.cdb` | Move-only `box<T>` values, compiler-owned allocation, drop glue, and recursive boxed enums. | Box allocation, moves, borrows, and recursive construction compile natively. |
 | `static_write.cdb` | Static string data passed through minimal `std.platform` and `std.io` modules. | Read-only static data links through an unsafe FFI write wrapper and prints bytes. |
+| `std_minimal.cdb` | Minimal stdlib skeleton with `std.core`, `std.mem`, `std.platform`, `std.io`, and `std.alloc`. | Stdlib wrappers compile as CodeDB code, build plans expose platform externs and capabilities, and native execution prints bytes. |
 | `parser_or_word_count.cdb` | Byte or string slices, bounds checks, loops, and later I/O. | Slice-heavy parsing or counting compiles natively without interpreter fallback. |
 | `todo_cli.cdb` | Capstone CLI with args, stdout, files, strings, dynamic allocation, and result handling. | Useful stateful CLI behavior passes native-required integration tests. |
 

@@ -1,0 +1,4 @@
+module std.mem {
+fn len_bytes<'a>(s: slice<'a, u8>) -> i64 = len(s)
+fn first_byte<'a>(s: slice<'a, u8>) -> u8 = s[0]
+}

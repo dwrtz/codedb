@@ -982,6 +982,14 @@ verify validates static data artifacts and source maps
 
 Goal: avoid a fat runtime by compiling stdlib logic as CodeDB code and limiting native capsule functions.
 
+Status: implemented for the current module-based package boundary. The repo now
+has `std.core`, `std.mem`, `std.platform`, `std.io`, and `std.alloc` projection
+fixtures, plus a combined `examples/v2/std_minimal.cdb` acceptance program that
+compiles stdlib wrappers as CodeDB functions over minimal platform externs.
+Native build plans report reachable platform capsule externs and stdlib-derived
+capability metadata, including compiler-generated `malloc`/`free` usage from
+box allocation/drop glue.
+
 Deliverables:
 
 ```text

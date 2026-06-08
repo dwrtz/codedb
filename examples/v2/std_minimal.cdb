@@ -1,0 +1,39 @@
+module std.core {
+fn id_i64(x: i64) -> i64 = x
+fn is_zero(x: i64) -> bool = x == 0
+}
+
+module std.mem {
+fn len_bytes<'a>(s: slice<'a, u8>) -> i64 = len(s)
+fn first_byte<'a>(s: slice<'a, u8>) -> u8 = s[0]
+}
+
+module std.platform {
+extern fn write(fd: i64, ptr: raw_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "write" library "c"
+extern fn read(fd: i64, ptr: raw_mut_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "read" library "c"
+extern fn malloc(size: i64, align: i64) -> raw_mut_ptr<u8> abi[c] effects[alloc, ffi, unsafe] link_name "malloc" library "c"
+extern fn free(ptr: raw_mut_ptr<u8>) -> unit abi[c] effects[alloc, ffi, unsafe] link_name "free" library "c"
+extern fn exit(code: i64) -> unit abi[c] effects[ffi] link_name "exit" library "c"
+fn trap(code: i64) -> unit effects[ffi, trap] = exit(code)
+}
+
+module std.io {
+fn write_stdout(s: slice<'static, u8>) -> i64 effects[io, ffi, unsafe] =
+  std.platform.write(1, raw_ptr(&'static s[0]), len(s))
+}
+
+module std.alloc {
+fn alloc_raw(size: i64, align: i64) -> raw_mut_ptr<u8> effects[alloc, ffi, unsafe] =
+  std.platform.malloc(size, align)
+
+fn free_raw(ptr: raw_mut_ptr<u8>) -> unit effects[alloc, ffi, unsafe] =
+  std.platform.free(ptr)
+}
+
+fn allocate_and_free() -> i64 effects[alloc, ffi, unsafe] =
+  let p: raw_mut_ptr<u8> = std.alloc.alloc_raw(8, 8) in
+  let _: unit = std.alloc.free_raw(p) in
+  7
+
+fn main() -> i64 effects[alloc, io, ffi, unsafe] =
+  std.core.id_i64(std.mem.len_bytes("hello")) + std.io.write_stdout("hello") + allocate_and_free()
