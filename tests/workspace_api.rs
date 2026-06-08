@@ -31,16 +31,27 @@ impl Drop for WorkspaceServer {
 }
 
 fn start_server(db: &Path) -> WorkspaceServer {
-    let addr = free_addr();
-    let child = StdCommand::new(assert_cmd::cargo::cargo_bin("codedb"))
-        .args(["serve", db.to_str().unwrap(), "--addr", &addr])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn codedb serve");
-    let mut server = WorkspaceServer { child, addr };
-    wait_for_server(&mut server);
-    server
+    // `free_addr()` binds :0, closes the listener, then `serve` re-binds the same
+    // port — so another process (e.g. a sibling test binary) can grab it in the
+    // gap, making `serve` exit immediately on a bind error. That manifested as a
+    // flaky "exited before accepting requests" panic under full-suite parallel
+    // load. Re-roll onto a fresh port instead of failing; only give up after
+    // several attempts.
+    for _ in 0..5 {
+        let addr = free_addr();
+        let child = StdCommand::new(assert_cmd::cargo::cargo_bin("codedb"))
+            .args(["serve", db.to_str().unwrap(), "--addr", &addr])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn codedb serve");
+        let mut server = WorkspaceServer { child, addr };
+        if wait_for_server(&mut server) {
+            return server;
+        }
+        // `server` is dropped here, killing the exited child, before we retry.
+    }
+    panic!("codedb serve failed to start after retrying on fresh ports");
 }
 
 fn free_addr() -> String {
@@ -48,14 +59,17 @@ fn free_addr() -> String {
     listener.local_addr().expect("local addr").to_string()
 }
 
-fn wait_for_server(server: &mut WorkspaceServer) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+/// Wait until the server accepts connections. Returns `true` when it is ready,
+/// `false` if it exited during startup (e.g. it lost the port race), so the
+/// caller can retry on a fresh port. A genuine hang still fails the test.
+fn wait_for_server(server: &mut WorkspaceServer) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if TcpStream::connect(&server.addr).is_ok() {
-            return;
+            return true;
         }
-        if let Some(status) = server.child.try_wait().expect("server status") {
-            panic!("codedb serve exited before accepting requests: {status}");
+        if server.child.try_wait().expect("server status").is_some() {
+            return false;
         }
         assert!(
             Instant::now() < deadline,
@@ -132,11 +146,16 @@ fn workspace_server_handles_slow_clients_concurrently() {
     )
     .expect("write slow request headers");
 
+    // The read timeout only bounds a regression where the pending slow client
+    // blocks the server from serving this concurrent request (a healthy server
+    // answers in milliseconds). Keep it generous so a CPU-saturated machine
+    // running the full suite in parallel does not time out a response that is
+    // merely late — the earlier 2s bound flaked under that load.
     let current = workspace_call_with_read_timeout(
         &server,
         "workspace.current",
         json!({}),
-        Some(Duration::from_secs(2)),
+        Some(Duration::from_secs(30)),
     );
     assert_eq!(current["schema"], "codedb/response/v1");
     assert_eq!(current["status"], "ok");

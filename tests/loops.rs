@@ -355,6 +355,88 @@ fn debug_kinds(ir: &JsonValue) -> Vec<String> {
         .collect()
 }
 
+/// A `fold` whose accumulator is a non-alphabetically-declared record must build
+/// the accumulator in the destination (declaration-order) layout in every result
+/// position: bound to a `let` (already supported), returned from a function
+/// through `let` tails, passed as a call argument, and nested inside another
+/// fold's body. The expected accumulator type is propagated into the fold (and
+/// through `let ... in` tails) so a record-literal accumulator builds in place;
+/// before that, the non-`let` positions compiled `unsupported`. Each entry reads
+/// a specific field so a field-order swap would be observable.
+#[test]
+fn fold_with_non_alphabetical_record_accumulator_agrees_with_native() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("fold-record-acc.sqlite");
+    let source = temp.path().join("fold-record-acc.cdb");
+    std::fs::write(
+        &source,
+        r#"
+record Acc { b: i64, a: i64 }
+
+fn read_a(r: Acc) -> i64 = r.a
+
+fn body_pos() -> Acc =
+  let xs: array<i64, 3> = [1, 2, 3] in
+  fold v in xs with acc = { b: 0, a: 0 } do { b: acc.b + v, a: acc.a + v * 10 }
+
+fn arg_pos() -> i64 =
+  read_a(
+    let xs: array<i64, 3> = [1, 2, 3] in
+    fold v in xs with acc = { b: 0, a: 0 } do { b: acc.b + v, a: acc.a + v * 10 }
+  )
+
+fn nested() -> i64 =
+  let xs: array<i64, 2> = [1, 2] in
+  let ys: array<i64, 2> = [10, 20] in
+  let r: Acc = fold x in xs with outer = { b: 0, a: 0 } do
+    (fold y in ys with inner = { b: outer.b, a: outer.a } do { b: inner.b + x, a: inner.a + y })
+  in
+  r.a
+
+fn body_a() -> i64 = let r: Acc = body_pos() in r.a
+fn body_b() -> i64 = let r: Acc = body_pos() in r.b
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    // Oracle: fold over [1,2,3] => { b: 6, a: 60 }; nested => { b: 6, a: 60 }.
+    assert_eq!(run(&["eval", path(&db), "body_a"]).trim(), "60");
+    assert_eq!(run(&["eval", path(&db), "body_b"]).trim(), "6");
+    assert_eq!(run(&["eval", path(&db), "arg_pos"]).trim(), "60");
+    assert_eq!(run(&["eval", path(&db), "nested"]).trim(), "60");
+    run(&["verify", path(&db)]);
+
+    if can_build_default_native_target() {
+        for (name, entry, expect) in [
+            ("fold_body_reads_a", "body_a", "60"),
+            ("fold_body_reads_b", "body_b", "6"),
+            ("fold_arg_pos", "arg_pos", "60"),
+            ("fold_nested", "nested", "60"),
+        ] {
+            run(&[
+                "create-test",
+                path(&db),
+                name,
+                "--entry",
+                entry,
+                "--expect-i64",
+                expect,
+                "--native-required",
+                "--json",
+            ]);
+        }
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["native_mismatches"], 0);
+        assert_eq!(report["unsupported"], 0);
+        for test in report["tests"].as_array().unwrap() {
+            assert_eq!(test["native"]["status"], "passed");
+        }
+    }
+}
+
 fn can_build_default_native_target() -> bool {
     let native_target = (std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64")
         || (std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64");

@@ -353,6 +353,74 @@ fn main() -> i64 = amount(Discount::percent(10))
     }
 }
 
+/// A `case` or `if` whose arms/branches build a record literal must construct it
+/// directly in the destination (declaration-order) layout when that layout flows
+/// in from an enclosing position (function return / `let` / call argument). For a
+/// non-alphabetically-declared record the structural literal type and the named
+/// layout differ, so a blind byte copy would swap fields; before the arms/branches
+/// were lowered into the expected type these compiled `unsupported`. Each entry
+/// reads a specific field whose value differs from its sibling, so a field swap is
+/// observable (native would return the sibling's value).
+#[test]
+fn case_and_if_returning_non_alphabetical_record_agree_with_native() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("case-if-record.sqlite");
+    let source = temp.path().join("case-if-record.cdb");
+    std::fs::write(
+        &source,
+        r#"
+record Pair { b: i64, a: i64 }
+enum Sel { Left: i64, Right: i64 }
+
+fn via_case(s: Sel) -> Pair =
+  case s of Left(x) => { b: x, a: x * 100 } | Right(y) => { b: y * 2, a: y * 200 }
+
+fn via_if(c: bool) -> Pair =
+  if c then { b: 1, a: 2 } else { b: 3, a: 4 }
+
+fn case_a() -> i64 = let p: Pair = via_case(Sel::Right(3)) in p.a
+fn case_b() -> i64 = let p: Pair = via_case(Sel::Right(3)) in p.b
+fn if_a() -> i64 = let p: Pair = via_if(true) in p.a
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    // Oracle: Right(3) => { b: 6, a: 600 }; if(true) => { b: 1, a: 2 }.
+    assert_eq!(run(&["eval", path(&db), "case_a"]).trim(), "600");
+    assert_eq!(run(&["eval", path(&db), "case_b"]).trim(), "6");
+    assert_eq!(run(&["eval", path(&db), "if_a"]).trim(), "2");
+    run(&["verify", path(&db)]);
+
+    if can_build_default_native_target() {
+        for (name, entry, expect) in [
+            ("case_reads_a", "case_a", "600"),
+            ("case_reads_b", "case_b", "6"),
+            ("if_reads_a", "if_a", "2"),
+        ] {
+            run(&[
+                "create-test",
+                path(&db),
+                name,
+                "--entry",
+                entry,
+                "--expect-i64",
+                expect,
+                "--native-required",
+                "--json",
+            ]);
+        }
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["native_mismatches"], 0);
+        assert_eq!(report["unsupported"], 0);
+        for test in report["tests"].as_array().unwrap() {
+            assert_eq!(test["native"]["status"], "passed");
+        }
+    }
+}
+
 fn can_build_default_native_target() -> bool {
     let native_target = (std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64")
         || (std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64");

@@ -1278,71 +1278,7 @@ impl CodeDb {
                 ctx,
                 locals,
             ),
-            "if" => {
-                let cond_hash = payload
-                    .get("cond")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("if missing cond"))?;
-                let then_hash = payload
-                    .get("then")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("if missing then"))?;
-                let else_hash = payload
-                    .get("else")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("if missing else"))?;
-                let cond = self.lower_expr(root, cond_hash, param_types, ctx, locals)?;
-                if cond.type_hash != type_hash_for("Bool") {
-                    bail!("if condition must lower to bool");
-                }
-                // `if` branches are alternative paths, so a value moved in one
-                // branch is live (and must still be dropped) on the other. The
-                // current scaffold emits a single unconditional drop per owned
-                // slot, which is only sound when both branches move the same set
-                // of *outer* slots (a value existing before the `if`). Track
-                // moves per branch and reject an asymmetric conditional move of
-                // an outer slot fail-closed; symmetric moves (both branches, or
-                // neither) and moves of branch-local temporaries are fine.
-                // Conditional drop glue is deferred (SPEC_V2 §12, PLAN_V2 Phase 15).
-                let locals_boundary = ctx.next_local;
-                let moved_before = ctx.moved.clone();
-                let then_expr = self.lower_expr(root, then_hash, param_types, ctx, locals)?;
-                let then_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
-                ctx.moved = moved_before.clone();
-                let else_expr = self.lower_expr(root, else_hash, param_types, ctx, locals)?;
-                let else_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
-                if then_moved != else_moved {
-                    bail!(
-                        "unsupported_move: lowering does not support moving an owned value in only one branch of an `if` (asymmetric conditional move); move it in both branches or neither — conditional drop glue is not yet implemented (SPEC_V2 §12, PLAN_V2 Phase 15)"
-                    );
-                }
-                // The outer-slot moves match, so `ctx.moved` (now moved_before ∪
-                // else-branch moves) is the correct post-`if` move set.
-                if then_expr.type_hash != else_expr.type_hash || then_expr.type_hash != type_hash {
-                    bail!("if branch type mismatch while lowering");
-                }
-                let id = ctx.value();
-                ctx.push_debug_op(expr_hash, "if", &id);
-                let mut operations = cond.operations;
-                operations.push(LoweredOp::If {
-                    id: id.clone(),
-                    cond: cond.value,
-                    then_block: LoweredBlock {
-                        operations: then_expr.operations,
-                        result: then_expr.value,
-                    },
-                    else_block: LoweredBlock {
-                        operations: else_expr.operations,
-                        result: else_expr.value,
-                    },
-                    type_hash: type_hash.clone(),
-                });
-                Ok(LoweredExpr {
-                    operations,
-                    value: id,
-                    type_hash,
-                })
-            }
+            "if" => self.lower_if(root, expr_hash, &type_hash, param_types, ctx, locals),
             "field_access" => {
                 self.lower_place_value(root, expr_hash, &type_hash, param_types, ctx, locals)
             }
@@ -2792,11 +2728,93 @@ impl CodeDb {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Lower an `if`, producing a value of `result_type`. Like `lower_case`,
+    /// `result_type` is the expression's own type on the ordinary path, but
+    /// `lower_expr_as` may pass an enclosing expected type so literal branches
+    /// build directly in the destination layout.
+    fn lower_if(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        result_type: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let cond_hash = payload
+            .get("cond")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("if missing cond"))?;
+        let then_hash = payload
+            .get("then")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("if missing then"))?;
+        let else_hash = payload
+            .get("else")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("if missing else"))?;
+        let cond = self.lower_expr(root, cond_hash, param_types, ctx, locals)?;
+        if cond.type_hash != type_hash_for("Bool") {
+            bail!("if condition must lower to bool");
+        }
+        // `if` branches are alternative paths, so a value moved in one branch is
+        // live (and must still be dropped) on the other. The current scaffold
+        // emits a single unconditional drop per owned slot, which is only sound
+        // when both branches move the same set of *outer* slots (a value existing
+        // before the `if`). Track moves per branch and reject an asymmetric
+        // conditional move of an outer slot fail-closed; symmetric moves (both
+        // branches, or neither) and moves of branch-local temporaries are fine.
+        // Conditional drop glue is deferred (SPEC_V2 §12, PLAN_V2 Phase 15).
+        let locals_boundary = ctx.next_local;
+        let moved_before = ctx.moved.clone();
+        let then_expr = self.lower_expr_as(root, then_hash, result_type, param_types, ctx, locals)?;
+        let then_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
+        ctx.moved = moved_before.clone();
+        let else_expr = self.lower_expr_as(root, else_hash, result_type, param_types, ctx, locals)?;
+        let else_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
+        if then_moved != else_moved {
+            bail!(
+                "unsupported_move: lowering does not support moving an owned value in only one branch of an `if` (asymmetric conditional move); move it in both branches or neither — conditional drop glue is not yet implemented (SPEC_V2 §12, PLAN_V2 Phase 15)"
+            );
+        }
+        // The outer-slot moves match, so `ctx.moved` (now moved_before ∪
+        // else-branch moves) is the correct post-`if` move set.
+        if then_expr.type_hash != else_expr.type_hash || then_expr.type_hash != result_type {
+            bail!("if branch type mismatch while lowering");
+        }
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "if", &id);
+        let mut operations = cond.operations;
+        operations.push(LoweredOp::If {
+            id: id.clone(),
+            cond: cond.value,
+            then_block: LoweredBlock {
+                operations: then_expr.operations,
+                result: then_expr.value,
+            },
+            else_block: LoweredBlock {
+                operations: else_expr.operations,
+                result: else_expr.value,
+            },
+            type_hash: result_type.to_string(),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: result_type.to_string(),
+        })
+    }
+
+    /// Lower a `case`, producing a value of `result_type`. `result_type` is the
+    /// case's own (typed-DAG) type on the ordinary path, but `lower_expr_as` may
+    /// pass an enclosing expected type so record/enum/array-literal arms build
+    /// directly in the destination layout (the field-order-safe path).
     fn lower_case(
         &self,
         root: &ProgramRootPayload,
         expr_hash: &str,
-        type_hash: &str,
+        result_type: &str,
         param_types: &[String],
         ctx: &mut LowerCtx,
         locals: &mut Vec<LocalLoweredBinding>,
@@ -2937,10 +2955,14 @@ impl CodeDb {
                     .get("body")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("case arm missing body"))?;
-                let body = self.lower_expr(root, body_hash, param_types, ctx, locals);
+                // Build the arm into `result_type` so a record/enum/array-literal
+                // arm constructs directly in the destination layout (see
+                // `lower_expr_as`). The exact-type assertion below keeps a
+                // non-buildable arm fail-closed.
+                let body = self.lower_expr_as(root, body_hash, result_type, param_types, ctx, locals);
                 locals.pop();
                 let body = body?;
-                if body.type_hash != type_hash {
+                if body.type_hash != result_type {
                     bail!("case arm {variant} result type mismatch while lowering");
                 }
                 arm_operations.extend(body.operations);
@@ -2960,8 +2982,8 @@ impl CodeDb {
                     .get("body")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("case arm missing body"))?;
-                let body = self.lower_expr(root, body_hash, param_types, ctx, locals)?;
-                if body.type_hash != type_hash {
+                let body = self.lower_expr_as(root, body_hash, result_type, param_types, ctx, locals)?;
+                if body.type_hash != result_type {
                     bail!("case arm {variant} result type mismatch while lowering");
                 }
                 arm_operations.extend(body.operations);
@@ -3003,12 +3025,12 @@ impl CodeDb {
             scrutinee: scrutinee.value,
             enum_type_hash: scrutinee.type_hash,
             arms: lowered_arms,
-            type_hash: type_hash.to_string(),
+            type_hash: result_type.to_string(),
         });
         Ok(LoweredExpr {
             operations,
             value: id,
-            type_hash: type_hash.to_string(),
+            type_hash: result_type.to_string(),
         })
     }
 
@@ -3112,6 +3134,63 @@ impl CodeDb {
                 ctx,
                 locals,
             );
+        }
+        // `case`/`if` produce their result from per-arm/branch values. Propagate
+        // the expected type into those arms so a record/enum/array-literal arm
+        // builds directly in the destination layout, instead of being assembled
+        // in its structural (alphabetical) type and then blind-copied. Only
+        // retarget when the construct's own type is assignable to `expected_type`
+        // but NOT byte-compatible with it — i.e. exactly the differing-field-order
+        // case that fails closed today. When the layouts are blind-copy compatible
+        // the existing copy already works, so keep the own type and do not change
+        // (or risk regressing) that path.
+        let kind = self
+            .get_payload(expr_hash)?
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
+        if matches!(kind.as_deref(), Some("case") | Some("if")) {
+            let own_type = expr_type(&self.get_payload(expr_hash)?, expr_hash)?;
+            let build_as = if own_type != expected_type
+                && self.type_assignable_in_root(root, &own_type, expected_type)?
+                && !self.layouts_blind_copy_compatible(
+                    root,
+                    ctx.target_triple(),
+                    &own_type,
+                    expected_type,
+                )? {
+                expected_type
+            } else {
+                own_type.as_str()
+            };
+            let lowered = if kind.as_deref() == Some("case") {
+                self.lower_case(root, expr_hash, build_as, param_types, ctx, locals)?
+            } else {
+                self.lower_if(root, expr_hash, build_as, param_types, ctx, locals)?
+            };
+            // Safety net identical to the generic path below: a result we did not
+            // build into the destination must still be a sound verbatim byte copy.
+            if lowered.type_hash != expected_type
+                && (self.type_is_record(root, &lowered.type_hash)?
+                    || self.type_is_record(root, expected_type)?
+                    || self.type_is_enum(root, &lowered.type_hash)?
+                    || self.type_is_enum(root, expected_type)?
+                    || self.type_is_fixed_array(root, &lowered.type_hash)?
+                    || self.type_is_fixed_array(root, expected_type)?)
+                && !self.layouts_blind_copy_compatible(
+                    root,
+                    ctx.target_triple(),
+                    &lowered.type_hash,
+                    expected_type,
+                )?
+            {
+                bail!(
+                    "unsupported_aggregate_layout: a value of type {} cannot be used where {} is expected because their native layouts differ; bind aggregate literals with an explicit `let x: <Type> = <literal>` so they are built in the destination layout",
+                    lowered.type_hash,
+                    expected_type
+                );
+            }
+            return Ok(lowered);
         }
         let value = self.lower_expr(root, expr_hash, param_types, ctx, locals)?;
         if value.type_hash != expected_type

@@ -2312,7 +2312,36 @@ impl CodeDb {
         param_types: &[String],
         region_scope: &BTreeMap<String, String>,
     ) -> Result<TypeCheckResult> {
-        self.type_expr_with_locals(
+        self.type_expr_in_module_with_regions_expecting(
+            current_module,
+            expr,
+            root,
+            param_names,
+            param_types,
+            region_scope,
+            None,
+        )
+    }
+
+    /// Type an expression that flows into a known destination type (e.g. a
+    /// function body checked against its return type). When `expected_type` is
+    /// supplied and the expression is a top-level `fold`, the accumulator is
+    /// anchored to that type so a record-literal accumulator builds in the
+    /// destination (declaration-order) layout — the same anchoring the
+    /// `let`-binding and call-argument paths apply (see `type_fold_expr`). All
+    /// other expression forms type identically to the unanchored entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn type_expr_in_module_with_regions_expecting(
+        &mut self,
+        current_module: &str,
+        expr: &RawExpr,
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
+        expected_type: Option<&str>,
+    ) -> Result<TypeCheckResult> {
+        self.type_expr_with_locals_expecting(
             current_module,
             expr,
             root,
@@ -2320,6 +2349,7 @@ impl CodeDb {
             param_types,
             region_scope,
             &mut Vec::new(),
+            expected_type,
         )
     }
 
@@ -2422,7 +2452,10 @@ impl CodeDb {
             name: acc.to_string(),
             type_hash: acc_type.clone(),
         });
-        let body = self.type_expr_with_locals(
+        // The body is a result position of type `acc_type`, so anchor a fold (or
+        // let-tail fold) in body position to it — this makes a nested fold whose
+        // accumulator is a non-alphabetical record native-buildable.
+        let body = self.type_expr_with_locals_expecting(
             current_module,
             body,
             root,
@@ -2430,6 +2463,7 @@ impl CodeDb {
             param_types,
             region_scope,
             locals,
+            Some(acc_type.as_str()),
         );
         locals.pop();
         locals.pop();
@@ -2481,6 +2515,35 @@ impl CodeDb {
         param_types: &[String],
         region_scope: &BTreeMap<String, String>,
         locals: &mut Vec<LocalTypeBinding>,
+    ) -> Result<TypeCheckResult> {
+        self.type_expr_with_locals_expecting(
+            current_module,
+            expr,
+            root,
+            param_names,
+            param_types,
+            region_scope,
+            locals,
+            None,
+        )
+    }
+
+    /// Type an expression carrying an optional `expected_type` for the result
+    /// position. Only a `fold` consumes it (to anchor its accumulator to the
+    /// destination layout — see `type_fold_expr`); the hint propagates through
+    /// `let ... in <tail>` so a fold in tail position is anchored too. Every
+    /// other form ignores it and types identically to `type_expr_with_locals`.
+    #[allow(clippy::too_many_arguments)]
+    fn type_expr_with_locals_expecting(
+        &mut self,
+        current_module: &str,
+        expr: &RawExpr,
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
+        locals: &mut Vec<LocalTypeBinding>,
+        expected_type: Option<&str>,
     ) -> Result<TypeCheckResult> {
         match expr {
             RawExpr::LiteralI64 { value } => {
@@ -2665,7 +2728,12 @@ impl CodeDb {
                     .collect::<BTreeSet<_>>();
                 let mut region_substitutions = BTreeMap::new();
                 for (idx, arg) in args.iter().enumerate() {
-                    let typed = self.type_expr_with_locals(
+                    // Anchor a `fold` argument (including one in `let ... in` tail
+                    // position) to the callee's parameter type so a record-literal
+                    // accumulator builds in the destination (declaration-order)
+                    // layout, mirroring the `let`-binding path (see
+                    // `type_fold_expr`). Non-fold args ignore the hint.
+                    let typed = self.type_expr_with_locals_expecting(
                         current_module,
                         arg,
                         root,
@@ -2673,6 +2741,7 @@ impl CodeDb {
                         param_types,
                         region_scope,
                         locals,
+                        Some(&expected_params[idx]),
                     )?;
                     if !self.type_assignable_for_call_in_root(
                         root,
@@ -3049,7 +3118,10 @@ impl CodeDb {
                     name: name.clone(),
                     type_hash: binding_type.clone(),
                 });
-                let body = self.type_expr_with_locals(
+                // The let body is in the same result position as the whole let, so
+                // propagate `expected_type` into it: a fold in tail position
+                // (`let xs = .. in fold ..`) anchors to the destination layout.
+                let body = self.type_expr_with_locals_expecting(
                     current_module,
                     body,
                     root,
@@ -3057,6 +3129,7 @@ impl CodeDb {
                     param_types,
                     region_scope,
                     locals,
+                    expected_type,
                 );
                 locals.pop();
                 let body = body?;
@@ -3164,7 +3237,7 @@ impl CodeDb {
                 param_types,
                 region_scope,
                 locals,
-                None,
+                expected_type,
             ),
             RawExpr::Array { elements } => {
                 if elements.is_empty() {

@@ -3103,13 +3103,14 @@ impl CodeDb {
             .iter()
             .map(|param| param.name.clone())
             .collect::<Vec<_>>();
-        let typed_body = self.type_expr_in_module_with_regions(
+        let typed_body = self.type_expr_in_module_with_regions_expecting(
             module,
             body,
             &root,
             &param_name_list,
             &param_types,
             &region_scope,
+            Some(&return_type_hash),
         )?;
         if !self.type_assignable_in_root(&root, &typed_body.type_hash, &return_type_hash)? {
             bail!(
@@ -3863,13 +3864,14 @@ impl CodeDb {
         let (param_types, return_type) = self.signature_parts(&signature)?;
         let region_scope = region_scope_from_params(&self.signature_region_params(&signature)?);
         let param_name_list = param_names(&root, symbol);
-        let typed_body = self.type_expr_in_module_with_regions(
+        let typed_body = self.type_expr_in_module_with_regions_expecting(
             module,
             body,
             &root,
             &param_name_list,
             &param_types,
             &region_scope,
+            Some(&return_type),
         )?;
         if !self.type_assignable_in_root(&root, &typed_body.type_hash, &return_type)? {
             bail!(
@@ -3954,13 +3956,14 @@ impl CodeDb {
             module,
             &old_region_names,
         )?;
-        let typed_body = self.type_expr_in_module_with_regions(
+        let typed_body = self.type_expr_in_module_with_regions_expecting(
             module,
             &raw_body,
             &root,
             &param_name_list,
             &param_types,
             &region_scope,
+            Some(&return_type_hash),
         )?;
         if !self.type_assignable_in_root(&root, &typed_body.type_hash, &return_type_hash)? {
             bail!(
@@ -4064,13 +4067,14 @@ impl CodeDb {
         } else {
             old_body
         };
-        let typed_body = self.type_expr_in_module_with_regions(
+        let typed_body = self.type_expr_in_module_with_regions_expecting(
             module,
             &target_body,
             &root,
             &param_name_list,
             &param_types,
             &region_scope,
+            Some(&return_type),
         )?;
         if !self.type_assignable_in_root(&root, &typed_body.type_hash, &return_type)? {
             bail!(
@@ -4669,13 +4673,14 @@ impl CodeDb {
                 rename,
             )?;
             let param_name_list = param_names(old_root, &symbol);
-            let typed_body = self.type_expr_in_module_with_regions(
+            let typed_body = self.type_expr_in_module_with_regions_expecting(
                 &module,
                 &raw_body,
                 root,
                 &param_name_list,
                 &param_types,
                 &region_scope,
+                Some(&return_type),
             )?;
             if !self.type_assignable_in_root(root, &typed_body.type_hash, &return_type)? {
                 bail!(
