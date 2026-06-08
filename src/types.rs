@@ -5375,6 +5375,7 @@ impl CodeDb {
                 self.check_place_not_moved(&target_place, state)?;
                 self.check_loan_conflicts(&LoanKind::Mutable, &target_place, &state.active)?;
                 self.verify_expr_borrows(root, value, param_types, state, ExprUse::Value)?;
+                self.check_place_not_moved(&target_place, state)?;
                 let target_type = self.expr_declared_type(target)?;
                 let target_class = self.value_class_in_root(root, &target_type)?;
                 if target_class.contains_reference {

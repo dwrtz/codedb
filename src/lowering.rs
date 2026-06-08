@@ -504,6 +504,10 @@ impl LowerCtx {
         self.moved.insert(root);
     }
 
+    fn mark_initialized(&mut self, root: RootSlot) {
+        self.moved.remove(&root);
+    }
+
     /// Whether the whole value of `root` was moved out somewhere in the body.
     fn is_moved(&self, root: RootSlot) -> bool {
         self.moved.contains(&root)
@@ -1251,82 +1255,32 @@ impl CodeDb {
                 let target = self.lower_place(root, target_hash, param_types, ctx, locals)?;
                 let target_type = target.type_hash.clone();
                 let target_address = target.address.clone();
+                let target_root_slot = self.place_whole_root_slot(target_hash, locals)?;
                 let mut operations = target.operations;
-                // The value must be built directly into the destination place's
-                // layout. A raw `lower_expr` + blind `Store` under `target_type`
-                // would reinterpret an aggregate literal's structural
-                // (alphabetical) field/variant order under the destination's
-                // declared order and miscompile non-alphabetical records/enums.
-                // This is the field-order invariant: every aggregate value-flow
-                // boundary goes through `lower_expr_as` / an `init_to_address`
-                // builder, never a blind byte copy. Mirror the `let` binding
-                // dispatch exactly, writing into the existing place address
-                // instead of a fresh local slot.
-                let value_kind = self
-                    .get_payload(value_hash)?
-                    .get("expr_kind")
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_string);
-                if value_kind.as_deref() == Some("record_literal") {
-                    operations.extend(self.lower_record_init_to_address(
-                        root,
-                        value_hash,
-                        &target_type,
-                        &target_address,
-                        param_types,
-                        ctx,
-                        locals,
-                    )?);
-                } else if value_kind.as_deref() == Some("enum_construct") {
-                    operations.extend(self.lower_enum_init_to_address(
-                        root,
-                        value_hash,
-                        &target_type,
-                        &target_address,
-                        param_types,
-                        ctx,
-                        locals,
-                    )?);
-                } else if value_kind.as_deref() == Some("array_literal") {
-                    operations.extend(self.lower_array_init_to_address(
-                        root,
-                        value_hash,
-                        &target_type,
-                        &target_address,
-                        param_types,
-                        ctx,
-                        locals,
-                    )?);
-                } else if self.type_passes_indirect(root, ctx.target_triple(), &target_type)?
-                    && self.expr_is_place(value_hash)?
+                let value =
+                    self.lower_expr_as(root, value_hash, &target_type, param_types, ctx, locals)?;
+                if !self.type_assignable_in_root(root, &value.type_hash, &target_type)? {
+                    bail!("assignment type mismatch while lowering");
+                }
+                if let Some(root_slot) = target_root_slot
+                    && ctx.is_moved(root_slot)
                 {
-                    operations.extend(self.lower_aggregate_place_init_to_address(
-                        root,
-                        value_hash,
-                        &target_type,
-                        &target_address,
-                        param_types,
-                        ctx,
-                        locals,
-                    )?);
-                } else {
-                    let value = self.lower_expr_as(
-                        root,
-                        value_hash,
-                        &target_type,
-                        param_types,
-                        ctx,
-                        locals,
-                    )?;
-                    if !self.type_assignable_in_root(root, &value.type_hash, &target_type)? {
-                        bail!("assignment type mismatch while lowering");
-                    }
-                    operations.extend(value.operations);
-                    operations.push(LoweredOp::Store {
-                        address: target_address,
-                        value: value.value,
-                        type_hash: target_type,
+                    bail!("assignment target was moved while lowering assignment value");
+                }
+                operations.extend(value.operations);
+                if self.type_requires_drop_scaffold(root, ctx.target_triple(), &target_type)? {
+                    operations.push(LoweredOp::Drop {
+                        address: target_address.clone(),
+                        type_hash: target_type.clone(),
                     });
+                }
+                operations.push(LoweredOp::Store {
+                    address: target_address,
+                    value: value.value,
+                    type_hash: target_type.clone(),
+                });
+                if let Some(root_slot) = target_root_slot {
+                    ctx.mark_initialized(root_slot);
                 }
                 let id = ctx.value();
                 ctx.push_debug_op(expr_hash, "const_unit", &id);
@@ -2141,19 +2095,34 @@ impl CodeDb {
         ctx: &mut LowerCtx,
         locals: &mut Vec<LocalLoweredBinding>,
     ) -> Result<LoweredExpr> {
+        self.lower_box_new_as(root, expr_hash, type_hash, param_types, ctx, locals)
+    }
+
+    fn lower_box_new_as(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        result_box_type: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
         let payload = self.get_payload(expr_hash)?;
         let value_hash = payload
             .get("value")
             .and_then(JsonValue::as_str)
             .ok_or_else(|| anyhow!("box_new missing value"))?;
-        let element_type_hash = payload
+        let declared_element_type = payload
             .get("element_type")
             .and_then(JsonValue::as_str)
             .ok_or_else(|| anyhow!("box_new missing element_type"))?
             .to_string();
-        match self.type_spec(type_hash)? {
-            TypeSpec::Box { element } if element == element_type_hash => {}
+        let element_type_hash = match self.type_spec(result_box_type)? {
+            TypeSpec::Box { element } => element,
             _ => bail!("box_new lowered type mismatch"),
+        };
+        if !self.type_assignable_in_root(root, &declared_element_type, &element_type_hash)? {
+            bail!("box_new value type mismatch while lowering");
         }
         let element_layout =
             self.compute_type_layout(root, &element_type_hash, ctx.target_triple())?;
@@ -2174,7 +2143,7 @@ impl CodeDb {
             size_bytes,
             align_bytes,
             element_type_hash: element_type_hash.clone(),
-            type_hash: type_hash.to_string(),
+            type_hash: result_box_type.to_string(),
         }];
         let value = self.lower_expr_as(
             root,
@@ -2196,7 +2165,7 @@ impl CodeDb {
         Ok(LoweredExpr {
             operations,
             value: id,
-            type_hash: type_hash.to_string(),
+            type_hash: result_box_type.to_string(),
         })
     }
 
@@ -3662,6 +3631,15 @@ impl CodeDb {
                 locals,
             );
         }
+        if self
+            .get_payload(expr_hash)?
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            == Some("box_new")
+            && self.type_is_box(root, expected_type)?
+        {
+            return self.lower_box_new_as(root, expr_hash, expected_type, param_types, ctx, locals);
+        }
         // `case`/`if` produce their result from per-arm/branch values. Propagate
         // the expected type into those arms so a record/enum/array-literal arm
         // builds directly in the destination layout, instead of being assembled
@@ -3703,7 +3681,9 @@ impl CodeDb {
                     || self.type_is_enum(root, &lowered.type_hash)?
                     || self.type_is_enum(root, expected_type)?
                     || self.type_is_fixed_array(root, &lowered.type_hash)?
-                    || self.type_is_fixed_array(root, expected_type)?)
+                    || self.type_is_fixed_array(root, expected_type)?
+                    || self.type_is_box(root, &lowered.type_hash)?
+                    || self.type_is_box(root, expected_type)?)
                 && !self.layouts_blind_copy_compatible(
                     root,
                     ctx.target_triple(),
@@ -3726,7 +3706,9 @@ impl CodeDb {
                 || self.type_is_enum(root, &value.type_hash)?
                 || self.type_is_enum(root, expected_type)?
                 || self.type_is_fixed_array(root, &value.type_hash)?
-                || self.type_is_fixed_array(root, expected_type)?)
+                || self.type_is_fixed_array(root, expected_type)?
+                || self.type_is_box(root, &value.type_hash)?
+                || self.type_is_box(root, expected_type)?)
             && !self.layouts_blind_copy_compatible(
                 root,
                 ctx.target_triple(),
@@ -3761,6 +3743,13 @@ impl CodeDb {
         Ok(matches!(
             self.type_spec_in_root(root, type_hash)?,
             TypeSpec::Enum(_)
+        ))
+    }
+
+    fn type_is_box(&self, root: &ProgramRootPayload, type_hash: &str) -> Result<bool> {
+        Ok(matches!(
+            self.type_spec_in_root(root, type_hash)?,
+            TypeSpec::Box { .. }
         ))
     }
 
@@ -3869,12 +3858,24 @@ impl CodeDb {
                 Ok(self.layout_size_bytes(root, target_triple, src)?
                     == self.layout_size_bytes(root, target_triple, dst)?)
             }
+            (
+                TypeSpec::Box {
+                    element: src_element,
+                },
+                TypeSpec::Box {
+                    element: dst_element,
+                },
+            ) => {
+                self.layouts_blind_copy_compatible(root, target_triple, &src_element, &dst_element)
+            }
             (TypeSpec::Record(_), _)
             | (_, TypeSpec::Record(_))
             | (TypeSpec::Enum(_), _)
             | (_, TypeSpec::Enum(_))
             | (TypeSpec::FixedArray { .. }, _)
-            | (_, TypeSpec::FixedArray { .. }) => Ok(false),
+            | (_, TypeSpec::FixedArray { .. })
+            | (TypeSpec::Box { .. }, _)
+            | (_, TypeSpec::Box { .. }) => Ok(false),
             _ => self.scalar_layouts_equal(root, target_triple, src, dst),
         }
     }
@@ -5429,7 +5430,9 @@ impl CodeDb {
                             || self.type_is_enum(root, value_ty)?
                             || self.type_is_enum(root, type_hash)?
                             || self.type_is_fixed_array(root, value_ty)?
-                            || self.type_is_fixed_array(root, type_hash)?)
+                            || self.type_is_fixed_array(root, type_hash)?
+                            || self.type_is_box(root, value_ty)?
+                            || self.type_is_box(root, type_hash)?)
                         && !self.layouts_blind_copy_compatible(
                             root,
                             target_triple,
@@ -5440,6 +5443,10 @@ impl CodeDb {
                         bail!(
                             "lowered store reinterprets an aggregate value of type {value_ty} under incompatible destination layout {type_hash}"
                         );
+                    }
+                    if let Some(root_slot) = drop_state.addr_roots.get(address).copied() {
+                        drop_state.dropped.remove(&root_slot);
+                        drop_state.moved.remove(&root_slot);
                     }
                 }
                 LoweredOp::Copy {

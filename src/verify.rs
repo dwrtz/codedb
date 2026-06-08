@@ -2723,6 +2723,9 @@ impl CodeDb {
             verify_native_debug_metadata_shape(errors, cache_key, metadata);
         }
         if uses_builtin_native_backend {
+            verify_native_static_data_metadata_shape(errors, cache_key, metadata, artifact_bytes);
+        }
+        if uses_builtin_native_backend {
             self.verify_object_artifact_matches_indexed_root(
                 errors,
                 cache_key,
@@ -4072,6 +4075,94 @@ fn verify_native_object_bytes_match_metadata(
     }
 }
 
+fn verify_native_static_data_metadata_shape(
+    errors: &mut Vec<String>,
+    cache_key: &str,
+    metadata: &JsonValue,
+    bytes: Option<&[u8]>,
+) {
+    let Some(entries) = metadata.get("static_data").and_then(JsonValue::as_array) else {
+        errors.push(format!(
+            "bad_object_artifact: {cache_key} static data metadata must be an array"
+        ));
+        return;
+    };
+    let mut seen = BTreeSet::new();
+    for entry in entries {
+        let Some(static_data_hash) = entry.get("static_data_hash").and_then(JsonValue::as_str)
+        else {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} static data entry missing hash"
+            ));
+            continue;
+        };
+        if !seen.insert(static_data_hash.to_string()) {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} duplicate static data metadata entry"
+            ));
+        }
+        let Some(bytes_hex) = entry.get("bytes_hex").and_then(JsonValue::as_str) else {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} static data entry missing bytes_hex"
+            ));
+            continue;
+        };
+        if let Err(err) = validate_hex_bytes(bytes_hex) {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} invalid static data bytes_hex: {err:#}"
+            ));
+            continue;
+        }
+        let Some(len) = entry.get("len").and_then(JsonValue::as_u64) else {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} static data entry missing len"
+            ));
+            continue;
+        };
+        if bytes_hex.len() as u64 != len.saturating_mul(2) {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} static data len does not match bytes_hex"
+            ));
+        }
+        let Some(offset) = entry.get("offset").and_then(JsonValue::as_u64) else {
+            errors.push(format!(
+                "bad_object_artifact: {cache_key} static data entry missing offset"
+            ));
+            continue;
+        };
+        if let Some(bytes) = bytes {
+            let Ok(offset) = usize::try_from(offset) else {
+                errors.push(format!(
+                    "bad_object_artifact: {cache_key} static data offset is too large"
+                ));
+                continue;
+            };
+            let len = bytes_hex.len() / 2;
+            let Some(end) = offset.checked_add(len) else {
+                errors.push(format!(
+                    "bad_object_artifact: {cache_key} static data offset overflows"
+                ));
+                continue;
+            };
+            if end > bytes.len() {
+                errors.push(format!(
+                    "bad_object_artifact: {cache_key} static data offset is outside object bytes"
+                ));
+                continue;
+            }
+            let actual = bytes[offset..end]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            if actual != bytes_hex {
+                errors.push(format!(
+                    "bad_object_artifact: {cache_key} static data bytes do not match object bytes"
+                ));
+            }
+        }
+    }
+}
+
 fn verify_builtin_native_object_bytes_reemit(
     errors: &mut Vec<String>,
     cache_key: &str,
@@ -4101,6 +4192,11 @@ fn verify_builtin_native_object_bytes_reemit(
             if emitted.metadata.get("debug_metadata") != metadata.get("debug_metadata") {
                 errors.push(format!(
                     "bad_object_artifact: {cache_key} debug metadata does not match deterministic native backend output"
+                ));
+            }
+            if emitted.metadata.get("static_data") != metadata.get("static_data") {
+                errors.push(format!(
+                    "bad_object_artifact: {cache_key} static data metadata does not match deterministic native backend output"
                 ));
             }
         }
@@ -4268,6 +4364,7 @@ fn verify_link_plan_object_matches_object_metadata(
         ("called symbols", "called_symbols", "called_symbols"),
         ("relocations", "relocations", "relocations"),
         ("debug metadata", "debug_metadata", "debug_metadata"),
+        ("static data", "static_data", "static_data"),
     ] {
         if object.get(plan_key) != metadata.get(metadata_key) {
             errors.push(format!(

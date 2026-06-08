@@ -451,6 +451,7 @@ impl CodeDb {
                 "called_symbols": required_metadata_value(&object_metadata, "called_symbols")?,
                 "relocations": required_metadata_value(&object_metadata, "relocations")?,
                 "debug_metadata": required_metadata_value(&object_metadata, "debug_metadata")?,
+                "static_data": required_metadata_value(&object_metadata, "static_data")?,
             }));
             objects.push(prepared_object(object));
         }

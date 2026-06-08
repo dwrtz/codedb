@@ -215,6 +215,162 @@ fn bad() -> i64 effects[alloc] =
 }
 
 #[test]
+fn box_new_builds_named_record_value_in_destination_layout() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("box-named-record-layout.sqlite");
+    let source = temp.path().join("box-named-record-layout.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+}
+
+record Holder {
+  tag: i64
+  line: box<Line>
+}
+
+fn nested_box() -> i64 effects[alloc] =
+  let h: box<Holder> = box_new({ tag: 1, line: box_new({ price_cents: 7 }) }) in
+  h.line.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&["verify", path(&db)]);
+    assert_eq!(run(&["eval", path(&db), "nested_box"]).trim(), "7");
+
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "nested_box_native",
+            "--entry",
+            "nested_box",
+            "--expect-i64",
+            "7",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["native_mismatches"], 0);
+    }
+}
+
+#[test]
+fn assigning_over_box_drops_previous_value() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("box-reassign.sqlite");
+    let source = temp.path().join("box-reassign.cdb");
+    let ir_path = temp.path().join("box-reassign.ir.json");
+
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+}
+
+fn reassign_box() -> i64 effects[alloc, state] =
+  let b: box<Line> = box_new({ price_cents: 1 }) in
+  let ignored: unit = b = box_new({ price_cents: 2 }) in
+  b.price_cents
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&["verify", path(&db)]);
+    assert_eq!(run(&["eval", path(&db), "reassign_box"]).trim(), "2");
+
+    run(&[
+        "emit-ir",
+        path(&db),
+        "reassign_box",
+        "--out",
+        path(&ir_path),
+    ]);
+    let ir = read_json(&ir_path);
+    let ops = op_names(&ir);
+    assert_eq!(
+        ops.iter().filter(|op| op.as_str() == "heap_alloc").count(),
+        2
+    );
+    assert_eq!(ops.iter().filter(|op| op.as_str() == "drop").count(), 2);
+
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "reassign_box_native",
+            "--entry",
+            "reassign_box",
+            "--expect-i64",
+            "2",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["native_mismatches"], 0);
+    }
+}
+
+#[test]
+fn recursive_box_payloads_drop_natively() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("box-recursive-drop.sqlite");
+    let source = temp.path().join("box-recursive-drop.cdb");
+
+    std::fs::write(
+        &source,
+        r#"
+enum Node {
+  empty: unit
+  next: box<Node>
+}
+
+fn recursive_next() -> i64 effects[alloc] =
+  let n: box<Node> = box_new(Node::next(box_new(Node::empty(())))) in
+  let moved: box<Node> = n in
+  5
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&["verify", path(&db)]);
+    assert_eq!(run(&["eval", path(&db), "recursive_next"]).trim(), "5");
+
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "recursive_next_native",
+            "--entry",
+            "recursive_next",
+            "--expect-i64",
+            "5",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["native_mismatches"], 0);
+    }
+}
+
+#[test]
 fn box_new_requires_alloc_effect() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("box-missing-alloc.sqlite");

@@ -1875,6 +1875,12 @@ struct TextRelocation {
     platform: bool,
 }
 
+#[derive(Debug, Clone)]
+struct DropCallPatch {
+    patch_offset: usize,
+    type_hash: String,
+}
+
 #[derive(Debug)]
 struct StackLayout {
     hidden_return_offset: Option<i32>,
@@ -1919,7 +1925,9 @@ fn compile_x86_64_function(
         relocations: Vec::new(),
         static_data: Vec::new(),
         static_data_patches: Vec::new(),
-        active_drop_types: BTreeSet::new(),
+        needed_drop_helpers: BTreeSet::new(),
+        emitted_drop_helpers: BTreeMap::new(),
+        drop_call_patches: Vec::new(),
         debug_ops: lowered_value_debug_ops(ir)?,
         debug_ranges: Vec::new(),
         symbol_hash: ir.symbol_hash.clone(),
@@ -1941,6 +1949,7 @@ fn compile_x86_64_function(
                 emitter.mov_rax_stack(offset);
             }
             emitter.emit_epilogue();
+            emitter.emit_drop_helpers_x86()?;
             emitter.finish_static_data_x86()?;
         }
         _ => bail!("lowered function must end with return"),
@@ -2111,7 +2120,9 @@ struct FunctionEmitter {
     relocations: Vec<TextRelocation>,
     static_data: Vec<StaticDataBlob>,
     static_data_patches: Vec<StaticDataPatch>,
-    active_drop_types: BTreeSet<String>,
+    needed_drop_helpers: BTreeSet<String>,
+    emitted_drop_helpers: BTreeMap<String, usize>,
+    drop_call_patches: Vec<DropCallPatch>,
     debug_ops: BTreeMap<String, LoweredDebugOp>,
     debug_ranges: Vec<NativeDebugRange>,
     symbol_hash: String,
@@ -3022,19 +3033,61 @@ impl FunctionEmitter {
         if !native_needs_drop(&self.type_layouts, type_hash)? {
             return Ok(());
         }
-        if !self.active_drop_types.insert(type_hash.to_string()) {
-            return Ok(());
+        self.emit_drop_call_x86(type_hash);
+        Ok(())
+    }
+
+    fn emit_drop_call_x86(&mut self, type_hash: &str) {
+        self.needed_drop_helpers.insert(type_hash.to_string());
+        self.text.push(0xe8);
+        let patch_offset = self.text.len();
+        self.text.extend_from_slice(&[0, 0, 0, 0]);
+        self.drop_call_patches.push(DropCallPatch {
+            patch_offset,
+            type_hash: type_hash.to_string(),
+        });
+    }
+
+    fn emit_drop_helpers_x86(&mut self) -> Result<()> {
+        while let Some(type_hash) = self
+            .needed_drop_helpers
+            .iter()
+            .find(|type_hash| !self.emitted_drop_helpers.contains_key(*type_hash))
+            .cloned()
+        {
+            let offset = self.text.len();
+            self.emitted_drop_helpers.insert(type_hash.clone(), offset);
+            self.emit_drop_helper_prologue_x86();
+            self.emit_drop_body_x86(&type_hash)?;
+            self.emit_drop_helper_epilogue_x86();
         }
+        for patch in self.drop_call_patches.clone() {
+            let target = *self
+                .emitted_drop_helpers
+                .get(&patch.type_hash)
+                .ok_or_else(|| anyhow!("missing x86_64 drop helper for {}", patch.type_hash))?;
+            self.patch_rel32_to(patch.patch_offset, target)?;
+        }
+        Ok(())
+    }
+
+    fn emit_drop_helper_prologue_x86(&mut self) {
+        self.text.push(0x55);
+    }
+
+    fn emit_drop_helper_epilogue_x86(&mut self) {
+        self.text.extend_from_slice(&[0x5d, 0xc3]);
+    }
+
+    fn emit_drop_body_x86(&mut self, type_hash: &str) -> Result<()> {
         let layout = native_type_layout(&self.type_layouts, type_hash)?.clone();
-        let result = match layout.kind.as_str() {
+        match layout.kind.as_str() {
             "box" => self.emit_drop_box_ptr_x86(&layout),
             "record" => self.emit_drop_record_ptr_x86(&layout),
             "enum" => self.emit_drop_enum_ptr_x86(&layout),
             "fixed_array" => self.emit_drop_fixed_array_ptr_x86(&layout),
             _ => Ok(()),
-        };
-        self.active_drop_types.remove(type_hash);
-        result
+        }
     }
 
     fn emit_drop_box_ptr_x86(&mut self, layout: &LoweredTypeLayout) -> Result<()> {
@@ -3413,6 +3466,15 @@ impl FunctionEmitter {
         Ok(())
     }
 
+    fn patch_rel32_to(&mut self, patch_offset: usize, target_offset: usize) -> Result<()> {
+        let target = target_offset as i64;
+        let next = (patch_offset + 4) as i64;
+        let disp = target - next;
+        let disp = i32::try_from(disp)?;
+        self.text[patch_offset..patch_offset + 4].copy_from_slice(&disp.to_le_bytes());
+        Ok(())
+    }
+
     fn push_i32(&mut self, value: i32) {
         self.text.extend_from_slice(&value.to_le_bytes());
     }
@@ -3441,7 +3503,9 @@ fn compile_arm64_function(
         relocations: Vec::new(),
         static_data: Vec::new(),
         static_data_patches: Vec::new(),
-        active_drop_types: BTreeSet::new(),
+        needed_drop_helpers: BTreeSet::new(),
+        emitted_drop_helpers: BTreeMap::new(),
+        drop_call_patches: Vec::new(),
         debug_ops: lowered_value_debug_ops(ir)?,
         debug_ranges: Vec::new(),
         symbol_hash: ir.symbol_hash.clone(),
@@ -3463,6 +3527,7 @@ fn compile_arm64_function(
                 emitter.ldr_stack(0, offset)?;
             }
             emitter.emit_epilogue()?;
+            emitter.emit_drop_helpers_arm64()?;
             emitter.finish_static_data_arm64()?;
         }
         _ => bail!("lowered function must end with return"),
@@ -3556,7 +3621,9 @@ struct Arm64Emitter {
     relocations: Vec<TextRelocation>,
     static_data: Vec<StaticDataBlob>,
     static_data_patches: Vec<StaticDataPatch>,
-    active_drop_types: BTreeSet<String>,
+    needed_drop_helpers: BTreeSet<String>,
+    emitted_drop_helpers: BTreeMap<String, usize>,
+    drop_call_patches: Vec<DropCallPatch>,
     debug_ops: BTreeMap<String, LoweredDebugOp>,
     debug_ranges: Vec<NativeDebugRange>,
     symbol_hash: String,
@@ -4454,19 +4521,62 @@ impl Arm64Emitter {
         if !native_needs_drop(&self.type_layouts, type_hash)? {
             return Ok(());
         }
-        if !self.active_drop_types.insert(type_hash.to_string()) {
-            return Ok(());
+        self.emit_drop_call_arm64(type_hash);
+        Ok(())
+    }
+
+    fn emit_drop_call_arm64(&mut self, type_hash: &str) {
+        self.needed_drop_helpers.insert(type_hash.to_string());
+        let patch_offset = self.text.len();
+        self.emit_u32(0x94000000);
+        self.drop_call_patches.push(DropCallPatch {
+            patch_offset,
+            type_hash: type_hash.to_string(),
+        });
+    }
+
+    fn emit_drop_helpers_arm64(&mut self) -> Result<()> {
+        while let Some(type_hash) = self
+            .needed_drop_helpers
+            .iter()
+            .find(|type_hash| !self.emitted_drop_helpers.contains_key(*type_hash))
+            .cloned()
+        {
+            let offset = self.text.len();
+            self.emitted_drop_helpers.insert(type_hash.clone(), offset);
+            self.emit_drop_helper_prologue_arm64();
+            self.emit_drop_body_arm64(&type_hash)?;
+            self.emit_drop_helper_epilogue_arm64();
         }
+        for patch in self.drop_call_patches.clone() {
+            let target = *self
+                .emitted_drop_helpers
+                .get(&patch.type_hash)
+                .ok_or_else(|| anyhow!("missing arm64 drop helper for {}", patch.type_hash))?;
+            self.patch_imm26_to(patch.patch_offset, target)?;
+        }
+        Ok(())
+    }
+
+    fn emit_drop_helper_prologue_arm64(&mut self) {
+        self.emit_u32(0xa9bf7bfd);
+        self.emit_u32(0x910003fd);
+    }
+
+    fn emit_drop_helper_epilogue_arm64(&mut self) {
+        self.emit_u32(0xa8c17bfd);
+        self.emit_u32(0xd65f03c0);
+    }
+
+    fn emit_drop_body_arm64(&mut self, type_hash: &str) -> Result<()> {
         let layout = native_type_layout(&self.type_layouts, type_hash)?.clone();
-        let result = match layout.kind.as_str() {
+        match layout.kind.as_str() {
             "box" => self.emit_drop_box_ptr_arm64(&layout),
             "record" => self.emit_drop_record_ptr_arm64(&layout),
             "enum" => self.emit_drop_enum_ptr_arm64(&layout),
             "fixed_array" => self.emit_drop_fixed_array_ptr_arm64(&layout),
             _ => Ok(()),
-        };
-        self.active_drop_types.remove(type_hash);
-        result
+        }
     }
 
     fn emit_drop_box_ptr_arm64(&mut self, layout: &LoweredTypeLayout) -> Result<()> {
@@ -4818,6 +4928,26 @@ impl Arm64Emitter {
 
     fn patch_imm26(&mut self, patch_offset: usize) -> Result<()> {
         let disp = self.branch_disp_words(patch_offset)?;
+        if !(-(1 << 25)..(1 << 25)).contains(&disp) {
+            bail!("arm64 branch target out of range");
+        }
+        let encoded = (disp as i32 as u32) & 0x03ff_ffff;
+        let mut instruction = u32::from_le_bytes(
+            self.text[patch_offset..patch_offset + 4]
+                .try_into()
+                .expect("instruction bytes"),
+        );
+        instruction = (instruction & !0x03ff_ffff) | encoded;
+        self.text[patch_offset..patch_offset + 4].copy_from_slice(&instruction.to_le_bytes());
+        Ok(())
+    }
+
+    fn patch_imm26_to(&mut self, patch_offset: usize, target_offset: usize) -> Result<()> {
+        let bytes = target_offset as i64 - patch_offset as i64;
+        if bytes % 4 != 0 {
+            bail!("arm64 branch target is not instruction-aligned");
+        }
+        let disp = bytes / 4;
         if !(-(1 << 25)..(1 << 25)).contains(&disp) {
             bail!("arm64 branch target out of range");
         }

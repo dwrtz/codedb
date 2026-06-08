@@ -37,6 +37,7 @@ fn static_strings_and_bytes_lower_emit_verify_and_run_native() {
     let rebuilt = temp.path().join("static-strings-rebuilt.sqlite");
     let ir_path = temp.path().join("literal-total.ir.json");
     let object_path = temp.path().join("literal-total.o");
+    let link_plan_path = temp.path().join("literal-total.link.json");
 
     std::fs::write(
         &source,
@@ -141,6 +142,21 @@ fn write_static() -> i64 effects[io, ffi, unsafe] =
         entry["bytes_hex"] == "68690021" && entry["len"] == 4 && entry["offset"].is_u64()
     }));
 
+    run(&[
+        "link-native",
+        path(&db),
+        "literal_total",
+        "--target",
+        codedb::DEFAULT_NATIVE_TARGET,
+        "--out",
+        path(&link_plan_path),
+    ]);
+    let link_plan = read_json(&link_plan_path);
+    let plan_static_data = link_plan["objects"][0]["static_data"]
+        .as_array()
+        .expect("link plan static data metadata");
+    assert_eq!(plan_static_data, static_data);
+
     let created = parse_json(&run(&[
         "create-test",
         path(&db),
@@ -191,6 +207,40 @@ fn write_static() -> i64 effects[io, ffi, unsafe] =
         .stderr(predicate::str::contains(
             "static data len does not match bytes_hex",
         ));
+}
+
+#[test]
+fn verify_rejects_corrupt_native_object_static_data_metadata() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("static-object-metadata.sqlite");
+    let source = temp.path().join("static-object-metadata.cdb");
+    let object_path = temp.path().join("literal-total.o");
+
+    std::fs::write(
+        &source,
+        r#"
+fn literal_total() -> i64 = len("hello") + len(b"hi")
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&[
+        "emit-object",
+        path(&db),
+        "literal_total",
+        "--target",
+        codedb::DEFAULT_NATIVE_TARGET,
+        "--out",
+        path(&object_path),
+    ]);
+    corrupt_first_object_static_data_len(&db);
+    bin()
+        .args(["verify", path(&db)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("static data"));
 }
 
 fn op_names(ir: &JsonValue) -> Vec<String> {
@@ -265,6 +315,18 @@ fn corrupt_first_static_data_len(db: &Path) {
          SET payload_json = ?1, payload_size_bytes = ?2
          WHERE hash = ?3",
         params![corrupted, corrupted.len() as i64, hash],
+    )
+    .unwrap();
+}
+
+fn corrupt_first_object_static_data_len(db: &Path) {
+    let conn = Connection::open(db).unwrap();
+    conn.execute(
+        "UPDATE compile_cache
+         SET artifact_json = json_set(artifact_json, '$.metadata.static_data[0].len', 999)
+         WHERE artifact_kind = 'object_file'
+           AND artifact_json LIKE '%static_data%'",
+        [],
     )
     .unwrap();
 }
