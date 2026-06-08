@@ -201,6 +201,11 @@ pub enum Value {
         elements: Vec<ValueCell>,
         mutable: bool,
     },
+    Vec {
+        elements: Vec<ValueCell>,
+        capacity: usize,
+    },
+    String(Vec<u8>),
     Array(Vec<ValueCell>),
     Record(BTreeMap<String, ValueCell>),
     Enum {
@@ -248,6 +253,24 @@ impl PartialEq for Value {
                         .zip(right)
                         .all(|(left, right)| *left.borrow() == *right.borrow())
             }
+            (
+                Value::Vec {
+                    elements: left,
+                    capacity: left_capacity,
+                },
+                Value::Vec {
+                    elements: right,
+                    capacity: right_capacity,
+                },
+            ) => {
+                left_capacity == right_capacity
+                    && left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| *left.borrow() == *right.borrow())
+            }
+            (Value::String(left), Value::String(right)) => left == right,
             (Value::Array(left), Value::Array(right)) => {
                 left.len() == right.len()
                     && left
@@ -308,6 +331,17 @@ impl Display for Value {
                     write!(f, "slice[{}]", rendered.join(", "))
                 }
             }
+            Value::Vec { elements, capacity } => {
+                let rendered = elements
+                    .iter()
+                    .map(|value| value.borrow().to_string())
+                    .collect::<Vec<_>>();
+                write!(f, "vec(capacity: {capacity})[{}]", rendered.join(", "))
+            }
+            Value::String(bytes) => match String::from_utf8(bytes.clone()) {
+                Ok(value) => write!(f, "\"{}\"", source_string_literal(&value)),
+                Err(_) => write!(f, "string({} bytes)", bytes.len()),
+            },
             Value::Array(elements) => {
                 let rendered = elements
                     .iter()
@@ -458,6 +492,15 @@ impl CodeDb {
             (Value::Boxed(value), TypeSpec::Box { element }) => {
                 self.value_has_type(root, &value.borrow(), &element)
             }
+            (Value::Vec { elements, .. }, TypeSpec::Vec { element }) => {
+                for value in elements {
+                    if !self.value_has_type(root, &value.borrow(), &element)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            (Value::String(_), TypeSpec::String) => Ok(true),
             (
                 Value::Slice { elements, mutable },
                 TypeSpec::Slice {
@@ -686,6 +729,95 @@ impl CodeDb {
                 Ok(Value::Boxed(value_cell(self.eval_expr_with_locals(
                     root_hash, value_hash, args, locals,
                 )?)))
+            }
+            "vec_new" => {
+                let capacity_hash = payload
+                    .get("capacity")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_new missing capacity"))?;
+                let capacity = eval_index_value(self.eval_expr_with_locals(
+                    root_hash,
+                    capacity_hash,
+                    args,
+                    locals,
+                )?)?;
+                Ok(Value::Vec {
+                    elements: Vec::with_capacity(capacity),
+                    capacity,
+                })
+            }
+            "vec_push" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_push missing target"))?;
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_push missing value"))?;
+                let value = self.eval_expr_with_locals(root_hash, value_hash, args, locals)?;
+                let target = self.eval_place_cell(root_hash, target_hash, args, locals)?;
+                match &mut *target.borrow_mut() {
+                    Value::Vec { elements, capacity } => {
+                        if elements.len() >= *capacity {
+                            bail!("vec_push capacity {} exceeded", capacity);
+                        }
+                        elements.push(value_cell(value));
+                        Ok(Value::Unit)
+                    }
+                    other => bail!("vec_push target evaluated to non-vec {other}"),
+                }
+            }
+            "vec_get" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_get missing target"))?;
+                let index_hash = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_get missing index"))?;
+                let index = eval_index_value(
+                    self.eval_expr_with_locals(root_hash, index_hash, args, locals)?,
+                )?;
+                let target = self.eval_place_cell(root_hash, target_hash, args, locals)?;
+                match &*target.borrow() {
+                    Value::Vec { elements, .. } => elements
+                        .get(index)
+                        .map(|value| semantic_clone_value(&value.borrow()))
+                        .ok_or_else(|| anyhow!("vec_get index {index} out of bounds")),
+                    other => bail!("vec_get target evaluated to non-vec {other}"),
+                }
+            }
+            "vec_len" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_len missing target"))?;
+                let target = self.eval_place_cell(root_hash, target_hash, args, locals)?;
+                match &*target.borrow() {
+                    Value::Vec { elements, .. } => Ok(Value::I64(elements.len() as i64)),
+                    other => bail!("vec_len target evaluated to non-vec {other}"),
+                }
+            }
+            "string_new" => {
+                let source_hash = payload
+                    .get("source")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_new missing source"))?;
+                let source = self.eval_expr_with_locals(root_hash, source_hash, args, locals)?;
+                Ok(Value::String(bytes_from_slice_value(&source)?))
+            }
+            "string_len" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_len missing target"))?;
+                let target = self.eval_place_cell(root_hash, target_hash, args, locals)?;
+                match &*target.borrow() {
+                    Value::String(bytes) => Ok(Value::I64(bytes.len() as i64)),
+                    other => bail!("string_len target evaluated to non-string {other}"),
+                }
             }
             "raw_ptr_cast" => {
                 let value_hash = payload
@@ -1854,6 +1986,140 @@ impl CodeDb {
                     )?
                 )
             }
+            "vec_new" => {
+                let capacity = payload
+                    .get("capacity")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_new missing capacity"))?;
+                format!(
+                    "vec_new({})",
+                    self.expr_to_source_with_locals(
+                        capacity,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
+            "vec_push" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_push missing target"))?;
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_push missing value"))?;
+                format!(
+                    "vec_push({}, {})",
+                    self.expr_to_source_with_locals(
+                        target,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?,
+                    self.expr_to_source_with_locals(
+                        value,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
+            "vec_get" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_get missing target"))?;
+                let index = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_get missing index"))?;
+                format!(
+                    "vec_get({}, {})",
+                    self.expr_to_source_with_locals(
+                        target,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?,
+                    self.expr_to_source_with_locals(
+                        index,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
+            "vec_len" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_len missing target"))?;
+                format!(
+                    "vec_len({})",
+                    self.expr_to_source_with_locals(
+                        target,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
+            "string_new" => {
+                let source = payload
+                    .get("source")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_new missing source"))?;
+                format!(
+                    "string_new({})",
+                    self.expr_to_source_with_locals(
+                        source,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
+            "string_len" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_len missing target"))?;
+                format!(
+                    "string_len({})",
+                    self.expr_to_source_with_locals(
+                        target,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
             "raw_ptr_cast" => {
                 let value = payload
                     .get("value")
@@ -2711,6 +2977,116 @@ impl CodeDb {
                     )?,
                 ],
             }),
+            "vec_new" => Ok(RawExpr::Call {
+                name: "vec_new".to_string(),
+                args: vec![
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("capacity")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("vec_new missing capacity"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ],
+            }),
+            "vec_push" => Ok(RawExpr::Call {
+                name: "vec_push".to_string(),
+                args: vec![
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("target")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("vec_push missing target"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("vec_push missing value"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ],
+            }),
+            "vec_get" => Ok(RawExpr::Call {
+                name: "vec_get".to_string(),
+                args: vec![
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("target")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("vec_get missing target"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("index")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("vec_get missing index"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ],
+            }),
+            "vec_len" => Ok(RawExpr::Call {
+                name: "vec_len".to_string(),
+                args: vec![
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("target")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("vec_len missing target"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ],
+            }),
+            "string_new" => Ok(RawExpr::Call {
+                name: "string_new".to_string(),
+                args: vec![
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("source")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("string_new missing source"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ],
+            }),
+            "string_len" => Ok(RawExpr::Call {
+                name: "string_len".to_string(),
+                args: vec![
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("target")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("string_len missing target"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ],
+            }),
             "raw_ptr_cast" => {
                 let mutable = payload
                     .get("mutable")
@@ -3304,6 +3680,10 @@ impl CodeDb {
             TypeSpec::Box { element } => {
                 self.collect_type_deps(&element, deps)?;
             }
+            TypeSpec::Vec { element } => {
+                self.collect_type_deps(&element, deps)?;
+            }
+            TypeSpec::String => {}
             TypeSpec::Slice { element, .. } => {
                 self.collect_type_deps(&element, deps)?;
             }
@@ -3399,6 +3779,52 @@ impl CodeDb {
                     .get("value")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("box_new missing value"))?;
+                self.collect_expr_deps(root, child, deps)?;
+            }
+            "vec_new" => {
+                let child = payload
+                    .get("capacity")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_new missing capacity"))?;
+                self.collect_expr_deps(root, child, deps)?;
+            }
+            "vec_push" => {
+                for key in ["target", "value"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("vec_push missing {key}"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
+            }
+            "vec_get" => {
+                for key in ["target", "index"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("vec_get missing {key}"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
+            }
+            "vec_len" => {
+                let child = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_len missing target"))?;
+                self.collect_expr_deps(root, child, deps)?;
+            }
+            "string_new" => {
+                let child = payload
+                    .get("source")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_new missing source"))?;
+                self.collect_expr_deps(root, child, deps)?;
+            }
+            "string_len" => {
+                let child = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_len missing target"))?;
                 self.collect_expr_deps(root, child, deps)?;
             }
             "raw_ptr_cast" => {
@@ -4202,6 +4628,7 @@ impl Parser {
             "u8" | "U8" => Ok("u8".to_string()),
             "bool" | "Bool" => Ok("bool".to_string()),
             "unit" | "Unit" => Ok("unit".to_string()),
+            "string" | "String" => Ok("string".to_string()),
             "record" => {
                 let fields = self.parse_type_fields()?;
                 Ok(format!("record {{{}}}", fields.join(", ")))
@@ -4221,6 +4648,12 @@ impl Parser {
                 let element = self.parse_type_source()?;
                 self.expect_symbol(">")?;
                 Ok(format!("box<{element}>"))
+            }
+            "vec" => {
+                self.expect_symbol("<")?;
+                let element = self.parse_type_source()?;
+                self.expect_symbol(">")?;
+                Ok(format!("vec<{element}>"))
             }
             "slice" | "mut_slice" => {
                 self.expect_symbol("<")?;
@@ -4593,6 +5026,14 @@ fn semantic_clone_value(value: &Value) -> Value {
             elements: elements.clone(),
             mutable: *mutable,
         },
+        Value::Vec { elements, capacity } => Value::Vec {
+            elements: elements
+                .iter()
+                .map(|value| value_cell(semantic_clone_value(&value.borrow())))
+                .collect(),
+            capacity: *capacity,
+        },
+        Value::String(bytes) => Value::String(bytes.clone()),
         Value::Array(elements) => Value::Array(
             elements
                 .iter()
@@ -4676,6 +5117,19 @@ pub(crate) fn slice_len_from_value(value: &Value) -> Result<usize> {
     match value {
         Value::Slice { elements, .. } => Ok(elements.len()),
         other => bail!("len target evaluated to non-slice {other}"),
+    }
+}
+
+fn bytes_from_slice_value(value: &Value) -> Result<Vec<u8>> {
+    match value {
+        Value::Slice { elements, .. } => elements
+            .iter()
+            .map(|value| match &*value.borrow() {
+                Value::U8(byte) => Ok(*byte),
+                other => bail!("string_new source contained non-u8 element {other}"),
+            })
+            .collect(),
+        other => bail!("string_new source evaluated to non-slice {other}"),
     }
 }
 

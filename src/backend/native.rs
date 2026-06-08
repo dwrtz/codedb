@@ -653,6 +653,12 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::ConstructSlice { .. }
             | LoweredOp::SliceLen { .. }
             | LoweredOp::SliceData { .. }
+            | LoweredOp::VecNew { .. }
+            | LoweredOp::VecPush { .. }
+            | LoweredOp::VecGet { .. }
+            | LoweredOp::VecLen { .. }
+            | LoweredOp::StringNew { .. }
+            | LoweredOp::StringLen { .. }
             | LoweredOp::BoundsCheck { .. }
             | LoweredOp::SliceRangeCheck { .. }
             | LoweredOp::LoadEnumTag { .. }
@@ -753,7 +759,13 @@ fn validate_native_ops(
             | LoweredOp::DerefRaw { .. }
             | LoweredOp::ConstructSlice { .. }
             | LoweredOp::SliceLen { .. }
-            | LoweredOp::SliceData { .. } => {}
+            | LoweredOp::SliceData { .. }
+            | LoweredOp::VecNew { .. }
+            | LoweredOp::VecPush { .. }
+            | LoweredOp::VecGet { .. }
+            | LoweredOp::VecLen { .. }
+            | LoweredOp::StringNew { .. }
+            | LoweredOp::StringLen { .. } => {}
             LoweredOp::AddrOfParam { place, .. } => {
                 let LoweredPlace::Param {
                     slot, type_hash, ..
@@ -909,7 +921,7 @@ fn native_supported_type(
     let layout = native_type_layout(type_layouts, type_hash)?;
     match layout.kind.as_str() {
         "scalar" | "record" | "enum" | "fixed_array" | "slice" | "reference" | "raw_pointer"
-        | "box" => Ok(()),
+        | "box" | "vec" | "string" => Ok(()),
         other => bail!("native object backend v0 does not support native values of {other} type"),
     }
 }
@@ -1422,6 +1434,130 @@ fn validate_native_op_flow(
             native_type_layout(type_layouts, element_type_hash)?;
             native_insert_address(addresses, id, element_type_hash)?;
         }
+        LoweredOp::VecNew {
+            id,
+            address,
+            capacity: _,
+            element_type_hash,
+            type_hash,
+        } => {
+            if native_address_type(addresses, address)? != type_hash {
+                bail!("native object backend saw vec_new address mismatch");
+            }
+            let layout = native_type_layout(type_layouts, type_hash)?;
+            if layout.kind != "vec"
+                || native_layout_string(layout, "element_type_hash")? != *element_type_hash
+            {
+                bail!("native object backend saw vec_new layout mismatch");
+            }
+            native_type_layout(type_layouts, element_type_hash)?;
+            native_insert_value(values, id, type_hash)?;
+            native_insert_address(addresses, id, type_hash)?;
+        }
+        LoweredOp::VecPush {
+            id,
+            vec_address,
+            value,
+            vec_type_hash,
+            element_type_hash,
+            type_hash,
+        } => {
+            if native_address_type(addresses, vec_address)? != vec_type_hash {
+                bail!("native object backend saw vec_push address mismatch");
+            }
+            let layout = native_type_layout(type_layouts, vec_type_hash)?;
+            if layout.kind != "vec"
+                || native_layout_string(layout, "element_type_hash")? != *element_type_hash
+            {
+                bail!("native object backend saw vec_push layout mismatch");
+            }
+            if native_value_type(values, value)? != element_type_hash {
+                bail!("native object backend saw vec_push value mismatch");
+            }
+            if type_hash != &type_hash_for("Unit") {
+                bail!("native object backend saw vec_push non-unit result");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::VecGet {
+            id,
+            vec_address,
+            index,
+            vec_type_hash,
+            element_type_hash,
+            type_hash,
+        } => {
+            if native_address_type(addresses, vec_address)? != vec_type_hash {
+                bail!("native object backend saw vec_get address mismatch");
+            }
+            let layout = native_type_layout(type_layouts, vec_type_hash)?;
+            if layout.kind != "vec"
+                || native_layout_string(layout, "element_type_hash")? != *element_type_hash
+            {
+                bail!("native object backend saw vec_get layout mismatch");
+            }
+            if native_value_type(values, index)? != &type_hash_for("I64") {
+                bail!("native object backend saw vec_get non-i64 index");
+            }
+            if type_hash != element_type_hash {
+                bail!("native object backend saw vec_get result mismatch");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::VecLen {
+            id,
+            vec_address,
+            vec_type_hash,
+            type_hash,
+        } => {
+            if native_address_type(addresses, vec_address)? != vec_type_hash {
+                bail!("native object backend saw vec_len address mismatch");
+            }
+            if native_type_layout(type_layouts, vec_type_hash)?.kind != "vec" {
+                bail!("native object backend saw vec_len for non-vec");
+            }
+            if type_hash != &type_hash_for("I64") {
+                bail!("native object backend saw vec_len non-i64 result");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::StringNew {
+            id,
+            address,
+            bytes_hex,
+            len,
+            type_hash,
+            ..
+        } => {
+            if native_address_type(addresses, address)? != type_hash {
+                bail!("native object backend saw string_new address mismatch");
+            }
+            if native_type_layout(type_layouts, type_hash)?.kind != "string" {
+                bail!("native object backend saw string_new for non-string");
+            }
+            if hex_to_bytes(bytes_hex)?.len() != usize::try_from(*len)? {
+                bail!("native object backend saw string_new len mismatch");
+            }
+            native_insert_value(values, id, type_hash)?;
+            native_insert_address(addresses, id, type_hash)?;
+        }
+        LoweredOp::StringLen {
+            id,
+            string_address,
+            string_type_hash,
+            type_hash,
+        } => {
+            if native_address_type(addresses, string_address)? != string_type_hash {
+                bail!("native object backend saw string_len address mismatch");
+            }
+            if native_type_layout(type_layouts, string_type_hash)?.kind != "string" {
+                bail!("native object backend saw string_len for non-string");
+            }
+            if type_hash != &type_hash_for("I64") {
+                bail!("native object backend saw string_len non-i64 result");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
         LoweredOp::BoundsCheck {
             id,
             index,
@@ -1656,6 +1792,40 @@ fn native_array_stride(
     Ok(element.size_bytes.div_ceil(element.align_bytes) * element.align_bytes)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct NativeBufferLayout {
+    ptr_offset: u64,
+    len_offset: u64,
+    capacity_offset: u64,
+    element_size: u64,
+    element_stride: u64,
+}
+
+fn native_buffer_layout(
+    layouts: &BTreeMap<String, LoweredTypeLayout>,
+    type_hash: &str,
+    expected_kind: &str,
+) -> Result<NativeBufferLayout> {
+    let layout = native_type_layout(layouts, type_hash)?;
+    if layout.kind != expected_kind {
+        bail!("native object backend expected {expected_kind} buffer layout");
+    }
+    Ok(NativeBufferLayout {
+        ptr_offset: native_layout_u64(layout, "ptr_offset_bytes")?,
+        len_offset: native_layout_u64(layout, "len_offset_bytes")?,
+        capacity_offset: native_layout_u64(layout, "capacity_offset_bytes")?,
+        element_size: native_layout_u64(layout, "element_size_bytes")?,
+        element_stride: native_layout_u64(layout, "element_stride_bytes")?,
+    })
+}
+
+fn native_buffer_payload_size(buffer: NativeBufferLayout, capacity: u64) -> Result<u64> {
+    buffer
+        .element_stride
+        .checked_mul(capacity)
+        .ok_or_else(|| anyhow!("native object backend buffer allocation size overflow"))
+}
+
 fn native_stack_slot_size_bytes(layout_size_bytes: u64) -> u64 {
     layout_size_bytes.max(1).div_ceil(8) * 8
 }
@@ -1684,6 +1854,11 @@ fn native_layout_compatible(
     }
     let actual = native_type_layout(layouts, actual)?;
     let expected = native_type_layout(layouts, expected)?;
+    if matches!(actual.kind.as_str(), "vec" | "string")
+        || matches!(expected.kind.as_str(), "vec" | "string")
+    {
+        return Ok(false);
+    }
     Ok(actual.kind == expected.kind
         && actual.size_bytes == expected.size_bytes
         && actual.align_bytes == expected.align_bytes
@@ -2134,6 +2309,12 @@ fn collect_value_ids_inner(
             | LoweredOp::ConstructSlice { id, .. }
             | LoweredOp::SliceLen { id, .. }
             | LoweredOp::SliceData { id, .. }
+            | LoweredOp::VecNew { id, .. }
+            | LoweredOp::VecPush { id, .. }
+            | LoweredOp::VecGet { id, .. }
+            | LoweredOp::VecLen { id, .. }
+            | LoweredOp::StringNew { id, .. }
+            | LoweredOp::StringLen { id, .. }
             | LoweredOp::BoundsCheck { id, .. }
             | LoweredOp::SliceRangeCheck { id, .. }
             | LoweredOp::LoadEnumTag { id, .. }
@@ -2581,6 +2762,59 @@ impl FunctionEmitter {
                 self.mov_rax_stack(self.value_offset(slice)?);
                 self.mov_rax_mem_rax();
                 self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::VecNew {
+                id,
+                address,
+                capacity,
+                type_hash,
+                ..
+            } => {
+                self.emit_vec_new_x86(id, address, *capacity, type_hash)?;
+            }
+            LoweredOp::VecPush {
+                id,
+                vec_address,
+                value,
+                vec_type_hash,
+                ..
+            } => {
+                self.emit_vec_push_x86(id, vec_address, value, vec_type_hash)?;
+            }
+            LoweredOp::VecGet {
+                id,
+                vec_address,
+                index,
+                vec_type_hash,
+                ..
+            } => {
+                self.emit_vec_get_x86(id, vec_address, index, vec_type_hash)?;
+            }
+            LoweredOp::VecLen {
+                id,
+                vec_address,
+                vec_type_hash,
+                ..
+            } => {
+                self.emit_buffer_len_x86(id, vec_address, vec_type_hash, "vec")?;
+            }
+            LoweredOp::StringNew {
+                id,
+                address,
+                bytes_hex,
+                len,
+                type_hash,
+                ..
+            } => {
+                self.emit_string_new_x86(id, address, bytes_hex, *len, type_hash)?;
+            }
+            LoweredOp::StringLen {
+                id,
+                string_address,
+                string_type_hash,
+                ..
+            } => {
+                self.emit_buffer_len_x86(id, string_address, string_type_hash, "string")?;
             }
             LoweredOp::BoundsCheck {
                 id,
@@ -3087,6 +3321,160 @@ impl FunctionEmitter {
         Ok(())
     }
 
+    fn emit_buffer_alloc_header_x86(
+        &mut self,
+        id: &str,
+        address: &str,
+        buffer: NativeBufferLayout,
+        payload_bytes: u64,
+        len: u64,
+        capacity: u64,
+    ) -> Result<()> {
+        self.mov_rax_imm64(i64::try_from(payload_bytes.max(1))?);
+        self.mov_rdi_rax();
+        self.emit_platform_call_x86(PLATFORM_MALLOC_SYMBOL_HASH, PLATFORM_MALLOC_ABI_SYMBOL);
+        self.cmp_rax_imm32(0);
+        let ok = self.emit_jne_placeholder();
+        self.emit_ud2();
+        self.patch_rel32(ok)?;
+        self.mov_stack_rax(self.value_offset(id)?);
+
+        self.mov_rax_stack(self.value_offset(address)?);
+        self.mov_rcx_stack(self.value_offset(id)?);
+        self.mov_mem_rax_disp_rcx(i32::try_from(buffer.ptr_offset)?);
+        self.mov_rcx_imm64(len);
+        self.mov_mem_rax_disp_rcx(i32::try_from(buffer.len_offset)?);
+        self.mov_rcx_imm64(capacity);
+        self.mov_mem_rax_disp_rcx(i32::try_from(buffer.capacity_offset)?);
+        Ok(())
+    }
+
+    fn emit_vec_new_x86(
+        &mut self,
+        id: &str,
+        address: &str,
+        capacity: u64,
+        type_hash: &str,
+    ) -> Result<()> {
+        let buffer = native_buffer_layout(&self.type_layouts, type_hash, "vec")?;
+        let payload_bytes = native_buffer_payload_size(buffer, capacity)?;
+        self.emit_buffer_alloc_header_x86(id, address, buffer, payload_bytes, 0, capacity)?;
+        self.mov_rax_stack(self.value_offset(address)?);
+        self.mov_stack_rax(self.value_offset(id)?);
+        Ok(())
+    }
+
+    fn emit_string_new_x86(
+        &mut self,
+        id: &str,
+        address: &str,
+        bytes_hex: &str,
+        len: u64,
+        type_hash: &str,
+    ) -> Result<()> {
+        let bytes = hex_to_bytes(bytes_hex)?;
+        if bytes.len() != usize::try_from(len)? {
+            bail!("native x86_64 string_new bytes length mismatch");
+        }
+        let buffer = native_buffer_layout(&self.type_layouts, type_hash, "string")?;
+        self.emit_buffer_alloc_header_x86(id, address, buffer, len, len, len)?;
+        self.mov_rcx_stack(self.value_offset(id)?);
+        for (offset, byte) in bytes.iter().enumerate() {
+            self.mov_rdx_imm64(u64::from(*byte));
+            self.mov_memb_rcx_disp_dl(i32::try_from(offset)?);
+        }
+        self.mov_rax_stack(self.value_offset(address)?);
+        self.mov_stack_rax(self.value_offset(id)?);
+        Ok(())
+    }
+
+    fn emit_vec_push_x86(
+        &mut self,
+        id: &str,
+        vec_address: &str,
+        value: &str,
+        vec_type_hash: &str,
+    ) -> Result<()> {
+        let buffer = native_buffer_layout(&self.type_layouts, vec_type_hash, "vec")?;
+        self.mov_rax_stack(self.value_offset(vec_address)?);
+        self.mov_rcx_mem_rax_disp(i32::try_from(buffer.len_offset)?);
+        self.mov_rdx_mem_rax_disp(i32::try_from(buffer.capacity_offset)?);
+        self.cmp_rcx_rdx();
+        let ok = self.emit_jb_placeholder();
+        self.emit_ud2();
+        self.patch_rel32(ok)?;
+
+        self.mov_rdx_mem_rax_disp(i32::try_from(buffer.ptr_offset)?);
+        if buffer.element_stride != 1 {
+            self.imul_rcx_imm32(i32::try_from(buffer.element_stride)?);
+        }
+        self.mov_rax_rdx();
+        self.add_rax_rcx();
+        match buffer.element_size {
+            1 => {
+                self.mov_rcx_stack(self.value_offset(value)?);
+                self.mov_memb_rax_cl();
+            }
+            8 => {
+                self.mov_rcx_stack(self.value_offset(value)?);
+                self.mov_mem_rax_rcx();
+            }
+            size => bail!("native x86_64 vec_push unsupported element size {size}"),
+        }
+
+        self.mov_rax_stack(self.value_offset(vec_address)?);
+        self.mov_rcx_mem_rax_disp(i32::try_from(buffer.len_offset)?);
+        self.add_rcx_imm32(1);
+        self.mov_mem_rax_disp_rcx(i32::try_from(buffer.len_offset)?);
+        self.mov_rax_imm32(0);
+        self.mov_stack_rax(self.value_offset(id)?);
+        Ok(())
+    }
+
+    fn emit_vec_get_x86(
+        &mut self,
+        id: &str,
+        vec_address: &str,
+        index: &str,
+        vec_type_hash: &str,
+    ) -> Result<()> {
+        let buffer = native_buffer_layout(&self.type_layouts, vec_type_hash, "vec")?;
+        self.mov_rax_stack(self.value_offset(vec_address)?);
+        self.mov_rcx_stack(self.value_offset(index)?);
+        self.mov_rdx_mem_rax_disp(i32::try_from(buffer.len_offset)?);
+        self.cmp_rcx_rdx();
+        let ok = self.emit_jb_placeholder();
+        self.emit_ud2();
+        self.patch_rel32(ok)?;
+
+        self.mov_rax_mem_rax_disp(i32::try_from(buffer.ptr_offset)?);
+        if buffer.element_stride != 1 {
+            self.imul_rcx_imm32(i32::try_from(buffer.element_stride)?);
+        }
+        self.add_rax_rcx();
+        match buffer.element_size {
+            1 => self.movzx_rax_memb_rax(),
+            8 => self.mov_rax_mem_rax(),
+            size => bail!("native x86_64 vec_get unsupported element size {size}"),
+        }
+        self.mov_stack_rax(self.value_offset(id)?);
+        Ok(())
+    }
+
+    fn emit_buffer_len_x86(
+        &mut self,
+        id: &str,
+        address: &str,
+        type_hash: &str,
+        kind: &str,
+    ) -> Result<()> {
+        let buffer = native_buffer_layout(&self.type_layouts, type_hash, kind)?;
+        self.mov_rax_stack(self.value_offset(address)?);
+        self.mov_rax_mem_rax_disp(i32::try_from(buffer.len_offset)?);
+        self.mov_stack_rax(self.value_offset(id)?);
+        Ok(())
+    }
+
     fn emit_drop_ptr_x86(&mut self, type_hash: &str) -> Result<()> {
         if !native_needs_drop(&self.type_layouts, type_hash)? {
             return Ok(());
@@ -3144,6 +3532,7 @@ impl FunctionEmitter {
             "record" => self.emit_drop_record_ptr_x86(&layout),
             "enum" => self.emit_drop_enum_ptr_x86(&layout),
             "fixed_array" => self.emit_drop_fixed_array_ptr_x86(&layout),
+            "vec" | "string" => self.emit_drop_buffer_ptr_x86(&layout),
             _ => Ok(()),
         }
     }
@@ -3161,6 +3550,17 @@ impl FunctionEmitter {
         }
         self.mov_rdi_rsp();
         self.add_rsp_imm8(16);
+        self.emit_platform_call_x86(PLATFORM_FREE_SYMBOL_HASH, PLATFORM_FREE_ABI_SYMBOL);
+        self.patch_rel32(done)?;
+        Ok(())
+    }
+
+    fn emit_drop_buffer_ptr_x86(&mut self, layout: &LoweredTypeLayout) -> Result<()> {
+        let buffer = native_buffer_layout(&self.type_layouts, &layout.type_hash, &layout.kind)?;
+        self.mov_rax_mem_rax_disp(i32::try_from(buffer.ptr_offset)?);
+        self.cmp_rax_imm32(0);
+        let done = self.emit_jz_placeholder();
+        self.mov_rdi_rax();
         self.emit_platform_call_x86(PLATFORM_FREE_SYMBOL_HASH, PLATFORM_FREE_ABI_SYMBOL);
         self.patch_rel32(done)?;
         Ok(())
@@ -3280,6 +3680,11 @@ impl FunctionEmitter {
         self.text.extend_from_slice(&value.to_le_bytes());
     }
 
+    fn mov_rdx_imm64(&mut self, value: u64) {
+        self.text.extend_from_slice(&[0x48, 0xba]);
+        self.text.extend_from_slice(&value.to_le_bytes());
+    }
+
     fn mov_rax_imm32(&mut self, value: i32) {
         self.text.push(0xb8);
         self.push_i32(value);
@@ -3306,6 +3711,11 @@ impl FunctionEmitter {
 
     fn mov_rax_mem_rax_disp(&mut self, offset: i32) {
         self.text.extend_from_slice(&[0x48, 0x8b, 0x80]);
+        self.push_i32(offset);
+    }
+
+    fn mov_rcx_mem_rax_disp(&mut self, offset: i32) {
+        self.text.extend_from_slice(&[0x48, 0x8b, 0x88]);
         self.push_i32(offset);
     }
 
@@ -3338,6 +3748,18 @@ impl FunctionEmitter {
 
     fn add_rax_rcx(&mut self) {
         self.text.extend_from_slice(&[0x48, 0x01, 0xc8]);
+    }
+
+    fn add_rcx_imm32(&mut self, value: i32) {
+        if value == 0 {
+            return;
+        }
+        self.text.extend_from_slice(&[0x48, 0x81, 0xc1]);
+        self.push_i32(value);
+    }
+
+    fn mov_rax_rdx(&mut self) {
+        self.text.extend_from_slice(&[0x48, 0x89, 0xd0]);
     }
 
     fn mov_mem_rax_rcx(&mut self) {
@@ -4077,6 +4499,59 @@ impl Arm64Emitter {
                 self.ldr_reg_addr(0, 0)?;
                 self.str_stack(0, self.value_offset(id)?)?;
             }
+            LoweredOp::VecNew {
+                id,
+                address,
+                capacity,
+                type_hash,
+                ..
+            } => {
+                self.emit_vec_new_arm64(id, address, *capacity, type_hash)?;
+            }
+            LoweredOp::VecPush {
+                id,
+                vec_address,
+                value,
+                vec_type_hash,
+                ..
+            } => {
+                self.emit_vec_push_arm64(id, vec_address, value, vec_type_hash)?;
+            }
+            LoweredOp::VecGet {
+                id,
+                vec_address,
+                index,
+                vec_type_hash,
+                ..
+            } => {
+                self.emit_vec_get_arm64(id, vec_address, index, vec_type_hash)?;
+            }
+            LoweredOp::VecLen {
+                id,
+                vec_address,
+                vec_type_hash,
+                ..
+            } => {
+                self.emit_buffer_len_arm64(id, vec_address, vec_type_hash, "vec")?;
+            }
+            LoweredOp::StringNew {
+                id,
+                address,
+                bytes_hex,
+                len,
+                type_hash,
+                ..
+            } => {
+                self.emit_string_new_arm64(id, address, bytes_hex, *len, type_hash)?;
+            }
+            LoweredOp::StringLen {
+                id,
+                string_address,
+                string_type_hash,
+                ..
+            } => {
+                self.emit_buffer_len_arm64(id, string_address, string_type_hash, "string")?;
+            }
             LoweredOp::BoundsCheck {
                 id,
                 index,
@@ -4574,6 +5049,154 @@ impl Arm64Emitter {
         Ok(())
     }
 
+    fn emit_buffer_alloc_header_arm64(
+        &mut self,
+        id: &str,
+        address: &str,
+        buffer: NativeBufferLayout,
+        payload_bytes: u64,
+        len: u64,
+        capacity: u64,
+    ) -> Result<()> {
+        self.mov_u64(0, payload_bytes.max(1));
+        self.emit_platform_call_arm64(PLATFORM_MALLOC_SYMBOL_HASH, PLATFORM_MALLOC_ABI_SYMBOL);
+        let ok = self.emit_cbnz_placeholder(0);
+        self.emit_u32(0xd4200000);
+        self.patch_imm19(ok)?;
+        self.str_stack(0, self.value_offset(id)?)?;
+
+        self.ldr_stack(0, self.value_offset(address)?)?;
+        self.ldr_stack(1, self.value_offset(id)?)?;
+        self.str_reg_addr_offset(1, 0, u32::try_from(buffer.ptr_offset)?)?;
+        self.mov_u64(1, len);
+        self.str_reg_addr_offset(1, 0, u32::try_from(buffer.len_offset)?)?;
+        self.mov_u64(1, capacity);
+        self.str_reg_addr_offset(1, 0, u32::try_from(buffer.capacity_offset)?)?;
+        Ok(())
+    }
+
+    fn emit_vec_new_arm64(
+        &mut self,
+        id: &str,
+        address: &str,
+        capacity: u64,
+        type_hash: &str,
+    ) -> Result<()> {
+        let buffer = native_buffer_layout(&self.type_layouts, type_hash, "vec")?;
+        let payload_bytes = native_buffer_payload_size(buffer, capacity)?;
+        self.emit_buffer_alloc_header_arm64(id, address, buffer, payload_bytes, 0, capacity)?;
+        self.ldr_stack(0, self.value_offset(address)?)?;
+        self.str_stack(0, self.value_offset(id)?)?;
+        Ok(())
+    }
+
+    fn emit_string_new_arm64(
+        &mut self,
+        id: &str,
+        address: &str,
+        bytes_hex: &str,
+        len: u64,
+        type_hash: &str,
+    ) -> Result<()> {
+        let bytes = hex_to_bytes(bytes_hex)?;
+        if bytes.len() != usize::try_from(len)? {
+            bail!("native arm64 string_new bytes length mismatch");
+        }
+        let buffer = native_buffer_layout(&self.type_layouts, type_hash, "string")?;
+        self.emit_buffer_alloc_header_arm64(id, address, buffer, len, len, len)?;
+        self.ldr_stack(0, self.value_offset(id)?)?;
+        for (offset, byte) in bytes.iter().enumerate() {
+            self.mov_u64(1, u64::from(*byte));
+            self.strb_reg_addr_offset(1, 0, u32::try_from(offset)?)?;
+        }
+        self.ldr_stack(0, self.value_offset(address)?)?;
+        self.str_stack(0, self.value_offset(id)?)?;
+        Ok(())
+    }
+
+    fn emit_vec_push_arm64(
+        &mut self,
+        id: &str,
+        vec_address: &str,
+        value: &str,
+        vec_type_hash: &str,
+    ) -> Result<()> {
+        let buffer = native_buffer_layout(&self.type_layouts, vec_type_hash, "vec")?;
+        self.ldr_stack(0, self.value_offset(vec_address)?)?;
+        self.ldr_reg_addr_offset(1, 0, u32::try_from(buffer.len_offset)?)?;
+        self.ldr_reg_addr_offset(2, 0, u32::try_from(buffer.capacity_offset)?)?;
+        self.cmp_reg(1, 2);
+        let ok = self.emit_b_cond_placeholder(3);
+        self.emit_u32(0xd4200000);
+        self.patch_imm19(ok)?;
+
+        self.ldr_reg_addr_offset(3, 0, u32::try_from(buffer.ptr_offset)?)?;
+        if buffer.element_stride != 1 {
+            self.mov_u64(2, buffer.element_stride);
+            self.mul_reg(1, 1, 2);
+        }
+        self.add_reg(3, 3, 1);
+        self.ldr_stack(4, self.value_offset(value)?)?;
+        match buffer.element_size {
+            1 => self.strb_reg_addr(4, 3)?,
+            8 => self.str_reg_addr(4, 3)?,
+            size => bail!("native arm64 vec_push unsupported element size {size}"),
+        }
+
+        self.ldr_reg_addr_offset(1, 0, u32::try_from(buffer.len_offset)?)?;
+        self.mov_u64(2, 1);
+        self.add_reg(1, 1, 2);
+        self.str_reg_addr_offset(1, 0, u32::try_from(buffer.len_offset)?)?;
+        self.mov_u64(0, 0);
+        self.str_stack(0, self.value_offset(id)?)?;
+        Ok(())
+    }
+
+    fn emit_vec_get_arm64(
+        &mut self,
+        id: &str,
+        vec_address: &str,
+        index: &str,
+        vec_type_hash: &str,
+    ) -> Result<()> {
+        let buffer = native_buffer_layout(&self.type_layouts, vec_type_hash, "vec")?;
+        self.ldr_stack(0, self.value_offset(vec_address)?)?;
+        self.ldr_stack(1, self.value_offset(index)?)?;
+        self.ldr_reg_addr_offset(2, 0, u32::try_from(buffer.len_offset)?)?;
+        self.cmp_reg(1, 2);
+        let ok = self.emit_b_cond_placeholder(3);
+        self.emit_u32(0xd4200000);
+        self.patch_imm19(ok)?;
+
+        self.ldr_reg_addr_offset(0, 0, u32::try_from(buffer.ptr_offset)?)?;
+        if buffer.element_stride != 1 {
+            self.mov_u64(2, buffer.element_stride);
+            self.mul_reg(1, 1, 2);
+        }
+        self.add_reg(0, 0, 1);
+        match buffer.element_size {
+            1 => self.ldrb_reg_addr(0, 0)?,
+            8 => self.ldr_reg_addr(0, 0)?,
+            size => bail!("native arm64 vec_get unsupported element size {size}"),
+        }
+        self.str_stack(0, self.value_offset(id)?)?;
+        Ok(())
+    }
+
+    fn emit_buffer_len_arm64(
+        &mut self,
+        id: &str,
+        address: &str,
+        type_hash: &str,
+        kind: &str,
+    ) -> Result<()> {
+        let buffer = native_buffer_layout(&self.type_layouts, type_hash, kind)?;
+        self.ldr_stack(0, self.value_offset(address)?)?;
+        self.ldr_reg_addr_offset(0, 0, u32::try_from(buffer.len_offset)?)?;
+        self.str_stack(0, self.value_offset(id)?)?;
+        Ok(())
+    }
+
     fn emit_drop_ptr_arm64(&mut self, type_hash: &str) -> Result<()> {
         if !native_needs_drop(&self.type_layouts, type_hash)? {
             return Ok(());
@@ -4632,6 +5255,7 @@ impl Arm64Emitter {
             "record" => self.emit_drop_record_ptr_arm64(&layout),
             "enum" => self.emit_drop_enum_ptr_arm64(&layout),
             "fixed_array" => self.emit_drop_fixed_array_ptr_arm64(&layout),
+            "vec" | "string" => self.emit_drop_buffer_ptr_arm64(&layout),
             _ => Ok(()),
         }
     }
@@ -4648,6 +5272,15 @@ impl Arm64Emitter {
         }
         self.ldr_stack(0, 0)?;
         self.add_sp_imm(16)?;
+        self.emit_platform_call_arm64(PLATFORM_FREE_SYMBOL_HASH, PLATFORM_FREE_ABI_SYMBOL);
+        self.patch_imm19(done)?;
+        Ok(())
+    }
+
+    fn emit_drop_buffer_ptr_arm64(&mut self, layout: &LoweredTypeLayout) -> Result<()> {
+        let buffer = native_buffer_layout(&self.type_layouts, &layout.type_hash, &layout.kind)?;
+        self.ldr_reg_addr_offset(0, 0, u32::try_from(buffer.ptr_offset)?)?;
+        let done = self.emit_cbz_placeholder(0);
         self.emit_platform_call_arm64(PLATFORM_FREE_SYMBOL_HASH, PLATFORM_FREE_ABI_SYMBOL);
         self.patch_imm19(done)?;
         Ok(())

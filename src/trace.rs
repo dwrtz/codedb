@@ -124,6 +124,46 @@ impl TraceValue {
                     value: TraceValue::from_value(&value.borrow()),
                 }],
             },
+            Value::Vec { elements, capacity } => TraceValue::Record {
+                fields: vec![
+                    TraceRecordField {
+                        name: "capacity".to_string(),
+                        value: TraceValue::I64 {
+                            value: capacity.to_string(),
+                        },
+                    },
+                    TraceRecordField {
+                        name: "elements".to_string(),
+                        value: TraceValue::Array {
+                            elements: elements
+                                .iter()
+                                .map(|value| TraceValue::from_value(&value.borrow()))
+                                .collect(),
+                        },
+                    },
+                ],
+            },
+            Value::String(bytes) => TraceValue::Record {
+                fields: vec![
+                    TraceRecordField {
+                        name: "len".to_string(),
+                        value: TraceValue::I64 {
+                            value: bytes.len().to_string(),
+                        },
+                    },
+                    TraceRecordField {
+                        name: "bytes".to_string(),
+                        value: TraceValue::Array {
+                            elements: bytes
+                                .iter()
+                                .map(|byte| TraceValue::I64 {
+                                    value: byte.to_string(),
+                                })
+                                .collect(),
+                        },
+                    },
+                ],
+            },
             Value::Array(elements) => TraceValue::Array {
                 elements: elements
                     .iter()

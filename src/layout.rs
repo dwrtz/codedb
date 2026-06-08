@@ -132,6 +132,20 @@ impl LayoutClass {
         }
     }
 
+    fn owned_buffer(payload: Self) -> Self {
+        Self {
+            copy_kind: CopyKind::MoveOnly,
+            drop_kind: DropKind::NeedsDrop,
+            contains_reference: payload.contains_reference,
+            contains_mut_reference: payload.contains_mut_reference,
+            contains_raw_pointer: payload.contains_raw_pointer,
+            // Existing native drop helpers use this as the recursive owned-drop
+            // fast path, not only for the literal `box<T>` type.
+            contains_box: true,
+            contains_capability_handle: payload.contains_capability_handle,
+        }
+    }
+
     fn merge(self, other: Self) -> Self {
         Self {
             copy_kind: if self.copy_kind == CopyKind::Copy && other.copy_kind == CopyKind::Copy {
@@ -395,6 +409,93 @@ impl LayoutComputer<'_> {
                     metadata,
                     size_bytes: self.target.pointer_size_bytes,
                     align_bytes: self.target.pointer_align_bytes,
+                    class,
+                })
+            }
+            TypeSpec::Vec { element } => {
+                let element_layout = self.layout_type(&element)?;
+                let payload_class =
+                    self.layout_class_flags_for_type(&element, &mut BTreeSet::new())?;
+                let class = LayoutClass::owned_buffer(payload_class);
+                let size_bytes = align_up(self.target.pointer_size_bytes, 8)?
+                    .checked_add(16)
+                    .ok_or_else(|| anyhow!("vec layout overflows for {type_hash}"))?;
+                let align_bytes = self.target.pointer_align_bytes.max(8);
+                let mut metadata =
+                    self.base_metadata(type_hash, "vec", size_bytes, align_bytes, class);
+                let object = metadata.as_object_mut().unwrap();
+                object.insert("element_type_hash".to_string(), json!(element));
+                object.insert("ptr_offset_bytes".to_string(), json!(0));
+                object.insert(
+                    "len_offset_bytes".to_string(),
+                    json!(align_up(self.target.pointer_size_bytes, 8)?),
+                );
+                object.insert(
+                    "capacity_offset_bytes".to_string(),
+                    json!(align_up(self.target.pointer_size_bytes, 8)? + 8),
+                );
+                object.insert(
+                    "element_size_bytes".to_string(),
+                    json!(element_layout.size_bytes),
+                );
+                object.insert(
+                    "element_align_bytes".to_string(),
+                    json!(element_layout.align_bytes),
+                );
+                object.insert(
+                    "element_stride_bytes".to_string(),
+                    json!(align_up(
+                        element_layout.size_bytes,
+                        element_layout.align_bytes
+                    )?),
+                );
+                Ok(ComputedLayout {
+                    metadata,
+                    size_bytes,
+                    align_bytes,
+                    class,
+                })
+            }
+            TypeSpec::String => {
+                let element = type_hash_for("U8");
+                let element_layout = self.layout_type(&element)?;
+                let class = LayoutClass::owned_buffer(LayoutClass::copy());
+                let size_bytes = align_up(self.target.pointer_size_bytes, 8)?
+                    .checked_add(16)
+                    .ok_or_else(|| anyhow!("string layout overflows for {type_hash}"))?;
+                let align_bytes = self.target.pointer_align_bytes.max(8);
+                let mut metadata =
+                    self.base_metadata(type_hash, "string", size_bytes, align_bytes, class);
+                let object = metadata.as_object_mut().unwrap();
+                object.insert("element_type_hash".to_string(), json!(element));
+                object.insert("ptr_offset_bytes".to_string(), json!(0));
+                object.insert(
+                    "len_offset_bytes".to_string(),
+                    json!(align_up(self.target.pointer_size_bytes, 8)?),
+                );
+                object.insert(
+                    "capacity_offset_bytes".to_string(),
+                    json!(align_up(self.target.pointer_size_bytes, 8)? + 8),
+                );
+                object.insert(
+                    "element_size_bytes".to_string(),
+                    json!(element_layout.size_bytes),
+                );
+                object.insert(
+                    "element_align_bytes".to_string(),
+                    json!(element_layout.align_bytes),
+                );
+                object.insert(
+                    "element_stride_bytes".to_string(),
+                    json!(align_up(
+                        element_layout.size_bytes,
+                        element_layout.align_bytes
+                    )?),
+                );
+                Ok(ComputedLayout {
+                    metadata,
+                    size_bytes,
+                    align_bytes,
                     class,
                 })
             }
@@ -662,6 +763,11 @@ impl LayoutComputer<'_> {
                 let payload = self.layout_class_flags_for_type(&element, active_types)?;
                 Ok(LayoutClass::boxed(payload))
             }
+            TypeSpec::Vec { element } => {
+                let payload = self.layout_class_flags_for_type(&element, active_types)?;
+                Ok(LayoutClass::owned_buffer(payload))
+            }
+            TypeSpec::String => Ok(LayoutClass::owned_buffer(LayoutClass::copy())),
             TypeSpec::Slice {
                 mutable, element, ..
             } => {
@@ -721,7 +827,7 @@ fn abi_metadata(kind: &str, size_bytes: u64) -> JsonValue {
             "pass": "by_value",
             "return": "by_value",
         }),
-        ("record" | "enum" | "fixed_array" | "slice", _) => json!({
+        ("record" | "enum" | "fixed_array" | "slice" | "vec" | "string", _) => json!({
             "pass": "by_indirect",
             "return": "hidden_return_slot",
         }),

@@ -915,6 +915,9 @@ impl CodeDb {
             Ok(crate::types::TypeSpec::Box { element }) => {
                 self.verify_type_region_args(parent_hash, &element, allowed_regions, errors)?;
             }
+            Ok(crate::types::TypeSpec::Vec { element }) => {
+                self.verify_type_region_args(parent_hash, &element, allowed_regions, errors)?;
+            }
             Ok(crate::types::TypeSpec::Slice {
                 region, element, ..
             }) => {
@@ -939,7 +942,7 @@ impl CodeDb {
                     )?;
                 }
             }
-            Ok(crate::types::TypeSpec::Builtin(_)) => {}
+            Ok(crate::types::TypeSpec::Builtin(_)) | Ok(crate::types::TypeSpec::String) => {}
             Err(err) => errors.push(format!("bad_type_def: {parent_hash}: {err:#}")),
         }
         Ok(())
@@ -4041,6 +4044,12 @@ fn collect_lowered_call_targets(
             | LoweredOp::ConstructSlice { .. }
             | LoweredOp::SliceLen { .. }
             | LoweredOp::SliceData { .. }
+            | LoweredOp::VecNew { .. }
+            | LoweredOp::VecPush { .. }
+            | LoweredOp::VecGet { .. }
+            | LoweredOp::VecLen { .. }
+            | LoweredOp::StringNew { .. }
+            | LoweredOp::StringLen { .. }
             | LoweredOp::BoundsCheck { .. }
             | LoweredOp::SliceRangeCheck { .. }
             | LoweredOp::BorrowShared { .. }

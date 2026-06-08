@@ -393,6 +393,10 @@ pub(crate) enum TypeSpec {
     Box {
         element: String,
     },
+    Vec {
+        element: String,
+    },
+    String,
     Slice {
         region: String,
         mutable: bool,
@@ -809,6 +813,15 @@ impl CodeDb {
                     Ok(format!("raw_ptr<{pointee}>"))
                 }
             }
+            TypeSpec::Box { element } => {
+                let element = self.type_name_with_regions(&element, region_names)?;
+                Ok(format!("box<{element}>"))
+            }
+            TypeSpec::Vec { element } => {
+                let element = self.type_name_with_regions(&element, region_names)?;
+                Ok(format!("vec<{element}>"))
+            }
+            TypeSpec::String => Ok("string".to_string()),
             TypeSpec::Slice {
                 region,
                 mutable,
@@ -954,6 +967,16 @@ impl CodeDb {
                 )?;
                 Ok(format!("box<{element}>"))
             }
+            TypeSpec::Vec { element } => {
+                let element = self.type_name_in_root_with_regions(
+                    root,
+                    current_module,
+                    &element,
+                    region_names,
+                )?;
+                Ok(format!("vec<{element}>"))
+            }
+            TypeSpec::String => Ok("string".to_string()),
             TypeSpec::Slice {
                 region,
                 mutable,
@@ -1166,6 +1189,11 @@ impl CodeDb {
                 let element = self.substitute_type_regions_hash(&element, region_substitutions)?;
                 hash_for_type_spec(&TypeSpec::Box { element })
             }
+            TypeSpec::Vec { element } => {
+                let element = self.substitute_type_regions_hash(&element, region_substitutions)?;
+                hash_for_type_spec(&TypeSpec::Vec { element })
+            }
+            TypeSpec::String => hash_for_type_spec(&TypeSpec::String),
             TypeSpec::Slice {
                 region,
                 mutable,
@@ -1256,6 +1284,11 @@ impl CodeDb {
                 let element = self.put_substituted_type_regions(&element, region_substitutions)?;
                 self.put_structural_type(TypeSpec::Box { element })
             }
+            TypeSpec::Vec { element } => {
+                let element = self.put_substituted_type_regions(&element, region_substitutions)?;
+                self.put_structural_type(TypeSpec::Vec { element })
+            }
+            TypeSpec::String => self.put_structural_type(TypeSpec::String),
             TypeSpec::Slice {
                 region,
                 mutable,
@@ -1442,6 +1475,14 @@ impl CodeDb {
                 },
             ) => self.type_assignable_in_root(root, &actual_element, &expected_element),
             (
+                TypeSpec::Vec {
+                    element: actual_element,
+                },
+                TypeSpec::Vec {
+                    element: expected_element,
+                },
+            ) => self.type_assignable_in_root(root, &actual_element, &expected_element),
+            (
                 TypeSpec::FixedArray {
                     element: actual_element,
                     len: actual_len,
@@ -1558,6 +1599,19 @@ impl CodeDb {
                     element: actual_element,
                 },
                 TypeSpec::Box {
+                    element: expected_element,
+                },
+            ) => self.type_assignable_for_call_in_root(
+                root,
+                &actual_element,
+                &expected_element,
+                callee_regions,
+            ),
+            (
+                TypeSpec::Vec {
+                    element: actual_element,
+                },
+                TypeSpec::Vec {
                     element: expected_element,
                 },
             ) => self.type_assignable_for_call_in_root(
@@ -1703,6 +1757,14 @@ impl CodeDb {
                 substitutions,
             ),
             (TypeSpec::Box { element: actual }, TypeSpec::Box { element: expected }) => self
+                .infer_call_region_substitutions(
+                    root,
+                    &actual,
+                    &expected,
+                    callee_regions,
+                    substitutions,
+                ),
+            (TypeSpec::Vec { element: actual }, TypeSpec::Vec { element: expected }) => self
                 .infer_call_region_substitutions(
                     root,
                     &actual,
@@ -1903,6 +1965,11 @@ impl CodeDb {
                 let element = self.put_type_spec(element)?;
                 self.put_structural_type(TypeSpec::Box { element })
             }
+            ParsedTypeSpec::Vec { element } => {
+                let element = self.put_type_spec(element)?;
+                self.put_structural_type(TypeSpec::Vec { element })
+            }
+            ParsedTypeSpec::String => self.put_structural_type(TypeSpec::String),
             ParsedTypeSpec::Slice {
                 region,
                 mutable,
@@ -2001,6 +2068,12 @@ impl CodeDb {
                     self.put_type_spec_in_root(current_module, root, element, region_scope)?;
                 self.put_structural_type(TypeSpec::Box { element })
             }
+            ParsedTypeSpec::Vec { element } => {
+                let element =
+                    self.put_type_spec_in_root(current_module, root, element, region_scope)?;
+                self.put_structural_type(TypeSpec::Vec { element })
+            }
+            ParsedTypeSpec::String => self.put_structural_type(TypeSpec::String),
             ParsedTypeSpec::Slice {
                 region,
                 mutable,
@@ -2115,6 +2188,12 @@ impl CodeDb {
                     self.type_hash_for_parsed_in_root(current_module, root, element, region_scope)?;
                 hash_for_type_spec(&TypeSpec::Box { element })
             }
+            ParsedTypeSpec::Vec { element } => {
+                let element =
+                    self.type_hash_for_parsed_in_root(current_module, root, element, region_scope)?;
+                hash_for_type_spec(&TypeSpec::Vec { element })
+            }
+            ParsedTypeSpec::String => hash_for_type_spec(&TypeSpec::String),
             ParsedTypeSpec::Slice {
                 region,
                 mutable,
@@ -2419,6 +2498,10 @@ impl CodeDb {
             TypeSpec::Box { element } => {
                 self.type_contains_raw_pointer(root, &element, active_types)
             }
+            TypeSpec::Vec { element } => {
+                self.type_contains_raw_pointer(root, &element, active_types)
+            }
+            TypeSpec::String => Ok(false),
             TypeSpec::Slice { element, .. } => {
                 self.type_contains_raw_pointer(root, &element, active_types)
             }
@@ -2780,10 +2863,10 @@ impl CodeDb {
     }
 
     /// Type an expression carrying an optional `expected_type` for the result
-    /// position. Only a `fold` consumes it (to anchor its accumulator to the
-    /// destination layout — see `type_fold_expr`); the hint propagates through
-    /// `let ... in <tail>` so a fold in tail position is anchored too. Every
-    /// other form ignores it and types identically to `type_expr_with_locals`.
+    /// position. `fold` uses it to anchor its accumulator to the destination
+    /// layout (see `type_fold_expr`), and `vec_new` uses it to infer its element
+    /// type. The hint propagates through `let ... in <tail>` so tail-position
+    /// constructs see the enclosing destination type.
     #[allow(clippy::too_many_arguments)]
     fn type_expr_with_locals_expecting(
         &mut self,
@@ -2979,6 +3062,22 @@ impl CodeDb {
                         param_types,
                         region_scope,
                         locals,
+                    );
+                }
+                if matches!(
+                    name.as_str(),
+                    "vec_new" | "vec_push" | "vec_get" | "vec_len" | "string_new" | "string_len"
+                ) {
+                    return self.type_builtin_dynamic_buffer_call(
+                        current_module,
+                        name,
+                        args,
+                        root,
+                        param_names,
+                        param_types,
+                        region_scope,
+                        locals,
+                        expected_type,
                     );
                 }
                 if name == "box_new" {
@@ -3374,40 +3473,19 @@ impl CodeDb {
                 validate_projection_identifier("let binding", name)?;
                 let binding_type =
                     self.resolve_type_in_root_with_regions(current_module, root, ty, region_scope)?;
-                // Pass the declared binding type into a fold value so its
-                // accumulator is anchored to the destination layout (see
-                // `type_fold_expr`); other value forms type without a hint.
-                let value = match value.as_ref() {
-                    RawExpr::Fold {
-                        item,
-                        target,
-                        acc,
-                        init,
-                        body,
-                    } => self.type_fold_expr(
-                        current_module,
-                        item,
-                        target,
-                        acc,
-                        init,
-                        body,
-                        root,
-                        param_names,
-                        param_types,
-                        region_scope,
-                        locals,
-                        Some(&binding_type),
-                    )?,
-                    _ => self.type_expr_with_locals(
-                        current_module,
-                        value,
-                        root,
-                        param_names,
-                        param_types,
-                        region_scope,
-                        locals,
-                    )?,
-                };
+                // Pass the declared binding type into the value so constructs
+                // needing a destination type (fold accumulators, vec_new element
+                // inference) anchor to the declared layout/type.
+                let value = self.type_expr_with_locals_expecting(
+                    current_module,
+                    value,
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                    Some(&binding_type),
+                )?;
                 if !self.type_assignable_in_root(root, &value.type_hash, &binding_type)? {
                     require_type(&value.type_hash, &binding_type, "let binding", self)?;
                 }
@@ -4213,6 +4291,390 @@ impl CodeDb {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn type_builtin_dynamic_buffer_call(
+        &mut self,
+        current_module: &str,
+        name: &str,
+        args: &[RawExpr],
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
+        locals: &mut Vec<LocalTypeBinding>,
+        expected_type: Option<&str>,
+    ) -> Result<TypeCheckResult> {
+        match name {
+            "vec_new" => {
+                if args.len() != 1 {
+                    bail!("vec_new expects 1 arg, got {}", args.len());
+                }
+                let expected_type = expected_type.ok_or_else(|| {
+                    anyhow!("vec_new requires a destination vec<T> type annotation")
+                })?;
+                let TypeSpec::Vec { element } = self.type_spec_in_root(root, expected_type)? else {
+                    bail!(
+                        "vec_new requires a destination vec<T> type annotation, got {}",
+                        self.type_name(expected_type)?
+                    );
+                };
+                self.require_phase20_buffer_element(root, &element, "vec_new")?;
+                let capacity = self.type_expr_with_locals(
+                    current_module,
+                    &args[0],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                require_type(
+                    &capacity.type_hash,
+                    &type_hash_for("I64"),
+                    "vec_new capacity",
+                    self,
+                )?;
+                let capacity_value = self
+                    .typed_literal_i64_value(&capacity.expr_hash)?
+                    .ok_or_else(|| {
+                        anyhow!("vec_new capacity must be an i64 literal in phase 20")
+                    })?;
+                if capacity_value < 0 {
+                    bail!("vec_new capacity must be non-negative, got {capacity_value}");
+                }
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "vec_new",
+                        "capacity": capacity.expr_hash,
+                        "capacity_type": capacity.type_hash,
+                        "capacity_value": capacity_value as u64,
+                        "element_type": element,
+                        "type": expected_type,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": expected_type }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash: expected_type.to_string(),
+                })
+            }
+            "vec_push" => {
+                if args.len() != 2 {
+                    bail!("vec_push expects 2 args, got {}", args.len());
+                }
+                let target = self.type_expr_with_locals(
+                    current_module,
+                    &args[0],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                if !self.typed_expr_is_assignable_place(root, &target.expr_hash)? {
+                    bail!("vec_push target must be a mutable vec place");
+                }
+                let TypeSpec::Vec { element } = self.type_spec_in_root(root, &target.type_hash)?
+                else {
+                    bail!(
+                        "vec_push target must be vec<T>, got {}",
+                        self.type_name(&target.type_hash)?
+                    );
+                };
+                self.require_phase20_buffer_element(root, &element, "vec_push")?;
+                let value = self.type_expr_with_locals_expecting(
+                    current_module,
+                    &args[1],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                    Some(&element),
+                )?;
+                if !self.type_assignable_in_root(root, &value.type_hash, &element)? {
+                    require_type(&value.type_hash, &element, "vec_push value", self)?;
+                }
+                let type_hash = type_hash_for("Unit");
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "vec_push",
+                        "target": target.expr_hash,
+                        "value": value.expr_hash,
+                        "vec_type": target.type_hash,
+                        "element_type": element,
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
+            "vec_get" => {
+                if args.len() != 2 {
+                    bail!("vec_get expects 2 args, got {}", args.len());
+                }
+                let target = self.type_expr_with_locals(
+                    current_module,
+                    &args[0],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                if !self.typed_expr_is_place(&target.expr_hash)? {
+                    bail!("vec_get target must be an addressable vec place");
+                }
+                let TypeSpec::Vec { element } = self.type_spec_in_root(root, &target.type_hash)?
+                else {
+                    bail!(
+                        "vec_get target must be vec<T>, got {}",
+                        self.type_name(&target.type_hash)?
+                    );
+                };
+                self.require_phase20_buffer_element(root, &element, "vec_get")?;
+                let index = self.type_expr_with_locals(
+                    current_module,
+                    &args[1],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                require_type(
+                    &index.type_hash,
+                    &type_hash_for("I64"),
+                    "vec_get index",
+                    self,
+                )?;
+                if let Some(value) = self.typed_literal_i64_value(&index.expr_hash)?
+                    && value < 0
+                {
+                    bail!("vec_get index must be non-negative, got {value}");
+                }
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "vec_get",
+                        "target": target.expr_hash,
+                        "index": index.expr_hash,
+                        "vec_type": target.type_hash,
+                        "element_type": element,
+                        "type": element,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": element }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash: element,
+                })
+            }
+            "vec_len" => {
+                if args.len() != 1 {
+                    bail!("vec_len expects 1 arg, got {}", args.len());
+                }
+                let target = self.type_expr_with_locals(
+                    current_module,
+                    &args[0],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                if !self.typed_expr_is_place(&target.expr_hash)? {
+                    bail!("vec_len target must be an addressable vec place");
+                }
+                let TypeSpec::Vec { element } = self.type_spec_in_root(root, &target.type_hash)?
+                else {
+                    bail!(
+                        "vec_len target must be vec<T>, got {}",
+                        self.type_name(&target.type_hash)?
+                    );
+                };
+                self.require_phase20_buffer_element(root, &element, "vec_len")?;
+                let type_hash = type_hash_for("I64");
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "vec_len",
+                        "target": target.expr_hash,
+                        "vec_type": target.type_hash,
+                        "element_type": element,
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
+            "string_new" => {
+                if args.len() != 1 {
+                    bail!("string_new expects 1 arg, got {}", args.len());
+                }
+                let source = self.type_expr_with_locals(
+                    current_module,
+                    &args[0],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                let TypeSpec::Slice {
+                    mutable: false,
+                    element,
+                    ..
+                } = self.type_spec_in_root(root, &source.type_hash)?
+                else {
+                    bail!("string_new source must be an immutable u8 slice");
+                };
+                if element != type_hash_for("U8") {
+                    bail!("string_new source must be an immutable u8 slice");
+                }
+                let source_payload = self.get_payload(&source.expr_hash)?;
+                if source_payload.get("expr_kind").and_then(JsonValue::as_str)
+                    != Some("static_bytes")
+                {
+                    bail!("string_new currently requires a static string or bytes literal source");
+                }
+                let static_data = source_payload
+                    .get("static_data")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_new source missing static_data"))?;
+                let bytes_hex = self.static_data_bytes_hex(static_data)?;
+                let type_hash = self.put_structural_type(TypeSpec::String)?;
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "string_new",
+                        "source": source.expr_hash,
+                        "source_type": source.type_hash,
+                        "source_static_data": static_data,
+                        "bytes_len": (bytes_hex.len() / 2) as u64,
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
+            "string_len" => {
+                if args.len() != 1 {
+                    bail!("string_len expects 1 arg, got {}", args.len());
+                }
+                let target = self.type_expr_with_locals(
+                    current_module,
+                    &args[0],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                if !self.typed_expr_is_place(&target.expr_hash)? {
+                    bail!("string_len target must be an addressable string place");
+                }
+                if !matches!(
+                    self.type_spec_in_root(root, &target.type_hash)?,
+                    TypeSpec::String
+                ) {
+                    bail!(
+                        "string_len target must be string, got {}",
+                        self.type_name(&target.type_hash)?
+                    );
+                }
+                let type_hash = type_hash_for("I64");
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "string_len",
+                        "target": target.expr_hash,
+                        "string_type": target.type_hash,
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
+            _ => bail!("unknown dynamic buffer builtin {name}"),
+        }
+    }
+
+    fn require_phase20_buffer_element(
+        &self,
+        root: &ProgramRootPayload,
+        element_type: &str,
+        op: &str,
+    ) -> Result<()> {
+        let class = self.value_class_in_root(root, element_type)?;
+        if class.copy_kind != ValueCopyKind::Copy
+            || class.drop_kind != ValueDropKind::Trivial
+            || class.contains_reference
+        {
+            bail!("{op} currently supports only Copy, non-reference elements with trivial drop");
+        }
+        let layout = self.compute_type_layout(root, element_type, DEFAULT_NATIVE_TARGET)?;
+        let size = layout
+            .metadata
+            .get("size_bytes")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| anyhow!("{op} element layout missing size_bytes"))?;
+        if !matches!(size, 1 | 8) {
+            bail!("{op} currently supports element sizes 1 and 8 bytes, got {size}");
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn type_builtin_slice_call(
         &mut self,
         current_module: &str,
@@ -4709,6 +5171,9 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("box_new missing value"))?;
                 self.expr_escapes_local_borrow(root, value, locals_with_local_borrows)
             }
+            "vec_new" | "vec_push" | "vec_get" | "vec_len" | "string_new" | "string_len" => {
+                Ok(false)
+            }
             "raw_ptr_cast" => {
                 let value = payload
                     .get("value")
@@ -5056,6 +5521,10 @@ impl CodeDb {
             TypeSpec::Box { element } => {
                 self.collect_reference_regions_in_type(root, &element, regions)
             }
+            TypeSpec::Vec { element } => {
+                self.collect_reference_regions_in_type(root, &element, regions)
+            }
+            TypeSpec::String => Ok(()),
             TypeSpec::Slice {
                 region, element, ..
             } => {
@@ -5150,6 +5619,10 @@ impl CodeDb {
             TypeSpec::Box { element } => {
                 self.validate_type_hash_in_root(root, &element, allowed_regions)
             }
+            TypeSpec::Vec { element } => {
+                self.validate_type_hash_in_root(root, &element, allowed_regions)
+            }
+            TypeSpec::String => Ok(()),
             TypeSpec::Slice {
                 region, element, ..
             } => {
@@ -5389,6 +5862,70 @@ impl CodeDb {
                         .any(|owner| loan_owner_overlaps(loan, owner))
                 });
                 Ok(())
+            }
+            "vec_new" => {
+                let capacity = payload
+                    .get("capacity")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_new missing capacity"))?;
+                self.verify_expr_borrows(root, capacity, param_types, state, ExprUse::Value)
+            }
+            "vec_push" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_push missing target"))?;
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_push missing value"))?;
+                self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
+                let target_place = self.loan_place_for_expr(target, param_types, &state.locals)?;
+                self.check_place_not_moved(&target_place, state)?;
+                self.check_loan_conflicts(&LoanKind::Mutable, &target_place, &state.active)?;
+                self.verify_expr_borrows(root, value, param_types, state, ExprUse::Value)
+            }
+            "vec_get" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_get missing target"))?;
+                let index = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_get missing index"))?;
+                self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
+                let place = self.loan_place_for_expr(target, param_types, &state.locals)?;
+                self.check_place_not_moved(&place, state)?;
+                self.check_shared_read_conflicts(&place, &state.active)?;
+                self.verify_expr_borrows(root, index, param_types, state, ExprUse::Value)
+            }
+            "vec_len" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_len missing target"))?;
+                self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
+                let place = self.loan_place_for_expr(target, param_types, &state.locals)?;
+                self.check_place_not_moved(&place, state)?;
+                self.check_shared_read_conflicts(&place, &state.active)
+            }
+            "string_new" => {
+                let source = payload
+                    .get("source")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_new missing source"))?;
+                self.verify_expr_borrows(root, source, param_types, state, ExprUse::Value)
+            }
+            "string_len" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_len missing target"))?;
+                self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
+                let place = self.loan_place_for_expr(target, param_types, &state.locals)?;
+                self.check_place_not_moved(&place, state)?;
+                self.check_shared_read_conflicts(&place, &state.active)
             }
             "raw_ptr_cast" => {
                 let value = payload
@@ -6448,7 +6985,15 @@ impl CodeDb {
                     *resolvable = false;
                 }
             }
-            TypeSpec::Builtin(_) | TypeSpec::RawPointer { .. } | TypeSpec::Named { .. } => {}
+            TypeSpec::Vec { element } => {
+                if self.value_class_in_root(root, &element)?.contains_reference {
+                    *resolvable = false;
+                }
+            }
+            TypeSpec::Builtin(_)
+            | TypeSpec::RawPointer { .. }
+            | TypeSpec::String
+            | TypeSpec::Named { .. } => {}
         }
         Ok(())
     }
@@ -6919,6 +7464,15 @@ impl CodeDb {
                         || self.expr_child_requires_state(&payload, "len")?
                 }
                 "box_new" => self.expr_child_requires_state(&payload, "value")?,
+                "vec_new" => self.expr_child_requires_state(&payload, "capacity")?,
+                "vec_push" => true,
+                "vec_get" => {
+                    self.expr_child_requires_state(&payload, "target")?
+                        || self.expr_child_requires_state(&payload, "index")?
+                }
+                "vec_len" => self.expr_child_requires_state(&payload, "target")?,
+                "string_new" => self.expr_child_requires_state(&payload, "source")?,
+                "string_len" => self.expr_child_requires_state(&payload, "target")?,
                 "raw_ptr_cast" => self.expr_child_requires_state(&payload, "value")?,
                 "raw_load" => self.expr_child_requires_state(&payload, "pointer")?,
                 "raw_store" => true,
@@ -7010,7 +7564,7 @@ impl CodeDb {
             {
                 "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref"
                 | "local_ref" => false,
-                "box_new" => true,
+                "box_new" | "vec_new" | "string_new" => true,
                 "assign" => {
                     self.expr_child_requires_alloc(&payload, "target")?
                         || self.expr_child_requires_alloc(&payload, "value")?
@@ -7048,6 +7602,16 @@ impl CodeDb {
                         || self.expr_child_requires_alloc(&payload, "start")?
                         || self.expr_child_requires_alloc(&payload, "len")?
                 }
+                "vec_push" => {
+                    self.expr_child_requires_alloc(&payload, "target")?
+                        || self.expr_child_requires_alloc(&payload, "value")?
+                }
+                "vec_get" => {
+                    self.expr_child_requires_alloc(&payload, "target")?
+                        || self.expr_child_requires_alloc(&payload, "index")?
+                }
+                "vec_len" => self.expr_child_requires_alloc(&payload, "target")?,
+                "string_len" => self.expr_child_requires_alloc(&payload, "target")?,
                 "let" => {
                     self.expr_child_requires_alloc(&payload, "value")?
                         || self.expr_child_requires_alloc(&payload, "body")?
@@ -7169,6 +7733,18 @@ impl CodeDb {
                         || self.expr_child_requires_unsafe(&payload, "len")?
                 }
                 "box_new" => self.expr_child_requires_unsafe(&payload, "value")?,
+                "vec_new" => self.expr_child_requires_unsafe(&payload, "capacity")?,
+                "vec_push" => {
+                    self.expr_child_requires_unsafe(&payload, "target")?
+                        || self.expr_child_requires_unsafe(&payload, "value")?
+                }
+                "vec_get" => {
+                    self.expr_child_requires_unsafe(&payload, "target")?
+                        || self.expr_child_requires_unsafe(&payload, "index")?
+                }
+                "vec_len" => self.expr_child_requires_unsafe(&payload, "target")?,
+                "string_new" => self.expr_child_requires_unsafe(&payload, "source")?,
+                "string_len" => self.expr_child_requires_unsafe(&payload, "target")?,
                 "let" => {
                     self.expr_child_requires_unsafe(&payload, "value")?
                         || self.expr_child_requires_unsafe(&payload, "body")?
@@ -7711,6 +8287,245 @@ impl CodeDb {
                 hash_for_type_spec(&TypeSpec::Box {
                     element: value_type,
                 })?
+            }
+            "vec_new" => {
+                let capacity_hash = payload
+                    .get("capacity")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_new missing capacity"))?;
+                let capacity_type = self.verify_expr_type_with_locals(
+                    capacity_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if capacity_type != type_hash_for("I64")
+                    || payload.get("capacity_type").and_then(JsonValue::as_str)
+                        != Some(capacity_type.as_str())
+                {
+                    bail!("vec_new capacity_type mismatch");
+                }
+                let capacity_value = payload
+                    .get("capacity_value")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("vec_new missing capacity_value"))?;
+                let Some(literal_capacity) = self.typed_literal_i64_value(capacity_hash)? else {
+                    bail!("vec_new capacity must be a literal in phase 20");
+                };
+                if literal_capacity < 0 || capacity_value != literal_capacity as u64 {
+                    bail!("vec_new capacity_value mismatch");
+                }
+                let element = payload
+                    .get("element_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_new missing element_type"))?;
+                self.validate_type_hash_in_root(root, element, allowed_regions)?;
+                self.require_phase20_buffer_element(root, element, "vec_new")?;
+                hash_for_type_spec(&TypeSpec::Vec {
+                    element: element.to_string(),
+                })?
+            }
+            "vec_push" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_push missing target"))?;
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_push missing value"))?;
+                let target_type = self.verify_expr_type_with_locals(
+                    target_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if payload.get("vec_type").and_then(JsonValue::as_str) != Some(target_type.as_str())
+                {
+                    bail!("vec_push vec_type mismatch");
+                }
+                if !self.typed_expr_is_assignable_place(root, target_hash)? {
+                    bail!("vec_push target must be a mutable vec place");
+                }
+                let TypeSpec::Vec { element } = self.type_spec_in_root(root, &target_type)? else {
+                    bail!("vec_push target must be vec<T>");
+                };
+                if payload.get("element_type").and_then(JsonValue::as_str) != Some(element.as_str())
+                {
+                    bail!("vec_push element_type mismatch");
+                }
+                self.require_phase20_buffer_element(root, &element, "vec_push")?;
+                let value_type = self.verify_expr_type_with_locals(
+                    value_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if !self.type_assignable_in_root(root, &value_type, &element)? {
+                    bail!("vec_push value type mismatch");
+                }
+                type_hash_for("Unit")
+            }
+            "vec_get" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_get missing target"))?;
+                let index_hash = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_get missing index"))?;
+                let target_type = self.verify_expr_type_with_locals(
+                    target_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if payload.get("vec_type").and_then(JsonValue::as_str) != Some(target_type.as_str())
+                {
+                    bail!("vec_get vec_type mismatch");
+                }
+                if !self.typed_expr_is_place(target_hash)? {
+                    bail!("vec_get target must be an addressable vec place");
+                }
+                let TypeSpec::Vec { element } = self.type_spec_in_root(root, &target_type)? else {
+                    bail!("vec_get target must be vec<T>");
+                };
+                if payload.get("element_type").and_then(JsonValue::as_str) != Some(element.as_str())
+                {
+                    bail!("vec_get element_type mismatch");
+                }
+                self.require_phase20_buffer_element(root, &element, "vec_get")?;
+                if self.verify_expr_type_with_locals(
+                    index_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )? != type_hash_for("I64")
+                {
+                    bail!("vec_get index must be i64");
+                }
+                if let Some(value) = self.typed_literal_i64_value(index_hash)?
+                    && value < 0
+                {
+                    bail!("vec_get index must be non-negative");
+                }
+                element
+            }
+            "vec_len" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("vec_len missing target"))?;
+                let target_type = self.verify_expr_type_with_locals(
+                    target_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if payload.get("vec_type").and_then(JsonValue::as_str) != Some(target_type.as_str())
+                {
+                    bail!("vec_len vec_type mismatch");
+                }
+                if !self.typed_expr_is_place(target_hash)? {
+                    bail!("vec_len target must be an addressable vec place");
+                }
+                let TypeSpec::Vec { element } = self.type_spec_in_root(root, &target_type)? else {
+                    bail!("vec_len target must be vec<T>");
+                };
+                if payload.get("element_type").and_then(JsonValue::as_str) != Some(element.as_str())
+                {
+                    bail!("vec_len element_type mismatch");
+                }
+                self.require_phase20_buffer_element(root, &element, "vec_len")?;
+                type_hash_for("I64")
+            }
+            "string_new" => {
+                let source_hash = payload
+                    .get("source")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_new missing source"))?;
+                let source_type = self.verify_expr_type_with_locals(
+                    source_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if payload.get("source_type").and_then(JsonValue::as_str)
+                    != Some(source_type.as_str())
+                {
+                    bail!("string_new source_type mismatch");
+                }
+                let TypeSpec::Slice {
+                    mutable: false,
+                    element,
+                    ..
+                } = self.type_spec_in_root(root, &source_type)?
+                else {
+                    bail!("string_new source must be immutable u8 slice");
+                };
+                if element != type_hash_for("U8") {
+                    bail!("string_new source must be immutable u8 slice");
+                }
+                let source_payload = self.get_payload(source_hash)?;
+                if source_payload.get("expr_kind").and_then(JsonValue::as_str)
+                    != Some("static_bytes")
+                {
+                    bail!("string_new source must be static_bytes in phase 20");
+                }
+                let static_data = payload
+                    .get("source_static_data")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_new missing source_static_data"))?;
+                if source_payload
+                    .get("static_data")
+                    .and_then(JsonValue::as_str)
+                    != Some(static_data)
+                {
+                    bail!("string_new source_static_data mismatch");
+                }
+                let bytes_hex = self.static_data_bytes_hex(static_data)?;
+                if payload.get("bytes_len").and_then(JsonValue::as_u64)
+                    != Some((bytes_hex.len() / 2) as u64)
+                {
+                    bail!("string_new bytes_len mismatch");
+                }
+                hash_for_type_spec(&TypeSpec::String)?
+            }
+            "string_len" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_len missing target"))?;
+                let target_type = self.verify_expr_type_with_locals(
+                    target_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if payload.get("string_type").and_then(JsonValue::as_str)
+                    != Some(target_type.as_str())
+                {
+                    bail!("string_len string_type mismatch");
+                }
+                if !self.typed_expr_is_place(target_hash)? {
+                    bail!("string_len target must be an addressable string place");
+                }
+                if !matches!(
+                    self.type_spec_in_root(root, &target_type)?,
+                    TypeSpec::String
+                ) {
+                    bail!("string_len target must be string");
+                }
+                type_hash_for("I64")
             }
             "raw_ptr_cast" => {
                 let value_hash = payload
@@ -8767,6 +9582,8 @@ impl TypeSpec {
                 }
             }
             TypeSpec::Box { element } => Ok(format!("box<{}>", db.type_name(element)?)),
+            TypeSpec::Vec { element } => Ok(format!("vec<{}>", db.type_name(element)?)),
+            TypeSpec::String => Ok("string".to_string()),
             TypeSpec::Slice {
                 region,
                 mutable,
@@ -8837,6 +9654,10 @@ enum ParsedTypeSpec {
     Box {
         element: Box<ParsedTypeSpec>,
     },
+    Vec {
+        element: Box<ParsedTypeSpec>,
+    },
+    String,
     Slice {
         region: String,
         mutable: bool,
@@ -8867,6 +9688,10 @@ impl ParsedTypeSpec {
             ParsedTypeSpec::Box { element } => Ok(TypeSpec::Box {
                 element: type_hash_for_spec(element)?,
             }),
+            ParsedTypeSpec::Vec { element } => Ok(TypeSpec::Vec {
+                element: type_hash_for_spec(element)?,
+            }),
+            ParsedTypeSpec::String => Ok(TypeSpec::String),
             ParsedTypeSpec::Slice { region, .. } => {
                 bail!("slice region '{region} requires root-aware resolution")
             }
@@ -8918,6 +9743,8 @@ fn type_hash_for_spec(spec: &ParsedTypeSpec) -> Result<String> {
         }
         ParsedTypeSpec::RawPointer { .. }
         | ParsedTypeSpec::Box { .. }
+        | ParsedTypeSpec::Vec { .. }
+        | ParsedTypeSpec::String
         | ParsedTypeSpec::FixedArray { .. }
         | ParsedTypeSpec::Record(_)
         | ParsedTypeSpec::Enum(_) => {
@@ -8974,6 +9801,16 @@ pub(crate) fn type_payload_for_spec(spec: &TypeSpec) -> Result<JsonValue> {
                 "element": element,
             })
         }
+        TypeSpec::Vec { element } => {
+            validate_type_hash("vec element", element)?;
+            json!({
+                "type_kind": "Vec",
+                "element": element,
+            })
+        }
+        TypeSpec::String => json!({
+            "type_kind": "String",
+        }),
         TypeSpec::Slice {
             region,
             mutable,
@@ -9099,6 +9936,16 @@ pub(crate) fn type_spec_from_payload(payload: &JsonValue) -> Result<TypeSpec> {
             validate_type_hash("box element", &element)?;
             Ok(TypeSpec::Box { element })
         }
+        "Vec" => {
+            let element = payload
+                .get("element")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("Vec Type object missing element"))?
+                .to_string();
+            validate_type_hash("vec element", &element)?;
+            Ok(TypeSpec::Vec { element })
+        }
+        "String" => Ok(TypeSpec::String),
         "Slice" => {
             let region = payload
                 .get("region")
@@ -9383,6 +10230,9 @@ impl TypeParser {
             TypeToken::Ident(value) if value == "unit" || value == "Unit" => {
                 Ok(ParsedTypeSpec::Builtin("Unit".to_string()))
             }
+            TypeToken::Ident(value) if value == "string" || value == "String" => {
+                Ok(ParsedTypeSpec::String)
+            }
             TypeToken::Ident(value) if value == "record" => {
                 Ok(ParsedTypeSpec::Record(self.parse_fields("record field")?))
             }
@@ -9398,6 +10248,9 @@ impl TypeParser {
                 pointee: Box::new(self.parse_single_type_arg()?),
             }),
             TypeToken::Ident(value) if value == "box" => Ok(ParsedTypeSpec::Box {
+                element: Box::new(self.parse_single_type_arg()?),
+            }),
+            TypeToken::Ident(value) if value == "vec" => Ok(ParsedTypeSpec::Vec {
                 element: Box::new(self.parse_single_type_arg()?),
             }),
             TypeToken::Ident(value) if value == "slice" => self.parse_slice_type(false),

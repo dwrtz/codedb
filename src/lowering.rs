@@ -344,6 +344,49 @@ pub(crate) enum LoweredOp {
         slice_type_hash: String,
         element_type_hash: String,
     },
+    VecNew {
+        id: String,
+        address: String,
+        capacity: u64,
+        element_type_hash: String,
+        type_hash: String,
+    },
+    VecPush {
+        id: String,
+        vec_address: String,
+        value: String,
+        vec_type_hash: String,
+        element_type_hash: String,
+        type_hash: String,
+    },
+    VecGet {
+        id: String,
+        vec_address: String,
+        index: String,
+        vec_type_hash: String,
+        element_type_hash: String,
+        type_hash: String,
+    },
+    VecLen {
+        id: String,
+        vec_address: String,
+        vec_type_hash: String,
+        type_hash: String,
+    },
+    StringNew {
+        id: String,
+        address: String,
+        static_data_hash: String,
+        bytes_hex: String,
+        len: u64,
+        type_hash: String,
+    },
+    StringLen {
+        id: String,
+        string_address: String,
+        string_type_hash: String,
+        type_hash: String,
+    },
     BoundsCheck {
         id: String,
         index: String,
@@ -1238,6 +1281,12 @@ impl CodeDb {
                 self.lower_subslice(root, expr_hash, &type_hash, param_types, ctx, locals)
             }
             "box_new" => self.lower_box_new(root, expr_hash, &type_hash, param_types, ctx, locals),
+            "vec_new" => self.lower_vec_new(root, expr_hash, &type_hash, param_types, ctx, locals),
+            "vec_push" => self.lower_vec_push(root, expr_hash, param_types, ctx, locals),
+            "vec_get" => self.lower_vec_get(root, expr_hash, &type_hash, param_types, ctx, locals),
+            "vec_len" => self.lower_vec_len(root, expr_hash, param_types, ctx, locals),
+            "string_new" => self.lower_string_new(root, expr_hash, &type_hash, ctx),
+            "string_len" => self.lower_string_len(root, expr_hash, param_types, ctx, locals),
             "raw_ptr_cast" => {
                 self.lower_raw_ptr_cast(root, expr_hash, &type_hash, param_types, ctx, locals)
             }
@@ -2167,6 +2216,281 @@ impl CodeDb {
             operations,
             value: id,
             type_hash: result_box_type.to_string(),
+        })
+    }
+
+    fn lower_vec_new(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        _param_types: &[String],
+        ctx: &mut LowerCtx,
+        _locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let element_type_hash = payload
+            .get("element_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("vec_new missing element_type"))?
+            .to_string();
+        match self.type_spec_in_root(root, type_hash)? {
+            TypeSpec::Vec { element } if element == element_type_hash => {}
+            _ => bail!("vec_new lowered type mismatch"),
+        }
+        let capacity = payload
+            .get("capacity_value")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| anyhow!("vec_new missing capacity_value"))?;
+        self.compute_type_layout(root, &element_type_hash, ctx.target_triple())?;
+        let slot_size =
+            stack_slot_size_bytes(self.layout_size_bytes(root, ctx.target_triple(), type_hash)?);
+        let slot = ctx.local_slot(type_hash.to_string(), slot_size);
+        let address = ctx.value();
+        ctx.push_debug_op(expr_hash, "addr_of_local", &address);
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "vec_new", &id);
+        Ok(LoweredExpr {
+            operations: vec![
+                LoweredOp::AddrOfLocal {
+                    id: address.clone(),
+                    place: LoweredPlace::Local {
+                        slot,
+                        type_hash: type_hash.to_string(),
+                    },
+                },
+                LoweredOp::VecNew {
+                    id: id.clone(),
+                    address,
+                    capacity,
+                    element_type_hash,
+                    type_hash: type_hash.to_string(),
+                },
+            ],
+            value: id,
+            type_hash: type_hash.to_string(),
+        })
+    }
+
+    fn lower_vec_push(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let target_hash = payload
+            .get("target")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("vec_push missing target"))?;
+        let value_hash = payload
+            .get("value")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("vec_push missing value"))?;
+        let target = self.lower_place(root, target_hash, param_types, ctx, locals)?;
+        let TypeSpec::Vec { element } = self.type_spec_in_root(root, &target.type_hash)? else {
+            bail!("vec_push target must lower as vec<T>");
+        };
+        let declared_element = payload
+            .get("element_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("vec_push missing element_type"))?;
+        if declared_element != element {
+            bail!("vec_push element_type mismatch while lowering");
+        }
+        let value = self.lower_expr_as(root, value_hash, &element, param_types, ctx, locals)?;
+        if !self.type_assignable_in_root(root, &value.type_hash, &element)? {
+            bail!("vec_push value type mismatch while lowering");
+        }
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "vec_push", &id);
+        let mut operations = target.operations;
+        operations.extend(value.operations);
+        operations.push(LoweredOp::VecPush {
+            id: id.clone(),
+            vec_address: target.address,
+            value: value.value,
+            vec_type_hash: target.type_hash,
+            element_type_hash: element,
+            type_hash: type_hash_for("Unit"),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash_for("Unit"),
+        })
+    }
+
+    fn lower_vec_get(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let target_hash = payload
+            .get("target")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("vec_get missing target"))?;
+        let index_hash = payload
+            .get("index")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("vec_get missing index"))?;
+        let target = self.lower_place(root, target_hash, param_types, ctx, locals)?;
+        let TypeSpec::Vec { element } = self.type_spec_in_root(root, &target.type_hash)? else {
+            bail!("vec_get target must lower as vec<T>");
+        };
+        if element != type_hash {
+            bail!("vec_get result type mismatch while lowering");
+        }
+        let index = self.lower_expr(root, index_hash, param_types, ctx, locals)?;
+        if index.type_hash != type_hash_for("I64") {
+            bail!("vec_get index type mismatch while lowering");
+        }
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "vec_get", &id);
+        let mut operations = target.operations;
+        operations.extend(index.operations);
+        operations.push(LoweredOp::VecGet {
+            id: id.clone(),
+            vec_address: target.address,
+            index: index.value,
+            vec_type_hash: target.type_hash,
+            element_type_hash: element,
+            type_hash: type_hash.to_string(),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash.to_string(),
+        })
+    }
+
+    fn lower_vec_len(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let target_hash = payload
+            .get("target")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("vec_len missing target"))?;
+        let target = self.lower_place(root, target_hash, param_types, ctx, locals)?;
+        if !matches!(
+            self.type_spec_in_root(root, &target.type_hash)?,
+            TypeSpec::Vec { .. }
+        ) {
+            bail!("vec_len target must lower as vec<T>");
+        }
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "vec_len", &id);
+        let mut operations = target.operations;
+        operations.push(LoweredOp::VecLen {
+            id: id.clone(),
+            vec_address: target.address,
+            vec_type_hash: target.type_hash,
+            type_hash: type_hash_for("I64"),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash_for("I64"),
+        })
+    }
+
+    fn lower_string_new(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        ctx: &mut LowerCtx,
+    ) -> Result<LoweredExpr> {
+        if !matches!(self.type_spec_in_root(root, type_hash)?, TypeSpec::String) {
+            bail!("string_new lowered type mismatch");
+        }
+        let payload = self.get_payload(expr_hash)?;
+        let static_data_hash = payload
+            .get("source_static_data")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("string_new missing source_static_data"))?
+            .to_string();
+        let bytes_hex = self.static_data_bytes_hex(&static_data_hash)?;
+        let len = u64::try_from(bytes_hex.len() / 2)?;
+        if payload.get("bytes_len").and_then(JsonValue::as_u64) != Some(len) {
+            bail!("string_new bytes_len mismatch while lowering");
+        }
+        let slot_size =
+            stack_slot_size_bytes(self.layout_size_bytes(root, ctx.target_triple(), type_hash)?);
+        let slot = ctx.local_slot(type_hash.to_string(), slot_size);
+        let address = ctx.value();
+        ctx.push_debug_op(expr_hash, "addr_of_local", &address);
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "string_new", &id);
+        Ok(LoweredExpr {
+            operations: vec![
+                LoweredOp::AddrOfLocal {
+                    id: address.clone(),
+                    place: LoweredPlace::Local {
+                        slot,
+                        type_hash: type_hash.to_string(),
+                    },
+                },
+                LoweredOp::StringNew {
+                    id: id.clone(),
+                    address,
+                    static_data_hash,
+                    bytes_hex,
+                    len,
+                    type_hash: type_hash.to_string(),
+                },
+            ],
+            value: id,
+            type_hash: type_hash.to_string(),
+        })
+    }
+
+    fn lower_string_len(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let target_hash = payload
+            .get("target")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("string_len missing target"))?;
+        let target = self.lower_place(root, target_hash, param_types, ctx, locals)?;
+        if !matches!(
+            self.type_spec_in_root(root, &target.type_hash)?,
+            TypeSpec::String
+        ) {
+            bail!("string_len target must lower as string");
+        }
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "string_len", &id);
+        let mut operations = target.operations;
+        operations.push(LoweredOp::StringLen {
+            id: id.clone(),
+            string_address: target.address,
+            string_type_hash: target.type_hash,
+            type_hash: type_hash_for("I64"),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash_for("I64"),
         })
     }
 
@@ -4182,7 +4506,9 @@ impl CodeDb {
             | TypeSpec::Slice { .. }
             | TypeSpec::Reference { .. }
             | TypeSpec::RawPointer { .. }
-            | TypeSpec::Box { .. } => Ok(()),
+            | TypeSpec::Box { .. }
+            | TypeSpec::Vec { .. }
+            | TypeSpec::String => Ok(()),
             _ => bail!("lowering v1 does not support aggregate return type {type_name}"),
         }
     }
@@ -4199,6 +4525,8 @@ impl CodeDb {
                 | TypeSpec::Enum(_)
                 | TypeSpec::FixedArray { .. }
                 | TypeSpec::Slice { .. }
+                | TypeSpec::Vec { .. }
+                | TypeSpec::String
         ))
     }
 
@@ -4264,6 +4592,9 @@ impl CodeDb {
             TypeSpec::Box { element } => {
                 self.collect_lowered_layout_type_hashes(root, &element, out, seen)?;
             }
+            TypeSpec::Vec { element } => {
+                self.collect_lowered_layout_type_hashes(root, &element, out, seen)?;
+            }
             TypeSpec::FixedArray { element, .. } | TypeSpec::Slice { element, .. } => {
                 self.collect_lowered_layout_type_hashes(root, &element, out, seen)?;
             }
@@ -4283,7 +4614,7 @@ impl CodeDb {
                     self.collect_lowered_layout_type_hashes(root, &variant.type_hash, out, seen)?;
                 }
             }
-            TypeSpec::Builtin(_) | TypeSpec::Named { .. } => {}
+            TypeSpec::Builtin(_) | TypeSpec::Named { .. } | TypeSpec::String => {}
         }
         Ok(())
     }
@@ -5326,6 +5657,131 @@ impl CodeDb {
                     }
                     insert_address(addresses, id, element_type_hash)?;
                 }
+                LoweredOp::VecNew {
+                    id,
+                    address,
+                    capacity: _,
+                    element_type_hash,
+                    type_hash,
+                } => {
+                    if address_type(addresses, address)? != type_hash {
+                        bail!("lowered vec_new address type mismatch");
+                    }
+                    match self.type_spec(type_hash)? {
+                        TypeSpec::Vec { element } if element == *element_type_hash => {}
+                        _ => bail!("lowered vec_new type mismatch"),
+                    }
+                    self.compute_type_layout(root, element_type_hash, target_triple)?;
+                    insert_value(values, id, type_hash)?;
+                    insert_address(addresses, id, type_hash)?;
+                }
+                LoweredOp::VecPush {
+                    id,
+                    vec_address,
+                    value,
+                    vec_type_hash,
+                    element_type_hash,
+                    type_hash,
+                } => {
+                    if address_type(addresses, vec_address)? != vec_type_hash {
+                        bail!("lowered vec_push address type mismatch");
+                    }
+                    match self.type_spec(vec_type_hash)? {
+                        TypeSpec::Vec { element } if element == *element_type_hash => {}
+                        _ => bail!("lowered vec_push vec type mismatch"),
+                    }
+                    if value_type(values, value)? != element_type_hash {
+                        bail!("lowered vec_push value type mismatch");
+                    }
+                    if type_hash != &type_hash_for("Unit") {
+                        bail!("lowered vec_push result type mismatch");
+                    }
+                    insert_value(values, id, type_hash)?;
+                }
+                LoweredOp::VecGet {
+                    id,
+                    vec_address,
+                    index,
+                    vec_type_hash,
+                    element_type_hash,
+                    type_hash,
+                } => {
+                    if address_type(addresses, vec_address)? != vec_type_hash {
+                        bail!("lowered vec_get address type mismatch");
+                    }
+                    match self.type_spec(vec_type_hash)? {
+                        TypeSpec::Vec { element } if element == *element_type_hash => {}
+                        _ => bail!("lowered vec_get vec type mismatch"),
+                    }
+                    if value_type(values, index)? != &type_hash_for("I64") {
+                        bail!("lowered vec_get index must be i64");
+                    }
+                    if type_hash != element_type_hash {
+                        bail!("lowered vec_get result type mismatch");
+                    }
+                    insert_value(values, id, type_hash)?;
+                    if self.is_aggregate_ir_type(root, type_hash)? {
+                        insert_address(addresses, id, type_hash)?;
+                    }
+                }
+                LoweredOp::VecLen {
+                    id,
+                    vec_address,
+                    vec_type_hash,
+                    type_hash,
+                } => {
+                    if address_type(addresses, vec_address)? != vec_type_hash {
+                        bail!("lowered vec_len address type mismatch");
+                    }
+                    if !matches!(self.type_spec(vec_type_hash)?, TypeSpec::Vec { .. }) {
+                        bail!("lowered vec_len target must be vec");
+                    }
+                    if type_hash != &type_hash_for("I64") {
+                        bail!("lowered vec_len result must be i64");
+                    }
+                    insert_value(values, id, type_hash)?;
+                }
+                LoweredOp::StringNew {
+                    id,
+                    address,
+                    static_data_hash,
+                    bytes_hex,
+                    len,
+                    type_hash,
+                } => {
+                    if address_type(addresses, address)? != type_hash {
+                        bail!("lowered string_new address type mismatch");
+                    }
+                    if !matches!(self.type_spec(type_hash)?, TypeSpec::String) {
+                        bail!("lowered string_new type mismatch");
+                    }
+                    let expected = self.static_data_bytes_hex(static_data_hash)?;
+                    if &expected != bytes_hex {
+                        bail!("lowered string_new bytes mismatch");
+                    }
+                    if bytes_hex.len() / 2 != usize::try_from(*len)? {
+                        bail!("lowered string_new len mismatch");
+                    }
+                    insert_value(values, id, type_hash)?;
+                    insert_address(addresses, id, type_hash)?;
+                }
+                LoweredOp::StringLen {
+                    id,
+                    string_address,
+                    string_type_hash,
+                    type_hash,
+                } => {
+                    if address_type(addresses, string_address)? != string_type_hash {
+                        bail!("lowered string_len address type mismatch");
+                    }
+                    if !matches!(self.type_spec(string_type_hash)?, TypeSpec::String) {
+                        bail!("lowered string_len target must be string");
+                    }
+                    if type_hash != &type_hash_for("I64") {
+                        bail!("lowered string_len result must be i64");
+                    }
+                    insert_value(values, id, type_hash)?;
+                }
                 LoweredOp::BoundsCheck {
                     id,
                     index,
@@ -5801,6 +6257,12 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::ConstructSlice { id, .. }
         | LoweredOp::SliceLen { id, .. }
         | LoweredOp::SliceData { id, .. }
+        | LoweredOp::VecNew { id, .. }
+        | LoweredOp::VecPush { id, .. }
+        | LoweredOp::VecGet { id, .. }
+        | LoweredOp::VecLen { id, .. }
+        | LoweredOp::StringNew { id, .. }
+        | LoweredOp::StringLen { id, .. }
         | LoweredOp::BoundsCheck { id, .. }
         | LoweredOp::SliceRangeCheck { id, .. }
         | LoweredOp::LoadEnumTag { id, .. }
@@ -5844,6 +6306,12 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::ConstructSlice { .. } => "construct_slice",
         LoweredOp::SliceLen { .. } => "slice_len",
         LoweredOp::SliceData { .. } => "slice_data",
+        LoweredOp::VecNew { .. } => "vec_new",
+        LoweredOp::VecPush { .. } => "vec_push",
+        LoweredOp::VecGet { .. } => "vec_get",
+        LoweredOp::VecLen { .. } => "vec_len",
+        LoweredOp::StringNew { .. } => "string_new",
+        LoweredOp::StringLen { .. } => "string_len",
         LoweredOp::BoundsCheck { .. } => "bounds_check",
         LoweredOp::SliceRangeCheck { .. } => "slice_range_check",
         LoweredOp::LoadEnumTag { .. } => "load_enum_tag",
@@ -6020,6 +6488,49 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             } => {
                 out.insert(slice_type_hash.clone());
                 out.insert(element_type_hash.clone());
+            }
+            LoweredOp::VecNew {
+                type_hash,
+                element_type_hash,
+                ..
+            } => {
+                out.insert(type_hash.clone());
+                out.insert(element_type_hash.clone());
+            }
+            LoweredOp::VecPush {
+                type_hash,
+                vec_type_hash,
+                element_type_hash,
+                ..
+            }
+            | LoweredOp::VecGet {
+                type_hash,
+                vec_type_hash,
+                element_type_hash,
+                ..
+            } => {
+                out.insert(type_hash.clone());
+                out.insert(vec_type_hash.clone());
+                out.insert(element_type_hash.clone());
+            }
+            LoweredOp::VecLen {
+                type_hash,
+                vec_type_hash,
+                ..
+            } => {
+                out.insert(type_hash.clone());
+                out.insert(vec_type_hash.clone());
+            }
+            LoweredOp::StringNew { type_hash, .. } => {
+                out.insert(type_hash.clone());
+            }
+            LoweredOp::StringLen {
+                type_hash,
+                string_type_hash,
+                ..
+            } => {
+                out.insert(type_hash.clone());
+                out.insert(string_type_hash.clone());
             }
             LoweredOp::Fold {
                 target_type_hash,

@@ -1937,7 +1937,9 @@ pub(crate) fn test_value_from_value(value: &Value) -> Result<TestValue> {
         | Value::MutRef(_)
         | Value::RawPtr { .. }
         | Value::Slice { .. }
-        | Value::Boxed(_) => bail!(
+        | Value::Boxed(_)
+        | Value::Vec { .. }
+        | Value::String(_) => bail!(
             "semantic test values do not support reference, raw-pointer, or heap-owner actual values"
         ),
     })
