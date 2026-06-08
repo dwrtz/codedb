@@ -619,6 +619,8 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::DerefMut { .. }
             | LoweredOp::DerefBox { .. }
             | LoweredOp::HeapAlloc { .. }
+            | LoweredOp::PtrCast { .. }
+            | LoweredOp::DerefRaw { .. }
             | LoweredOp::AddrOfParam { .. }
             | LoweredOp::AddrOfLocal { .. }
             | LoweredOp::AddrOfField { .. }
@@ -715,6 +717,7 @@ fn validate_native_ops(
             | LoweredOp::Case { type_hash, .. }
             | LoweredOp::Fold { type_hash, .. }
             | LoweredOp::HeapAlloc { type_hash, .. }
+            | LoweredOp::PtrCast { type_hash, .. }
             | LoweredOp::Return { type_hash, .. } => {
                 native_supported_type(type_layouts, type_hash, i64_type, bool_type, unit_type)?;
             }
@@ -723,6 +726,7 @@ fn validate_native_ops(
             | LoweredOp::DerefShared { .. }
             | LoweredOp::DerefMut { .. }
             | LoweredOp::DerefBox { .. }
+            | LoweredOp::DerefRaw { .. }
             | LoweredOp::ConstructSlice { .. }
             | LoweredOp::SliceLen { .. }
             | LoweredOp::SliceData { .. } => {}
@@ -1116,6 +1120,91 @@ fn validate_native_op_flow(
             }
             native_insert_value(values, id, type_hash)?;
             native_insert_address(addresses, id, element_type_hash)?;
+        }
+        LoweredOp::PtrCast {
+            id,
+            value,
+            source_type_hash,
+            type_hash,
+        } => {
+            if native_value_type(values, value)? != source_type_hash {
+                bail!("native object backend saw ptr_cast source type mismatch");
+            }
+            let target_layout = native_type_layout(type_layouts, type_hash)?;
+            if target_layout.kind != "raw_pointer" {
+                bail!("native object backend saw ptr_cast to non-raw-pointer");
+            }
+            let target_pointee = native_layout_string(target_layout, "pointee_type_hash")?;
+            let source_layout = native_type_layout(type_layouts, source_type_hash)?;
+            match source_layout.kind.as_str() {
+                "reference" => {
+                    if native_layout_string(source_layout, "referent_type_hash")? != target_pointee
+                    {
+                        bail!("native object backend saw ptr_cast reference pointee mismatch");
+                    }
+                    let source_mutable = source_layout
+                        .metadata
+                        .get("mutable")
+                        .and_then(JsonValue::as_bool)
+                        .ok_or_else(|| anyhow!("native reference layout missing mutable"))?;
+                    let target_mutable = target_layout
+                        .metadata
+                        .get("mutable")
+                        .and_then(JsonValue::as_bool)
+                        .ok_or_else(|| anyhow!("native raw pointer layout missing mutable"))?;
+                    if target_mutable && !source_mutable {
+                        bail!("native object backend saw ptr_cast mutability upgrade");
+                    }
+                }
+                "raw_pointer" => {
+                    if native_layout_string(source_layout, "pointee_type_hash")? != target_pointee {
+                        bail!("native object backend saw ptr_cast raw pointee mismatch");
+                    }
+                    let source_mutable = source_layout
+                        .metadata
+                        .get("mutable")
+                        .and_then(JsonValue::as_bool)
+                        .ok_or_else(|| anyhow!("native raw pointer layout missing mutable"))?;
+                    let target_mutable = target_layout
+                        .metadata
+                        .get("mutable")
+                        .and_then(JsonValue::as_bool)
+                        .ok_or_else(|| anyhow!("native raw pointer layout missing mutable"))?;
+                    if target_mutable && !source_mutable {
+                        bail!("native object backend saw ptr_cast mutability upgrade");
+                    }
+                }
+                other => bail!("native object backend saw ptr_cast source kind {other}"),
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::DerefRaw {
+            id,
+            pointer,
+            pointer_type_hash,
+            pointee_type_hash,
+            mutable,
+        } => {
+            if native_value_type(values, pointer)? != pointer_type_hash {
+                bail!("native object backend saw deref_raw pointer type mismatch");
+            }
+            let pointer_layout = native_type_layout(type_layouts, pointer_type_hash)?;
+            if pointer_layout.kind != "raw_pointer"
+                || native_layout_string(pointer_layout, "pointee_type_hash")? != *pointee_type_hash
+            {
+                bail!("native object backend saw deref_raw layout mismatch");
+            }
+            let pointer_mutable = pointer_layout
+                .metadata
+                .get("mutable")
+                .and_then(JsonValue::as_bool)
+                .ok_or_else(|| anyhow!("native raw pointer layout missing mutable"))?;
+            if *mutable && !pointer_mutable {
+                bail!("native object backend saw mutable deref_raw from shared raw pointer");
+            }
+            native_type_layout(type_layouts, pointee_type_hash)?;
+            native_insert_address(addresses, id, pointee_type_hash)?;
+            native_insert_value(values, id, pointee_type_hash)?;
         }
         LoweredOp::AddrOfParam { id, place } => {
             let LoweredPlace::Param {
@@ -1886,6 +1975,8 @@ fn collect_value_ids_inner(
             | LoweredOp::DerefMut { id, .. }
             | LoweredOp::DerefBox { id, .. }
             | LoweredOp::HeapAlloc { id, .. }
+            | LoweredOp::PtrCast { id, .. }
+            | LoweredOp::DerefRaw { id, .. }
             | LoweredOp::AddrOfParam { id, .. }
             | LoweredOp::AddrOfLocal { id, .. }
             | LoweredOp::AddrOfField { id, .. }
@@ -2136,6 +2227,14 @@ impl FunctionEmitter {
             }
             LoweredOp::HeapAlloc { id, size_bytes, .. } => {
                 self.emit_heap_alloc_x86(id, *size_bytes)?;
+            }
+            LoweredOp::PtrCast { id, value, .. } => {
+                self.mov_rax_stack(self.value_offset(value)?);
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::DerefRaw { id, pointer, .. } => {
+                self.mov_rax_stack(self.value_offset(pointer)?);
+                self.mov_stack_rax(self.value_offset(id)?);
             }
             LoweredOp::AddrOfParam { id, place } => {
                 let LoweredPlace::Param { slot, indirect, .. } = place else {
@@ -3465,6 +3564,14 @@ impl Arm64Emitter {
             }
             LoweredOp::HeapAlloc { id, size_bytes, .. } => {
                 self.emit_heap_alloc_arm64(id, *size_bytes)?;
+            }
+            LoweredOp::PtrCast { id, value, .. } => {
+                self.ldr_stack(0, self.value_offset(value)?)?;
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::DerefRaw { id, pointer, .. } => {
+                self.ldr_stack(0, self.value_offset(pointer)?)?;
+                self.str_stack(0, self.value_offset(id)?)?;
             }
             LoweredOp::AddrOfParam { id, place } => {
                 let LoweredPlace::Param { slot, indirect, .. } = place else {

@@ -871,6 +871,16 @@ layouts, so there is no user-callable `heap_free` surface.
 
 Goal: expose low-level native interop without weakening safe semantic references.
 
+Status: implemented. Raw pointer structural types are usable in projection and
+apply surfaces, `unsafe` is a first-class effect, raw pointer conversion from
+references and raw mutable-to-shared pointer casts lower through explicit
+`ptr_cast`, raw load/store lower through `deref_raw` plus native load/store,
+and raw load/store are limited to Copy, non-reference, trivially-droppable
+pointees for the initial unsafe surface. Extern declarations with raw pointer
+arguments or returns must declare both `ffi` and `unsafe`, platform externs
+such as `write`, `malloc`, and `free` validate with explicit unsafe effects,
+and compiled link plans list compiler-generated platform capsule relocations.
+
 Deliverables:
 
 ```text

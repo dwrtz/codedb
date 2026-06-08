@@ -937,6 +937,14 @@ fn expr_reachable_from(
             expr_reachable_child_field(db, &payload, "right", target_hash, seen)
         }
         "unary" => expr_reachable_child_field(db, &payload, "expr", target_hash, seen),
+        "raw_ptr_cast" => expr_reachable_child_field(db, &payload, "value", target_hash, seen),
+        "raw_load" => expr_reachable_child_field(db, &payload, "pointer", target_hash, seen),
+        "raw_store" => {
+            if expr_reachable_child_field(db, &payload, "pointer", target_hash, seen)? {
+                return Ok(true);
+            }
+            expr_reachable_child_field(db, &payload, "value", target_hash, seen)
+        }
         "let" => {
             if expr_reachable_child_field(db, &payload, "value", target_hash, seen)? {
                 return Ok(true);

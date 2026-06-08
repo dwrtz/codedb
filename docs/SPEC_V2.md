@@ -168,10 +168,10 @@ std.platform
 The platform capsule should be as small as practical. Initial capsule candidates:
 
 ```text
-extern write(fd: i64, ptr: raw_ptr<u8>, len: i64) -> i64 effects [ffi, io]
-extern read(fd: i64, ptr: raw_mut_ptr<u8>, len: i64) -> i64 effects [ffi, io]
-extern malloc(size: i64, align: i64) -> raw_mut_ptr<u8> effects [ffi, alloc]
-extern free(ptr: raw_mut_ptr<u8>) -> unit effects [ffi, alloc]
+extern write(fd: i64, ptr: raw_ptr<u8>, len: i64) -> i64 effects [ffi, io, unsafe]
+extern read(fd: i64, ptr: raw_mut_ptr<u8>, len: i64) -> i64 effects [ffi, io, unsafe]
+extern malloc(size: i64, align: i64) -> raw_mut_ptr<u8> effects [ffi, alloc, unsafe]
+extern free(ptr: raw_mut_ptr<u8>) -> unit effects [ffi, alloc, unsafe]
 extern trap(code: i64) -> unit effects [ffi, trap]
 extern exit(code: i64) -> unit effects [ffi]
 ```

@@ -284,6 +284,19 @@ pub(crate) enum LoweredOp {
         element_type_hash: String,
         type_hash: String,
     },
+    PtrCast {
+        id: String,
+        value: String,
+        source_type_hash: String,
+        type_hash: String,
+    },
+    DerefRaw {
+        id: String,
+        pointer: String,
+        pointer_type_hash: String,
+        pointee_type_hash: String,
+        mutable: bool,
+    },
     AddrOfParam {
         id: String,
         place: LoweredPlace,
@@ -1213,6 +1226,11 @@ impl CodeDb {
                 self.lower_subslice(root, expr_hash, &type_hash, param_types, ctx, locals)
             }
             "box_new" => self.lower_box_new(root, expr_hash, &type_hash, param_types, ctx, locals),
+            "raw_ptr_cast" => {
+                self.lower_raw_ptr_cast(root, expr_hash, &type_hash, param_types, ctx, locals)
+            }
+            "raw_load" => self.lower_raw_load(root, expr_hash, param_types, ctx, locals),
+            "raw_store" => self.lower_raw_store(root, expr_hash, param_types, ctx, locals),
             "assign" => {
                 let target_hash = payload
                     .get("target")
@@ -2089,6 +2107,207 @@ impl CodeDb {
             operations,
             value: id,
             type_hash: type_hash.to_string(),
+        })
+    }
+
+    fn lower_raw_ptr_cast(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let value_hash = payload
+            .get("value")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("raw_ptr_cast missing value"))?;
+        let source_type_hash = payload
+            .get("source_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("raw_ptr_cast missing source_type"))?
+            .to_string();
+        let pointee_type_hash = payload
+            .get("pointee_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("raw_ptr_cast missing pointee_type"))?;
+        let mutable = payload
+            .get("mutable")
+            .and_then(JsonValue::as_bool)
+            .ok_or_else(|| anyhow!("raw_ptr_cast missing mutable"))?;
+        match self.type_spec(type_hash)? {
+            TypeSpec::RawPointer {
+                mutable: m,
+                pointee,
+            } if m == mutable && pointee == pointee_type_hash => {}
+            _ => bail!("raw_ptr_cast result type mismatch while lowering"),
+        }
+        let value = self.lower_expr_as(
+            root,
+            value_hash,
+            &source_type_hash,
+            param_types,
+            ctx,
+            locals,
+        )?;
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "ptr_cast", &id);
+        let mut operations = value.operations;
+        operations.push(LoweredOp::PtrCast {
+            id: id.clone(),
+            value: value.value,
+            source_type_hash,
+            type_hash: type_hash.to_string(),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash.to_string(),
+        })
+    }
+
+    fn lower_raw_load(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let pointer_hash = payload
+            .get("pointer")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("raw_load missing pointer"))?;
+        let pointer_type_hash = payload
+            .get("pointer_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("raw_load missing pointer_type"))?
+            .to_string();
+        let pointee_type_hash = payload
+            .get("pointee_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("raw_load missing pointee_type"))?
+            .to_string();
+        let TypeSpec::RawPointer { pointee, .. } = self.type_spec(&pointer_type_hash)? else {
+            bail!("raw_load pointer_type is not raw pointer");
+        };
+        if pointee != pointee_type_hash {
+            bail!("raw_load pointee metadata mismatch while lowering");
+        }
+        let pointer = self.lower_expr_as(
+            root,
+            pointer_hash,
+            &pointer_type_hash,
+            param_types,
+            ctx,
+            locals,
+        )?;
+        let address = ctx.value();
+        ctx.push_debug_op(expr_hash, "deref_raw", &address);
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "load", &id);
+        let mut operations = pointer.operations;
+        operations.push(LoweredOp::DerefRaw {
+            id: address.clone(),
+            pointer: pointer.value,
+            pointer_type_hash,
+            pointee_type_hash: pointee_type_hash.clone(),
+            mutable: false,
+        });
+        operations.push(LoweredOp::Load {
+            id: id.clone(),
+            address,
+            type_hash: pointee_type_hash.clone(),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: pointee_type_hash,
+        })
+    }
+
+    fn lower_raw_store(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let pointer_hash = payload
+            .get("pointer")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("raw_store missing pointer"))?;
+        let value_hash = payload
+            .get("value")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("raw_store missing value"))?;
+        let pointer_type_hash = payload
+            .get("pointer_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("raw_store missing pointer_type"))?
+            .to_string();
+        let pointee_type_hash = payload
+            .get("pointee_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("raw_store missing pointee_type"))?
+            .to_string();
+        let TypeSpec::RawPointer {
+            mutable: true,
+            pointee,
+        } = self.type_spec(&pointer_type_hash)?
+        else {
+            bail!("raw_store pointer_type is not raw mutable pointer");
+        };
+        if pointee != pointee_type_hash {
+            bail!("raw_store pointee metadata mismatch while lowering");
+        }
+        let pointer = self.lower_expr_as(
+            root,
+            pointer_hash,
+            &pointer_type_hash,
+            param_types,
+            ctx,
+            locals,
+        )?;
+        let value = self.lower_expr_as(
+            root,
+            value_hash,
+            &pointee_type_hash,
+            param_types,
+            ctx,
+            locals,
+        )?;
+        let address = ctx.value();
+        ctx.push_debug_op(expr_hash, "deref_raw", &address);
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "const_unit", &id);
+        let mut operations = pointer.operations;
+        operations.extend(value.operations);
+        operations.push(LoweredOp::DerefRaw {
+            id: address.clone(),
+            pointer: pointer.value,
+            pointer_type_hash,
+            pointee_type_hash: pointee_type_hash.clone(),
+            mutable: true,
+        });
+        operations.push(LoweredOp::Store {
+            address,
+            value: value.value,
+            type_hash: pointee_type_hash,
+        });
+        operations.push(LoweredOp::ConstUnit {
+            id: id.clone(),
+            type_hash: type_hash_for("Unit"),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash_for("Unit"),
         })
     }
 
@@ -4739,6 +4958,55 @@ impl CodeDb {
                     insert_value(values, id, type_hash)?;
                     insert_address(addresses, id, element_type_hash)?;
                 }
+                LoweredOp::PtrCast {
+                    id,
+                    value,
+                    source_type_hash,
+                    type_hash,
+                } => {
+                    if value_type(values, value)? != source_type_hash {
+                        bail!("lowered ptr_cast source type mismatch");
+                    }
+                    let TypeSpec::RawPointer { mutable, pointee } = self.type_spec(type_hash)?
+                    else {
+                        bail!("lowered ptr_cast result must be raw pointer");
+                    };
+                    match self.type_spec(source_type_hash)? {
+                        TypeSpec::Reference {
+                            mutable: source_mutable,
+                            referent,
+                            ..
+                        } if referent == pointee && (!mutable || source_mutable) => {}
+                        TypeSpec::RawPointer {
+                            mutable: source_mutable,
+                            pointee: source_pointee,
+                        } if source_pointee == pointee && (!mutable || source_mutable) => {}
+                        _ => bail!("lowered ptr_cast source must be compatible pointer"),
+                    }
+                    insert_value(values, id, type_hash)?;
+                }
+                LoweredOp::DerefRaw {
+                    id,
+                    pointer,
+                    pointer_type_hash,
+                    pointee_type_hash,
+                    mutable,
+                } => {
+                    if value_type(values, pointer)? != pointer_type_hash {
+                        bail!("lowered deref_raw pointer type mismatch");
+                    }
+                    match self.type_spec(pointer_type_hash)? {
+                        TypeSpec::RawPointer {
+                            mutable: source_mutable,
+                            pointee,
+                        } if pointee == *pointee_type_hash && (!*mutable || source_mutable) => {}
+                        _ => bail!("lowered deref_raw requires compatible raw pointer value"),
+                    }
+                    insert_address(addresses, id, pointee_type_hash)?;
+                    if self.is_aggregate_ir_type(root, pointee_type_hash)? {
+                        insert_value(values, id, pointee_type_hash)?;
+                    }
+                }
                 LoweredOp::AddrOfParam { id, place } => {
                     let LoweredPlace::Param {
                         slot,
@@ -5402,6 +5670,8 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::DerefMut { id, .. }
         | LoweredOp::DerefBox { id, .. }
         | LoweredOp::HeapAlloc { id, .. }
+        | LoweredOp::PtrCast { id, .. }
+        | LoweredOp::DerefRaw { id, .. }
         | LoweredOp::AddrOfParam { id, .. }
         | LoweredOp::AddrOfLocal { id, .. }
         | LoweredOp::AddrOfField { id, .. }
@@ -5442,6 +5712,8 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::DerefMut { .. } => "deref_mut",
         LoweredOp::DerefBox { .. } => "deref_box",
         LoweredOp::HeapAlloc { .. } => "heap_alloc",
+        LoweredOp::PtrCast { .. } => "ptr_cast",
+        LoweredOp::DerefRaw { .. } => "deref_raw",
         LoweredOp::AddrOfParam { .. } => "addr_of_param",
         LoweredOp::AddrOfLocal { .. } => "addr_of_local",
         LoweredOp::AddrOfField { .. } => "addr_of_field",
@@ -5584,6 +5856,22 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             } => {
                 out.insert(box_type_hash.clone());
                 out.insert(element_type_hash.clone());
+            }
+            LoweredOp::PtrCast {
+                source_type_hash,
+                type_hash,
+                ..
+            } => {
+                out.insert(source_type_hash.clone());
+                out.insert(type_hash.clone());
+            }
+            LoweredOp::DerefRaw {
+                pointer_type_hash,
+                pointee_type_hash,
+                ..
+            } => {
+                out.insert(pointer_type_hash.clone());
+                out.insert(pointee_type_hash.clone());
             }
             LoweredOp::ConstructSlice {
                 type_hash,

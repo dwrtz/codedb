@@ -167,6 +167,7 @@ pub enum Effect {
     State,
     Alloc,
     Ffi,
+    Unsafe,
     Concurrent,
 }
 
@@ -179,6 +180,7 @@ impl Effect {
             Effect::State => "state",
             Effect::Alloc => "alloc",
             Effect::Ffi => "ffi",
+            Effect::Unsafe => "unsafe",
             Effect::Concurrent => "concurrent",
         }
     }
@@ -191,6 +193,7 @@ impl Effect {
             "state" => Ok(Effect::State),
             "alloc" => Ok(Effect::Alloc),
             "ffi" => Ok(Effect::Ffi),
+            "unsafe" => Ok(Effect::Unsafe),
             "concurrent" => Ok(Effect::Concurrent),
             other => bail!("unknown effect {other}"),
         }
@@ -2263,7 +2266,41 @@ impl CodeDb {
         if !effects.contains(&Effect::Ffi) {
             bail!("external functions must declare the ffi effect");
         }
+        if self.signature_uses_raw_pointer(signature)? && !effects.contains(&Effect::Unsafe) {
+            bail!(
+                "external functions with raw pointer arguments or returns must declare the unsafe effect"
+            );
+        }
         Ok(())
+    }
+
+    fn signature_uses_raw_pointer(&self, signature: &str) -> Result<bool> {
+        let (params, return_type) = self.signature_parts(signature)?;
+        for param in params {
+            if self.type_contains_raw_pointer(&param)? {
+                return Ok(true);
+            }
+        }
+        self.type_contains_raw_pointer(&return_type)
+    }
+
+    fn type_contains_raw_pointer(&self, type_hash: &str) -> Result<bool> {
+        match self.type_spec(type_hash)? {
+            TypeSpec::RawPointer { .. } => Ok(true),
+            TypeSpec::Reference { referent, .. } => self.type_contains_raw_pointer(&referent),
+            TypeSpec::Box { element } => self.type_contains_raw_pointer(&element),
+            TypeSpec::Slice { element, .. } => self.type_contains_raw_pointer(&element),
+            TypeSpec::FixedArray { element, .. } => self.type_contains_raw_pointer(&element),
+            TypeSpec::Record(fields) | TypeSpec::Enum(fields) => {
+                for field in fields {
+                    if self.type_contains_raw_pointer(&field.type_hash)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            TypeSpec::Builtin(_) | TypeSpec::Named { .. } => Ok(false),
+        }
     }
 
     pub(crate) fn function_body_hash(&self, definition_hash: &str) -> Result<String> {
@@ -2765,6 +2802,21 @@ impl CodeDb {
                 }
             }
             RawExpr::Call { name, args } => {
+                if matches!(
+                    name.as_str(),
+                    "raw_ptr" | "raw_mut_ptr" | "raw_load" | "raw_store"
+                ) {
+                    return self.type_builtin_raw_pointer_call(
+                        current_module,
+                        name,
+                        args,
+                        root,
+                        param_names,
+                        param_types,
+                        region_scope,
+                        locals,
+                    );
+                }
                 if matches!(name.as_str(), "slice" | "mut_slice" | "len" | "subslice") {
                     return self.type_builtin_slice_call(
                         current_module,
@@ -3717,6 +3769,200 @@ impl CodeDb {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn type_builtin_raw_pointer_call(
+        &mut self,
+        current_module: &str,
+        name: &str,
+        args: &[RawExpr],
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
+        locals: &mut Vec<LocalTypeBinding>,
+    ) -> Result<TypeCheckResult> {
+        match name {
+            "raw_ptr" | "raw_mut_ptr" => {
+                if args.len() != 1 {
+                    bail!("{name} expects 1 arg, got {}", args.len());
+                }
+                let value = self.type_expr_with_locals(
+                    current_module,
+                    &args[0],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                let target_mutable = name == "raw_mut_ptr";
+                let pointee = match self.type_spec_in_root(root, &value.type_hash)? {
+                    TypeSpec::Reference {
+                        mutable, referent, ..
+                    } => {
+                        if target_mutable && !mutable {
+                            bail!("raw_mut_ptr expects a mutable reference or raw mutable pointer");
+                        }
+                        referent
+                    }
+                    TypeSpec::RawPointer {
+                        mutable, pointee, ..
+                    } => {
+                        if target_mutable && !mutable {
+                            bail!("raw_mut_ptr cannot cast a shared raw pointer to mutable");
+                        }
+                        pointee
+                    }
+                    other => bail!(
+                        "{name} expects a reference or raw pointer, got {}",
+                        other.to_source(self)?
+                    ),
+                };
+                let type_hash = self.put_structural_type(TypeSpec::RawPointer {
+                    mutable: target_mutable,
+                    pointee: pointee.clone(),
+                })?;
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "raw_ptr_cast",
+                        "value": value.expr_hash,
+                        "source_type": value.type_hash,
+                        "pointee_type": pointee,
+                        "mutable": target_mutable,
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
+            "raw_load" => {
+                if args.len() != 1 {
+                    bail!("raw_load expects 1 arg, got {}", args.len());
+                }
+                let pointer = self.type_expr_with_locals(
+                    current_module,
+                    &args[0],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                let TypeSpec::RawPointer { pointee, .. } =
+                    self.type_spec_in_root(root, &pointer.type_hash)?
+                else {
+                    bail!("raw_load expects a raw pointer");
+                };
+                let class = self.value_class_in_root(root, &pointee)?;
+                if class.copy_kind != ValueCopyKind::Copy
+                    || class.drop_kind != ValueDropKind::Trivial
+                    || class.contains_reference
+                {
+                    bail!(
+                        "raw_load currently supports only Copy, non-reference values with trivial drop"
+                    );
+                }
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "raw_load",
+                        "pointer": pointer.expr_hash,
+                        "pointer_type": pointer.type_hash,
+                        "pointee_type": pointee.clone(),
+                        "type": pointee.clone(),
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": pointee }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash: pointee,
+                })
+            }
+            "raw_store" => {
+                if args.len() != 2 {
+                    bail!("raw_store expects 2 args, got {}", args.len());
+                }
+                let pointer = self.type_expr_with_locals(
+                    current_module,
+                    &args[0],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                let TypeSpec::RawPointer {
+                    mutable: true,
+                    pointee,
+                } = self.type_spec_in_root(root, &pointer.type_hash)?
+                else {
+                    bail!("raw_store expects a raw mutable pointer");
+                };
+                let class = self.value_class_in_root(root, &pointee)?;
+                if class.copy_kind != ValueCopyKind::Copy
+                    || class.drop_kind != ValueDropKind::Trivial
+                    || class.contains_reference
+                {
+                    bail!(
+                        "raw_store currently supports only Copy, non-reference values with trivial drop"
+                    );
+                }
+                let value = self.type_expr_with_locals_expecting(
+                    current_module,
+                    &args[1],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                    Some(&pointee),
+                )?;
+                if !self.type_assignable_in_root(root, &value.type_hash, &pointee)? {
+                    require_type(&value.type_hash, &pointee, "raw_store value", self)?;
+                }
+                let type_hash = type_hash_for("Unit");
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "raw_store",
+                        "pointer": pointer.expr_hash,
+                        "value": value.expr_hash,
+                        "pointer_type": pointer.type_hash,
+                        "pointee_type": pointee,
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
+            _ => bail!("unknown raw pointer builtin {name}"),
+        }
+    }
+
     fn type_builtin_box_new(
         &mut self,
         current_module: &str,
@@ -4259,6 +4505,15 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("box_new missing value"))?;
                 self.expr_escapes_local_borrow(root, value, locals_with_local_borrows)
             }
+            "raw_ptr_cast" => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_ptr_cast missing value"))?;
+                self.expr_escapes_local_borrow(root, value, locals_with_local_borrows)
+            }
+            "raw_load" => Ok(false),
+            "raw_store" => Ok(false),
             "assign" => Ok(false),
             "let" => {
                 let value_hash = payload
@@ -4736,6 +4991,12 @@ impl CodeDb {
                 self.symbol_display(root, &entry.symbol)?
             );
         }
+        if self.expr_requires_unsafe(&body)? && !declared.contains(&Effect::Unsafe) {
+            bail!(
+                "bad_effects: function {} requires undeclared effect unsafe",
+                self.symbol_display(root, &entry.symbol)?
+            );
+        }
         let dependencies = self.dependencies_for_definition(root, &entry.definition)?;
         for dependency in dependencies {
             let Some(callee) = self.root_symbol(root, &dependency) else {
@@ -4923,6 +5184,30 @@ impl CodeDb {
                         .iter()
                         .any(|owner| loan_owner_overlaps(loan, owner))
                 });
+                Ok(())
+            }
+            "raw_ptr_cast" => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_ptr_cast missing value"))?;
+                self.verify_expr_borrows(root, value, param_types, state, ExprUse::Value)
+            }
+            "raw_load" => {
+                let pointer = payload
+                    .get("pointer")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_load missing pointer"))?;
+                self.verify_expr_borrows(root, pointer, param_types, state, ExprUse::Value)
+            }
+            "raw_store" => {
+                for key in ["pointer", "value"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("raw_store missing {key}"))?;
+                    self.verify_expr_borrows(root, child, param_types, state, ExprUse::Value)?;
+                }
                 Ok(())
             }
             "assign" => {
@@ -6420,6 +6705,9 @@ impl CodeDb {
                         || self.expr_child_requires_state(&payload, "len")?
                 }
                 "box_new" => self.expr_child_requires_state(&payload, "value")?,
+                "raw_ptr_cast" => self.expr_child_requires_state(&payload, "value")?,
+                "raw_load" => self.expr_child_requires_state(&payload, "pointer")?,
+                "raw_store" => true,
                 "let" => {
                     self.expr_child_requires_state(&payload, "value")?
                         || self.expr_child_requires_state(&payload, "body")?
@@ -6536,6 +6824,12 @@ impl CodeDb {
                 "borrow_shared" | "borrow_mut" | "slice_from_array" | "slice_len" => {
                     self.expr_child_requires_alloc(&payload, "target")?
                 }
+                "raw_ptr_cast" => self.expr_child_requires_alloc(&payload, "value")?,
+                "raw_load" => self.expr_child_requires_alloc(&payload, "pointer")?,
+                "raw_store" => {
+                    self.expr_child_requires_alloc(&payload, "pointer")?
+                        || self.expr_child_requires_alloc(&payload, "value")?
+                }
                 "subslice" => {
                     self.expr_child_requires_alloc(&payload, "target")?
                         || self.expr_child_requires_alloc(&payload, "start")?
@@ -6617,6 +6911,128 @@ impl CodeDb {
             .and_then(JsonValue::as_str)
             .ok_or_else(|| anyhow!("expression missing {key}"))?;
         self.expr_requires_alloc(child)
+    }
+
+    fn expr_requires_unsafe(&self, expr_hash: &str) -> Result<bool> {
+        let payload = self.get_payload(expr_hash)?;
+        Ok(
+            match payload
+                .get("expr_kind")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
+            {
+                "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" | "local_ref" => {
+                    false
+                }
+                "raw_ptr_cast" | "raw_load" | "raw_store" => true,
+                "assign" => {
+                    self.expr_child_requires_unsafe(&payload, "target")?
+                        || self.expr_child_requires_unsafe(&payload, "value")?
+                }
+                "call" => {
+                    let mut required = false;
+                    for arg in payload
+                        .get("args")
+                        .and_then(JsonValue::as_array)
+                        .ok_or_else(|| anyhow!("call missing args"))?
+                    {
+                        let arg = arg
+                            .as_str()
+                            .ok_or_else(|| anyhow!("call arg must be hash"))?;
+                        required |= self.expr_requires_unsafe(arg)?;
+                    }
+                    required
+                }
+                "binary" => {
+                    self.expr_child_requires_unsafe(&payload, "left")?
+                        || self.expr_child_requires_unsafe(&payload, "right")?
+                }
+                "unary" => self.expr_child_requires_unsafe(&payload, "expr")?,
+                "borrow_shared" | "borrow_mut" | "slice_from_array" | "slice_len" => {
+                    self.expr_child_requires_unsafe(&payload, "target")?
+                }
+                "subslice" => {
+                    self.expr_child_requires_unsafe(&payload, "target")?
+                        || self.expr_child_requires_unsafe(&payload, "start")?
+                        || self.expr_child_requires_unsafe(&payload, "len")?
+                }
+                "box_new" => self.expr_child_requires_unsafe(&payload, "value")?,
+                "let" => {
+                    self.expr_child_requires_unsafe(&payload, "value")?
+                        || self.expr_child_requires_unsafe(&payload, "body")?
+                }
+                "if" => {
+                    self.expr_child_requires_unsafe(&payload, "cond")?
+                        || self.expr_child_requires_unsafe(&payload, "then")?
+                        || self.expr_child_requires_unsafe(&payload, "else")?
+                }
+                "fold" => {
+                    self.expr_child_requires_unsafe(&payload, "target")?
+                        || self.expr_child_requires_unsafe(&payload, "init")?
+                        || self.expr_child_requires_unsafe(&payload, "body")?
+                }
+                "record_literal" => {
+                    let mut required = false;
+                    for field in payload
+                        .get("fields")
+                        .and_then(JsonValue::as_array)
+                        .ok_or_else(|| anyhow!("record_literal missing fields"))?
+                    {
+                        let value = field
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("record field missing value"))?;
+                        required |= self.expr_requires_unsafe(value)?;
+                    }
+                    required
+                }
+                "array_literal" => {
+                    let mut required = false;
+                    for element in payload
+                        .get("elements")
+                        .and_then(JsonValue::as_array)
+                        .ok_or_else(|| anyhow!("array_literal missing elements"))?
+                    {
+                        let value = element
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("array element missing value"))?;
+                        required |= self.expr_requires_unsafe(value)?;
+                    }
+                    required
+                }
+                "array_index" => {
+                    self.expr_child_requires_unsafe(&payload, "target")?
+                        || self.expr_child_requires_unsafe(&payload, "index")?
+                }
+                "field_access" => self.expr_child_requires_unsafe(&payload, "target")?,
+                "enum_construct" => self.expr_child_requires_unsafe(&payload, "value")?,
+                "case" => {
+                    let mut required = self.expr_child_requires_unsafe(&payload, "expr")?;
+                    for arm in payload
+                        .get("arms")
+                        .and_then(JsonValue::as_array)
+                        .ok_or_else(|| anyhow!("case missing arms"))?
+                    {
+                        let body = arm
+                            .get("body")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("case arm missing body"))?;
+                        required |= self.expr_requires_unsafe(body)?;
+                    }
+                    required
+                }
+                other => bail!("unknown expression kind {other}"),
+            },
+        )
+    }
+
+    fn expr_child_requires_unsafe(&self, payload: &JsonValue, key: &str) -> Result<bool> {
+        let child = payload
+            .get(key)
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing {key}"))?;
+        self.expr_requires_unsafe(child)
     }
 
     pub(crate) fn verify_expr_type(
@@ -7041,6 +7457,154 @@ impl CodeDb {
                 hash_for_type_spec(&TypeSpec::Box {
                     element: value_type,
                 })?
+            }
+            "raw_ptr_cast" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_ptr_cast missing value"))?;
+                let value_type = self.verify_expr_type_with_locals(
+                    value_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if payload.get("source_type").and_then(JsonValue::as_str)
+                    != Some(value_type.as_str())
+                {
+                    bail!("raw_ptr_cast source_type mismatch");
+                }
+                let mutable = payload
+                    .get("mutable")
+                    .and_then(JsonValue::as_bool)
+                    .ok_or_else(|| anyhow!("raw_ptr_cast missing mutable"))?;
+                let pointee_type = payload
+                    .get("pointee_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_ptr_cast missing pointee_type"))?;
+                match self.type_spec_in_root(root, &value_type)? {
+                    TypeSpec::Reference {
+                        mutable: source_mutable,
+                        referent,
+                        ..
+                    } => {
+                        if referent != pointee_type {
+                            bail!("raw_ptr_cast pointee_type mismatch");
+                        }
+                        if mutable && !source_mutable {
+                            bail!(
+                                "raw_ptr_cast cannot create raw mutable pointer from shared reference"
+                            );
+                        }
+                    }
+                    TypeSpec::RawPointer {
+                        mutable: source_mutable,
+                        pointee,
+                    } => {
+                        if pointee != pointee_type {
+                            bail!("raw_ptr_cast pointee_type mismatch");
+                        }
+                        if mutable && !source_mutable {
+                            bail!("raw_ptr_cast cannot cast raw shared pointer to mutable");
+                        }
+                    }
+                    _ => bail!("raw_ptr_cast source must be reference or raw pointer"),
+                }
+                hash_for_type_spec(&TypeSpec::RawPointer {
+                    mutable,
+                    pointee: pointee_type.to_string(),
+                })?
+            }
+            "raw_load" => {
+                let pointer_hash = payload
+                    .get("pointer")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_load missing pointer"))?;
+                let pointer_type = self.verify_expr_type_with_locals(
+                    pointer_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if payload.get("pointer_type").and_then(JsonValue::as_str)
+                    != Some(pointer_type.as_str())
+                {
+                    bail!("raw_load pointer_type mismatch");
+                }
+                let TypeSpec::RawPointer { pointee, .. } =
+                    self.type_spec_in_root(root, &pointer_type)?
+                else {
+                    bail!("raw_load pointer must be raw pointer");
+                };
+                if payload.get("pointee_type").and_then(JsonValue::as_str) != Some(pointee.as_str())
+                {
+                    bail!("raw_load pointee_type mismatch");
+                }
+                let class = self.value_class_in_root(root, &pointee)?;
+                if class.copy_kind != ValueCopyKind::Copy
+                    || class.drop_kind != ValueDropKind::Trivial
+                    || class.contains_reference
+                {
+                    bail!(
+                        "raw_load currently supports only Copy, non-reference values with trivial drop"
+                    );
+                }
+                pointee
+            }
+            "raw_store" => {
+                let pointer_hash = payload
+                    .get("pointer")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_store missing pointer"))?;
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_store missing value"))?;
+                let pointer_type = self.verify_expr_type_with_locals(
+                    pointer_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if payload.get("pointer_type").and_then(JsonValue::as_str)
+                    != Some(pointer_type.as_str())
+                {
+                    bail!("raw_store pointer_type mismatch");
+                }
+                let TypeSpec::RawPointer {
+                    mutable: true,
+                    pointee,
+                } = self.type_spec_in_root(root, &pointer_type)?
+                else {
+                    bail!("raw_store pointer must be raw mutable pointer");
+                };
+                if payload.get("pointee_type").and_then(JsonValue::as_str) != Some(pointee.as_str())
+                {
+                    bail!("raw_store pointee_type mismatch");
+                }
+                let value_type = self.verify_expr_type_with_locals(
+                    value_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if !self.type_assignable_in_root(root, &value_type, &pointee)? {
+                    bail!("raw_store value type mismatch");
+                }
+                let class = self.value_class_in_root(root, &pointee)?;
+                if class.copy_kind != ValueCopyKind::Copy
+                    || class.drop_kind != ValueDropKind::Trivial
+                    || class.contains_reference
+                {
+                    bail!(
+                        "raw_store currently supports only Copy, non-reference values with trivial drop"
+                    );
+                }
+                type_hash_for("Unit")
             }
             "assign" => {
                 let target = payload

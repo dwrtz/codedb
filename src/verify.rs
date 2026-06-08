@@ -3970,6 +3970,8 @@ fn collect_lowered_call_targets(
             | LoweredOp::DerefMut { .. }
             | LoweredOp::DerefBox { .. }
             | LoweredOp::HeapAlloc { .. }
+            | LoweredOp::PtrCast { .. }
+            | LoweredOp::DerefRaw { .. }
             | LoweredOp::LoadEnumTag { .. }
             | LoweredOp::Load { .. }
             | LoweredOp::StoreEnumTag { .. }

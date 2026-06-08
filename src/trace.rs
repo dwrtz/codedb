@@ -99,6 +99,16 @@ impl TraceValue {
                     value: TraceValue::from_value(&value.borrow()),
                 }],
             },
+            Value::RawPtr { mutable, .. } => TraceValue::Record {
+                fields: vec![TraceRecordField {
+                    name: if *mutable {
+                        "raw_mut_ptr".to_string()
+                    } else {
+                        "raw_ptr".to_string()
+                    },
+                    value: TraceValue::Unit,
+                }],
+            },
             Value::Slice { elements, .. } => TraceValue::Array {
                 elements: elements
                     .iter()
@@ -958,6 +968,127 @@ impl CodeDb {
                     expr_hash,
                     value,
                 )
+            }
+            "raw_ptr_cast" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_ptr_cast missing value"))?;
+                let mutable = payload
+                    .get("mutable")
+                    .and_then(JsonValue::as_bool)
+                    .ok_or_else(|| anyhow!("raw_ptr_cast missing mutable"))?;
+                let source = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    value_hash,
+                    args,
+                    locals,
+                )?;
+                let value = match source {
+                    Value::SharedRef(target) => {
+                        if mutable {
+                            bail!("cannot make raw mutable pointer from shared reference");
+                        }
+                        Ok(Value::RawPtr { target, mutable })
+                    }
+                    Value::MutRef(target) => Ok(Value::RawPtr { target, mutable }),
+                    Value::RawPtr {
+                        target,
+                        mutable: source_mutable,
+                    } => {
+                        if mutable && !source_mutable {
+                            bail!("cannot cast raw shared pointer to mutable");
+                        }
+                        Ok(Value::RawPtr { target, mutable })
+                    }
+                    other => bail!("raw_ptr cast evaluated non-pointer source {other}"),
+                };
+                self.finish_current_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    expr_hash,
+                    value,
+                )
+            }
+            "raw_load" => {
+                let pointer_hash = payload
+                    .get("pointer")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_load missing pointer"))?;
+                let pointer = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    pointer_hash,
+                    args,
+                    locals,
+                )?;
+                let value = match pointer {
+                    Value::RawPtr { target, .. } => Ok(target.borrow().clone()),
+                    other => bail!("raw_load evaluated non-pointer source {other}"),
+                };
+                self.finish_current_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    expr_hash,
+                    value,
+                )
+            }
+            "raw_store" => {
+                let pointer_hash = payload
+                    .get("pointer")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_store missing pointer"))?;
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_store missing value"))?;
+                let pointer = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    pointer_hash,
+                    args,
+                    locals,
+                )?;
+                let value = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    value_hash,
+                    args,
+                    locals,
+                )?;
+                match pointer {
+                    Value::RawPtr {
+                        target,
+                        mutable: true,
+                    } => {
+                        *target.borrow_mut() = value;
+                        self.finish_current_expr(
+                            state,
+                            frame,
+                            symbol_hash,
+                            function_def_hash,
+                            expr_hash,
+                            Ok(Value::Unit),
+                        )
+                    }
+                    Value::RawPtr { mutable: false, .. } => {
+                        bail!("raw_store requires raw mutable pointer")
+                    }
+                    other => bail!("raw_store evaluated non-pointer source {other}"),
+                }
             }
             "assign" => {
                 let target_hash = payload

@@ -459,6 +459,7 @@ impl CodeDb {
         if input_hash != planned.input_hash {
             bail!("computed link input hash does not match planned link input hash");
         }
+        let platform_external_symbols = platform_external_symbols_from_objects(&object_entries)?;
         let mut plan = json!({
             "schema": LINK_PLAN_SCHEMA,
             "input_hash": &input_hash,
@@ -468,6 +469,7 @@ impl CodeDb {
             "objects": object_entries,
             "export_map": planned.export_map.clone(),
             "external_symbols": planned.external_symbol_entries(),
+            "platform_external_symbols": platform_external_symbols,
             "output_kind": planned.input["output_kind"].clone(),
             "link_options": planned.link_options.clone(),
         });
@@ -1039,6 +1041,38 @@ fn required_metadata_u64(metadata: &JsonValue, key: &str) -> Result<u64> {
         .get(key)
         .and_then(JsonValue::as_u64)
         .ok_or_else(|| anyhow!("native metadata missing u64 {key}"))
+}
+
+fn platform_external_symbols_from_objects(objects: &[JsonValue]) -> Result<Vec<JsonValue>> {
+    let mut symbols = BTreeMap::new();
+    for object in objects {
+        for relocation in object
+            .get("relocations")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| anyhow!("link object missing relocations"))?
+        {
+            if relocation.get("platform").and_then(JsonValue::as_bool) != Some(true) {
+                continue;
+            }
+            let symbol_hash = relocation
+                .get("target_symbol_hash")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("platform relocation missing target_symbol_hash"))?;
+            let abi_symbol = relocation
+                .get("target_abi_symbol")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("platform relocation missing target_abi_symbol"))?;
+            symbols.insert(
+                symbol_hash.to_string(),
+                json!({
+                    "symbol_hash": symbol_hash,
+                    "link_name": abi_symbol,
+                    "platform": true,
+                }),
+            );
+        }
+    }
+    Ok(symbols.into_values().collect())
 }
 
 fn native_record_field_layouts(

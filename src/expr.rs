@@ -184,6 +184,10 @@ pub enum Value {
     Unit,
     SharedRef(ValueCell),
     MutRef(ValueCell),
+    RawPtr {
+        target: ValueCell,
+        mutable: bool,
+    },
     Boxed(ValueCell),
     Slice {
         elements: Vec<ValueCell>,
@@ -207,6 +211,16 @@ impl PartialEq for Value {
             (Value::Unit, Value::Unit) => true,
             (Value::SharedRef(left), Value::SharedRef(right))
             | (Value::MutRef(left), Value::MutRef(right)) => *left.borrow() == *right.borrow(),
+            (
+                Value::RawPtr {
+                    target: left,
+                    mutable: left_mutable,
+                },
+                Value::RawPtr {
+                    target: right,
+                    mutable: right_mutable,
+                },
+            ) => left_mutable == right_mutable && Rc::ptr_eq(left, right),
             (Value::Boxed(left), Value::Boxed(right)) => *left.borrow() == *right.borrow(),
             (
                 Value::Slice {
@@ -265,6 +279,13 @@ impl Display for Value {
             Value::Unit => write!(f, "()"),
             Value::SharedRef(value) => write!(f, "&{}", value.borrow()),
             Value::MutRef(value) => write!(f, "&mut {}", value.borrow()),
+            Value::RawPtr { mutable, .. } => {
+                if *mutable {
+                    write!(f, "raw_mut_ptr(...)")
+                } else {
+                    write!(f, "raw_ptr(...)")
+                }
+            }
             Value::Boxed(value) => write!(f, "box({})", value.borrow()),
             Value::Slice { elements, mutable } => {
                 let rendered = elements
@@ -387,6 +408,14 @@ impl CodeDb {
                     ..
                 },
             ) => self.value_has_type(root, &value.borrow(), &referent),
+            (
+                Value::RawPtr { target, mutable },
+                TypeSpec::RawPointer {
+                    mutable: expected_mutable,
+                    pointee,
+                },
+            ) => Ok((*mutable || !expected_mutable)
+                && self.value_has_type(root, &target.borrow(), &pointee)?),
             (Value::Boxed(value), TypeSpec::Box { element }) => {
                 self.value_has_type(root, &value.borrow(), &element)
             }
@@ -607,6 +636,70 @@ impl CodeDb {
                 Ok(Value::Boxed(value_cell(self.eval_expr_with_locals(
                     root_hash, value_hash, args, locals,
                 )?)))
+            }
+            "raw_ptr_cast" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_ptr_cast missing value"))?;
+                let mutable = payload
+                    .get("mutable")
+                    .and_then(JsonValue::as_bool)
+                    .ok_or_else(|| anyhow!("raw_ptr_cast missing mutable"))?;
+                match self.eval_expr_with_locals(root_hash, value_hash, args, locals)? {
+                    Value::SharedRef(target) => {
+                        if mutable {
+                            bail!("cannot make raw mutable pointer from shared reference");
+                        }
+                        Ok(Value::RawPtr { target, mutable })
+                    }
+                    Value::MutRef(target) => Ok(Value::RawPtr { target, mutable }),
+                    Value::RawPtr {
+                        target,
+                        mutable: source_mutable,
+                    } => {
+                        if mutable && !source_mutable {
+                            bail!("cannot cast raw shared pointer to mutable");
+                        }
+                        Ok(Value::RawPtr { target, mutable })
+                    }
+                    other => bail!("raw_ptr cast evaluated non-pointer source {other}"),
+                }
+            }
+            "raw_load" => {
+                let pointer_hash = payload
+                    .get("pointer")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_load missing pointer"))?;
+                match self.eval_expr_with_locals(root_hash, pointer_hash, args, locals)? {
+                    Value::RawPtr { target, .. } => Ok(semantic_clone_value(&target.borrow())),
+                    other => bail!("raw_load evaluated non-pointer source {other}"),
+                }
+            }
+            "raw_store" => {
+                let pointer_hash = payload
+                    .get("pointer")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_store missing pointer"))?;
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_store missing value"))?;
+                let pointer = self.eval_expr_with_locals(root_hash, pointer_hash, args, locals)?;
+                let value = self.eval_expr_with_locals(root_hash, value_hash, args, locals)?;
+                match pointer {
+                    Value::RawPtr {
+                        target,
+                        mutable: true,
+                    } => {
+                        *target.borrow_mut() = value;
+                        Ok(Value::Unit)
+                    }
+                    Value::RawPtr { mutable: false, .. } => {
+                        bail!("raw_store requires raw mutable pointer")
+                    }
+                    other => bail!("raw_store evaluated non-pointer source {other}"),
+                }
             }
             "assign" => {
                 let target_hash = payload
@@ -1690,6 +1783,78 @@ impl CodeDb {
                     )?
                 )
             }
+            "raw_ptr_cast" => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_ptr_cast missing value"))?;
+                let mutable = payload
+                    .get("mutable")
+                    .and_then(JsonValue::as_bool)
+                    .ok_or_else(|| anyhow!("raw_ptr_cast missing mutable"))?;
+                let name = if mutable { "raw_mut_ptr" } else { "raw_ptr" };
+                format!(
+                    "{name}({})",
+                    self.expr_to_source_with_locals(
+                        value,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
+            "raw_load" => {
+                let pointer = payload
+                    .get("pointer")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_load missing pointer"))?;
+                format!(
+                    "raw_load({})",
+                    self.expr_to_source_with_locals(
+                        pointer,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
+            "raw_store" => {
+                let pointer = payload
+                    .get("pointer")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_store missing pointer"))?;
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_store missing value"))?;
+                format!(
+                    "raw_store({}, {})",
+                    self.expr_to_source_with_locals(
+                        pointer,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?,
+                    self.expr_to_source_with_locals(
+                        value,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
             "assign" => {
                 let target = payload
                     .get("target")
@@ -2455,6 +2620,71 @@ impl CodeDb {
                     )?,
                 ],
             }),
+            "raw_ptr_cast" => {
+                let mutable = payload
+                    .get("mutable")
+                    .and_then(JsonValue::as_bool)
+                    .ok_or_else(|| anyhow!("raw_ptr_cast missing mutable"))?;
+                Ok(RawExpr::Call {
+                    name: if mutable {
+                        "raw_mut_ptr".to_string()
+                    } else {
+                        "raw_ptr".to_string()
+                    },
+                    args: vec![
+                        self.typed_expr_to_raw_with_locals(
+                            payload
+                                .get("value")
+                                .and_then(JsonValue::as_str)
+                                .ok_or_else(|| anyhow!("raw_ptr_cast missing value"))?,
+                            root,
+                            current_module,
+                            region_names,
+                            local_names,
+                        )?,
+                    ],
+                })
+            }
+            "raw_load" => Ok(RawExpr::Call {
+                name: "raw_load".to_string(),
+                args: vec![
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("pointer")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("raw_load missing pointer"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ],
+            }),
+            "raw_store" => Ok(RawExpr::Call {
+                name: "raw_store".to_string(),
+                args: vec![
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("pointer")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("raw_store missing pointer"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("raw_store missing value"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ],
+            }),
             "assign" => Ok(RawExpr::Assign {
                 target: Box::new(
                     self.typed_expr_to_raw_with_locals(
@@ -3062,6 +3292,29 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("box_new missing value"))?;
                 self.collect_expr_deps(root, child, deps)?;
+            }
+            "raw_ptr_cast" => {
+                let child = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_ptr_cast missing value"))?;
+                self.collect_expr_deps(root, child, deps)?;
+            }
+            "raw_load" => {
+                let child = payload
+                    .get("pointer")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_load missing pointer"))?;
+                self.collect_expr_deps(root, child, deps)?;
+            }
+            "raw_store" => {
+                for key in ["pointer", "value"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("raw_store missing {key}"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
             }
             "assign" => {
                 for key in ["target", "value"] {
@@ -4167,6 +4420,10 @@ fn semantic_clone_value(value: &Value) -> Value {
         Value::Unit => Value::Unit,
         Value::SharedRef(value) => Value::SharedRef(value.clone()),
         Value::MutRef(value) => Value::MutRef(value.clone()),
+        Value::RawPtr { target, mutable } => Value::RawPtr {
+            target: target.clone(),
+            mutable: *mutable,
+        },
         Value::Boxed(value) => Value::Boxed(value_cell(semantic_clone_value(&value.borrow()))),
         Value::Slice { elements, mutable } => Value::Slice {
             elements: elements.clone(),
