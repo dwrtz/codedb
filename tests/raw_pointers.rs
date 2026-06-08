@@ -182,6 +182,8 @@ fn raw_pointer_ffi_declarations_validate_unsafe_effect() {
     let good = temp.path().join("raw-ffi.cdb");
     let bad_db = temp.path().join("raw-ffi-bad.sqlite");
     let bad = temp.path().join("raw-ffi-bad.cdb");
+    let bad_named_db = temp.path().join("raw-ffi-bad-named.sqlite");
+    let bad_named = temp.path().join("raw-ffi-bad-named.cdb");
     let link_plan = temp.path().join("raw-ffi-link.json");
 
     std::fs::write(
@@ -231,6 +233,21 @@ extern fn platform_write(fd: i64, ptr: raw_ptr<i64>, len: i64) -> i64 abi[c] eff
     .unwrap();
     run(&["init", path(&bad_db)]);
     let stderr = run_fail(&["import", path(&bad_db), path(&bad)]);
+    assert!(stderr.contains("unsafe"), "{stderr}");
+
+    std::fs::write(
+        &bad_named,
+        r#"
+record RawSlot {
+  p: raw_ptr<i64>
+}
+
+extern fn host(slot: RawSlot) -> i64 abi[c] effects[ffi] link_name "host" library "c"
+"#,
+    )
+    .unwrap();
+    run(&["init", path(&bad_named_db)]);
+    let stderr = run_fail(&["import", path(&bad_named_db), path(&bad_named)]);
     assert!(stderr.contains("unsafe"), "{stderr}");
 }
 

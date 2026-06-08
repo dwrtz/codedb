@@ -2330,7 +2330,7 @@ impl CodeDb {
         if let Some(library) = library {
             validate_external_library_name(library)?;
         }
-        self.validate_external_signature_effects(signature)?;
+        self.validate_external_signature_effects(None, signature)?;
         let mut payload = serde_json::Map::new();
         payload.insert("symbol".to_string(), JsonValue::String(symbol.to_string()));
         payload.insert(
@@ -2351,12 +2351,16 @@ impl CodeDb {
         self.put_object("ExternalFunction", &JsonValue::Object(payload))
     }
 
-    fn validate_external_signature_effects(&self, signature: &str) -> Result<()> {
+    fn validate_external_signature_effects(
+        &self,
+        root: Option<&ProgramRootPayload>,
+        signature: &str,
+    ) -> Result<()> {
         let effects = self.signature_effects(signature)?;
         if !effects.contains(&Effect::Ffi) {
             bail!("external functions must declare the ffi effect");
         }
-        if self.signature_uses_raw_pointer(signature)? && !effects.contains(&Effect::Unsafe) {
+        if self.signature_uses_raw_pointer(root, signature)? && !effects.contains(&Effect::Unsafe) {
             bail!(
                 "external functions with raw pointer arguments or returns must declare the unsafe effect"
             );
@@ -2364,33 +2368,61 @@ impl CodeDb {
         Ok(())
     }
 
-    fn signature_uses_raw_pointer(&self, signature: &str) -> Result<bool> {
+    fn signature_uses_raw_pointer(
+        &self,
+        root: Option<&ProgramRootPayload>,
+        signature: &str,
+    ) -> Result<bool> {
         let (params, return_type) = self.signature_parts(signature)?;
         for param in params {
-            if self.type_contains_raw_pointer(&param)? {
+            if self.type_contains_raw_pointer(root, &param, &mut BTreeSet::new())? {
                 return Ok(true);
             }
         }
-        self.type_contains_raw_pointer(&return_type)
+        self.type_contains_raw_pointer(root, &return_type, &mut BTreeSet::new())
     }
 
-    fn type_contains_raw_pointer(&self, type_hash: &str) -> Result<bool> {
-        match self.type_spec(type_hash)? {
+    fn type_contains_raw_pointer(
+        &self,
+        root: Option<&ProgramRootPayload>,
+        type_hash: &str,
+        active_types: &mut BTreeSet<String>,
+    ) -> Result<bool> {
+        if !active_types.insert(type_hash.to_string()) {
+            return Ok(false);
+        }
+        let spec = match root {
+            Some(root) => self.type_spec_in_root(root, type_hash)?,
+            None => self.type_spec(type_hash)?,
+        };
+        let contains = match spec {
             TypeSpec::RawPointer { .. } => Ok(true),
-            TypeSpec::Reference { referent, .. } => self.type_contains_raw_pointer(&referent),
-            TypeSpec::Box { element } => self.type_contains_raw_pointer(&element),
-            TypeSpec::Slice { element, .. } => self.type_contains_raw_pointer(&element),
-            TypeSpec::FixedArray { element, .. } => self.type_contains_raw_pointer(&element),
+            TypeSpec::Reference { referent, .. } => {
+                self.type_contains_raw_pointer(root, &referent, active_types)
+            }
+            TypeSpec::Box { element } => {
+                self.type_contains_raw_pointer(root, &element, active_types)
+            }
+            TypeSpec::Slice { element, .. } => {
+                self.type_contains_raw_pointer(root, &element, active_types)
+            }
+            TypeSpec::FixedArray { element, .. } => {
+                self.type_contains_raw_pointer(root, &element, active_types)
+            }
             TypeSpec::Record(fields) | TypeSpec::Enum(fields) => {
+                let mut contains = false;
                 for field in fields {
-                    if self.type_contains_raw_pointer(&field.type_hash)? {
-                        return Ok(true);
+                    if self.type_contains_raw_pointer(root, &field.type_hash, active_types)? {
+                        contains = true;
+                        break;
                     }
                 }
-                Ok(false)
+                Ok(contains)
             }
             TypeSpec::Builtin(_) | TypeSpec::Named { .. } => Ok(false),
-        }
+        };
+        active_types.remove(type_hash);
+        contains
     }
 
     pub(crate) fn function_body_hash(&self, definition_hash: &str) -> Result<String> {
@@ -4576,7 +4608,7 @@ impl CodeDb {
                 if external.signature != entry.signature {
                     bail!("bad_external: external function signature does not match root");
                 }
-                self.validate_external_signature_effects(&entry.signature)
+                self.validate_external_signature_effects(Some(&root), &entry.signature)
                     .context("bad_external: external function signature effects are invalid")?;
                 continue;
             }
