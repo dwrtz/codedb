@@ -64,6 +64,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Run a native CLI acceptance test by capturing stdout and exit code")]
+    TestCli {
+        db: PathBuf,
+        entry_name: String,
+        #[arg(long, default_value = codedb::DEFAULT_NATIVE_TARGET)]
+        target: String,
+        #[arg(long)]
+        expect_stdout: String,
+        #[arg(long)]
+        expect_exit_code: i32,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Create a semantic test object for an entry function")]
     CreateTest {
         db: PathBuf,
@@ -603,6 +616,48 @@ fn main() -> Result<()> {
                 print!("{}", codedb.run_tests_branch_json(&branch, &labels)?);
             } else {
                 print!("{}", codedb.run_tests_branch(&branch, &labels)?);
+            }
+        }
+        Command::TestCli {
+            db,
+            entry_name,
+            target,
+            expect_stdout,
+            expect_exit_code,
+            json,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            let report = codedb.run_native_cli_test_main_branch_json(
+                &entry_name,
+                &target,
+                &expect_stdout,
+                expect_exit_code,
+            )?;
+            if json {
+                print!("{report}");
+            } else {
+                let payload: serde_json::Value = serde_json::from_str(report.trim_end())?;
+                println!(
+                    "{} native_cli entry {} stdout_matches {} exit_code_matches {}",
+                    payload
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("error"),
+                    payload
+                        .get("entry_name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("<unknown>"),
+                    payload
+                        .get("comparison")
+                        .and_then(|comparison| comparison.get("stdout_matches"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    payload
+                        .get("comparison")
+                        .and_then(|comparison| comparison.get("exit_code_matches"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                );
             }
         }
         Command::CreateTest {

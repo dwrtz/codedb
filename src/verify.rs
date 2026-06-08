@@ -15,6 +15,7 @@ use crate::backend::{ArtifactKind, ObjectBackend, ObjectBackendInput};
 use crate::backend_c::ensure_no_forbidden_runtime_calls;
 use crate::diff::dependency_pairs;
 use crate::layout::{TYPE_LAYOUT_BACKEND_ID, TYPE_LAYOUT_SCHEMA, type_layout_cache_key_input};
+use crate::link::{ENTRY_POINT_METADATA_SCHEMA, native_process_entry_metadata};
 use crate::lowering::{
     LoweredFunctionIr, LoweredOp, lowered_op_id_for_value, lowered_value_debug_ops,
 };
@@ -2980,6 +2981,12 @@ impl CodeDb {
         } else {
             errors.push(format!("bad_link_plan: {cache_key} missing entry symbol"));
         }
+        match plan.get("entry_point") {
+            Some(entry_point) => verify_entry_point_metadata_shape(errors, cache_key, entry_point),
+            None => errors.push(format!(
+                "bad_link_plan: {cache_key} missing entry point metadata"
+            )),
+        }
         for object in plan
             .get("objects")
             .and_then(JsonValue::as_array)
@@ -3143,6 +3150,7 @@ impl CodeDb {
                 if input.get("target_triple") != plan.get("target_triple")
                     || input.get("entry_symbol_hash") != plan.get("entry_symbol_hash")
                     || input.get("entry_abi_symbol") != plan.get("entry_abi_symbol")
+                    || input.get("entry_point") != plan.get("entry_point")
                     || input.get("external_symbols") != plan.get("external_symbols")
                     || input.get("export_map") != plan.get("export_map")
                     || input.get("output_kind") != plan.get("output_kind")
@@ -3274,6 +3282,18 @@ impl CodeDb {
             internal_abi_symbol(entry_symbol)?
         };
         if entry_abi_symbol != expected_entry_abi {
+            return Ok(false);
+        }
+        let (entry_params, entry_return_type) = self.signature_parts(&entry.signature)?;
+        let entry_effects = self.signature_effect_names(&entry.signature)?;
+        let expected_entry_point = native_process_entry_metadata(
+            entry_symbol,
+            entry_abi_symbol,
+            &entry_params,
+            &entry_return_type,
+            &entry_effects,
+        );
+        if plan.get("entry_point") != Some(&expected_entry_point) {
             return Ok(false);
         }
         let planned_symbols = link_plan_object_symbols(plan);
@@ -4470,6 +4490,53 @@ fn json_value_set(value: Option<&JsonValue>) -> BTreeSet<String> {
         .flatten()
         .map(canonical_json)
         .collect()
+}
+
+fn verify_entry_point_metadata_shape(
+    errors: &mut Vec<String>,
+    cache_key: &str,
+    entry_point: &JsonValue,
+) {
+    if entry_point.get("schema").and_then(JsonValue::as_str) != Some(ENTRY_POINT_METADATA_SCHEMA) {
+        errors.push(format!(
+            "bad_link_plan: {cache_key} bad entry point metadata schema"
+        ));
+    }
+    if entry_point.get("kind").and_then(JsonValue::as_str) != Some("process") {
+        errors.push(format!(
+            "bad_link_plan: {cache_key} bad entry point metadata kind"
+        ));
+    }
+    for field in ["entry_symbol_hash", "entry_abi_symbol"] {
+        if entry_point.get(field).and_then(JsonValue::as_str).is_none() {
+            errors.push(format!(
+                "bad_link_plan: {cache_key} entry point metadata missing {field}"
+            ));
+        }
+    }
+    let Some(signature) = entry_point.get("signature") else {
+        errors.push(format!(
+            "bad_link_plan: {cache_key} entry point metadata missing signature"
+        ));
+        return;
+    };
+    if signature
+        .get("param_type_hashes")
+        .and_then(JsonValue::as_array)
+        .is_none()
+        || signature
+            .get("return_type_hash")
+            .and_then(JsonValue::as_str)
+            .is_none()
+        || signature
+            .get("effects")
+            .and_then(JsonValue::as_array)
+            .is_none()
+    {
+        errors.push(format!(
+            "bad_link_plan: {cache_key} malformed entry point signature metadata"
+        ));
+    }
 }
 
 fn link_plan_object_symbols(plan: &JsonValue) -> Vec<String> {

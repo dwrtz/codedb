@@ -26,6 +26,7 @@ use crate::{
 const LINK_PLAN_SCHEMA: &str = "codedb/link-plan/v1";
 const LINK_INPUT_SCHEMA: &str = "codedb/link-input/v1";
 const EXECUTABLE_METADATA_SCHEMA: &str = "codedb/executable/v1";
+pub(crate) const ENTRY_POINT_METADATA_SCHEMA: &str = "codedb/entry-point/v1";
 const LINK_PLAN_BACKEND_ID: &str = "native-link-plan-v0";
 const EXTERNAL_CC_LINKER_BACKEND_ID: &str = "external-cc-linker-v0";
 
@@ -75,6 +76,7 @@ struct PlannedLink {
     entry_symbol_hash: String,
     entry_abi_symbol: String,
     entry_effects: Vec<String>,
+    entry_point: JsonValue,
     objects: Vec<PlannedObject>,
     external_symbols: Vec<PlannedExternalSymbol>,
     platform_external_symbols: Vec<PlannedPlatformExternalSymbol>,
@@ -239,6 +241,7 @@ impl CodeDb {
             "entry_symbol_hash": &planned.entry_symbol_hash,
             "entry_abi_symbol": &planned.entry_abi_symbol,
             "entry_effects": &planned.entry_effects,
+            "entry_point": &planned.entry_point,
             "link_plan_input_hash": &planned.input_hash,
             "link_plan_cache_key": &planned.link_plan_cache_key,
             "link_plan_hash": link_plan_hash,
@@ -322,6 +325,7 @@ impl CodeDb {
             "target_triple": target_triple,
             "entry_symbol_hash": prepared.plan["entry_symbol_hash"].clone(),
             "entry_abi_symbol": prepared.plan["entry_abi_symbol"].clone(),
+            "entry_point": prepared.plan["entry_point"].clone(),
             "link_plan_hash": prepared.plan_hash,
             "linker": "cc",
             "linker_identity_hash": linker_identity_hash,
@@ -518,6 +522,7 @@ impl CodeDb {
             "target_triple": &planned.target_triple,
             "entry_symbol_hash": &planned.entry_symbol_hash,
             "entry_abi_symbol": &planned.entry_abi_symbol,
+            "entry_point": planned.entry_point.clone(),
             "objects": object_entries,
             "export_map": planned.export_map.clone(),
             "external_symbols": planned.external_symbol_entries(),
@@ -722,11 +727,28 @@ impl CodeDb {
             .iter()
             .find(|entry| entry.symbol == entry_symbol)
             .ok_or_else(|| anyhow!("entry symbol missing from root {entry_symbol}"))?;
+        let entry_abi_symbol = self.abi_symbol_for_entry(entry)?;
+        let entry_param_type_hashes;
+        let entry_return_type_hash;
+        {
+            let (params, return_type) = self.signature_parts(&entry.signature)?;
+            entry_param_type_hashes = params;
+            entry_return_type_hash = return_type;
+        }
+        let entry_effects = self.signature_effect_names(&entry.signature)?;
+        let entry_point = native_process_entry_metadata(
+            entry_symbol,
+            &entry_abi_symbol,
+            &entry_param_type_hashes,
+            &entry_return_type_hash,
+            &entry_effects,
+        );
         let input = json!({
             "schema": LINK_INPUT_SCHEMA,
             "target_triple": target_triple,
             "entry_symbol_hash": entry_symbol,
-            "entry_abi_symbol": self.abi_symbol_for_entry(entry)?,
+            "entry_abi_symbol": &entry_abi_symbol,
+            "entry_point": &entry_point,
             "object_cache_keys": &object_cache_keys,
             "external_symbols": &external_symbol_entries,
             "export_map": &export_map,
@@ -751,8 +773,9 @@ impl CodeDb {
             link_plan_key_input,
             target_triple: target_triple.to_string(),
             entry_symbol_hash: entry_symbol.to_string(),
-            entry_abi_symbol: self.abi_symbol_for_entry(entry)?,
-            entry_effects: self.signature_effect_names(&entry.signature)?,
+            entry_abi_symbol,
+            entry_effects,
+            entry_point,
             objects,
             external_symbols,
             platform_external_symbols: platform_external_symbols.into_values().collect(),
@@ -1079,6 +1102,44 @@ impl CodeDb {
             ),
         }
     }
+}
+
+pub(crate) fn native_process_entry_metadata(
+    entry_symbol_hash: &str,
+    entry_abi_symbol: &str,
+    param_type_hashes: &[String],
+    return_type_hash: &str,
+    effects: &[String],
+) -> JsonValue {
+    json!({
+        "schema": ENTRY_POINT_METADATA_SCHEMA,
+        "kind": "process",
+        "entry_symbol_hash": entry_symbol_hash,
+        "entry_abi_symbol": entry_abi_symbol,
+        "signature": {
+            "param_type_hashes": param_type_hashes,
+            "return_type_hash": return_type_hash,
+            "effects": effects,
+        },
+        "args": {
+            "supported": false,
+            "reason": "argv lowering is deferred until args support lands",
+        },
+        "stdout": {
+            "supported": effects.iter().any(|effect| effect == "io"),
+            "capability_source": "build_plan.capabilities",
+        },
+        "exit_code": {
+            "source": "entry_return_value",
+            "harness": "c-main-return-entry-value",
+            "success_code": 0,
+        },
+        "runtime": {
+            "semantic_interpreter": false,
+            "dispatcher": false,
+            "linker": "cc",
+        },
+    })
 }
 
 fn prepared_object(object: NativeObjectArtifact) -> PreparedObject {

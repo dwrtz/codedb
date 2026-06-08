@@ -21,6 +21,7 @@ const TEST_LIST_SCHEMA: &str = "codedb/tests-list/v1";
 const TEST_RUN_SCHEMA: &str = "codedb/test-run/v1";
 const TEST_IMPACT_SCHEMA: &str = "codedb/test-impact/v1";
 const NATIVE_TEST_RESULT_SCHEMA: &str = "codedb/native-test-result/v1";
+const NATIVE_CLI_TEST_RESULT_SCHEMA: &str = "codedb/native-cli-test-result/v1";
 
 impl CodeDb {
     #[allow(clippy::too_many_arguments)]
@@ -516,6 +517,180 @@ impl CodeDb {
                 "tests": tests,
             }))
         ))
+    }
+
+    pub fn run_native_cli_test_main_branch_json(
+        &mut self,
+        entry_name: &str,
+        target_triple: &str,
+        expected_stdout: &str,
+        expected_exit_code: i32,
+    ) -> Result<String> {
+        self.ensure_initialized()?;
+        let branch = self.branch(MAIN_BRANCH)?;
+        let entry_symbol = self
+            .resolve_symbol_or_name(&branch.root_hash, entry_name)
+            .with_context(|| format!("unknown entry function {entry_name}"))?;
+        let expected_stdout_bytes = expected_stdout.as_bytes();
+        if !native_target_is_host_linkable(target_triple) {
+            return Ok(format!(
+                "{}\n",
+                canonical_json(&native_cli_unavailable_result(
+                    entry_name,
+                    &entry_symbol,
+                    target_triple,
+                    expected_stdout_bytes,
+                    expected_exit_code,
+                    "backend_unavailable",
+                    "target is not linkable on this host",
+                ))
+            ));
+        }
+        if !host_has_cc() {
+            return Ok(format!(
+                "{}\n",
+                canonical_json(&native_cli_unavailable_result(
+                    entry_name,
+                    &entry_symbol,
+                    target_triple,
+                    expected_stdout_bytes,
+                    expected_exit_code,
+                    "backend_unavailable",
+                    "cc linker is not available",
+                ))
+            ));
+        }
+
+        let build_plan = match self.build_plan_branch(MAIN_BRANCH, entry_name, target_triple) {
+            Ok(plan) => serde_json::from_str::<JsonValue>(plan.trim_end())
+                .context("native CLI build plan was not valid JSON")?,
+            Err(err) => {
+                return Ok(format!(
+                    "{}\n",
+                    canonical_json(&native_cli_unavailable_result(
+                        entry_name,
+                        &entry_symbol,
+                        target_triple,
+                        expected_stdout_bytes,
+                        expected_exit_code,
+                        "unsupported_feature",
+                        &format!("native CLI build plan unavailable: {err:#}"),
+                    ))
+                ));
+            }
+        };
+        let build = match self.build_main_branch(entry_name, target_triple) {
+            Ok(build) => build,
+            Err(err) => {
+                return Ok(format!(
+                    "{}\n",
+                    canonical_json(&native_cli_unavailable_result(
+                        entry_name,
+                        &entry_symbol,
+                        target_triple,
+                        expected_stdout_bytes,
+                        expected_exit_code,
+                        "unsupported_feature",
+                        &format!("native CLI build unavailable: {err:#}"),
+                    ))
+                ));
+            }
+        };
+        let exe = native_test_executable_path(&build.artifact_hash);
+        if let Err(err) =
+            std::fs::write(&exe, &build.executable).and_then(|_| make_executable(&exe))
+        {
+            let _ = std::fs::remove_file(&exe);
+            return Ok(format!(
+                "{}\n",
+                canonical_json(&native_cli_failed_result(
+                    entry_name,
+                    &entry_symbol,
+                    target_triple,
+                    expected_stdout_bytes,
+                    expected_exit_code,
+                    &build_plan,
+                    Some((&build.cache_key, &build.artifact_hash)),
+                    "native_execution_failed",
+                    &format!("failed to materialize native executable: {err}"),
+                    None,
+                ))
+            ));
+        }
+        let output = ProcessCommand::new(&exe).output();
+        let _ = std::fs::remove_file(&exe);
+        let output = match output {
+            Ok(output) => output,
+            Err(err) => {
+                return Ok(format!(
+                    "{}\n",
+                    canonical_json(&native_cli_failed_result(
+                        entry_name,
+                        &entry_symbol,
+                        target_triple,
+                        expected_stdout_bytes,
+                        expected_exit_code,
+                        &build_plan,
+                        Some((&build.cache_key, &build.artifact_hash)),
+                        "native_execution_failed",
+                        &format!("failed to run native executable: {err}"),
+                        None,
+                    ))
+                ));
+            }
+        };
+
+        let actual_exit_code = output.status.code();
+        let stdout_matches = output.stdout == expected_stdout_bytes;
+        let exit_matches = actual_exit_code == Some(expected_exit_code);
+        let passed = stdout_matches && exit_matches;
+        let mut diagnostics = Vec::new();
+        if !stdout_matches {
+            diagnostics.push(native_cli_diagnostic(
+                target_triple,
+                "stdout_mismatch",
+                "native CLI stdout did not match expected bytes",
+            ));
+        }
+        if !exit_matches {
+            diagnostics.push(native_cli_diagnostic(
+                target_triple,
+                "exit_code_mismatch",
+                "native CLI exit code did not match expected status",
+            ));
+        }
+        let result = json!({
+            "schema": NATIVE_CLI_TEST_RESULT_SCHEMA,
+            "status": if passed { "passed" } else { "failed" },
+            "native_required": true,
+            "target_triple": target_triple,
+            "entry_name": entry_name,
+            "entry_symbol": entry_symbol,
+            "entry_point": build_plan.get("entry_point").cloned().unwrap_or(JsonValue::Null),
+            "expected": {
+                "stdout": String::from_utf8_lossy(expected_stdout_bytes).to_string(),
+                "stdout_hex": hex::encode(expected_stdout_bytes),
+                "exit_code": expected_exit_code,
+            },
+            "actual": {
+                "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
+                "stdout_hex": hex::encode(&output.stdout),
+                "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
+                "stderr_hex": hex::encode(&output.stderr),
+                "exit_code": actual_exit_code,
+                "success": output.status.success(),
+            },
+            "comparison": {
+                "stdout_matches": stdout_matches,
+                "exit_code_matches": exit_matches,
+            },
+            "executable_cache_key": build.cache_key,
+            "executable_artifact_hash": build.artifact_hash,
+            "reason_code": if passed { JsonValue::Null } else { JsonValue::String("cli_mismatch".to_string()) },
+            "reason": if passed { JsonValue::Null } else { JsonValue::String("native CLI process output did not match expected stdout and exit code".to_string()) },
+            "diagnostics": diagnostics,
+        });
+        Ok(format!("{}\n", canonical_json(&result)))
     }
 
     fn run_one_test(
@@ -1576,12 +1751,98 @@ fn native_result_base(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn native_cli_unavailable_result(
+    entry_name: &str,
+    entry_symbol: &str,
+    target_triple: &str,
+    expected_stdout: &[u8],
+    expected_exit_code: i32,
+    reason_code: &str,
+    reason: &str,
+) -> JsonValue {
+    json!({
+        "schema": NATIVE_CLI_TEST_RESULT_SCHEMA,
+        "status": "unsupported",
+        "native_required": true,
+        "target_triple": target_triple,
+        "entry_name": entry_name,
+        "entry_symbol": entry_symbol,
+        "expected": {
+            "stdout": String::from_utf8_lossy(expected_stdout).to_string(),
+            "stdout_hex": hex::encode(expected_stdout),
+            "exit_code": expected_exit_code,
+        },
+        "actual": JsonValue::Null,
+        "comparison": {
+            "stdout_matches": false,
+            "exit_code_matches": false,
+        },
+        "executable_cache_key": JsonValue::Null,
+        "executable_artifact_hash": JsonValue::Null,
+        "entry_point": JsonValue::Null,
+        "reason_code": reason_code,
+        "reason": reason,
+        "diagnostics": [native_cli_diagnostic(target_triple, reason_code, reason)],
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn native_cli_failed_result(
+    entry_name: &str,
+    entry_symbol: &str,
+    target_triple: &str,
+    expected_stdout: &[u8],
+    expected_exit_code: i32,
+    build_plan: &JsonValue,
+    executable: Option<(&str, &str)>,
+    reason_code: &str,
+    reason: &str,
+    actual: Option<JsonValue>,
+) -> JsonValue {
+    let (cache_key, artifact_hash) = executable.unwrap_or(("", ""));
+    json!({
+        "schema": NATIVE_CLI_TEST_RESULT_SCHEMA,
+        "status": "failed",
+        "native_required": true,
+        "target_triple": target_triple,
+        "entry_name": entry_name,
+        "entry_symbol": entry_symbol,
+        "expected": {
+            "stdout": String::from_utf8_lossy(expected_stdout).to_string(),
+            "stdout_hex": hex::encode(expected_stdout),
+            "exit_code": expected_exit_code,
+        },
+        "actual": actual.unwrap_or(JsonValue::Null),
+        "comparison": {
+            "stdout_matches": false,
+            "exit_code_matches": false,
+        },
+        "executable_cache_key": if cache_key.is_empty() { JsonValue::Null } else { JsonValue::String(cache_key.to_string()) },
+        "executable_artifact_hash": if artifact_hash.is_empty() { JsonValue::Null } else { JsonValue::String(artifact_hash.to_string()) },
+        "entry_point": build_plan.get("entry_point").cloned().unwrap_or(JsonValue::Null),
+        "reason_code": reason_code,
+        "reason": reason,
+        "diagnostics": [native_cli_diagnostic(target_triple, reason_code, reason)],
+    })
+}
+
 fn native_diagnostic(kind: &str, message: &str) -> JsonValue {
     json!({
         "kind": kind,
         "message": message,
         "details": {
             "target_triple": DEFAULT_NATIVE_TARGET,
+        },
+    })
+}
+
+fn native_cli_diagnostic(target_triple: &str, kind: &str, message: &str) -> JsonValue {
+    json!({
+        "kind": kind,
+        "message": message,
+        "details": {
+            "target_triple": target_triple,
         },
     })
 }

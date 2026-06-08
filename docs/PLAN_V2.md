@@ -1041,6 +1041,17 @@ allocation wrappers compile and link where supported
 
 Goal: compile a small useful CLI-style program with minimal I/O.
 
+Status: implemented for stdout and process exit-code behavior. Native link
+inputs, link plans, build plans, and executable metadata now include process
+entry-point metadata that records the native harness, entry signature, stdout
+support, deferred argv support, exit-code source, and lack of semantic
+interpreter/dispatcher participation. The `test-cli` command builds and runs a
+native executable, captures stdout/stderr and process exit code, and compares
+stdout bytes plus exit status as a native-required CLI result. The
+`hello_invoice.cdb` fixture proves the minimal stdlib/platform stdout path with
+an explicit zero exit code. Process argv is still deferred until target argv
+lowering and a standard args abstraction are ready.
+
 Deliverables:
 
 ```text

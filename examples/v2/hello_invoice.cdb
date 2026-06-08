@@ -1,0 +1,26 @@
+module std.platform {
+extern fn write(fd: i64, ptr: raw_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "write" library "c"
+}
+
+module std.io {
+fn write_stdout(s: slice<'static, u8>) -> i64 effects[io, ffi, unsafe] =
+  std.platform.write(1, raw_ptr(&'static s[0]), len(s))
+}
+
+record Line {
+  price_cents: i64
+  quantity: i64
+}
+
+fn line_total(line: Line) -> i64 =
+  line.price_cents * line.quantity
+
+fn invoice_total() -> i64 =
+  line_total({price_cents: 1200, quantity: 2}) + line_total({price_cents: 500, quantity: 1})
+
+fn print_invoice() -> i64 effects[io, ffi, unsafe] =
+  std.io.write_stdout("hello invoice total 2900\n")
+
+fn main() -> i64 effects[io, ffi, unsafe] =
+  let _: i64 = print_invoice() in
+  0
