@@ -97,7 +97,7 @@ mutable_cursor.cdb
 invoice_static.cdb
   records, enums, fixed arrays/slices, references, loops/folds
 
-parser_or_word_count.cdb
+word_count.cdb
   byte/string slices, bounds checks, loops, later I/O
 
 todo_cli.cdb
@@ -1128,6 +1128,14 @@ native-required tests pass
 ## Phase 21 — Parser or Word Count Acceptance
 
 Goal: compile a useful native text-processing program.
+
+Status: implemented with `examples/v2/word_count.cdb`. The fixture counts
+words over a static byte/string slice using a `fold` loop and a record
+accumulator, routes ASCII whitespace helpers through `std.string`, includes a
+native bounds-trap entrypoint, and is covered by native-required tests plus
+trace/debug and export/import verification. Phase 21 also adds same-type `u8`
+comparisons so byte-slice text processing lowers to native code without
+interpreter fallback.
 
 Deliverables:
 

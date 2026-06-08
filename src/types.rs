@@ -3191,17 +3191,30 @@ impl CodeDb {
                     region_scope,
                     locals,
                 )?;
-                let i64_hash = type_hash_for("I64");
                 let bool_hash = type_hash_for("Bool");
                 let result_type = match op.as_str() {
                     "+" | "-" | "*" | "/" => {
+                        let i64_hash = type_hash_for("I64");
                         require_type(&left.type_hash, &i64_hash, "left operand", self)?;
                         require_type(&right.type_hash, &i64_hash, "right operand", self)?;
                         i64_hash
                     }
                     "==" | "!=" | "<" | "<=" | ">" | ">=" => {
-                        require_type(&left.type_hash, &i64_hash, "left operand", self)?;
-                        require_type(&right.type_hash, &i64_hash, "right operand", self)?;
+                        if left.type_hash != right.type_hash {
+                            bail!(
+                                "comparison operands differ: {} vs {}",
+                                self.type_name(&left.type_hash)?,
+                                self.type_name(&right.type_hash)?
+                            );
+                        }
+                        if left.type_hash != type_hash_for("I64")
+                            && left.type_hash != type_hash_for("U8")
+                        {
+                            bail!(
+                                "comparison operand expected i64 or u8, got {}",
+                                self.type_name(&left.type_hash)?
+                            );
+                        }
                         bool_hash
                     }
                     "&&" | "||" => {
@@ -8005,18 +8018,21 @@ impl CodeDb {
                     allowed_regions,
                     locals,
                 )?;
-                let i64_hash = type_hash_for("I64");
                 let bool_hash = type_hash_for("Bool");
                 match op {
                     "+" | "-" | "*" | "/" => {
+                        let i64_hash = type_hash_for("I64");
                         if left != i64_hash || right != i64_hash {
                             bail!("integer op requires i64 operands");
                         }
                         i64_hash
                     }
                     "==" | "!=" | "<" | "<=" | ">" | ">=" => {
-                        if left != i64_hash || right != i64_hash {
-                            bail!("comparison op requires i64 operands");
+                        if left != right {
+                            bail!("comparison operands differ");
+                        }
+                        if left != type_hash_for("I64") && left != type_hash_for("U8") {
+                            bail!("comparison op requires i64 or u8 operands");
                         }
                         bool_hash
                     }

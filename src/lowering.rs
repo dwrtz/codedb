@@ -6072,6 +6072,7 @@ fn lower_binary_kind(
     result_type: &str,
 ) -> Result<String> {
     let i64_hash = type_hash_for("I64");
+    let u8_hash = type_hash_for("U8");
     let bool_hash = type_hash_for("Bool");
     let kind = match source_op {
         "+" if left_type == i64_hash && right_type == i64_hash && result_type == i64_hash => {
@@ -6103,6 +6104,20 @@ fn lower_binary_kind(
         }
         ">=" if left_type == i64_hash && right_type == i64_hash && result_type == bool_hash => {
             "ge_i64"
+        }
+        "==" if left_type == u8_hash && right_type == u8_hash && result_type == bool_hash => {
+            "eq_u8"
+        }
+        "!=" if left_type == u8_hash && right_type == u8_hash && result_type == bool_hash => {
+            "ne_u8"
+        }
+        "<" if left_type == u8_hash && right_type == u8_hash && result_type == bool_hash => "lt_u8",
+        "<=" if left_type == u8_hash && right_type == u8_hash && result_type == bool_hash => {
+            "le_u8"
+        }
+        ">" if left_type == u8_hash && right_type == u8_hash && result_type == bool_hash => "gt_u8",
+        ">=" if left_type == u8_hash && right_type == u8_hash && result_type == bool_hash => {
+            "ge_u8"
         }
         "&&" if left_type == bool_hash && right_type == bool_hash && result_type == bool_hash => {
             "and_bool"
@@ -6144,6 +6159,12 @@ fn verify_binary_kind(
         "le_i64" => "<=",
         "gt_i64" => ">",
         "ge_i64" => ">=",
+        "eq_u8" => "==",
+        "ne_u8" => "!=",
+        "lt_u8" => "<",
+        "le_u8" => "<=",
+        "gt_u8" => ">",
+        "ge_u8" => ">=",
         "and_bool" => "&&",
         "or_bool" => "||",
         _ => bail!("unknown lowered binary kind {kind}"),

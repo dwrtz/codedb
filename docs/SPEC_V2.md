@@ -876,7 +876,7 @@ trace/debug identifies loop, case, field, and reference operations
 verify validates layout, regions, and effects
 ```
 
-### 21.4 Parser or word-count
+### 21.4 Word count
 
 Demonstrates slices, static/dynamic bytes, loops, and later I/O.
 

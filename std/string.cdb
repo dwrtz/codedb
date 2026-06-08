@@ -1,0 +1,8 @@
+module std.string {
+fn space_byte() -> u8 = b" "[0]
+fn newline_byte() -> u8 = b"\n"[0]
+fn tab_byte() -> u8 = b"\t"[0]
+
+fn is_ascii_space(ch: u8) -> bool =
+  ch == space_byte() || ch == newline_byte() || ch == tab_byte()
+}

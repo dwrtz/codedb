@@ -3145,15 +3145,16 @@ impl FunctionEmitter {
                 self.text.extend_from_slice(&[0x48, 0x99]);
                 self.text.extend_from_slice(&[0x48, 0xf7, 0xf9]);
             }
-            "eq_i64" | "ne_i64" | "lt_i64" | "le_i64" | "gt_i64" | "ge_i64" => {
+            "eq_i64" | "ne_i64" | "lt_i64" | "le_i64" | "gt_i64" | "ge_i64" | "eq_u8" | "ne_u8"
+            | "lt_u8" | "le_u8" | "gt_u8" | "ge_u8" => {
                 self.text.extend_from_slice(&[0x48, 0x39, 0xc8]);
                 let cc = match kind {
-                    "eq_i64" => 0x94,
-                    "ne_i64" => 0x95,
-                    "lt_i64" => 0x9c,
-                    "le_i64" => 0x9e,
-                    "gt_i64" => 0x9f,
-                    "ge_i64" => 0x9d,
+                    "eq_i64" | "eq_u8" => 0x94,
+                    "ne_i64" | "ne_u8" => 0x95,
+                    "lt_i64" | "lt_u8" => 0x9c,
+                    "le_i64" | "le_u8" => 0x9e,
+                    "gt_i64" | "gt_u8" => 0x9f,
+                    "ge_i64" | "ge_u8" => 0x9d,
                     _ => unreachable!(),
                 };
                 self.text.extend_from_slice(&[0x0f, cc, 0xc0]);
@@ -4879,15 +4880,16 @@ impl Arm64Emitter {
                 self.patch_imm19(skip_trap)?;
                 self.sdiv_reg(0, 0, 1);
             }
-            "eq_i64" | "ne_i64" | "lt_i64" | "le_i64" | "gt_i64" | "ge_i64" => {
+            "eq_i64" | "ne_i64" | "lt_i64" | "le_i64" | "gt_i64" | "ge_i64" | "eq_u8" | "ne_u8"
+            | "lt_u8" | "le_u8" | "gt_u8" | "ge_u8" => {
                 self.cmp_reg(0, 1);
                 let cond = match kind {
-                    "eq_i64" => 0,
-                    "ne_i64" => 1,
-                    "lt_i64" => 11,
-                    "le_i64" => 13,
-                    "gt_i64" => 12,
-                    "ge_i64" => 10,
+                    "eq_i64" | "eq_u8" => 0,
+                    "ne_i64" | "ne_u8" => 1,
+                    "lt_i64" | "lt_u8" => 11,
+                    "le_i64" | "le_u8" => 13,
+                    "gt_i64" | "gt_u8" => 12,
+                    "ge_i64" | "ge_u8" => 10,
                     _ => unreachable!(),
                 };
                 self.cset(0, cond);
