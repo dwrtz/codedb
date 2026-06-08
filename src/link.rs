@@ -816,6 +816,12 @@ impl CodeDb {
             self.external_link_names_for_direct_dependencies(root, &entry.definition)?;
         let has_io = effects.iter().any(|effect| effect == "io");
         let has_alloc = effects.iter().any(|effect| effect == "alloc");
+        // Capability classification is a direct-dependency heuristic: it tags the
+        // function that directly calls the platform externs (the std.io wrappers),
+        // keyed on those link names plus the declared effect. The build plan then
+        // aggregates capabilities across the whole reachable set. A function that
+        // reads/writes an already-open fd (no `open`/`creat` among its direct
+        // deps) is intentionally not tagged read_file/write_file.
         let capability_name = if has_io
             && dependency_link_names.contains("open")
             && dependency_link_names.contains("read")

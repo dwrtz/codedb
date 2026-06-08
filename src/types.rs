@@ -2452,6 +2452,16 @@ impl CodeDb {
         signature: &str,
     ) -> Result<()> {
         let effects = self.signature_effects(signature)?;
+        // Only `ffi` (always) and `unsafe` (raw-pointer signatures, below) are
+        // derived structurally for an extern. `io` and `alloc` are TRUSTED
+        // annotations: the compiler has no ground truth that `write` performs I/O
+        // or that `malloc` allocates, so it cannot synthesize those effects from
+        // the signature. Capability/effect reporting for I/O and allocation
+        // therefore rests on the `std.platform.*` extern declarations being
+        // annotated correctly. This is a trusted-base property, not a wrapper
+        // escape: a wrapper can never drop an effect its callee declares (see
+        // `verify_function_effects`), but a mis-annotated extern would let its
+        // callers under-report `io`/`alloc`.
         if !effects.contains(&Effect::Ffi) {
             bail!("external functions must declare the ffi effect");
         }

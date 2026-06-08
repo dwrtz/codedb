@@ -3145,6 +3145,13 @@ impl FunctionEmitter {
                 self.text.extend_from_slice(&[0x48, 0x99]);
                 self.text.extend_from_slice(&[0x48, 0xf7, 0xf9]);
             }
+            // u8 relational ops reuse the i64 path: a signed 64-bit `cmp` plus a
+            // signed setcc (setl/setle/setg/setge below). This is correct because
+            // every u8 value is held zero-extended to [0,255] in its 64-bit slot
+            // (byte loads use movzx; u8 has no arithmetic), and for two operands in
+            // [0,255] a signed comparison agrees with an unsigned one. If a future
+            // change ever lets a u8 slot carry non-zero-extended high bits, the u8
+            // arms must move to the unsigned setcc opcodes (setb/setbe/seta/setae).
             "eq_i64" | "ne_i64" | "lt_i64" | "le_i64" | "gt_i64" | "ge_i64" | "eq_u8" | "ne_u8"
             | "lt_u8" | "le_u8" | "gt_u8" | "ge_u8" => {
                 self.text.extend_from_slice(&[0x48, 0x39, 0xc8]);
@@ -4880,6 +4887,11 @@ impl Arm64Emitter {
                 self.patch_imm19(skip_trap)?;
                 self.sdiv_reg(0, 0, 1);
             }
+            // u8 relational ops reuse the i64 signed condition codes (LT/LE/GT/GE
+            // below). Correct because u8 operands are always zero-extended to
+            // [0,255] (byte loads use ldrb; u8 has no arithmetic), where signed and
+            // unsigned comparison agree. If that invariant ever breaks, the u8 arms
+            // must use the unsigned conditions (HS=2/LO=3/HI=8/LS=9).
             "eq_i64" | "ne_i64" | "lt_i64" | "le_i64" | "gt_i64" | "ge_i64" | "eq_u8" | "ne_u8"
             | "lt_u8" | "le_u8" | "gt_u8" | "ge_u8" => {
                 self.cmp_reg(0, 1);

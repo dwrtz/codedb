@@ -14,6 +14,11 @@ fn run(args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("utf8 stdout")
 }
 
+fn run_failure(args: &[&str]) -> String {
+    let output = bin().args(args).assert().failure().get_output().clone();
+    String::from_utf8(output.stderr).expect("utf8 stderr")
+}
+
 fn path(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
 }
@@ -196,4 +201,131 @@ fn can_build_default_native_target() -> bool {
     let native_target = (std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64")
         || (std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64");
     native_target && StdCommand::new("cc").arg("--version").output().is_ok()
+}
+
+// A `vec<T>` / `string` buffer drops only its heap payload; it never iterates
+// and drops individual elements. That is sound only because the element is
+// restricted to Copy, non-reference, trivially-droppable 1/8-byte values
+// (`require_phase20_buffer_element`). These cases lock in fail-closed rejection
+// of every element category that would break the assumption (a leaked nested
+// buffer/box, a dangling reference, or a too-wide element), so the boundary
+// cannot silently regress.
+#[test]
+fn vec_rejects_unsupported_elements() {
+    // (label, program, expected diagnostic substring)
+    let cases = [
+        (
+            "nested-owned-buffer",
+            "fn bad() -> i64 effects[alloc] =\n  let xs: vec<vec<i64>> = vec_new(1) in 0\n",
+            "supports only Copy, non-reference elements with trivial drop",
+        ),
+        (
+            "boxed-owned-element",
+            "fn bad() -> i64 effects[alloc] =\n  let xs: vec<box<i64>> = vec_new(1) in 0\n",
+            "supports only Copy, non-reference elements with trivial drop",
+        ),
+        (
+            "reference-element",
+            "fn bad<'a>(value: &'a i64) -> i64 effects[alloc] =\n  let xs: vec<&'a i64> = vec_new(1) in 0\n",
+            "supports only Copy, non-reference elements with trivial drop",
+        ),
+        (
+            "oversized-element",
+            "record Wide { a: i64, b: i64 }\n\nfn bad() -> i64 effects[alloc] =\n  let xs: vec<Wide> = vec_new(1) in 0\n",
+            "supports element sizes 1 and 8 bytes",
+        ),
+    ];
+
+    for (label, program, expected) in cases {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join(format!("reject-{label}.sqlite"));
+        let source = temp.path().join(format!("reject-{label}.cdb"));
+        std::fs::write(&source, program).unwrap();
+        run(&["init", path(&db)]);
+        let stderr = run_failure(&["import", path(&db), path(&source)]);
+        assert!(
+            stderr.contains(expected),
+            "case {label}: expected {expected:?} in stderr, got: {stderr}"
+        );
+    }
+}
+
+// A `vec<T>` element may be any Copy, trivially-droppable 1- or 8-byte value,
+// including a small record (the plan's "1- and 8-byte elements"). Only scalar
+// elements are exercised above, so this locks in the small-record path: an
+// 8-byte record round-trips through vec_push/vec_get natively and the buffer
+// drop frees the payload exactly once (the record element needs no drop).
+#[test]
+fn vec_of_small_record_lowers_and_runs_native() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("vec-record.sqlite");
+    let source = temp.path().join("vec-record.cdb");
+    let object_path = temp.path().join("vec-record.o");
+
+    std::fs::write(
+        &source,
+        r#"
+record Pair { lo: i64 }
+
+fn vec_record_total() -> i64 effects[alloc, state] =
+  let xs: vec<Pair> = vec_new(2) in
+  let pushed1: unit = vec_push(xs, {lo: 10}) in
+  let pushed2: unit = vec_push(xs, {lo: 32}) in
+  let got: Pair = vec_get(xs, 1) in
+  got.lo + vec_len(xs)
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    assert_eq!(run(&["eval", path(&db), "vec_record_total"]).trim(), "34");
+    run(&["verify", path(&db)]);
+
+    let layout_path = temp.path().join("vec-record.layout.json");
+    run(&[
+        "emit-type-layout",
+        path(&db),
+        "vec<Pair>",
+        "--out",
+        path(&layout_path),
+    ]);
+    let layout = read_json(&layout_path);
+    assert_eq!(layout["kind"], "vec");
+    assert_eq!(layout["copy_kind"], "move_only");
+    assert_eq!(layout["drop_kind"], "needs_drop");
+    // The element (Pair) carries no owned resource, so the buffer payload is the
+    // only thing the drop frees.
+    assert_eq!(layout["contains_owned_resource"], true);
+
+    run(&[
+        "emit-object",
+        path(&db),
+        "vec_record_total",
+        "--target",
+        codedb::DEFAULT_NATIVE_TARGET,
+        "--out",
+        path(&object_path),
+    ]);
+    assert_native_object_magic(&std::fs::read(&object_path).unwrap());
+
+    if can_build_default_native_target() {
+        let record_test = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "vec_record_native",
+            "--entry",
+            "vec_record_total",
+            "--expect-i64",
+            "34",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(record_test["status"], "applied");
+
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["unsupported"], 0);
+        assert_eq!(report["native_mismatches"], 0);
+    }
 }
