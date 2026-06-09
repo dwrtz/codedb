@@ -593,6 +593,14 @@ fn type_field_and_variant_blame_follow_migration_history() {
         "--json",
     ]));
     assert_eq!(field_blame["schema"], "codedb/blame-field/v1");
+    assert_eq!(field_blame["member_kind"], "field");
+    assert_eq!(field_blame["name"], "pennies");
+    assert!(
+        field_blame["member_type_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
     assert_eq!(
         field_blame["birth_migration"]["operation_kind"],
         "create_type"
@@ -601,6 +609,8 @@ fn type_field_and_variant_blame_follow_migration_history() {
         field_blame["last_rename_migration"]["operation_kind"],
         "rename_field"
     );
+    let field_blame_text = run(&["blame-field", path(&db), "Cash", "pennies"]);
+    assert!(field_blame_text.contains("name pennies\n"));
 
     // blame-variant: last renamed by rename_variant.
     let variant_blame = parse_json(&run(&[
@@ -611,6 +621,14 @@ fn type_field_and_variant_blame_follow_migration_history() {
         "--json",
     ]));
     assert_eq!(variant_blame["schema"], "codedb/blame-variant/v1");
+    assert_eq!(variant_blame["member_kind"], "variant");
+    assert_eq!(variant_blame["name"], "pct");
+    assert!(
+        variant_blame["member_type_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
     assert_eq!(
         variant_blame["birth_migration"]["operation_kind"],
         "create_type"

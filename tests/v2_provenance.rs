@@ -64,6 +64,18 @@ fn why_layout_and_drop_cite_type_and_field_history() {
     assert_eq!(layout["field_layout"]["name"], "qty");
     assert_eq!(layout["field_layout"]["offset_bytes"], 8);
     assert!(layout["field_layout"]["field_symbol"].as_str().is_some());
+    assert!(
+        layout["layout_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert!(
+        layout["layout_cache_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
     assert_eq!(
         layout["field_blame"]["birth_migration"]["operation_kind"],
         "create_type"
@@ -84,6 +96,13 @@ fn why_layout_and_drop_cite_type_and_field_history() {
 
     let drop = parse_json(&run(&["why-drop", path(&db), "Node", "--json"]));
     assert_eq!(drop["schema"], "codedb/why-drop/v1");
+    assert!(drop["layout_hash"].as_str().unwrap().starts_with("sha256:"));
+    assert!(
+        drop["layout_cache_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
     assert_eq!(drop["copy_kind"], "move_only");
     assert_eq!(drop["drop_kind"], "needs_drop");
     assert_eq!(drop["contains_box"], true);

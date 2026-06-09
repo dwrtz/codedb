@@ -4,11 +4,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value as JsonValue, json};
 
+use crate::BYTES_DOMAIN;
 use crate::MAIN_BRANCH;
 use crate::expr::parse_expr_source;
+use crate::layout::type_layout_cache_key_input;
 use crate::migrations::Operation;
 use crate::model::{ProgramRootPayload, aliases_for, param_names, test_binding_for};
-use crate::store::{CodeDb, canonical_json};
+use crate::store::{CodeDb, cache_key_for_input, canonical_json, hash_bytes};
 use crate::tests::{test_value_from_value, value_from_test_value};
 use crate::types::{Effect, TypeDefinition, TypeSpec, type_payload_for_spec};
 
@@ -431,6 +433,8 @@ impl CodeDb {
         let type_symbol = self.resolve_type_for_blame(&branch.root_hash, type_or_name)?;
         let member_symbol = self.resolve_member_for_blame(&root, &type_symbol, member, is_field)?;
         let type_binding = self.preferred_type_binding(&root, &type_symbol);
+        let (member_name, member_type_hash) =
+            self.current_member_for_blame(&root, &type_symbol, &member_symbol, is_field)?;
 
         let mut birth = None;
         let mut last_name = None;
@@ -472,7 +476,10 @@ impl CodeDb {
             "type_symbol": type_symbol,
             "type_module": type_binding.map(|binding| binding.module.as_str()),
             "type_name": type_binding.map(|binding| binding.display_name.as_str()),
+            "member_kind": if is_field { "field" } else { "variant" },
             "member_symbol": member_symbol,
+            "name": member_name,
+            "member_type_hash": member_type_hash,
             "birth_migration": birth,
             "last_name_migration": last_name,
             "last_rename_migration": last_rename,
@@ -947,9 +954,18 @@ impl CodeDb {
         let branch = self.branch(branch_name)?;
         let root = self.load_root(&branch.root_hash)?;
         let resolved = self.resolve_type_for_why(&root, type_or_name)?;
-        let layout = self
-            .compute_type_layout(&root, &resolved.type_hash, target_triple)?
-            .metadata;
+        let layout_result = self.compute_type_layout(&root, &resolved.type_hash, target_triple)?;
+        let layout_hash = hash_bytes(
+            BYTES_DOMAIN,
+            canonical_json(&layout_result.metadata).as_bytes(),
+        );
+        let layout_cache_key_input = type_layout_cache_key_input(
+            &resolved.type_hash,
+            target_triple,
+            layout_result.dependency_type_def_hashes.clone(),
+        );
+        let layout_cache_key = cache_key_for_input(&layout_cache_key_input)?;
+        let layout = layout_result.metadata;
         let field_layout = match field {
             Some(field_name) => Some(layout_field_by_name_or_symbol(&layout, field_name)?),
             None => None,
@@ -977,6 +993,8 @@ impl CodeDb {
             "type_hash": resolved.type_hash,
             "type_symbol": resolved.type_symbol,
             "type_def_hash": resolved.type_def_hash,
+            "layout_hash": layout_hash,
+            "layout_cache_key": layout_cache_key,
             "layout": layout,
             "field_layout": field_layout,
             "explanation": layout_explanation(field, &field_layout),
@@ -1014,9 +1032,18 @@ impl CodeDb {
         let branch = self.branch(branch_name)?;
         let root = self.load_root(&branch.root_hash)?;
         let resolved = self.resolve_type_for_why(&root, type_or_name)?;
-        let layout = self
-            .compute_type_layout(&root, &resolved.type_hash, target_triple)?
-            .metadata;
+        let layout_result = self.compute_type_layout(&root, &resolved.type_hash, target_triple)?;
+        let layout_hash = hash_bytes(
+            BYTES_DOMAIN,
+            canonical_json(&layout_result.metadata).as_bytes(),
+        );
+        let layout_cache_key_input = type_layout_cache_key_input(
+            &resolved.type_hash,
+            target_triple,
+            layout_result.dependency_type_def_hashes.clone(),
+        );
+        let layout_cache_key = cache_key_for_input(&layout_cache_key_input)?;
+        let layout = layout_result.metadata;
         let type_blame = match &resolved.type_symbol {
             Some(type_symbol) => Some(self.blame_type_branch_value(branch_name, type_symbol)?),
             None => None,
@@ -1033,6 +1060,8 @@ impl CodeDb {
             "type_hash": resolved.type_hash,
             "type_symbol": resolved.type_symbol,
             "type_def_hash": resolved.type_def_hash,
+            "layout_hash": layout_hash,
+            "layout_cache_key": layout_cache_key,
             "copy_kind": layout.get("copy_kind").cloned().unwrap_or(JsonValue::Null),
             "drop_kind": layout.get("drop_kind").cloned().unwrap_or(JsonValue::Null),
             "contains_reference": layout.get("contains_reference").cloned().unwrap_or(JsonValue::Null),
@@ -1655,6 +1684,29 @@ impl CodeDb {
         } else {
             self.variant_symbol_by_name(root, type_symbol, member_or_name)
         }
+    }
+
+    fn current_member_for_blame(
+        &self,
+        root: &ProgramRootPayload,
+        type_symbol: &str,
+        member_symbol: &str,
+        is_field: bool,
+    ) -> Result<(Option<String>, Option<String>)> {
+        let Some(entry) = self.root_type(root, type_symbol) else {
+            return Ok((None, None));
+        };
+        let definition = self.type_definition(&entry.type_def)?;
+        let members = match (&definition, is_field) {
+            (TypeDefinition::Record { fields, .. }, true) => fields,
+            (TypeDefinition::Enum { variants, .. }, false) => variants,
+            _ => return Ok((None, None)),
+        };
+        Ok(members
+            .iter()
+            .find(|member| member.member_symbol == member_symbol)
+            .map(|member| (Some(member.name.clone()), Some(member.type_hash.clone())))
+            .unwrap_or((None, None)))
     }
 
     fn classify_type_migration(
