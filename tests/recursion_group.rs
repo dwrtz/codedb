@@ -187,6 +187,91 @@ fn verify_rejects_inconsistent_in_group_reference() {
     );
 }
 
+#[test]
+fn recursion_group_hash_is_source_order_independent() {
+    // The clique's content identity is structural, not textual: declaring the same
+    // mutually-recursive clique in two different source orders yields the SAME
+    // recursion-group hash, because member ordinals (→ birth identities, SPEC_V3
+    // §10) derive from the clique's structure, not source position.
+    let even_first = "fn is_even(n: i64) -> i64 = if n < 1 then 1 else is_odd(n - 1)\n\
+                      fn is_odd(n: i64) -> i64 = if n < 1 then 0 else is_even(n - 1)\n";
+    let odd_first = "fn is_odd(n: i64) -> i64 = if n < 1 then 0 else is_even(n - 1)\n\
+                     fn is_even(n: i64) -> i64 = if n < 1 then 1 else is_odd(n - 1)\n";
+    let temp = tempdir().unwrap();
+    let db1 = temp.path().join("even_first.sqlite");
+    let db2 = temp.path().join("odd_first.sqlite");
+    import_root(&db1, even_first);
+    import_root(&db2, odd_first);
+    let (hash1, _) = recursion_group(&db1);
+    let (hash2, _) = recursion_group(&db2);
+    assert_eq!(
+        hash1, hash2,
+        "recursion-group hash must be source-order-independent"
+    );
+}
+
+#[test]
+fn recursion_group_projection_round_trip_is_a_fixpoint() {
+    // import → export → re-import reproduces the SAME root hash and group hash: the
+    // exported checked-view projection is identity-preserving even though its render
+    // order may differ from the original source (the SPEC_V3 §11 round-trip gate).
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("rt.sqlite");
+    let export = temp.path().join("rt.export.cdb");
+    let root1 = import_root(&db, MUTUAL);
+    let (group1, _) = recursion_group(&db);
+
+    run(&["export", path(&db), "--branch", "main", "--out", path(&export)]);
+    let db2 = temp.path().join("rt2.sqlite");
+    run(&["init", path(&db2)]);
+    let root2 = run(&["import", path(&db2), path(&export)])
+        .lines()
+        .find_map(|line| line.strip_prefix("root "))
+        .expect("import prints root")
+        .trim()
+        .to_string();
+    let (group2, _) = recursion_group(&db2);
+
+    assert_eq!(root1, root2, "root hash must round-trip through the projection");
+    assert_eq!(
+        group1, group2,
+        "recursion-group hash must round-trip through the projection"
+    );
+}
+
+#[test]
+fn verify_rejects_duplicate_recursion_group_member() {
+    // A group that lists the same member symbol twice is malformed (the importer
+    // mints exactly one ordinal per member, SPEC_V3 §10). Build a correctly-hashed
+    // group whose members repeat member[0] and confirm `verify` rejects it.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("dup.sqlite");
+    import_root(&db, MUTUAL);
+    let (_, group) = recursion_group(&db);
+    let members = group["members"].as_array().unwrap().clone();
+
+    let bad_payload = serde_json::json!({
+        "module": group["module"],
+        "members": [members[0].clone(), members[0].clone()],
+    });
+    let canonical = canonical_json(&bad_payload);
+    let hash = object_hash("RecursionGroup", &canonical);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO objects (hash, kind, schema_version, payload_json, payload_size_bytes)
+         VALUES (?1, 'RecursionGroup', 1, ?2, ?3)",
+        (&hash, &canonical, canonical.len() as i64),
+    )
+    .unwrap();
+
+    let stderr = run_failure(&["verify", path(&db)]);
+    assert!(
+        stderr.contains("more than once"),
+        "expected duplicate-member rejection, got: {stderr}"
+    );
+}
+
 fn object_hash(kind: &str, canonical_payload: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"codedb/object/v1\0");

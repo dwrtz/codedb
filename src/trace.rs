@@ -1737,27 +1737,75 @@ impl CodeDb {
                     locals,
                 )?;
                 let scrutinee_trace = TraceValue::from_value(&scrutinee);
-                let Value::Enum { variant, value } = scrutinee else {
-                    bail!("case expression evaluated to non-enum {scrutinee}");
-                };
                 let arms = payload
                     .get("arms")
                     .and_then(JsonValue::as_array)
                     .ok_or_else(|| anyhow!("case missing arms"))?;
-                let arm = arms
-                    .iter()
-                    .find(|arm| arm.get("variant").and_then(JsonValue::as_str) == Some(&variant))
-                    .or_else(|| {
-                        arms.iter().find(|arm| {
-                            arm.get("default").and_then(JsonValue::as_bool) == Some(true)
-                        })
-                    })
-                    .ok_or_else(|| anyhow!("case missing arm for variant {variant}"))?;
+                // Select the arm (and, for enums, the bound payload cell) by
+                // scrutinee kind: an enum dispatches by variant; an i64/bool
+                // scrutinee dispatches by literal pattern with a `_` fallback —
+                // mirroring the reference evaluator (R14). Scalars never bind.
+                let (arm, selected_label, binding_value) = match &scrutinee {
+                    Value::Enum { variant, value } => {
+                        let arm = arms
+                            .iter()
+                            .find(|arm| {
+                                arm.get("variant").and_then(JsonValue::as_str) == Some(variant)
+                            })
+                            .or_else(|| {
+                                arms.iter().find(|arm| {
+                                    arm.get("default").and_then(JsonValue::as_bool) == Some(true)
+                                })
+                            })
+                            .ok_or_else(|| anyhow!("case missing arm for variant {variant}"))?;
+                        (arm, variant.clone(), Some(value.clone()))
+                    }
+                    Value::I64(scrutinee_value) => {
+                        let arm = arms
+                            .iter()
+                            .find(|arm| {
+                                arm.get("literal_i64")
+                                    .and_then(JsonValue::as_str)
+                                    .and_then(|literal| literal.parse::<i64>().ok())
+                                    == Some(*scrutinee_value)
+                            })
+                            .or_else(|| {
+                                arms.iter().find(|arm| {
+                                    arm.get("default").and_then(JsonValue::as_bool) == Some(true)
+                                })
+                            })
+                            .ok_or_else(|| {
+                                anyhow!("scalar case missing arm for value {scrutinee_value}")
+                            })?;
+                        (arm, scrutinee_value.to_string(), None)
+                    }
+                    Value::Bool(scrutinee_value) => {
+                        let arm = arms
+                            .iter()
+                            .find(|arm| {
+                                arm.get("literal_bool").and_then(JsonValue::as_bool)
+                                    == Some(*scrutinee_value)
+                            })
+                            .or_else(|| {
+                                arms.iter().find(|arm| {
+                                    arm.get("default").and_then(JsonValue::as_bool) == Some(true)
+                                })
+                            })
+                            .ok_or_else(|| {
+                                anyhow!("scalar case missing arm for value {scrutinee_value}")
+                            })?;
+                        (arm, scrutinee_value.to_string(), None)
+                    }
+                    other => bail!("case expression evaluated to non-enum/scalar {other}"),
+                };
                 let body_hash = arm
                     .get("body")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("case arm missing body"))?;
-                let payload_trace = TraceValue::from_value(&value.borrow());
+                let payload_trace = match &binding_value {
+                    Some(value) => TraceValue::from_value(&value.borrow()),
+                    None => scrutinee_trace.clone(),
+                };
                 state.events.push(TraceEvent::CaseDecision {
                     root_hash: state.root_hash.clone(),
                     frame,
@@ -1765,7 +1813,7 @@ impl CodeDb {
                     function_def_hash: function_def_hash.to_string(),
                     expr_hash: expr_hash.to_string(),
                     scrutinee: scrutinee_trace,
-                    selected_variant: variant.clone(),
+                    selected_variant: selected_label,
                     selected_expr_hash: body_hash.to_string(),
                     payload: payload_trace,
                 });
@@ -1774,7 +1822,9 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .is_some()
                 {
-                    locals.push(value);
+                    let binding =
+                        binding_value.ok_or_else(|| anyhow!("scalar case arm cannot bind a value"))?;
+                    locals.push(binding);
                     let body = self.trace_expr(
                         state,
                         frame,

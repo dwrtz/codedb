@@ -253,7 +253,10 @@ of a partially-moved aggregate is allowed); lowering (`src/lowering.rs`) tracks
 per-place move state (`MovedPlace`) and the lowered-IR verifier proves
 exactly-once with per-branch isolation + merge. `tests/drop_glue_conditional.rs`
 runs a `box`-heap program natively (no double-free) confirming exactly-once under
-conditional and field-granular moves; the five former-rejection tests in
+conditional moves, field-granular moves, and the two COMBINED (a record field
+moved in only some `if`/`case` branches while a sibling field stays live — the
+branch-merge compensation drops the live remainder without recursing into the
+untouched non-record sibling); the five former-rejection tests in
 `tests/move_drop.rs` are now acceptance tests. Array-element partial moves stay
 fail-closed (records only).
 
@@ -293,14 +296,19 @@ Status: implemented (functions). A `RecursionGroup` object kind plus an
 names before any body is type-checked, so members may call each other. Member
 birth identities derive deterministically from the creating migration's parent
 history and the member's in-group ordinal (`recursion_group:{ordinal}`), so the
-clique reproduces on rebuild. Recursion groups are an internal representation:
+clique reproduces on rebuild. Ordinals are assigned by canonical clique structure
+(colour refinement over the call graph with peer identities erased), not source
+declaration order, so the group's content hash is order-independent and
+import→export→import is a fixpoint (two textual orderings of one clique dedup).
+Recursion groups are an internal representation:
 the importer detects recursive SCCs (`analyze_recursion_groups` + Tarjan) and
 emits the op, while members project back as ordinary `fn`s and non-recursive
 functions keep their original one-op-per-fn lowering (no migration-history
 churn). Verify validates a group (members resolve; each member's definition is a
-`FunctionDef` of its symbol — rejecting inconsistent in-group references) and
-bundle export/import follows group refs. Mutually-recursive *type* definitions
-(D1) remain functions-only follow-on. See `tests/recursion_group.rs`.
+`FunctionDef` of its symbol — rejecting duplicate members and inconsistent
+in-group references) and bundle export/import follows group refs.
+Mutually-recursive *type* definitions (D1) remain functions-only follow-on. See
+`tests/recursion_group.rs`.
 
 Deliverables:
 
@@ -364,12 +372,21 @@ src/types.rs, src/lowering.rs, src/verify.rs, src/expr.rs, src/backend/native.rs
 examples/v3/, tests/recursion_native.rs
 ```
 
-Acceptance fixture and oracle:
+Acceptance fixture and oracle (partially met — see Deferred):
 
 ```text
 sum/length over a recursive box<Node>, and a tree-walking expression evaluator,
   compile to native artifacts and match the reference evaluator
 ```
+
+Deferred: case-traversal of a recursive `box`/enum heap (length/sum over a list, a
+tree-walker) is NOT yet expressible — there is no box-unbox / deref-by-move
+expression to turn a `box<Node>` payload back into a `Node` to recurse on — so the
+named fixture above is not yet met. What IS met: a self-recursive function that
+BUILDS and DROPS a recursive `box<Node>` chain compiles native and matches the
+evaluator (recursion + recursive type layout + recursive drop glue). The box-unbox
+expression, with enum-payload field-granular moves, is the follow-on that unblocks
+both the named fixture and the Phase 8 self-hosted evaluator.
 
 ## Phase 7 — Pattern Matching Richness (R14)
 
@@ -384,9 +401,10 @@ at lowering — reusing the existing backend with no new code generation, and
 inheriting Phase 4 conditional drop glue for arm bodies. Exhaustiveness is
 checked with a deterministic diagnostic (an `i64` case needs a `_`; a `bool` case
 must cover true/false or have a `_`; enum coverage as before). `case`-in-arm
-nesting works. Evaluator and native parity in `tests/pattern_match_native.rs`.
-Range patterns, `if` guards, and nested enum-destructuring patterns are
-documented follow-on R14 surface.
+nesting works and round-trips — a nested `case` in a non-last arm is parenthesized
+so the projection re-parses. Evaluator, native, and `trace`/`debug` parity in
+`tests/pattern_match_native.rs` and `tests/trace.rs`. Range patterns, `if` guards,
+and nested enum-destructuring patterns are documented follow-on R14 surface.
 
 Deliverables:
 
@@ -777,11 +795,22 @@ Success: features add with a small edit surface, and concurrent agents build the
 Includes: Phases 4–7 (drop glue, recursion groups, recursion, pattern matching).
 Status: implemented. Recursion (self and mutual) compiles native and matches the
 oracle; conditional and field-granular drop glue is sound (interposer/double-free
-verified); verify accepts recursive call graphs and recursion-group objects;
-scalar literal `case` with `_` and exhaustiveness compiles native. Documented
-follow-on R14/structure surface: range/guard/nested-enum patterns, recursive type
-definitions, and enum-payload field-granular moves (which together unlock
-case-traversal of recursive heap structures).
+verified) — including the two dimensions COMBINED (a record field moved in only
+some branches while a sibling field stays live, which now lowers and is
+double-free-verified); verify accepts recursive call graphs and recursion-group
+objects; recursion-group content identity is canonical (member ordinals derive
+from clique structure, not source order, so the hash is order-independent and
+import→export→import is a fixpoint); scalar literal `case` with `_` and
+exhaustiveness compiles native, projects round-trip (including a nested `case` in a
+non-last arm), and steps under `trace`/`debug`.
+
+Documented follow-on R14/structure surface: range/guard/nested-enum patterns,
+recursive type definitions, and the box-unbox / enum-payload field-granular move
+expression — which together unlock case-traversal of recursive heap structures
+(the Phase 6 acceptance fixture and the Phase 8 self-hosted evaluator). Known
+oracle caveat: the reference evaluator recurses on the host stack, so a
+deeply/infinitely recursive program can overflow it (the native backend, on the OS
+stack, is unaffected) — a robustness bound on the oracle, not a language limit.
 
 ```text
 Success: recursion compiles native; drops occur exactly once across conditional

@@ -119,6 +119,35 @@ fn trace_cli_returns_deterministic_semantic_events() {
 }
 
 #[test]
+fn trace_steps_through_a_scalar_case() {
+    // `trace`/`debug` must step through an i64/bool `case` (R14), not only an enum
+    // case: the scalar scrutinee selects an arm by literal pattern with a `_`
+    // fallback, like the reference evaluator. Previously this trapped with
+    // "case expression evaluated to non-enum".
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("scalar_case_trace.sqlite");
+    let src = temp.path().join("scalar_case_trace.cdb");
+    std::fs::write(
+        &src,
+        "fn classify(n: i64) -> i64 = case n of 0 => 100 | 1 => 200 | _ => 999\n\
+         fn main() -> i64 = classify(1)\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+
+    let trace = parse_json(&run(&["trace", path(&db), "main", "--json"]));
+    assert_eq!(trace["status"], "ok");
+    assert_eq!(trace["result"], json!({"kind": "i64", "value": "200"}));
+
+    let decision = events(&trace)
+        .iter()
+        .find(|event| event["event"] == "case_decision")
+        .expect("a case_decision event for the scalar case");
+    assert_eq!(decision["selected_variant"], "1", "selected the `1 => 200` arm");
+}
+
+#[test]
 fn trace_targets_survive_rename_while_display_names_change() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("trace-rename.sqlite");

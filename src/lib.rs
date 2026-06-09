@@ -126,8 +126,11 @@ impl CodeDb {
             if !recursive {
                 continue;
             }
-            let mut members: Vec<usize> = component.iter().map(|&node| func_items[node]).collect();
-            members.sort_unstable();
+            let members: Vec<usize> = component.iter().map(|&node| func_items[node]).collect();
+            // Order members canonically (by clique structure, not source position)
+            // so the group's content identity is order-independent and
+            // import→export→import is a fixpoint (SPEC_V3 §6/§10).
+            let members = canonical_recursion_member_order(items, &members);
             let group_id = analysis.groups.len();
             for &member in &members {
                 analysis.group_of.insert(member, group_id);
@@ -1157,7 +1160,7 @@ fn format_outcome(outcome: migrations::MigrationOutcome, json: bool) -> String {
 struct RecursionAnalysis {
     /// item index -> group id (only for items in a recursive clique).
     group_of: std::collections::HashMap<usize, usize>,
-    /// group id -> member item indices, in source order.
+    /// group id -> member item indices, in canonical (structural) member order.
     groups: Vec<Vec<usize>>,
 }
 
@@ -1314,4 +1317,121 @@ fn tarjan_scc(adjacency: &[Vec<usize>]) -> Vec<Vec<usize>> {
         }
     }
     sccs
+}
+
+/// Rewrite, in a JSON-serialized `RawExpr`, every direct call to an in-clique peer
+/// so it carries the peer's current refinement colour instead of its name. This
+/// erases member identity (and display names) from the body shape while preserving
+/// which structural position calls a peer of which colour — the signal colour
+/// refinement folds in. Non-peer calls (builtins, external/non-member functions)
+/// keep their names: they are stable identities, not clique members.
+fn recolor_peer_calls(
+    value: &mut serde_json::Value,
+    module: &str,
+    name_to_local: &std::collections::HashMap<(String, String), usize>,
+    colors: &[String],
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let peer_tag = if map.get("kind").and_then(|kind| kind.as_str()) == Some("call") {
+                map.get("name")
+                    .and_then(|name| name.as_str())
+                    .and_then(|name| resolve_call_node(name, module, name_to_local))
+                    .map(|local| format!("@recursion-peer:{}", colors[local]))
+            } else {
+                None
+            };
+            if let Some(tag) = peer_tag {
+                map.insert("name".to_string(), serde_json::Value::String(tag));
+            }
+            for child in map.values_mut() {
+                recolor_peer_calls(child, module, name_to_local, colors);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                recolor_peer_calls(item, module, name_to_local, colors);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Canonical, name-independent ordering of a recursion clique's member items, so a
+/// member's ordinal — and thus its deterministic birth identity (SPEC_V3 §10) — is
+/// a property of the clique's STRUCTURE rather than of source declaration order.
+/// Without it, two textual orderings of the same clique receive different content
+/// hashes, and import→export→import is not a fixpoint (the export render order
+/// differs from the source). Colour refinement over the call graph — keyed on each
+/// member's body shape with peer identities erased — yields the order; renaming a
+/// member (metadata-only) never reorders the clique. Members still indistinguishable
+/// after refinement are automorphism-equivalent (their relative order cannot change
+/// the group hash), so the original source order is a safe final tiebreak.
+fn canonical_recursion_member_order(
+    items: &[ProgramItem],
+    member_item_indices: &[usize],
+) -> Vec<usize> {
+    let n = member_item_indices.len();
+    if n <= 1 {
+        return member_item_indices.to_vec();
+    }
+    let functions: Vec<&FunctionSource> = member_item_indices
+        .iter()
+        .map(|&idx| match &items[idx] {
+            ProgramItem::Function(function) => function,
+            _ => unreachable!("recursion-group member is not a function"),
+        })
+        .collect();
+    let mut name_to_local: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    for (local, function) in functions.iter().enumerate() {
+        name_to_local.insert((function.module.clone(), function.name.clone()), local);
+    }
+    // Body-independent signature (no display name appears): regions, param types,
+    // return type, effects. Two members with different signatures never tie.
+    let static_sig: Vec<String> = functions
+        .iter()
+        .map(|function| {
+            store::canonical_json(&serde_json::json!({
+                "regions": function.region_params,
+                "params": function.params.iter().map(|param| &param.ty).collect::<Vec<_>>(),
+                "return": function.return_type,
+                "effects": serde_json::to_value(&function.effects).expect("effects serialize"),
+            }))
+        })
+        .collect();
+    // Colour refinement: a member's colour folds in the colours of the peers it
+    // calls (their identity erased), so the final colour reflects the member's
+    // position in the clique's structure. Converges in <= n rounds.
+    let mut colors = vec![String::new(); n];
+    let mut classes = 1usize;
+    for _ in 0..n {
+        let next: Vec<String> = (0..n)
+            .map(|local| {
+                let mut body =
+                    serde_json::to_value(&functions[local].body).expect("RawExpr serializes");
+                recolor_peer_calls(&mut body, &functions[local].module, &name_to_local, &colors);
+                store::hash_bytes(
+                    b"codedb/recursion-order/v1\0",
+                    format!("{}|{}", static_sig[local], store::canonical_json(&body)).as_bytes(),
+                )
+            })
+            .collect();
+        let next_classes = next.iter().collect::<std::collections::BTreeSet<_>>().len();
+        colors = next;
+        if next_classes == classes {
+            break;
+        }
+        classes = next_classes;
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        colors[a]
+            .cmp(&colors[b])
+            .then_with(|| member_item_indices[a].cmp(&member_item_indices[b]))
+    });
+    order
+        .into_iter()
+        .map(|local| member_item_indices[local])
+        .collect()
 }

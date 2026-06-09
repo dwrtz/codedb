@@ -111,6 +111,87 @@ fn partial_field() -> i64 effects[alloc] =
 fn main() -> i64 effects[alloc] = cond_true() + cond_false() + partial_field()
 "#;
 
+// The two Phase-4 dimensions COMBINED in one value: an owned heap field is moved
+// conditionally (in only one branch) AND partially (a sibling field stays live).
+// This is the case the separate `cond_move`/`partial_field` fixtures above don't
+// reach — it drives `emit_branch_compensation` into a partially-moved record with
+// a surviving non-record (box) sibling, which previously crashed lowering with
+// "aggregate place initializer requires record type, got box<...>" even though the
+// checker and evaluator accepted it (SPEC_V3 §7). A double-free aborts the native
+// run; a leak drops the `free` reference (static guard); eval is the value oracle.
+const COMBINED_SOURCE: &str = r#"
+record Line { price_cents: i64
+  qty: i64 }
+record Two { a: box<Line>
+  c: box<Line> }
+
+fn take(x: box<Line>) -> i64 effects[alloc] = x.price_cents
+
+// `t.a` (owned box) is moved into `take` on the `then` path only; `t.c` (sibling
+// box) stays owned and is read. On `then`: `t.a` is freed in `take`, `t.c` at
+// scope exit. On `else`: `t.a` is freed by the branch's compensating drop, `t.c`
+// at scope exit. Each box is freed exactly once on each path.
+fn cond_field(flag: bool) -> i64 effects[alloc] =
+  let t: Two = { a: box_new({ price_cents: 1, qty: 0 }), c: box_new({ price_cents: 3, qty: 0 }) } in
+  let picked: i64 = if flag then take(t.a) else 99 in
+  picked + t.c.price_cents
+
+fn cond_field_true() -> i64 effects[alloc] = cond_field(true)
+fn cond_field_false() -> i64 effects[alloc] = cond_field(false)
+
+fn main() -> i64 effects[alloc] = cond_field_true() + cond_field_false()
+"#;
+
+#[test]
+fn conditional_partial_field_move_with_surviving_sibling_lowers_and_runs_native() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("combined.sqlite");
+    let source = temp.path().join("combined.cdb");
+    std::fs::write(&source, COMBINED_SOURCE).unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+
+    // Value oracle: then = take(t.a)=1 + t.c=3 = 4; else = 99 + t.c=3 = 102.
+    assert_eq!(run(&["eval", path(&db), "cond_field_true"]).trim(), "4");
+    assert_eq!(run(&["eval", path(&db), "cond_field_false"]).trim(), "102");
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "106");
+    run(&["verify", path(&db)]);
+
+    // The compensating drop must be emitted (the formerly-crashing path), and the
+    // object stays wired to free so a skipped drop would be caught as a leak.
+    let ir_path = temp.path().join("cond_field.ir.json");
+    run(&["emit-ir", path(&db), "cond_field", "--out", path(&ir_path)]);
+    let ops = op_names(&read_json(&ir_path));
+    assert!(
+        ops.iter().filter(|op| *op == "drop").count() >= 2,
+        "expected a compensating drop AND a residual scope-exit drop, got {ops:?}"
+    );
+
+    // Runtime exactly-once: a double-free aborts (native status != passed).
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "combined_drop_native",
+            "--entry",
+            "main",
+            "--expect-i64",
+            "106",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["native_mismatches"], 0);
+        assert_eq!(
+            report["tests"][0]["native"]["comparison"]["actual"],
+            json!({"kind": "i64", "value": "106"})
+        );
+    }
+}
+
 #[test]
 fn conditional_and_partial_drop_glue_typecheck_lower_verify_and_run_native() {
     let temp = tempdir().unwrap();

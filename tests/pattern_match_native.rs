@@ -116,6 +116,39 @@ fn nested_scalar_case_lowers_and_runs_native() {
 }
 
 #[test]
+fn nested_case_in_non_last_arm_round_trips() {
+    // A nested `case` in a NON-last arm must project to text that re-parses: the
+    // inner case is parenthesized so its `| arm` list is not captured by the outer
+    // case (SPEC_V3 §11 checked-view round-trip). Without the parens the export
+    // reads back as "default case arm must be last".
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("nested.sqlite");
+    let src = temp.path().join("nested.cdb");
+    let export = temp.path().join("nested.export.cdb");
+    std::fs::write(
+        &src,
+        "fn f(n: i64) -> i64 = case n of 0 => (case n of 9 => 1 | _ => 2) | _ => 3\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+    run(&["export", path(&db), "--branch", "main", "--out", path(&export)]);
+    let exported = std::fs::read_to_string(&export).unwrap();
+    assert!(
+        exported.contains("0 => (case n of 9 => 1 | else => 2)"),
+        "nested non-last case must be parenthesized: {exported}"
+    );
+
+    // The exported projection re-imports and stays value-stable.
+    let db2 = temp.path().join("nested2.sqlite");
+    run(&["init", path(&db2)]);
+    run(&["import", path(&db2), path(&export)]);
+    run(&["verify", path(&db2)]);
+    assert_eq!(run(&["eval", path(&db2), "f", "0"]).trim(), "2");
+    assert_eq!(run(&["eval", path(&db2), "f", "5"]).trim(), "3");
+}
+
+#[test]
 fn non_exhaustive_integer_case_is_rejected() {
     // Exhaustiveness: an i64 `case` with no `_` wildcard is rejected with a
     // deterministic diagnostic.

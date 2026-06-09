@@ -1809,7 +1809,23 @@ impl CodeDb {
                 operations,
             );
         }
-        // `dead` only marks sub-fields of `place`; recurse (records only).
+        // `dead` neither covers `place` nor any sub-field of it: this branch's
+        // view of `place` already matches the merged state (the merge `dead` set
+        // is the union of every branch's moves, so `branch_moved ⊆ dead` — an
+        // untouched-by-`dead` place is untouched by this branch too). Nothing to
+        // compensate. Mirror of `emit_residual_drops`' `has_inner_move` guard;
+        // without it an untouched non-record sibling (a `box`/scalar field left
+        // live while another field is conditionally moved) is wrongly recursed
+        // into as a record and `aggregate_record_fields` bails (SPEC_V3 §7).
+        let has_inner_dead = dead
+            .iter()
+            .any(|m| place_is_ancestor_or_equal(place, m) && m != place);
+        if !has_inner_dead {
+            return Ok(());
+        }
+        // `dead` marks sub-fields of `place`; recurse. Only records are
+        // field-granular-tracked (array/enum-payload partial moves stay
+        // fail-closed), so a place with an inner-dead sub-field is a record.
         for field in self.aggregate_record_fields(root, place_type)? {
             let mut child = place.clone();
             child.fields.push(field.name.clone());

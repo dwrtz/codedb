@@ -987,6 +987,18 @@ impl CodeDb {
             errors.push(format!("bad_recursion_group: {parent_hash} has no members"));
             return Ok(());
         }
+        // Each member is a distinct symbol in the clique; a repeated member symbol
+        // is malformed (the importer mints one ordinal per member, SPEC_V3 §10).
+        let mut seen_symbols = std::collections::BTreeSet::new();
+        for member in members {
+            if let Some(symbol) = member.get("symbol").and_then(JsonValue::as_str)
+                && !seen_symbols.insert(symbol)
+            {
+                errors.push(format!(
+                    "bad_recursion_group: {parent_hash} lists member symbol {symbol} more than once"
+                ));
+            }
+        }
         for (idx, member) in members.iter().enumerate() {
             self.check_hash_ref(
                 parent_hash,

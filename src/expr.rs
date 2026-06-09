@@ -2628,9 +2628,18 @@ impl CodeDb {
                     .get("arms")
                     .and_then(JsonValue::as_array)
                     .ok_or_else(|| anyhow!("case missing arms"))?;
+                let arm_count = arms.len();
                 let rendered_arms = arms
                     .iter()
-                    .map(|arm| {
+                    .enumerate()
+                    .map(|(arm_index, arm)| {
+                        // A nested low-precedence body — notably another `case`,
+                        // whose `| arm` list the OUTER case would otherwise capture
+                        // — must be parenthesized, except in the last arm where
+                        // nothing follows it to capture. Without this, a nested
+                        // non-last `case` projects to text that won't re-parse
+                        // (SPEC_V3 §11 checked-view round-trip).
+                        let body_prec = if arm_index + 1 == arm_count { 0 } else { 1 };
                         let binding = arm.get("binding_name").and_then(JsonValue::as_str);
                         if typed_case_arm_is_default(arm) {
                             if binding.is_some() {
@@ -2649,7 +2658,7 @@ impl CodeDb {
                                     local_params,
                                     region_names,
                                     local_names,
-                                    0,
+                                    body_prec,
                                 )?
                             ));
                         }
@@ -2676,7 +2685,7 @@ impl CodeDb {
                                     local_params,
                                     region_names,
                                     local_names,
-                                    0,
+                                    body_prec,
                                 )?
                             ));
                         }
@@ -2698,7 +2707,7 @@ impl CodeDb {
                             local_params,
                             region_names,
                             local_names,
-                            0,
+                            body_prec,
                         );
                         if binding.is_some() {
                             local_names.pop();
