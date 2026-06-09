@@ -1,0 +1,88 @@
+// fnv1a.cdb - FNV-1a (32-bit) hash, printed as hex.
+//
+// This program is a deliberate stress test for docs/ROADMAP.md. FNV-1a wants
+// bitwise XOR, a 32-bit unsigned wrapping multiply, and hex (nibble) output.
+// None of bitwise ops, fixed-width/unsigned ints, or u8->i64 casts exist today,
+// so every one of those is faked with integer arithmetic. The contortions below
+// ARE the evidence for the roadmap items; the comments tag where each bites.
+//
+//   reference:  fnv1a32("codedb") = 505568406 = 0x1e225c96
+
+module std.platform {
+extern fn write(fd: i64, ptr: raw_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "write" library "c"
+}
+
+module std.io {
+fn write_str(s: slice<'static, u8>) -> i64 effects[io, ffi, unsafe] =
+  std.platform.write(1, raw_ptr(&'static s[0]), len(s))
+
+fn write_byte(s: slice<'static, u8>, i: i64) -> i64 effects[io, ffi, unsafe] =
+  std.platform.write(1, raw_ptr(&'static s[i]), 1)
+}
+
+// --- FNV-1a constants (32-bit) ------------------------------------------
+fn fnv_offset() -> i64 = 2166136261   // 0x811c9dc5
+fn fnv_prime()  -> i64 = 16777619     // 0x01000193
+fn two_32()     -> i64 = 4294967296   // 2^32
+
+// R5 (no u32 / wrapping arithmetic): emulate a 32-bit unsigned wrap.
+// Should be `(x as u32)`; instead:  x mod 2^32, and mod is R2 (no `%`).
+fn wrap32(x: i64) -> i64 = x - (x / two_32()) * two_32()
+
+// R4 (no bitwise ops): emulate XOR of the low byte of `acc` with byte `b`.
+// Should be `acc ^ b`; instead a fold over the 8 bit positions, extracting
+// each bit with division (no `>>`/`&`) and XOR-ing via (a+b) mod 2.
+fn bit_places() -> array<i64, 8> = [1, 2, 4, 8, 16, 32, 64, 128]
+
+fn xor_low_byte<'a>(acc: i64, b: i64) -> i64 =
+  let low: i64 = acc - (acc / 256) * 256 in   // R4: should be `acc & 0xff`
+  let high: i64 = acc - low in                // bits 8..31, untouched
+  let places: array<i64, 8> = bit_places() in
+  let view: slice<'a, i64> = slice(places) in
+  let xored_low: i64 =
+    fold p in view with sum = 0 do
+      let ba: i64 = (acc / p) - 2 * (acc / (p * 2)) in  // bit of acc at p
+      let bb: i64 = (b   / p) - 2 * (b   / (p * 2)) in  // bit of b at p
+      let xb: i64 = (ba + bb) - 2 * ((ba + bb) / 2) in  // (ba xor bb)
+      sum + xb * p
+  in
+  high + xored_low
+
+// The hash itself is pure arithmetic (no FFI/state), so the reference
+// evaluator can run it as an oracle for the native build.
+fn fnv1a<'a>(msg: slice<'a, i64>) -> i64 =
+  fold byte in msg with h = fnv_offset() do
+    wrap32(xor_low_byte(h, byte) * fnv_prime())
+
+// --- hex output ---------------------------------------------------------
+// R4 again: nibbles via division instead of `>> 4` / `& 0xf`.
+fn hex_places() -> array<i64, 8> =
+  [268435456, 16777216, 1048576, 65536, 4096, 256, 16, 1]   // 16^7 .. 16^0
+
+fn print_hex8<'a>(h: i64) -> i64 effects[io, ffi, unsafe] =
+  let places: array<i64, 8> = hex_places() in
+  let view: slice<'a, i64> = slice(places) in
+  let _done: i64 =
+    fold pv in view with acc = 0 do
+      let nibble: i64 = (h / pv) - (h / (pv * 16)) * 16 in
+      let _w: i64 = std.io.write_byte(b"0123456789abcdef", nibble) in
+      acc + 1
+  in
+  0
+
+// --- message (R-block: no u8->i64 cast, so bytes are modeled as i64) -----
+// We CANNOT hash a real `b"codedb"` because a u8 element's numeric value
+// cannot reach i64 arithmetic (no cast). So the message is hand-encoded as
+// i64 byte values:  "codedb" = [99,111,100,101,100,98].
+fn message() -> array<i64, 6> = [99, 111, 100, 101, 100, 98]
+
+fn hash_codedb<'a>() -> i64 =
+  let msg: array<i64, 6> = message() in
+  fnv1a(slice(msg))
+
+fn main<'a>() -> i64 effects[io, ffi, unsafe] =
+  let h: i64 = hash_codedb() in
+  let _1: i64 = std.io.write_str("fnv1a-32(\"codedb\") = 0x") in
+  let _2: i64 = print_hex8(h) in
+  let _3: i64 = std.io.write_str("\n") in
+  0

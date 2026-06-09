@@ -1,0 +1,118 @@
+// calc_vm.cdb - a tiny stack-based bytecode interpreter written in CodeDB.
+//
+// This is a real program: a little calculator VM. Bytecode is an array of
+// typed `Instr` values; the interpreter is a single `fold` over the program
+// that pushes/pops a mutable stack array (the borrow checker proves the stack
+// writes are sound). It evaluates a polynomial via Horner's method, prints the
+// decimal result to stdout, and returns it as the process exit code.
+
+module std.platform {
+extern fn write(fd: i64, ptr: raw_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "write" library "c"
+}
+
+module std.io {
+fn write_str(s: slice<'static, u8>) -> i64 effects[io, ffi, unsafe] =
+  std.platform.write(1, raw_ptr(&'static s[0]), len(s))
+
+fn write_byte(s: slice<'static, u8>, i: i64) -> i64 effects[io, ffi, unsafe] =
+  std.platform.write(1, raw_ptr(&'static s[i]), 1)
+}
+
+// --- Bytecode instruction set -------------------------------------------
+// A typed sum type. `Push` carries an immediate; the rest act on the stack.
+enum Instr {
+  Push: i64    // push immediate
+  LoadX: unit  // push the input variable x
+  Add: unit
+  Sub: unit
+  Mul: unit
+  Neg: unit    // negate top of stack
+}
+
+// --- The virtual machine ------------------------------------------------
+// One fold over the program. The accumulator is the stack pointer `sp`; the
+// stack itself is a local fixed array mutated in place. `case` dispatches on
+// the instruction; mutation is gated by the `state` effect.
+fn stack0() -> array<i64, 16> =
+  [0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0]
+
+fn run<'a>(program: slice<'a, Instr>, x: i64) -> i64 effects[state] =
+  let stack: array<i64, 16> = stack0() in
+  let final_sp: i64 =
+    fold instr in program with sp = 0 do
+      case instr of
+        Push(n) =>
+          let _p: unit = stack[sp] = n in sp + 1
+      | LoadX =>
+          let _l: unit = stack[sp] = x in sp + 1
+      | Add =>
+          let _a: unit = stack[sp - 2] = stack[sp - 2] + stack[sp - 1] in sp - 1
+      | Sub =>
+          let _s: unit = stack[sp - 2] = stack[sp - 2] - stack[sp - 1] in sp - 1
+      | Mul =>
+          let _m: unit = stack[sp - 2] = stack[sp - 2] * stack[sp - 1] in sp - 1
+      | Neg =>
+          let _n: unit = stack[sp - 1] = 0 - stack[sp - 1] in sp
+  in
+  stack[final_sp - 1]
+
+// --- Decimal printer ----------------------------------------------------
+// No modulo operator and no recursion, so digits come from a second fold over
+// place values: digit(p) = n/p - (n/(p*10))*10. A static table maps the digit
+// to its ASCII byte. `started` suppresses leading zeros.
+fn places() -> array<i64, 10> =
+  [1000000000, 100000000, 10000000, 1000000, 100000, 10000, 1000, 100, 10, 1]
+
+fn print_nonneg<'a>(n: i64) -> i64 effects[io, ffi, unsafe] =
+  let pv: array<i64, 10> = places() in
+  let view: slice<'a, i64> = slice(pv) in
+  let _done: bool =
+    fold p in view with started = false do
+      let d: i64 = (n / p) - (n / (p * 10)) * 10 in
+      if started || d != 0 || p == 1 then
+        let _w: i64 = std.io.write_byte(b"0123456789", d) in true
+      else
+        false
+  in
+  0
+
+fn print_i64(n: i64) -> i64 effects[io, ffi, unsafe] =
+  if n < 0 then
+    let _m: i64 = std.io.write_str(b"-") in print_nonneg(0 - n)
+  else
+    print_nonneg(n)
+
+// --- Demo programs (bytecode) -------------------------------------------
+// Horner form of  3*x^2 + 2*x + 7  =  ((3)*x + 2)*x + 7
+fn poly_program() -> array<Instr, 9> =
+  [
+    Instr::Push(3), Instr::LoadX(()), Instr::Mul(()),
+    Instr::Push(2), Instr::Add(()), Instr::LoadX(()), Instr::Mul(()),
+    Instr::Push(7), Instr::Add(())
+  ]
+
+// 10 - 25  (exercises Sub and the negative-number printer)
+fn sub_program() -> array<Instr, 3> =
+  [Instr::Push(10), Instr::Push(25), Instr::Sub(())]
+
+// Pure entry (no FFI), so the interpreter can evaluate it as an oracle for the
+// native build:  `codedb eval <db> poly_at 5`  ==  the native exit code.
+fn poly_at<'a>(x: i64) -> i64 effects[state] =
+  let poly: array<Instr, 9> = poly_program() in
+  let poly_view: slice<'a, Instr> = slice(poly) in
+  run(poly_view, x)
+
+fn main<'a>() -> i64 effects[state, io, ffi, unsafe] =
+  let poly_result: i64 = poly_at(5) in
+
+  let sub: array<Instr, 3> = sub_program() in
+  let sub_view: slice<'a, Instr> = slice(sub) in
+  let sub_result: i64 = run(sub_view, 0) in
+
+  let _b1: i64 = std.io.write_str("codedb stack-VM: a bytecode interpreter\n") in
+  let _b2: i64 = std.io.write_str("  3*x*x + 2*x + 7  at x=5  =  ") in
+  let _b3: i64 = print_i64(poly_result) in
+  let _b4: i64 = std.io.write_str("\n  10 - 25            =  ") in
+  let _b5: i64 = print_i64(sub_result) in
+  let _b6: i64 = std.io.write_str("\n") in
+  poly_result

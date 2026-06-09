@@ -1,0 +1,90 @@
+// http_server.cdb - a real TCP/HTTP/1.1 server, native, via libc sockets.
+//
+// It binds 127.0.0.1:8080, listens, and answers HTTP requests with a fixed
+// 200 response. This is a roadmap stress test (docs/ROADMAP.md): it works, but
+// several things are contorted by missing language features, tagged inline.
+//
+//   - the accept loop CANNOT be `for(;;)` (no unbounded loop / no recursion):
+//     it is a `fold` over a fixed array, so it serves exactly N requests.       [R1/R8]
+//   - the sockaddr_in struct is a raw byte literal, not a typed struct, because
+//     numeric struct fields with explicit byte layout + htons need bitwise/casts. [R4/R5/R6]
+//   - the read buffer is malloc'd because array literals have no `[x; N]` fill.   [R9]
+//
+// Build:  codedb build <db> main --out http && ./http     (serves 16 requests)
+// Test:   curl -s http://127.0.0.1:8080/
+
+module std.platform {
+extern fn socket(domain: i64, ty: i64, protocol: i64) -> i64 abi[c] effects[io, ffi] link_name "socket" library "c"
+extern fn setsockopt(fd: i64, level: i64, name: i64, val: raw_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "setsockopt" library "c"
+extern fn bind(fd: i64, addr: raw_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "bind" library "c"
+extern fn listen(fd: i64, backlog: i64) -> i64 abi[c] effects[io, ffi] link_name "listen" library "c"
+extern fn accept(fd: i64, addr: raw_mut_ptr<u8>, len: raw_mut_ptr<u8>) -> i64 abi[c] effects[io, ffi, unsafe] link_name "accept" library "c"
+extern fn read(fd: i64, ptr: raw_mut_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "read" library "c"
+extern fn write(fd: i64, ptr: raw_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "write" library "c"
+extern fn close(fd: i64) -> i64 abi[c] effects[io, ffi] link_name "close" library "c"
+extern fn malloc(size: i64, align: i64) -> raw_mut_ptr<u8> abi[c] effects[alloc, ffi, unsafe] link_name "malloc" library "c"
+extern fn free(ptr: raw_mut_ptr<u8>) -> unit abi[c] effects[alloc, ffi, unsafe] link_name "free" library "c"
+}
+
+// struct sockaddr_in (macOS, 16 bytes), 127.0.0.1-reachable INADDR_ANY:8080
+//   [sin_len=0x10][sin_family=0x02][sin_port=0x1f90 big-endian][sin_addr=0][pad=0]
+fn server_addr() -> slice<'static, u8> =
+  b"\x10\x02\x1f\x90\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+
+// optval for SO_REUSEADDR: the C `int 1` as 4 little-endian bytes
+fn reuse_one() -> slice<'static, u8> = b"\x01\x00\x00\x00"
+
+fn response() -> slice<'static, u8> =
+  b"HTTP/1.1 200 OK\x0d\x0aContent-Type: text/plain\x0d\x0aContent-Length: 19\x0d\x0aConnection: close\x0d\x0a\x0d\x0aHello from CodeDB!\n"
+
+fn banner() -> slice<'static, u8> =
+  b"CodeDB http server listening on http://127.0.0.1:8080 (serves 16 requests)\n"
+
+// All address-of-static happens on a slice PARAMETER `s` (taking &'static of a
+// call result is a borrow error), so every write routes through this helper.
+fn write_all(fd: i64, s: slice<'static, u8>) -> i64 effects[io, ffi, unsafe] =
+  std.platform.write(fd, raw_ptr(&'static s[0]), len(s))
+
+fn bind_addr(fd: i64, s: slice<'static, u8>) -> i64 effects[io, ffi, unsafe] =
+  std.platform.bind(fd, raw_ptr(&'static s[0]), 16)
+
+fn set_reuse(fd: i64, s: slice<'static, u8>) -> i64 effects[io, ffi, unsafe] =
+  std.platform.setsockopt(fd, 65535, 4, raw_ptr(&'static s[0]), 4)
+
+// One request: drain it into req (contents ignored), reply, close.
+fn handle(client: i64, req: raw_mut_ptr<u8>, resp: slice<'static, u8>) -> i64 effects[io, ffi, unsafe] =
+  let _n: i64 = std.platform.read(client, req, 1024) in
+  let _w: i64 = write_all(client, resp) in
+  std.platform.close(client)
+
+// The accept "loop": a fold over a 16-element array == serve 16 connections.
+// `for(;;)` is impossible today, so the server is intentionally bounded.       [R8]
+fn accept_ticks() -> array<i64, 16> =
+  [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+fn serve<'a>(listen_fd: i64) -> i64 effects[io, alloc, ffi, unsafe] =
+  let req: raw_mut_ptr<u8> = std.platform.malloc(1024, 16) in
+  let addr_buf: raw_mut_ptr<u8> = std.platform.malloc(16, 8) in
+  let len_buf: raw_mut_ptr<u8> = std.platform.malloc(8, 8) in
+  let ticks: array<i64, 16> = accept_ticks() in
+  let view: slice<'a, i64> = slice(ticks) in
+  let served: i64 =
+    fold t in view with count = 0 do
+      let client: i64 = std.platform.accept(listen_fd, addr_buf, len_buf) in
+      let _h: i64 = handle(client, req, response()) in
+      count + 1
+  in
+  let _f1: unit = std.platform.free(req) in
+  let _f2: unit = std.platform.free(addr_buf) in
+  let _f3: unit = std.platform.free(len_buf) in
+  served
+
+fn main<'a>() -> i64 effects[io, alloc, ffi, unsafe] =
+  let fd: i64 = std.platform.socket(2, 1, 0) in
+  let _r: i64 = set_reuse(fd, reuse_one()) in
+  let _b: i64 = bind_addr(fd, server_addr()) in
+  let _l: i64 = std.platform.listen(fd, 16) in
+  let _banner: i64 = write_all(1, banner()) in
+  let served: i64 = serve(fd) in
+  let _c: i64 = std.platform.close(fd) in
+  served
