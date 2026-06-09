@@ -191,6 +191,12 @@ caller wants to pin the exact source root.
   track.
 - [docs/PLAN_V2.md](docs/PLAN_V2.md): v2 native semantic programming roadmap
   and phase plan.
+- [docs/SPEC_V3.md](docs/SPEC_V3.md): v3 self-hosting semantic programming
+  design track.
+- [docs/PLAN_V3.md](docs/PLAN_V3.md): v3 self-hosting implementation roadmap
+  and phase plan.
+- [docs/SPEC_V4.md](docs/SPEC_V4.md): v4 agent-native platform design sketch
+  (a horizon, not yet a contract).
 - [docs/ROADMAP.md](docs/ROADMAP.md): forward-looking language/compiler gaps
   found by writing real programs against the v2 surface.
 - [docs/NATIVE_DONE.md](docs/NATIVE_DONE.md): native-required checklist for v2
