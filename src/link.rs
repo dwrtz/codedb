@@ -669,7 +669,28 @@ impl CodeDb {
             dependency_interface_hashes.sort();
             dependency_interface_hashes.dedup();
             let lowered = self.build_lowered_function_ir(root, root_entry, target_triple)?;
+            let compiler_platform_usage = compiler_platform_usage_for_ir(&lowered);
             collect_compiler_platform_externals(&lowered, &mut platform_external_symbols);
+            // Compiler-generated box allocation/drop glue uses the platform
+            // allocator without a direct `malloc`/`free` call in the function
+            // body, so the direct-dependency heuristic in
+            // `collect_symbol_capabilities` misses it. Tag the `alloc` capability
+            // here too, so a box-allocating function's capability accounting
+            // matches its declared `alloc` effect and the malloc/free it links.
+            if (compiler_platform_usage.uses_malloc || compiler_platform_usage.uses_free)
+                && effects.iter().any(|effect| effect == "alloc")
+            {
+                if let Some(source) = qualified_symbol_display(root, &symbol) {
+                    capabilities
+                        .entry(format!("alloc:{symbol}"))
+                        .or_insert(PlannedCapability {
+                            name: "alloc".to_string(),
+                            source,
+                            symbol_hash: symbol.clone(),
+                            effects: effects.clone(),
+                        });
+                }
+            }
             let dependency_implementation_hashes =
                 self.native_object_type_dependency_hashes(root, &lowered, target_triple)?;
             let object_key_input = CacheKeyInput::new(
@@ -1319,7 +1340,14 @@ fn collect_semantic_platform_external(
     let Some(source) = qualified_symbol_display(root, symbol_hash) else {
         return Ok(());
     };
-    if !source.starts_with("std.platform.") || !is_minimal_platform_extern(link_name) {
+    // Recognize a platform-capsule extern by its nature — an external (FFI)
+    // declaration (this is only called under `definition_is_external`) whose
+    // link name is a minimal platform extern — NOT by the module it happens to
+    // live in. Keying on a literal `std.platform.` prefix made the build-plan
+    // metadata fragile: a `move_symbol` out of that module silently dropped the
+    // extern from the reported capsule (and verify, sharing the rule, could not
+    // catch it). The link name is rename/move-stable.
+    if !is_minimal_platform_extern(link_name) {
         return Ok(());
     }
     out.insert(

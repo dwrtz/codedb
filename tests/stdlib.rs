@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
-use serde_json::{Value as JsonValue, json};
+use serde_json::Value as JsonValue;
 use tempfile::tempdir;
 
 fn bin() -> Command {
@@ -111,7 +111,11 @@ fn build_plan_reports_compiler_generated_allocation_capsule() {
         &build_plan["platform_external_symbols"],
         &[("compiler.heap_alloc", "malloc"), ("compiler.drop", "free")],
     );
-    assert_eq!(build_plan["capabilities"], json!([]));
+    // Box allocation goes through compiler-generated malloc/free rather than a
+    // direct platform call, but it is still allocation: the `alloc` capability
+    // must be reported so the capability accounting matches the declared `alloc`
+    // effect and the malloc/free this entry links.
+    assert_capability_names(&build_plan["capabilities"], &["alloc"]);
 }
 
 #[test]

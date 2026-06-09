@@ -3255,7 +3255,20 @@ impl CodeDb {
         if !self.type_assignable_in_root(root, &source_type, target_type)? {
             bail!("aggregate initializer type mismatch while lowering");
         }
-        if self.type_is_enum(root, target_type)? || self.type_is_fixed_array(root, target_type)? {
+        // Enums, fixed arrays, and owned buffers (`vec`/`string`) are whole-slot
+        // values with no field-addressable sub-structure, so a `let`-rebind of
+        // one initializes the destination by a blind whole-slot copy/move rather
+        // than the field-by-field record path below (which would otherwise bail
+        // for `vec`/`string`, leaving a program the evaluator accepts but native
+        // lowering rejected). Move-only buffers take the `Move` branch and mark
+        // the source moved, so the drop scaffold still frees the slot once.
+        if self.type_is_enum(root, target_type)?
+            || self.type_is_fixed_array(root, target_type)?
+            || matches!(
+                self.type_spec_in_root(root, target_type)?,
+                TypeSpec::Vec { .. } | TypeSpec::String
+            )
+        {
             if !self.layouts_blind_copy_compatible(
                 root,
                 ctx.target_triple(),

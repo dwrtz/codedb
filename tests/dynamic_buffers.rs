@@ -329,3 +329,58 @@ fn vec_record_total() -> i64 effects[alloc, state] =
         assert_eq!(report["native_mismatches"], 0);
     }
 }
+
+/// A `let`-rebind that moves an owned `vec`/`string` out of one local into
+/// another previously lowered through the field-by-field record path and bailed
+/// ("aggregate place initializer requires record type"), so the program ran
+/// under the evaluator but could not be built natively. It must now lower as a
+/// whole-slot move — the source is marked moved so the drop scaffold still frees
+/// the buffer exactly once — and run natively with the evaluator's result.
+#[test]
+fn vec_and_string_rebind_moves_build_and_run_native() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("rebind.sqlite");
+    let source = temp.path().join("rebind.cdb");
+    std::fs::write(
+        &source,
+        r#"
+fn rebind_vec() -> i64 effects[alloc, state] =
+  let xs: vec<i64> = vec_new(3) in
+  let pushed: unit = vec_push(xs, 9) in
+  let ys: vec<i64> = xs in
+  vec_get(ys, 0)
+
+fn rebind_string() -> i64 effects[alloc] =
+  let s: string = string_new("hello") in
+  let t: string = s in
+  string_len(t)
+
+fn main() -> i64 effects[alloc, state] = rebind_vec() + rebind_string()
+"#,
+    )
+    .unwrap();
+
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&["verify", path(&db)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "14");
+
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "rebind_move_native",
+            "--entry",
+            "main",
+            "--expect-i64",
+            "14",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["unsupported"], 0);
+        assert_eq!(report["native_mismatches"], 0);
+    }
+}

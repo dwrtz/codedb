@@ -318,6 +318,14 @@ struct ActiveLoan {
     region: String,
     place: LoanPlace,
     owner: Option<LoanPlace>,
+    // Reference- and slice-derived loans are `exclusive` and participate in
+    // aliasing checks (a mutable loan excludes other loans / reads / moves of
+    // the same place). Raw-pointer-derived loans are NOT exclusive: SPEC §15
+    // says raw pointers carry no region guarantees and dereferencing one is the
+    // caller's `unsafe` responsibility, so they may legally alias. They are
+    // still tracked (for liveness/escape: a raw pointer must not outlive the
+    // storage it points into), but are skipped by the exclusivity checks.
+    exclusive: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5353,7 +5361,9 @@ impl CodeDb {
             "call" => {
                 let (args, return_type, _) = self.call_region_context(root, &payload)?;
                 let return_regions = self.reference_regions_in_type(root, &return_type)?;
-                if return_regions.is_empty() {
+                let return_has_raw =
+                    self.type_contains_raw_pointer(Some(root), &return_type, &mut BTreeSet::new())?;
+                if return_regions.is_empty() && !return_has_raw {
                     return Ok(false);
                 }
                 for arg in args {
@@ -5363,6 +5373,21 @@ impl CodeDb {
                     let arg_type = self.expr_declared_type(&arg)?;
                     let arg_regions = self.reference_regions_in_type(root, &arg_type)?;
                     if !arg_regions.is_disjoint(&return_regions) {
+                        return Ok(true);
+                    }
+                    // A raw-pointer return is region-erased, so an escaping
+                    // raw-pointer argument may flow out through it. Treat that as
+                    // an escape rather than letting the empty region set wave it
+                    // through (the raw-pointer laundering hole): the direct
+                    // `return raw_mut_ptr(&'a mut local[0])` case is already
+                    // rejected, and laundering it through a call must be too.
+                    if return_has_raw
+                        && self.type_contains_raw_pointer(
+                            Some(root),
+                            &arg_type,
+                            &mut BTreeSet::new(),
+                        )?
+                    {
                         return Ok(true);
                     }
                 }
@@ -5825,7 +5850,7 @@ impl CodeDb {
                 self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
                 let place = self.loan_place_for_expr(target, param_types, &state.locals)?;
                 self.check_place_not_moved(&place, state)?;
-                self.check_loan_conflicts(&kind, &place, &state.active)?;
+                self.check_loan_conflicts(&kind, &place, true, &state.active)?;
                 Ok(())
             }
             "slice_from_array" => {
@@ -5845,7 +5870,7 @@ impl CodeDb {
                 self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
                 let place = self.loan_place_for_expr(target, param_types, &state.locals)?;
                 self.check_place_not_moved(&place, state)?;
-                self.check_loan_conflicts(&kind, &place, &state.active)?;
+                self.check_loan_conflicts(&kind, &place, true, &state.active)?;
                 Ok(())
             }
             "slice_len" => {
@@ -5905,7 +5930,7 @@ impl CodeDb {
                 self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
                 let target_place = self.loan_place_for_expr(target, param_types, &state.locals)?;
                 self.check_place_not_moved(&target_place, state)?;
-                self.check_loan_conflicts(&LoanKind::Mutable, &target_place, &state.active)?;
+                self.check_loan_conflicts(&LoanKind::Mutable, &target_place, true, &state.active)?;
                 self.verify_expr_borrows(root, value, param_types, state, ExprUse::Value)
             }
             "vec_get" => {
@@ -5987,7 +6012,7 @@ impl CodeDb {
                 self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
                 let target_place = self.loan_place_for_expr(target, param_types, &state.locals)?;
                 self.check_place_not_moved(&target_place, state)?;
-                self.check_loan_conflicts(&LoanKind::Mutable, &target_place, &state.active)?;
+                self.check_loan_conflicts(&LoanKind::Mutable, &target_place, true, &state.active)?;
                 self.verify_expr_borrows(root, value, param_types, state, ExprUse::Value)?;
                 self.check_place_not_moved(&target_place, state)?;
                 let target_type = self.expr_declared_type(target)?;
@@ -6480,6 +6505,7 @@ impl CodeDb {
                     region,
                     place: self.loan_place_for_expr(target, param_types, &state.locals)?,
                     owner: None,
+                    exclusive: true,
                 });
             }
             "slice_from_array" => {
@@ -6505,6 +6531,7 @@ impl CodeDb {
                     region,
                     place: self.loan_place_for_expr(target, param_types, &state.locals)?,
                     owner: None,
+                    exclusive: true,
                 });
             }
             "subslice" => {
@@ -6521,17 +6548,54 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("box_new missing value"))?;
                 out.extend(self.collect_value_loans(root, value, param_types, state)?);
             }
+            "raw_ptr_cast" => {
+                // Converting a borrow of a place into a raw pointer erases its
+                // region (SPEC §15), but the raw pointer still points into that
+                // storage. Keep carrying the underlying loan so liveness/escape
+                // checks (`check_loans_point_to_live_storage`,
+                // `check_no_loans_outlive_local`) fire when the raw pointer would
+                // outlive the place it borrows — otherwise a raw cast launders an
+                // escaping borrow of a local. Mark the carried loans non-exclusive:
+                // raw pointers may legally alias under `unsafe`, so they must not
+                // trigger the aliasing/exclusivity checks.
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("raw_ptr_cast missing value"))?;
+                out.extend(
+                    self.collect_value_loans(root, value, param_types, state)?
+                        .into_iter()
+                        .map(|mut loan| {
+                            loan.exclusive = false;
+                            loan
+                        }),
+                );
+            }
             "call" => {
                 let (args, return_type, _) = self.call_region_context(root, &payload)?;
                 let return_regions = self.reference_regions_in_type(root, &return_type)?;
-                if return_regions.is_empty() {
+                // A call whose return type contains a raw pointer may return a
+                // region-erased pointer derived from any raw-pointer argument
+                // (we cannot prove otherwise without raw-pointer provenance), so
+                // we conservatively carry such arguments' loans out of the call.
+                let return_has_raw =
+                    self.type_contains_raw_pointer(Some(root), &return_type, &mut BTreeSet::new())?;
+                if return_regions.is_empty() && !return_has_raw {
                     return Ok(out);
                 }
                 for arg in args {
+                    let arg_carries_raw = return_has_raw
+                        && self.type_contains_raw_pointer(
+                            Some(root),
+                            &self.expr_declared_type(&arg)?,
+                            &mut BTreeSet::new(),
+                        )?;
                     out.extend(
                         self.collect_value_loans(root, &arg, param_types, state)?
                             .into_iter()
-                            .filter(|loan| return_regions.contains(&loan.region)),
+                            .filter(|loan| {
+                                arg_carries_raw || return_regions.contains(&loan.region)
+                            }),
                     );
                 }
             }
@@ -7386,7 +7450,7 @@ impl CodeDb {
     ) -> Result<Vec<ActiveLoan>> {
         let mut added = Vec::new();
         for loan in loans {
-            self.check_loan_conflicts(&loan.kind, &loan.place, active)?;
+            self.check_loan_conflicts(&loan.kind, &loan.place, loan.exclusive, active)?;
             if active.contains(loan) {
                 continue;
             }
@@ -7396,14 +7460,23 @@ impl CodeDb {
         Ok(added)
     }
 
+    // Aliasing/exclusivity checks below only consider `exclusive` loans (those
+    // derived from safe references/slices). Non-exclusive raw-pointer loans are
+    // tracked for liveness/escape only and may legally alias under `unsafe`
+    // (SPEC §15), so they neither conflict with nor are blocked by other loans.
     fn check_loan_conflicts(
         &self,
         kind: &LoanKind,
         place: &LoanPlace,
+        new_exclusive: bool,
         active: &[ActiveLoan],
     ) -> Result<()> {
+        if !new_exclusive {
+            return Ok(());
+        }
         for loan in active {
-            if places_overlap(place, &loan.place)
+            if loan.exclusive
+                && places_overlap(place, &loan.place)
                 && (*kind == LoanKind::Mutable || loan.kind == LoanKind::Mutable)
             {
                 bail!(
@@ -7420,7 +7493,10 @@ impl CodeDb {
 
     fn check_shared_read_conflicts(&self, place: &LoanPlace, active: &[ActiveLoan]) -> Result<()> {
         for loan in active {
-            if loan.kind == LoanKind::Mutable && places_overlap(place, &loan.place) {
+            if loan.exclusive
+                && loan.kind == LoanKind::Mutable
+                && places_overlap(place, &loan.place)
+            {
                 bail!(
                     "shared read of {:?} conflicts with live mutable borrow of {:?}",
                     place,
@@ -7433,7 +7509,7 @@ impl CodeDb {
 
     fn check_move_conflicts(&self, place: &LoanPlace, active: &[ActiveLoan]) -> Result<()> {
         for loan in active {
-            if places_overlap(place, &loan.place) {
+            if loan.exclusive && places_overlap(place, &loan.place) {
                 bail!(
                     "move of {:?} conflicts with live {:?} borrow of {:?}",
                     place,

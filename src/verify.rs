@@ -3506,7 +3506,11 @@ impl CodeDb {
             let Some(source) = qualified_symbol_display(root, symbol_hash) else {
                 continue;
             };
-            if !source.starts_with("std.platform.") || !is_minimal_platform_extern(link_name) {
+            // Mirror `collect_semantic_platform_external`: recognize the capsule
+            // extern by its (extern, minimal-link-name) nature, not by a literal
+            // `std.platform.` module prefix, so this recomputation stays move/
+            // rename-stable and matches the plan it validates.
+            if !is_minimal_platform_extern(link_name) {
                 continue;
             }
             symbols.insert(

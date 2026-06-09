@@ -443,3 +443,85 @@ extern fn make() -> RawSlot abi[c] effects[ffi] link_name "make" library "c"
         }
     }
 }
+
+/// A raw pointer derived from a borrow of a local must not be able to outlive
+/// the storage it points into, even though `raw_ptr_cast` erases the region.
+/// The direct `return raw_mut_ptr(&'a mut local[0])` form was already rejected;
+/// these two forms (laundering the pointer through a raw-pointer-returning call,
+/// and letting the pointee's scope end before a later deref) previously passed
+/// `verify`, built, and ran while dereferencing a dead stack frame. They must be
+/// rejected. A local-derived raw pointer passed to a function that does *not*
+/// return a raw pointer (the `copy_todos`/`read_file` shape) stays valid.
+#[test]
+fn raw_pointer_to_local_cannot_escape_via_cast() {
+    // Bypass 1: launder a pointer-to-local out through a raw-pointer-returning
+    // call, then return it (use-after-return).
+    let launder = r#"
+fn make_buffer() -> array<u8, 4> = [b"A"[0], b"A"[0], b"A"[0], b"A"[0]]
+fn id_ptr(p: raw_mut_ptr<u8>) -> raw_mut_ptr<u8> = p
+fn leak<'a>() -> raw_mut_ptr<u8> effects[unsafe] =
+  let buffer: array<u8, 4> = make_buffer() in
+  id_ptr(raw_mut_ptr(&'a mut buffer[0]))
+fn main<'a>() -> i64 effects[unsafe] =
+  let dangling: raw_mut_ptr<u8> = leak() in
+  if raw_load(dangling) == b"A"[0] then 0 else 1
+"#;
+    let stderr = import_fail(launder);
+    assert!(
+        stderr.contains("reference to local storage") || stderr.contains("outlives local storage"),
+        "expected laundered ptr-to-local escape to be rejected, got: {stderr}"
+    );
+
+    // Bypass 2: the pointee's `let` scope ends before the raw pointer is read
+    // (use-after-scope) — caught by loan liveness, not the return-escape check.
+    let scope = r#"
+fn make_buffer() -> array<u8, 4> = [b"A"[0], b"A"[0], b"A"[0], b"A"[0]]
+fn use_after_scope<'a>() -> u8 effects[unsafe] =
+  let dangling: raw_mut_ptr<u8> =
+    (let buffer: array<u8, 4> = make_buffer() in
+     raw_mut_ptr(&'a mut buffer[0])) in
+  raw_load(dangling)
+fn main<'a>() -> i64 effects[unsafe] =
+  if use_after_scope() == b"A"[0] then 0 else 1
+"#;
+    let stderr = import_fail(scope);
+    assert!(
+        stderr.contains("outlives local storage"),
+        "expected use-after-scope raw pointer to be rejected, got: {stderr}"
+    );
+
+    // Over-rejection guard: a local-derived raw pointer passed to a function
+    // that returns a non-pointer (and used entirely within the borrower) is the
+    // valid `copy_todos`/`read_file` shape and must still verify.
+    let valid = r#"
+fn sink(p: raw_mut_ptr<i64>, v: i64) -> i64 effects[state, unsafe] =
+  let ignored: unit = raw_store(p, v) in
+  raw_load(raw_ptr(p))
+fn use_in_fn<'a>() -> i64 effects[state, unsafe] =
+  let x: i64 = 1 in
+  let p: raw_mut_ptr<i64> = raw_mut_ptr(&'a mut x) in
+  sink(p, 9)
+fn main<'a>() -> i64 effects[state, unsafe] = use_in_fn()
+"#;
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("valid.sqlite");
+    let source = temp.path().join("valid.cdb");
+    std::fs::write(&source, valid).unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    bin()
+        .args(["verify", path(&db)])
+        .assert()
+        .success()
+        .stdout("verify ok\n");
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "9");
+}
+
+fn import_fail(source_text: &str) -> String {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("reject.sqlite");
+    let source = temp.path().join("reject.cdb");
+    std::fs::write(&source, source_text).unwrap();
+    run(&["init", path(&db)]);
+    run_fail(&["import", path(&db), path(&source)])
+}
