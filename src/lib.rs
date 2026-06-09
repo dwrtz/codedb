@@ -1357,16 +1357,177 @@ fn recolor_peer_calls(
     }
 }
 
+/// The static (body-independent, name-independent) signature of each clique member:
+/// regions, param types, return type, effects. Two members with different signatures
+/// never share a colour. No display name appears, so rename stays metadata-only.
+fn recursion_member_static_sigs(functions: &[&FunctionSource]) -> Vec<String> {
+    functions
+        .iter()
+        .map(|function| {
+            store::canonical_json(&serde_json::json!({
+                "regions": function.region_params,
+                "params": function.params.iter().map(|param| &param.ty).collect::<Vec<_>>(),
+                "return": function.return_type,
+                "effects": serde_json::to_value(&function.effects).expect("effects serialize"),
+            }))
+        })
+        .collect()
+}
+
+fn distinct_color_count(colors: &[String]) -> usize {
+    colors.iter().collect::<std::collections::BTreeSet<_>>().len()
+}
+
+/// One run of 1-WL colour refinement to stability: a member's colour folds in the
+/// colours of the peers it calls (their identity erased by `recolor_peer_calls`), so
+/// the colour reflects the member's structural position. Converges in <= n rounds.
+///
+/// `preserve_own` controls whether a member's *own* previous colour is folded into
+/// its next colour. The initial refinement uses `false`, reproducing the historical
+/// colouring exactly (so a clique that 1-WL already discretizes keeps its prior
+/// order and content hash). The individualization search uses `true` so that a
+/// colour pinned by individualization survives subsequent refinement rounds.
+fn refine_recursion_colors(
+    functions: &[&FunctionSource],
+    static_sig: &[String],
+    name_to_local: &std::collections::HashMap<(String, String), usize>,
+    initial: &[String],
+    preserve_own: bool,
+) -> Vec<String> {
+    let n = functions.len();
+    let mut colors = initial.to_vec();
+    let mut classes = distinct_color_count(&colors);
+    for _ in 0..n {
+        let next: Vec<String> = (0..n)
+            .map(|local| {
+                let mut body =
+                    serde_json::to_value(&functions[local].body).expect("RawExpr serializes");
+                recolor_peer_calls(&mut body, &functions[local].module, name_to_local, &colors);
+                let payload = if preserve_own {
+                    format!(
+                        "{}|{}|{}",
+                        colors[local],
+                        static_sig[local],
+                        store::canonical_json(&body)
+                    )
+                } else {
+                    format!("{}|{}", static_sig[local], store::canonical_json(&body))
+                };
+                store::hash_bytes(b"codedb/recursion-order/v1\0", payload.as_bytes())
+            })
+            .collect();
+        let next_classes = distinct_color_count(&next);
+        colors = next;
+        if next_classes == classes {
+            break;
+        }
+        classes = next_classes;
+    }
+    colors
+}
+
+/// The clique's canonical *form* under a labeling `order` (where `order[ordinal]`
+/// is the local member index assigned that ordinal): each member's body with peer
+/// calls recoloured to the peer's ORDINAL, paired with its static signature, in
+/// ordinal order. Two labelings are compared by this form to choose the canonical
+/// one. The form contains only ordinals (0..n-1) and structure — never member
+/// identities or source positions — so isomorphic cliques produce identical forms.
+fn recursion_clique_form(
+    functions: &[&FunctionSource],
+    static_sig: &[String],
+    name_to_local: &std::collections::HashMap<(String, String), usize>,
+    order: &[usize],
+) -> Vec<String> {
+    let n = functions.len();
+    let mut ordinal_color = vec![String::new(); n];
+    for (ordinal, &local) in order.iter().enumerate() {
+        ordinal_color[local] = ordinal.to_string();
+    }
+    order
+        .iter()
+        .map(|&local| {
+            let mut body =
+                serde_json::to_value(&functions[local].body).expect("RawExpr serializes");
+            recolor_peer_calls(
+                &mut body,
+                &functions[local].module,
+                name_to_local,
+                &ordinal_color,
+            );
+            format!("{}|{}", static_sig[local], store::canonical_json(&body))
+        })
+        .collect()
+}
+
+/// Individualization-refinement search for the canonical labeling of a clique whose
+/// 1-WL refinement did not fully discretize. At each node: refine to stability; if
+/// discrete, rank members by colour to get a labeling and keep it if its
+/// `recursion_clique_form` is the lexicographically smallest seen. Otherwise pick
+/// the lowest-coloured non-singleton cell (a structural choice) and recurse once per
+/// member, individualizing that member. The result is the lex-min over ALL choices,
+/// so it is invariant to the order members were tried in — hence to source order.
+/// Members in a genuine automorphism orbit yield equal forms, so the choice among
+/// them does not affect the resulting content hash.
+fn canonical_label_search(
+    functions: &[&FunctionSource],
+    static_sig: &[String],
+    name_to_local: &std::collections::HashMap<(String, String), usize>,
+    seed_colors: Vec<String>,
+    depth: usize,
+    best: &mut Option<(Vec<String>, Vec<usize>)>,
+) {
+    let n = functions.len();
+    let colors = refine_recursion_colors(functions, static_sig, name_to_local, &seed_colors, true);
+    if distinct_color_count(&colors) == n {
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| colors[a].cmp(&colors[b]));
+        let form = recursion_clique_form(functions, static_sig, name_to_local, &order);
+        if best.as_ref().is_none_or(|(best_form, _)| &form < best_form) {
+            *best = Some((form, order));
+        }
+        return;
+    }
+    // Target cell = the lowest-coloured class with more than one member. Selecting by
+    // colour value (not member index) keeps the choice independent of source order.
+    let mut cells: std::collections::BTreeMap<&String, Vec<usize>> = Default::default();
+    for (local, color) in colors.iter().enumerate() {
+        cells.entry(color).or_default().push(local);
+    }
+    let target_cell = cells
+        .into_values()
+        .find(|members| members.len() > 1)
+        .expect("a non-discrete partition has a non-singleton cell");
+    for &member in &target_cell {
+        let mut individualized = colors.clone();
+        // Pin `member` into its own singleton cell with a distinct, ordering-neutral
+        // colour. The depth tag keeps individualizations at different levels apart;
+        // the choice of marker cannot affect the result because the final selection
+        // is by lex-min form over every branch.
+        individualized[member] = format!("\u{0}ind:{depth}\u{0}{}", colors[member]);
+        canonical_label_search(
+            functions,
+            static_sig,
+            name_to_local,
+            individualized,
+            depth + 1,
+            best,
+        );
+    }
+}
+
 /// Canonical, name-independent ordering of a recursion clique's member items, so a
-/// member's ordinal — and thus its deterministic birth identity (SPEC_V3 §10) — is
-/// a property of the clique's STRUCTURE rather than of source declaration order.
-/// Without it, two textual orderings of the same clique receive different content
-/// hashes, and import→export→import is not a fixpoint (the export render order
-/// differs from the source). Colour refinement over the call graph — keyed on each
-/// member's body shape with peer identities erased — yields the order; renaming a
-/// member (metadata-only) never reorders the clique. Members still indistinguishable
-/// after refinement are automorphism-equivalent (their relative order cannot change
-/// the group hash), so the original source order is a safe final tiebreak.
+/// member's ordinal — and thus its deterministic birth identity (SPEC_V3 §10) — is a
+/// property of the clique's STRUCTURE, not of source declaration order. Without it,
+/// two textual orderings of one clique receive different content hashes and
+/// import→export→import is not a fixpoint.
+///
+/// 1-WL colour refinement yields the order when it discretizes the clique. But 1-WL
+/// is an incomplete graph canonicalization: it can leave distinct (non-automorphic)
+/// members sharing a colour — e.g. byte-identical bodies that call peers in
+/// position-distinguishable argument slots. Falling back to source order there
+/// reintroduces the order-dependence. So when refinement does not discretize, we run
+/// individualization-refinement (`canonical_label_search`) to a true canonical
+/// labeling instead.
 fn canonical_recursion_member_order(
     items: &[ProgramItem],
     member_item_indices: &[usize],
@@ -1387,50 +1548,32 @@ fn canonical_recursion_member_order(
     for (local, function) in functions.iter().enumerate() {
         name_to_local.insert((function.module.clone(), function.name.clone()), local);
     }
-    // Body-independent signature (no display name appears): regions, param types,
-    // return type, effects. Two members with different signatures never tie.
-    let static_sig: Vec<String> = functions
-        .iter()
-        .map(|function| {
-            store::canonical_json(&serde_json::json!({
-                "regions": function.region_params,
-                "params": function.params.iter().map(|param| &param.ty).collect::<Vec<_>>(),
-                "return": function.return_type,
-                "effects": serde_json::to_value(&function.effects).expect("effects serialize"),
-            }))
-        })
-        .collect();
-    // Colour refinement: a member's colour folds in the colours of the peers it
-    // calls (their identity erased), so the final colour reflects the member's
-    // position in the clique's structure. Converges in <= n rounds.
-    let mut colors = vec![String::new(); n];
-    let mut classes = 1usize;
-    for _ in 0..n {
-        let next: Vec<String> = (0..n)
-            .map(|local| {
-                let mut body =
-                    serde_json::to_value(&functions[local].body).expect("RawExpr serializes");
-                recolor_peer_calls(&mut body, &functions[local].module, &name_to_local, &colors);
-                store::hash_bytes(
-                    b"codedb/recursion-order/v1\0",
-                    format!("{}|{}", static_sig[local], store::canonical_json(&body)).as_bytes(),
-                )
-            })
-            .collect();
-        let next_classes = next.iter().collect::<std::collections::BTreeSet<_>>().len();
-        colors = next;
-        if next_classes == classes {
-            break;
-        }
-        classes = next_classes;
-    }
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| {
-        colors[a]
-            .cmp(&colors[b])
-            .then_with(|| member_item_indices[a].cmp(&member_item_indices[b]))
-    });
-    order
+    let static_sig = recursion_member_static_sigs(&functions);
+
+    // Initial 1-WL refinement (own colour NOT folded in), identical to the historical
+    // colouring so cliques that already discretize keep their prior order and hash.
+    let colors = refine_recursion_colors(
+        &functions,
+        &static_sig,
+        &name_to_local,
+        &vec![String::new(); n],
+        false,
+    );
+
+    let local_order = if distinct_color_count(&colors) == n {
+        // Discrete: colour order is canonical (the historical, unchanged path).
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| colors[a].cmp(&colors[b]));
+        order
+    } else {
+        // Not discretized by 1-WL: individualization-refinement to a canonical label.
+        let mut best: Option<(Vec<String>, Vec<usize>)> = None;
+        canonical_label_search(&functions, &static_sig, &name_to_local, colors, 0, &mut best);
+        best.expect("individualization-refinement yields at least one labeling")
+            .1
+    };
+
+    local_order
         .into_iter()
         .map(|local| member_item_indices[local])
         .collect()

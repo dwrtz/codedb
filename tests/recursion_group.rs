@@ -211,6 +211,62 @@ fn recursion_group_hash_is_source_order_independent() {
 }
 
 #[test]
+fn recursion_group_hash_is_canonical_for_a_symmetric_clique() {
+    // Regression for the 1-WL incompleteness hole (SPEC_V3 §6): the two members have
+    // BYTE-IDENTICAL bodies but call their peers in position-distinguishable argument
+    // slots (`a` is always called with `n - 1`, `b` with `n - 2`). Colour refinement
+    // (1-WL) cannot tell such members apart, so the old source-order tiebreak gave the
+    // two source orderings DIFFERENT group/root hashes (and a non-fixpoint round-trip).
+    // Individualization-refinement now assigns a canonical labeling, so both orderings
+    // — and the export round-trip — agree. (is_even/is_odd cannot exercise this: their
+    // differing base cases let 1-WL discretize them, so the tiebreak never fired.)
+    let a_first = "fn a(n: i64) -> i64 = if n < 1 then 0 else a(n - 1) + b(n - 2)\n\
+                   fn b(n: i64) -> i64 = if n < 1 then 0 else a(n - 1) + b(n - 2)\n\
+                   fn main() -> i64 = a(6) + b(6)\n";
+    let b_first = "fn b(n: i64) -> i64 = if n < 1 then 0 else a(n - 1) + b(n - 2)\n\
+                   fn a(n: i64) -> i64 = if n < 1 then 0 else a(n - 1) + b(n - 2)\n\
+                   fn main() -> i64 = a(6) + b(6)\n";
+    let temp = tempdir().unwrap();
+    let db1 = temp.path().join("a_first.sqlite");
+    let db2 = temp.path().join("b_first.sqlite");
+    let root1 = import_root(&db1, a_first);
+    let root2 = import_root(&db2, b_first);
+    let (group1, _) = recursion_group(&db1);
+    let (group2, _) = recursion_group(&db2);
+
+    assert_eq!(
+        group1, group2,
+        "symmetric-clique recursion-group hash must be source-order-independent"
+    );
+    assert_eq!(
+        root1, root2,
+        "symmetric-clique root hash must be source-order-independent"
+    );
+    // Semantics are preserved regardless of the canonical labeling chosen.
+    assert_eq!(
+        run(&["eval", path(&db1), "main"]).trim(),
+        run(&["eval", path(&db2), "main"]).trim(),
+    );
+
+    // import → export → re-import is a fixpoint even when export renders the members
+    // in a different (display) order than either source ordering.
+    let export = temp.path().join("sym.export.cdb");
+    run(&["export", path(&db1), "--branch", "main", "--out", path(&export)]);
+    let db3 = temp.path().join("sym.rt.sqlite");
+    run(&["init", path(&db3)]);
+    let root3 = run(&["import", path(&db3), path(&export)])
+        .lines()
+        .find_map(|line| line.strip_prefix("root "))
+        .expect("import prints root")
+        .trim()
+        .to_string();
+    assert_eq!(
+        root1, root3,
+        "symmetric-clique root hash must round-trip through the projection"
+    );
+}
+
+#[test]
 fn recursion_group_projection_round_trip_is_a_fixpoint() {
     // import → export → re-import reproduces the SAME root hash and group hash: the
     // exported checked-view projection is identity-preserving even though its render
