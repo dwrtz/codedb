@@ -135,6 +135,95 @@ fn recursion_over_recursive_box_heap_type_builds_and_drops_natively() {
 }
 
 #[test]
+fn unbox_moves_an_owned_box_payload_out_and_frees_the_shell() {
+    // `unbox(b: box<T>) -> T` (Phase 6 deref-by-move): moves the `Cons` record out
+    // of the heap into an owned local and frees the box shell. A double-free aborts
+    // the native run; the evaluator agrees on the value.
+    check_native(
+        "unbox_local",
+        "record Cons { head: i64\n  tail: i64 }\n\
+         fn f() -> i64 effects[alloc] =\n\
+           let b: box<Cons> = box_new({ head: 7, tail: 3 }) in\n\
+           let c: Cons = unbox(b) in c.head + c.tail\n\
+         fn main() -> i64 effects[alloc] = f()\n",
+        "main",
+        10,
+    );
+}
+
+#[test]
+fn unbox_of_a_scalar_box_loads_the_value_and_frees() {
+    // The scalar `unbox` path (box<i64> -> i64): the value is loaded straight into
+    // the result and the box is freed (the `emit_unbox_move` scalar branch).
+    check_native(
+        "unbox_scalar",
+        "fn f() -> i64 effects[alloc] =\n\
+           let b: box<i64> = box_new(41) in unbox(b) + 1\n\
+         fn main() -> i64 effects[alloc] = f()\n",
+        "main",
+        42,
+    );
+}
+
+#[test]
+fn unbox_transfers_nested_box_ownership() {
+    // box<Outer> where Outer owns box<Inner>: unbox frees the outer shell and
+    // transfers ownership of the inner box to the result; a second unbox frees the
+    // inner box. Each block is freed exactly once (a mishandled free aborts).
+    check_native(
+        "unbox_nested",
+        "record Inner { x: i64 }\n\
+         record Outer { inner: box<Inner>\n  y: i64 }\n\
+         fn f() -> i64 effects[alloc] =\n\
+           let b: box<Outer> = box_new({ inner: box_new({ x: 5 }), y: 2 }) in\n\
+           let o: Outer = unbox(b) in\n\
+           let inner: Inner = unbox(o.inner) in inner.x + o.y\n\
+         fn main() -> i64 effects[alloc] = f()\n",
+        "main",
+        7,
+    );
+}
+
+#[test]
+fn case_traversal_of_a_recursive_box_heap_lengths_and_frees_natively() {
+    // The Phase 6 acceptance fixture (formerly Deferred): traverse a recursive
+    // `box<Node>` heap by `case`. The `next` arm binds the move-only box payload and
+    // `unbox`es it to recurse; the scrutinee is consumed, so each of the 6 allocated
+    // nodes is freed exactly once (a double-free aborts; the evaluator agrees).
+    check_native(
+        "node_length",
+        "enum Node { empty: unit\n  next: box<Node> }\n\
+         fn build(n: i64) -> Node effects[alloc] =\n\
+           if n < 1 then Node::empty(()) else Node::next(box_new(build(n - 1)))\n\
+         fn length(n: Node) -> i64 effects[alloc] =\n\
+           case n of\n\
+             empty(u) => 0\n\
+           | next(boxed) => 1 + length(unbox(boxed))\n\
+         fn main() -> i64 effects[alloc] = length(build(6))\n",
+        "main",
+        6,
+    );
+}
+
+#[test]
+fn case_arm_that_ignores_a_box_binding_drops_it_exactly_once() {
+    // The `next` arm binds the box payload but does NOT consume it: the binding's
+    // scope-exit residual drop must free the bound box (and recursively its
+    // sub-chain) exactly once, while the consumed scrutinee is never dropped.
+    check_native(
+        "node_ignored_binding",
+        "enum Node { empty: unit\n  next: box<Node> }\n\
+         fn build(n: i64) -> Node effects[alloc] =\n\
+           if n < 1 then Node::empty(()) else Node::next(box_new(build(n - 1)))\n\
+         fn first(n: Node) -> i64 effects[alloc] =\n\
+           case n of empty(u) => 0 | next(boxed) => 99\n\
+         fn main() -> i64 effects[alloc] = first(build(4))\n",
+        "main",
+        99,
+    );
+}
+
+#[test]
 fn recursion_members_project_back_to_plain_functions() {
     // A recursion group is an internal representation: members export as ordinary
     // `fn`s (no special syntax), so the checked-view projection round-trips.

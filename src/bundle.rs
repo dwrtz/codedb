@@ -1371,6 +1371,11 @@ fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<St
                     push_hash_ref(payload.get("value"), refs);
                     push_hash_ref(payload.get("element_type"), refs);
                 }
+                Some("unbox") => {
+                    push_hash_ref(payload.get("value"), refs);
+                    push_hash_ref(payload.get("element_type"), refs);
+                    push_hash_ref(payload.get("box_type"), refs);
+                }
                 Some("raw_ptr_cast") => {
                     push_hash_ref(payload.get("value"), refs);
                     push_hash_ref(payload.get("source_type"), refs);

@@ -4310,6 +4310,7 @@ fn collect_lowered_call_targets(
             | LoweredOp::DerefShared { .. }
             | LoweredOp::DerefMut { .. }
             | LoweredOp::DerefBox { .. }
+            | LoweredOp::UnboxMove { .. }
             | LoweredOp::HeapAlloc { .. }
             | LoweredOp::PtrCast { .. }
             | LoweredOp::DerefRaw { .. }

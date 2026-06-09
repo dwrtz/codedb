@@ -3173,6 +3173,17 @@ impl CodeDb {
                         locals,
                     );
                 }
+                if name == "unbox" {
+                    return self.type_builtin_unbox(
+                        current_module,
+                        args,
+                        root,
+                        param_names,
+                        param_types,
+                        region_scope,
+                        locals,
+                    );
+                }
                 let symbol = resolve_function_name_in_root(root, current_module, name)
                     .ok_or_else(|| anyhow!("unknown function {name}"))?;
                 let callee = self
@@ -4540,6 +4551,60 @@ impl CodeDb {
         })
     }
 
+    /// `unbox(b: box<T>) -> T`: move the payload out of the heap and free the box
+    /// shell. The argument is consumed (the box is move-only), and the result is an
+    /// owned `T` (SPEC_V3 §6/Phase 6: the deref-by-move that turns a `box<Node>`
+    /// payload back into a `Node` to recurse on).
+    #[allow(clippy::too_many_arguments)]
+    fn type_builtin_unbox(
+        &mut self,
+        current_module: &str,
+        args: &[RawExpr],
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
+        locals: &mut Vec<LocalTypeBinding>,
+    ) -> Result<TypeCheckResult> {
+        if args.len() != 1 {
+            bail!("unbox expects 1 arg, got {}", args.len());
+        }
+        let value = self.type_expr_with_locals(
+            current_module,
+            &args[0],
+            root,
+            param_names,
+            param_types,
+            region_scope,
+            locals,
+        )?;
+        let element_type = match self.type_spec(&value.type_hash)? {
+            TypeSpec::Box { element } => element,
+            _ => bail!("unbox expects a box<T> argument, got {}", value.type_hash),
+        };
+        let expr_hash = self.put_object(
+            "Expression",
+            &json!({
+                "expr_kind": "unbox",
+                "value": value.expr_hash,
+                "element_type": element_type.clone(),
+                "box_type": value.type_hash,
+                "type": element_type.clone(),
+            }),
+        )?;
+        self.write_cache_json(
+            &expr_hash,
+            "typechecker",
+            "typed-dag",
+            ArtifactKind::TypedExpression,
+            &json!({ "type": element_type.clone() }),
+        )?;
+        Ok(TypeCheckResult {
+            expr_hash,
+            type_hash: element_type,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn type_builtin_dynamic_buffer_call(
         &mut self,
@@ -5421,6 +5486,13 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("box_new missing value"))?;
                 self.expr_escapes_local_borrow(root, value, locals_with_local_borrows)
             }
+            "unbox" => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unbox missing value"))?;
+                self.expr_escapes_local_borrow(root, value, locals_with_local_borrows)
+            }
             "vec_new" | "vec_push" | "vec_get" | "vec_len" | "string_new" | "string_len" => {
                 Ok(false)
             }
@@ -6138,6 +6210,29 @@ impl CodeDb {
                 });
                 Ok(())
             }
+            "unbox" => {
+                // `unbox` consumes (moves) its `box` argument, exactly like `box_new`
+                // consumes the value it boxes: collect the moved place, borrow-check
+                // the argument as a value, and retire loans owned by the moved box.
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unbox missing value"))?;
+                let pre_value_state = state.clone();
+                let transfer_owners = self.move_source_places_for_expr(
+                    root,
+                    value,
+                    param_types,
+                    &pre_value_state.locals,
+                )?;
+                self.verify_expr_borrows(root, value, param_types, state, ExprUse::Value)?;
+                state.active.retain(|loan| {
+                    !transfer_owners
+                        .iter()
+                        .any(|owner| loan_owner_overlaps(loan, owner))
+                });
+                Ok(())
+            }
             "vec_new" => {
                 let capacity = payload
                     .get("capacity")
@@ -6753,6 +6848,13 @@ impl CodeDb {
                     .get("value")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("box_new missing value"))?;
+                out.extend(self.collect_value_loans(root, value, param_types, state)?);
+            }
+            "unbox" => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unbox missing value"))?;
                 out.extend(self.collect_value_loans(root, value, param_types, state)?);
             }
             "raw_ptr_cast" => {
@@ -7474,6 +7576,13 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("box_new missing value"))?;
                 self.move_source_places_for_expr(root, value, param_types, locals)
             }
+            Some("unbox") => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unbox missing value"))?;
+                self.move_source_places_for_expr(root, value, param_types, locals)
+            }
             Some("subslice") => {
                 let target = payload
                     .get("target")
@@ -7798,6 +7907,7 @@ impl CodeDb {
                         || self.expr_child_requires_state(&payload, "len")?
                 }
                 "box_new" => self.expr_child_requires_state(&payload, "value")?,
+                "unbox" => self.expr_child_requires_state(&payload, "value")?,
                 "vec_new" => self.expr_child_requires_state(&payload, "capacity")?,
                 "vec_push" => true,
                 "vec_get" => {
@@ -7898,7 +8008,9 @@ impl CodeDb {
             {
                 "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref"
                 | "local_ref" => false,
-                "box_new" | "vec_new" | "string_new" => true,
+                // `unbox` frees the box shell, so it requires `alloc` just like the
+                // allocating builtins (the deallocation is in the alloc effect domain).
+                "box_new" | "unbox" | "vec_new" | "string_new" => true,
                 "assign" => {
                     self.expr_child_requires_alloc(&payload, "target")?
                         || self.expr_child_requires_alloc(&payload, "value")?
@@ -8067,6 +8179,7 @@ impl CodeDb {
                         || self.expr_child_requires_unsafe(&payload, "len")?
                 }
                 "box_new" => self.expr_child_requires_unsafe(&payload, "value")?,
+                "unbox" => self.expr_child_requires_unsafe(&payload, "value")?,
                 "vec_new" => self.expr_child_requires_unsafe(&payload, "capacity")?,
                 "vec_push" => {
                     self.expr_child_requires_unsafe(&payload, "target")?
@@ -8704,6 +8817,32 @@ impl CodeDb {
                 hash_for_type_spec(&TypeSpec::Box {
                     element: value_type,
                 })?
+            }
+            "unbox" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unbox missing value"))?;
+                let box_type = self.verify_expr_type_with_locals(
+                    value_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                let element_type = match self.type_spec(&box_type)? {
+                    TypeSpec::Box { element } => element,
+                    _ => bail!("unbox requires a box value, got {box_type}"),
+                };
+                if payload.get("element_type").and_then(JsonValue::as_str)
+                    != Some(element_type.as_str())
+                {
+                    bail!("unbox element_type mismatch");
+                }
+                if payload.get("box_type").and_then(JsonValue::as_str) != Some(box_type.as_str()) {
+                    bail!("unbox box_type mismatch");
+                }
+                element_type
             }
             "vec_new" => {
                 let capacity_hash = payload

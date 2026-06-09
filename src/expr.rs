@@ -749,6 +749,17 @@ impl CodeDb {
                     root_hash, value_hash, args, locals,
                 )?)))
             }
+            "unbox" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unbox missing value"))?;
+                let boxed = self.eval_expr_with_locals(root_hash, value_hash, args, locals)?;
+                match boxed {
+                    Value::Boxed(cell) => Ok(cell.borrow().clone()),
+                    _ => bail!("unbox expects a boxed value"),
+                }
+            }
             "vec_new" => {
                 let capacity_hash = payload
                     .get("capacity")
@@ -2044,6 +2055,24 @@ impl CodeDb {
                     )?
                 )
             }
+            "unbox" => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unbox missing value"))?;
+                format!(
+                    "unbox({})",
+                    self.expr_to_source_with_locals(
+                        value,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
             "vec_new" => {
                 let capacity = payload
                     .get("capacity")
@@ -3071,6 +3100,21 @@ impl CodeDb {
                     )?,
                 ],
             }),
+            "unbox" => Ok(RawExpr::Call {
+                name: "unbox".to_string(),
+                args: vec![
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("unbox missing value"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ],
+            }),
             "vec_new" => Ok(RawExpr::Call {
                 name: "vec_new".to_string(),
                 args: vec![
@@ -3867,6 +3911,13 @@ impl CodeDb {
                     .get("value")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("box_new missing value"))?;
+                self.collect_expr_deps(root, child, deps)?;
+            }
+            "unbox" => {
+                let child = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("unbox missing value"))?;
                 self.collect_expr_deps(root, child, deps)?;
             }
             "vec_new" => {

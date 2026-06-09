@@ -353,9 +353,15 @@ covers factorial, fibonacci (two recursive calls), mutual is_even/is_odd, and a
 recursive `box<Node>` builder (recursion + recursive type layout + recursive drop
 glue). A latent overflow — `collect_reference_regions_in_type` lacked a cycle
 guard and recursed forever on a recursive return type — was fixed with a `seen`
-set. Traversing a recursive heap structure *by case* (sum/length over a list,
-full tree-walking evaluator) additionally needs enum-payload field-granular moves
-and is a documented follow-on. Depends on Phase 4 and Phase 5.
+set. Traversing a recursive `box` heap *by case* now works too: an `unbox`
+(deref-by-move) builtin moves a `box<T>` payload back to an owned `T` (copying the
+payload out and freeing the shell, like `Box::into_inner`), and a `case` arm may
+bind and move a move-only `box` payload out of a consumed (param/local) scrutinee —
+so `length` over a recursive `box<Node>` compiles native and matches the evaluator,
+with `leaks` reporting `0 leaks` and no double-free. Per-node-data structures (sum
+over a cons-list, a tree-walking evaluator) additionally need mutually-recursive
+*type* definitions (D1, e.g. `Cons`↔`List`), which remain a follow-on. Depends on
+Phase 4 and Phase 5.
 
 Deliverables:
 
@@ -372,21 +378,23 @@ src/types.rs, src/lowering.rs, src/verify.rs, src/expr.rs, src/backend/native.rs
 examples/v3/, tests/recursion_native.rs
 ```
 
-Acceptance fixture and oracle (partially met — see Deferred):
+Acceptance fixture and oracle (met for the recursive-`box` heap; see Note):
 
 ```text
-sum/length over a recursive box<Node>, and a tree-walking expression evaluator,
-  compile to native artifacts and match the reference evaluator
+length over a recursive box<Node> compiles to a native artifact, traverses the heap
+  by case + unbox, and matches the reference evaluator (0 leaks, no double-free)
 ```
 
-Deferred: case-traversal of a recursive `box`/enum heap (length/sum over a list, a
-tree-walker) is NOT yet expressible — there is no box-unbox / deref-by-move
-expression to turn a `box<Node>` payload back into a `Node` to recurse on — so the
-named fixture above is not yet met. What IS met: a self-recursive function that
-BUILDS and DROPS a recursive `box<Node>` chain compiles native and matches the
-evaluator (recursion + recursive type layout + recursive drop glue). The box-unbox
-expression, with enum-payload field-granular moves, is the follow-on that unblocks
-both the named fixture and the Phase 8 self-hosted evaluator.
+Note: the deref-by-move blocker is resolved. `unbox(b: box<T>) -> T` (a builtin,
+lowered to a new `UnboxMove` op that copies the payload to an owned slot then frees
+the box shell — heap read strictly before free, on both x86_64 and arm64) and
+move-only `box` case-arm binding together make case-traversal of a recursive
+`box<Node>` heap expressible and native (`tests/recursion_native.rs`). Still
+deferred: a tree-walking evaluator and a per-node-data cons-list `sum` need
+mutually-recursive *type* definitions (D1) — `box` provides the size indirection,
+but the type *names* form a cycle the importer cannot yet resolve (recursion groups
+are functions-only). Inline (non-`box`) move-only enum payloads also stay
+fail-closed. These unblock more of the Phase 8 self-hosted evaluator.
 
 ## Phase 7 — Pattern Matching Richness (R14)
 
@@ -798,17 +806,23 @@ oracle; conditional and field-granular drop glue is sound (interposer/double-fre
 verified) — including the two dimensions COMBINED (a record field moved in only
 some branches while a sibling field stays live, which now lowers and is
 double-free-verified); verify accepts recursive call graphs and recursion-group
-objects; recursion-group content identity is canonical (member ordinals derive
-from clique structure, not source order, so the hash is order-independent and
-import→export→import is a fixpoint); scalar literal `case` with `_` and
-exhaustiveness compiles native, projects round-trip (including a nested `case` in a
-non-last arm), and steps under `trace`/`debug`.
+objects; recursion-group content identity is canonical — member ordinals derive
+from clique structure via individualization-refinement (a true canonical graph
+labeling, not just incomplete 1-WL colour refinement), so two source orderings of
+one clique — including structurally-symmetric members with byte-identical bodies —
+produce the same hash and import→export→import is a fixpoint; scalar literal `case`
+with `_` and exhaustiveness compiles native, projects round-trip (including a nested
+`case` in a non-last arm), and steps under `trace`/`debug`. Case-traversal of a
+recursive `box<Node>` heap also compiles native: an `unbox` (deref-by-move) builtin
+and move-only `box` case-arm binding free each node exactly once (`0 leaks`,
+double-free verified).
 
-Documented follow-on R14/structure surface: range/guard/nested-enum patterns,
-recursive type definitions, and the box-unbox / enum-payload field-granular move
-expression — which together unlock case-traversal of recursive heap structures
-(the Phase 6 acceptance fixture and the Phase 8 self-hosted evaluator). Known
-oracle caveat: the reference evaluator recurses on the host stack, so a
+Documented follow-on R14/structure surface: range/guard/nested-enum patterns;
+mutually-recursive *type* definitions (D1) and inline (non-`box`) move-only
+enum-payload moves — which together unlock per-node-data recursive structures (a
+cons-list `sum`, a tree-walking evaluator) and more of the Phase 8 self-hosted
+evaluator. Known oracle caveat: the reference evaluator recurses on the host stack,
+so a
 deeply/infinitely recursive program can overflow it (the native backend, on the OS
 stack, is unaffected) — a robustness bound on the oracle, not a language limit.
 

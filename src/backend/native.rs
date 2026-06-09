@@ -689,6 +689,7 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::DerefShared { .. }
             | LoweredOp::DerefMut { .. }
             | LoweredOp::DerefBox { .. }
+            | LoweredOp::UnboxMove { .. }
             | LoweredOp::HeapAlloc { .. }
             | LoweredOp::PtrCast { .. }
             | LoweredOp::DerefRaw { .. }
@@ -804,6 +805,7 @@ fn validate_native_ops(
             | LoweredOp::DerefShared { .. }
             | LoweredOp::DerefMut { .. }
             | LoweredOp::DerefBox { .. }
+            | LoweredOp::UnboxMove { .. }
             | LoweredOp::DerefRaw { .. }
             | LoweredOp::ConstructSlice { .. }
             | LoweredOp::SliceLen { .. }
@@ -1192,6 +1194,30 @@ fn validate_native_op_flow(
             native_type_layout(type_layouts, element_type_hash)?;
             native_insert_address(addresses, id, element_type_hash)?;
             native_insert_value(values, id, element_type_hash)?;
+        }
+        LoweredOp::UnboxMove {
+            id,
+            box_value,
+            box_type_hash,
+            element_type_hash,
+            dest_slot: _,
+        } => {
+            if native_value_type(values, box_value)? != box_type_hash {
+                bail!("native object backend saw unbox_move value type mismatch");
+            }
+            let box_layout = native_type_layout(type_layouts, box_type_hash)?;
+            if box_layout.kind != "box"
+                || native_layout_string(box_layout, "element_type_hash")? != *element_type_hash
+            {
+                bail!("native object backend saw unbox_move layout mismatch");
+            }
+            native_type_layout(type_layouts, element_type_hash)?;
+            native_insert_value(values, id, element_type_hash)?;
+            // An aggregate result is a pointer to its owned backing slot (consumers
+            // memcpy from it); a scalar result is the value itself.
+            if native_passes_indirect(type_layouts, element_type_hash)? {
+                native_insert_address(addresses, id, element_type_hash)?;
+            }
         }
         LoweredOp::HeapAlloc {
             id,
@@ -2345,6 +2371,7 @@ fn collect_value_ids_inner(
             | LoweredOp::DerefShared { id, .. }
             | LoweredOp::DerefMut { id, .. }
             | LoweredOp::DerefBox { id, .. }
+            | LoweredOp::UnboxMove { id, .. }
             | LoweredOp::HeapAlloc { id, .. }
             | LoweredOp::PtrCast { id, .. }
             | LoweredOp::DerefRaw { id, .. }
@@ -2689,6 +2716,15 @@ impl FunctionEmitter {
             LoweredOp::DerefBox { id, box_value, .. } => {
                 self.mov_rax_stack(self.value_offset(box_value)?);
                 self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::UnboxMove {
+                id,
+                box_value,
+                element_type_hash,
+                dest_slot,
+                ..
+            } => {
+                self.emit_unbox_move_x86(id, box_value, element_type_hash, *dest_slot)?;
             }
             LoweredOp::HeapAlloc { id, size_bytes, .. } => {
                 self.emit_heap_alloc_x86(id, *size_bytes)?;
@@ -3374,6 +3410,38 @@ impl FunctionEmitter {
         self.emit_ud2();
         self.patch_rel32(ok)?;
         self.mov_stack_rax(self.value_offset(id)?);
+        Ok(())
+    }
+
+    /// `unbox`: copy the payload out of the box's heap block, then free the block.
+    /// The heap read happens BEFORE `free` in every path. For an aggregate the bytes
+    /// are copied into the owned scratch slot and `id` becomes its address; for a
+    /// scalar the value is loaded straight into `id`'s slot.
+    fn emit_unbox_move_x86(
+        &mut self,
+        id: &str,
+        box_value: &str,
+        element_type_hash: &str,
+        dest_slot: usize,
+    ) -> Result<()> {
+        if self.type_passes_indirect(element_type_hash)? {
+            let size = self.type_size(element_type_hash)?;
+            self.copy_memory_from_stack_pointer_to_stack(
+                self.local_offset(dest_slot)?,
+                self.value_offset(box_value)?,
+                size,
+            )?;
+            self.mov_rax_stack(self.value_offset(box_value)?);
+            self.mov_rdi_rax();
+            self.emit_platform_call_x86(PLATFORM_FREE_SYMBOL_HASH, PLATFORM_FREE_ABI_SYMBOL);
+            self.lea_rax_stack(self.local_offset(dest_slot)?);
+            self.mov_stack_rax(self.value_offset(id)?);
+        } else {
+            self.emit_load_addressed_value_to_stack(id, element_type_hash, box_value)?;
+            self.mov_rax_stack(self.value_offset(box_value)?);
+            self.mov_rdi_rax();
+            self.emit_platform_call_x86(PLATFORM_FREE_SYMBOL_HASH, PLATFORM_FREE_ABI_SYMBOL);
+        }
         Ok(())
     }
 
@@ -4433,6 +4501,15 @@ impl Arm64Emitter {
                 self.ldr_stack(0, self.value_offset(box_value)?)?;
                 self.str_stack(0, self.value_offset(id)?)?;
             }
+            LoweredOp::UnboxMove {
+                id,
+                box_value,
+                element_type_hash,
+                dest_slot,
+                ..
+            } => {
+                self.emit_unbox_move_arm64(id, box_value, element_type_hash, *dest_slot)?;
+            }
             LoweredOp::HeapAlloc { id, size_bytes, .. } => {
                 self.emit_heap_alloc_arm64(id, *size_bytes)?;
             }
@@ -5108,6 +5185,35 @@ impl Arm64Emitter {
         self.emit_u32(0xd4200000);
         self.patch_imm19(ok)?;
         self.str_stack(0, self.value_offset(id)?)?;
+        Ok(())
+    }
+
+    /// `unbox` (arm64): copy the payload out of the box's heap block BEFORE freeing
+    /// it. Aggregate → memcpy into the owned scratch slot, `id` := its address;
+    /// scalar → load straight into `id`'s slot.
+    fn emit_unbox_move_arm64(
+        &mut self,
+        id: &str,
+        box_value: &str,
+        element_type_hash: &str,
+        dest_slot: usize,
+    ) -> Result<()> {
+        if self.type_passes_indirect(element_type_hash)? {
+            let size = self.type_size(element_type_hash)?;
+            self.copy_memory_from_stack_pointer_to_stack(
+                self.local_offset(dest_slot)?,
+                self.value_offset(box_value)?,
+                size,
+            )?;
+            self.ldr_stack(0, self.value_offset(box_value)?)?;
+            self.emit_platform_call_arm64(PLATFORM_FREE_SYMBOL_HASH, PLATFORM_FREE_ABI_SYMBOL);
+            self.add_reg_sp_imm(0, self.local_offset(dest_slot)?)?;
+            self.str_stack(0, self.value_offset(id)?)?;
+        } else {
+            self.emit_load_addressed_value_to_stack(id, element_type_hash, box_value)?;
+            self.ldr_stack(0, self.value_offset(box_value)?)?;
+            self.emit_platform_call_arm64(PLATFORM_FREE_SYMBOL_HASH, PLATFORM_FREE_ABI_SYMBOL);
+        }
         Ok(())
     }
 

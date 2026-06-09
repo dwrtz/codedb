@@ -277,6 +277,19 @@ pub(crate) enum LoweredOp {
         box_type_hash: String,
         element_type_hash: String,
     },
+    /// Move the payload out of a `box<T>` and free the box shell (`unbox`, like
+    /// `Box::into_inner`). The payload bytes are copied out of the heap into
+    /// `dest_slot` (an owned scratch slot) BEFORE `free(box_value)`, so the result
+    /// is an independently-owned `T`, not a pointer into freed memory. The box
+    /// argument is consumed (moved) by the producing `Move`, so the shell is freed
+    /// exactly once and never recursively drops the moved-out payload.
+    UnboxMove {
+        id: String,
+        box_value: String,
+        box_type_hash: String,
+        element_type_hash: String,
+        dest_slot: usize,
+    },
     HeapAlloc {
         id: String,
         size_bytes: u64,
@@ -1399,6 +1412,7 @@ impl CodeDb {
                 self.lower_subslice(root, expr_hash, &type_hash, param_types, ctx, locals)
             }
             "box_new" => self.lower_box_new(root, expr_hash, &type_hash, param_types, ctx, locals),
+            "unbox" => self.lower_unbox(root, expr_hash, &type_hash, param_types, ctx, locals),
             "vec_new" => self.lower_vec_new(root, expr_hash, &type_hash, param_types, ctx, locals),
             "vec_push" => self.lower_vec_push(root, expr_hash, param_types, ctx, locals),
             "vec_get" => self.lower_vec_get(root, expr_hash, &type_hash, param_types, ctx, locals),
@@ -2643,6 +2657,68 @@ impl CodeDb {
             operations,
             value: id,
             type_hash: result_box_type.to_string(),
+        })
+    }
+
+    /// Lower `unbox(b)`: move the payload out of `b: box<T>` and free the shell.
+    /// The box argument is lowered as a consumed value (a move-only `box` place is
+    /// `Move`d, marking its slot moved so it is not also dropped at scope exit), and
+    /// the payload is copied into an owned scratch slot before the shell is freed.
+    fn lower_unbox(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        result_element_type: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let value_hash = payload
+            .get("value")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("unbox missing value"))?;
+        let box_type_hash = payload
+            .get("box_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("unbox missing box_type"))?
+            .to_string();
+        let element_type_hash = match self.type_spec(&box_type_hash)? {
+            TypeSpec::Box { element } => element,
+            _ => bail!("unbox lowered type mismatch"),
+        };
+        if element_type_hash != result_element_type {
+            bail!("unbox lowered element type mismatch");
+        }
+        let boxed =
+            self.lower_expr_as(root, value_hash, &box_type_hash, param_types, ctx, locals)?;
+        if boxed.type_hash != box_type_hash {
+            bail!("unbox box value type mismatch while lowering");
+        }
+        // Owned scratch slot for the moved-out payload. Like a record/enum literal's
+        // backing slot, it is NOT pushed as a droppable local: ownership of the
+        // payload flows out through the result value, which the consumer copies.
+        self.compute_type_layout(root, &element_type_hash, ctx.target_triple())?;
+        let slot_size = stack_slot_size_bytes(self.layout_size_bytes(
+            root,
+            ctx.target_triple(),
+            &element_type_hash,
+        )?);
+        let dest_slot = ctx.local_slot(element_type_hash.clone(), slot_size);
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "unbox_move", &id);
+        let mut operations = boxed.operations;
+        operations.push(LoweredOp::UnboxMove {
+            id: id.clone(),
+            box_value: boxed.value,
+            box_type_hash,
+            element_type_hash: element_type_hash.clone(),
+            dest_slot,
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: element_type_hash,
         })
     }
 
@@ -4200,10 +4276,30 @@ impl CodeDb {
                 .and_then(JsonValue::as_str)
                 .is_some()
             {
-                if self.type_is_move_only(root, ctx.target_triple(), &variant_info.type_hash)? {
-                    bail!(
-                        "unsupported_move: lowering does not support moving a move-only enum payload out of a case arm; field-granular drop glue is not yet implemented (SPEC_V2 §12; deferred post-Phase-15 extension)"
+                let binding_is_move_only =
+                    self.type_is_move_only(root, ctx.target_triple(), &variant_info.type_hash)?;
+                // Moving a move-only payload out of a case arm is sound only when the
+                // scrutinee is itself consumed, so the payload's single owner becomes
+                // the binding and the scrutinee is never dropped (no double free). A
+                // move-only enum scrutinee that is a place (param/local) is `Move`d
+                // when lowered above, satisfying this. Only a `box<T>` payload is
+                // supported (pointer-sized: moved by copying the pointer out); an
+                // inline move-only aggregate payload, or a non-place scrutinee, stays
+                // fail-closed (SPEC_V3 §7 field-granular enum-payload moves; Phase 6).
+                if binding_is_move_only {
+                    let scrutinee_is_consumed_place = matches!(
+                        self.get_payload(scrutinee_hash)?
+                            .get("expr_kind")
+                            .and_then(JsonValue::as_str),
+                        Some("param_ref" | "local_ref")
                     );
+                    let payload_is_box =
+                        matches!(self.type_spec(&variant_info.type_hash)?, TypeSpec::Box { .. });
+                    if !scrutinee_is_consumed_place || !payload_is_box {
+                        bail!(
+                            "unsupported_move: moving a move-only enum payload out of a case arm is supported only for a box<T> payload bound from a consumed (param/local) scrutinee; inline move-only aggregate payloads and non-place scrutinees are not yet supported (SPEC_V3 §7)"
+                        );
+                    }
                 }
                 let slot_size = stack_slot_size_bytes(self.layout_size_bytes(
                     root,
@@ -4225,14 +4321,28 @@ impl CodeDb {
                         type_hash: variant_info.type_hash.clone(),
                     },
                 });
-                let payload_value = self.lower_copy_value_from_address(
-                    root,
-                    expr_hash,
-                    &variant_info.type_hash,
-                    &payload_address,
-                    ctx,
-                    &mut arm_operations,
-                )?;
+                let payload_value = if binding_is_move_only {
+                    // Move the box pointer out of the (consumed) scrutinee into the
+                    // binding: a plain pointer `Load` transfers ownership, since the
+                    // scrutinee is moved and never dropped.
+                    let pv = ctx.value();
+                    ctx.push_debug_op(expr_hash, "load", &pv);
+                    arm_operations.push(LoweredOp::Load {
+                        id: pv.clone(),
+                        address: payload_address.clone(),
+                        type_hash: variant_info.type_hash.clone(),
+                    });
+                    pv
+                } else {
+                    self.lower_copy_value_from_address(
+                        root,
+                        expr_hash,
+                        &variant_info.type_hash,
+                        &payload_address,
+                        ctx,
+                        &mut arm_operations,
+                    )?
+                };
                 let local_address = ctx.value();
                 ctx.push_debug_op(expr_hash, "addr_of_local", &local_address);
                 arm_operations.push(LoweredOp::AddrOfLocal {
@@ -4267,6 +4377,25 @@ impl CodeDb {
                     bail!("case arm {variant} result type mismatch while lowering");
                 }
                 arm_operations.extend(body.operations);
+                // Drop the binding at arm-scope exit if the body did not consume it.
+                // A move-only `box` binding requires drop glue (free the box); a
+                // copyable binding requires none. Mirrors `let`-binding drop placement
+                // (SPEC_V3 §7): a consumed binding emits no drop, an untouched one a
+                // whole-slot drop.
+                if self.type_requires_drop_scaffold(root, ctx.target_triple(), &variant_info.type_hash)? {
+                    let moved = ctx.moved.clone();
+                    let place = MovedPlace::whole(RootSlot::Local(slot));
+                    self.emit_residual_drops(
+                        root,
+                        &place,
+                        &variant_info.type_hash,
+                        &variant_info.type_hash,
+                        &moved,
+                        body_hash,
+                        ctx,
+                        &mut arm_operations,
+                    )?;
+                }
                 lowered_arms.push(LoweredCaseArm {
                     variant,
                     variant_symbol: variant_info.variant_symbol,
@@ -6113,6 +6242,40 @@ impl CodeDb {
                         insert_value(values, id, element_type_hash)?;
                     }
                 }
+                LoweredOp::UnboxMove {
+                    id,
+                    box_value,
+                    box_type_hash,
+                    element_type_hash,
+                    dest_slot,
+                } => {
+                    match self.type_spec(value_type(values, box_value)?)? {
+                        TypeSpec::Box { element } if element == *element_type_hash => {}
+                        _ => bail!("lowered unbox_move requires box value"),
+                    }
+                    if self.type_spec(box_type_hash)?
+                        != (TypeSpec::Box {
+                            element: element_type_hash.clone(),
+                        })
+                    {
+                        bail!("lowered unbox_move box type mismatch");
+                    }
+                    // The owned scratch slot must exist and match the payload type.
+                    let expected = local_slots.get(*dest_slot).ok_or_else(|| {
+                        anyhow!("lowered unbox_move dest slot out of bounds {dest_slot}")
+                    })?;
+                    if expected.slot != *dest_slot || expected.type_hash != *element_type_hash {
+                        bail!("lowered unbox_move dest slot type mismatch");
+                    }
+                    // The result is an owned rvalue of the payload type. Aggregates are
+                    // represented as a pointer to their backing slot, so register the
+                    // result as an address too (consumers memcpy from it); it is NOT a
+                    // drop-tracked place (the scratch slot's ownership flows out).
+                    insert_value(values, id, element_type_hash)?;
+                    if self.is_aggregate_ir_type(root, element_type_hash)? {
+                        insert_address(addresses, id, element_type_hash)?;
+                    }
+                }
                 LoweredOp::HeapAlloc {
                     id,
                     size_bytes,
@@ -6942,6 +7105,7 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::DerefShared { id, .. }
         | LoweredOp::DerefMut { id, .. }
         | LoweredOp::DerefBox { id, .. }
+        | LoweredOp::UnboxMove { id, .. }
         | LoweredOp::HeapAlloc { id, .. }
         | LoweredOp::PtrCast { id, .. }
         | LoweredOp::DerefRaw { id, .. }
@@ -6991,6 +7155,7 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::DerefShared { .. } => "deref_shared",
         LoweredOp::DerefMut { .. } => "deref_mut",
         LoweredOp::DerefBox { .. } => "deref_box",
+        LoweredOp::UnboxMove { .. } => "unbox_move",
         LoweredOp::HeapAlloc { .. } => "heap_alloc",
         LoweredOp::PtrCast { .. } => "ptr_cast",
         LoweredOp::DerefRaw { .. } => "deref_raw",
@@ -7137,6 +7302,11 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
                 out.insert(element_type_hash.clone());
             }
             LoweredOp::DerefBox {
+                box_type_hash,
+                element_type_hash,
+                ..
+            }
+            | LoweredOp::UnboxMove {
                 box_type_hash,
                 element_type_hash,
                 ..
