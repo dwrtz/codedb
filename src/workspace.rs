@@ -466,6 +466,14 @@ fn dispatch_workspace_method(
         "provenance.blame_type" | "blame.type" => provenance_blame_type(db, params),
         "provenance.blame_field" | "blame.field" => provenance_blame_field(db, params),
         "provenance.blame_variant" | "blame.variant" => provenance_blame_variant(db, params),
+        "provenance.why_layout" | "why.layout" => provenance_why_layout(db, params),
+        "provenance.why_borrow" | "why.borrow" => provenance_why_borrow(db, params),
+        "provenance.why_move" | "why.move" => provenance_why_move(db, params),
+        "provenance.why_drop" | "why.drop" => provenance_why_drop(db, params),
+        "provenance.why_effect" | "why.effect" => provenance_why_effect(db, params),
+        "provenance.why_platform_extern" | "why.platform_extern" => {
+            provenance_why_platform_extern(db, params)
+        }
         "roots.diff" => roots_diff(db, params),
         "roots.export_projection" => roots_export_projection(db, params),
         "ops.apply" => ops_apply(db, params, idempotency),
@@ -983,6 +991,93 @@ fn provenance_blame_variant(
     let variant = required_str_any(object, &["variant", "name"])?;
     let result = parse_json_payload(
         db.blame_variant_branch_json(&branch, type_or_name, variant)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, &branch)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn provenance_why_layout(
+    db: &mut CodeDb,
+    params: &JsonValue,
+) -> MethodResult<WorkspaceMethodResult> {
+    let branch = branch_param(params)?;
+    let object = params_object(params)?;
+    let type_or_name = required_str_any(object, &["type_or_name", "type", "name"])?;
+    let field = optional_str(object, "field")?;
+    let target = optional_str(object, "target")?.unwrap_or(DEFAULT_NATIVE_TARGET);
+    let result = parse_json_payload(
+        db.why_layout_branch_json(&branch, type_or_name, field, target)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, &branch)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn provenance_why_borrow(
+    db: &mut CodeDb,
+    params: &JsonValue,
+) -> MethodResult<WorkspaceMethodResult> {
+    let branch = branch_param(params)?;
+    let object = params_object(params)?;
+    let symbol_or_name = required_str_any(object, &["symbol_or_name", "symbol", "name"])?;
+    let body = optional_str(object, "body")?;
+    let result = parse_json_payload(
+        db.why_borrow_branch_json(&branch, symbol_or_name, body)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, &branch)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn provenance_why_move(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let branch = branch_param(params)?;
+    let object = params_object(params)?;
+    let symbol_or_name = required_str_any(object, &["symbol_or_name", "symbol", "name"])?;
+    let body = optional_str(object, "body")?;
+    let result = parse_json_payload(
+        db.why_move_branch_json(&branch, symbol_or_name, body)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, &branch)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn provenance_why_drop(db: &mut CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let branch = branch_param(params)?;
+    let object = params_object(params)?;
+    let type_or_name = required_str_any(object, &["type_or_name", "type", "name"])?;
+    let target = optional_str(object, "target")?.unwrap_or(DEFAULT_NATIVE_TARGET);
+    let result = parse_json_payload(
+        db.why_drop_branch_json(&branch, type_or_name, target)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, &branch)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn provenance_why_effect(db: &CodeDb, params: &JsonValue) -> MethodResult<WorkspaceMethodResult> {
+    let branch = branch_param(params)?;
+    let symbol_or_name = symbol_or_name_param(params)?;
+    let result = parse_json_payload(
+        db.why_effect_branch_json(&branch, &symbol_or_name)
+            .map_err(WorkspaceMethodError::method)?,
+    )?;
+    let snapshot = workspace_snapshot(db, &branch)?;
+    Ok(WorkspaceMethodResult::new(result, snapshot))
+}
+
+fn provenance_why_platform_extern(
+    db: &mut CodeDb,
+    params: &JsonValue,
+) -> MethodResult<WorkspaceMethodResult> {
+    let branch = branch_param(params)?;
+    let object = params_object(params)?;
+    let entry_name = required_str_alias(object, "entry_name", "entry")?;
+    let extern_name = required_str_any(object, &["extern_name", "extern", "link_name", "symbol"])?;
+    let target = optional_str(object, "target")?.unwrap_or(DEFAULT_NATIVE_TARGET);
+    let result = parse_json_payload(
+        db.why_platform_extern_branch_json(&branch, entry_name, extern_name, target)
             .map_err(WorkspaceMethodError::method)?,
     )?;
     let snapshot = workspace_snapshot(db, &branch)?;

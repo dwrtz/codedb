@@ -7522,7 +7522,7 @@ impl CodeDb {
         Ok(())
     }
 
-    fn expr_requires_state(&self, expr_hash: &str) -> Result<bool> {
+    pub(crate) fn expr_requires_state(&self, expr_hash: &str) -> Result<bool> {
         let payload = self.get_payload(expr_hash)?;
         Ok(
             match payload
@@ -7654,7 +7654,7 @@ impl CodeDb {
         self.expr_requires_state(child)
     }
 
-    fn expr_requires_alloc(&self, expr_hash: &str) -> Result<bool> {
+    pub(crate) fn expr_requires_alloc(&self, expr_hash: &str) -> Result<bool> {
         let payload = self.get_payload(expr_hash)?;
         Ok(
             match payload
@@ -7790,7 +7790,7 @@ impl CodeDb {
         self.expr_requires_alloc(child)
     }
 
-    fn expr_requires_unsafe(&self, expr_hash: &str) -> Result<bool> {
+    pub(crate) fn expr_requires_unsafe(&self, expr_hash: &str) -> Result<bool> {
         let payload = self.get_payload(expr_hash)?;
         Ok(
             match payload

@@ -1281,6 +1281,14 @@ build impact distinguishes metadata/layout/codegen changes
 
 Goal: make memory/layout/native decisions explainable.
 
+Status: implemented. Type, field, and variant blame now cover V2 semantic
+type/member identities, and V2 why commands explain layout offsets, borrow and
+move diagnostics for rollback-only candidate bodies, drop/copy/move
+classification, declared and required effects, and platform extern reachability
+from native build plans. Outputs cite branch roots, histories, semantic object
+hashes, layout/build-plan hashes where applicable, and relevant migration
+blame records.
+
 Deliverables:
 
 ```text

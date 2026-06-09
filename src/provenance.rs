@@ -5,11 +5,12 @@ use rusqlite::{OptionalExtension, params};
 use serde_json::{Value as JsonValue, json};
 
 use crate::MAIN_BRANCH;
+use crate::expr::parse_expr_source;
 use crate::migrations::Operation;
 use crate::model::{ProgramRootPayload, aliases_for, param_names, test_binding_for};
 use crate::store::{CodeDb, canonical_json};
 use crate::tests::{test_value_from_value, value_from_test_value};
-use crate::types::TypeDefinition;
+use crate::types::{Effect, TypeDefinition, TypeSpec, type_payload_for_spec};
 
 const BLAME_SYMBOL_SCHEMA: &str = "codedb/blame-symbol/v1";
 const BLAME_EXPR_SCHEMA: &str = "codedb/blame-expr/v1";
@@ -18,6 +19,12 @@ const BLAME_FIELD_SCHEMA: &str = "codedb/blame-field/v1";
 const BLAME_VARIANT_SCHEMA: &str = "codedb/blame-variant/v1";
 const BISECT_HISTORY_SCHEMA: &str = "codedb/bisect-history/v1";
 const WHY_SCHEMA: &str = "codedb/why/v1";
+const WHY_BORROW_SCHEMA: &str = "codedb/why-borrow/v1";
+const WHY_MOVE_SCHEMA: &str = "codedb/why-move/v1";
+const WHY_DROP_SCHEMA: &str = "codedb/why-drop/v1";
+const WHY_LAYOUT_SCHEMA: &str = "codedb/why-layout/v1";
+const WHY_EFFECT_SCHEMA: &str = "codedb/why-effect/v1";
+const WHY_PLATFORM_EXTERN_SCHEMA: &str = "codedb/why-platform-extern/v1";
 
 impl CodeDb {
     pub fn blame_symbol_main_branch_json(&self, symbol_or_name: &str) -> Result<String> {
@@ -102,10 +109,12 @@ impl CodeDb {
             .collect::<Vec<_>>();
         let definition_hash = current_entry.map(|entry| entry.definition.clone());
         let signature_hash = current_entry.map(|entry| entry.signature.clone());
-        let body_hash = definition_hash
-            .as_deref()
-            .map(|definition| self.function_body_hash(definition))
-            .transpose()?;
+        let body_hash = match definition_hash.as_deref() {
+            Some(definition) if !self.definition_is_external(definition)? => {
+                Some(self.function_body_hash(definition)?)
+            }
+            _ => None,
+        };
         let current = current_entry.map(|entry| {
             json!({
                 "module": binding.map(|binding| binding.module.as_str()),
@@ -902,6 +911,569 @@ impl CodeDb {
             "migration_path": migration_path,
             "direct_migration": direct_migration,
         }))
+    }
+
+    pub fn why_layout_branch_json(
+        &mut self,
+        branch_name: &str,
+        type_or_name: &str,
+        field: Option<&str>,
+        target_triple: &str,
+    ) -> Result<String> {
+        let payload =
+            self.why_layout_branch_value(branch_name, type_or_name, field, target_triple)?;
+        Ok(format!("{}\n", canonical_json(&payload)))
+    }
+
+    pub fn why_layout_branch(
+        &mut self,
+        branch_name: &str,
+        type_or_name: &str,
+        field: Option<&str>,
+        target_triple: &str,
+    ) -> Result<String> {
+        let payload =
+            self.why_layout_branch_value(branch_name, type_or_name, field, target_triple)?;
+        Ok(format_v2_why(&payload))
+    }
+
+    fn why_layout_branch_value(
+        &mut self,
+        branch_name: &str,
+        type_or_name: &str,
+        field: Option<&str>,
+        target_triple: &str,
+    ) -> Result<JsonValue> {
+        let branch = self.branch(branch_name)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let resolved = self.resolve_type_for_why(&root, type_or_name)?;
+        let layout = self
+            .compute_type_layout(&root, &resolved.type_hash, target_triple)?
+            .metadata;
+        let field_layout = match field {
+            Some(field_name) => Some(layout_field_by_name_or_symbol(&layout, field_name)?),
+            None => None,
+        };
+        let field_blame = match (&resolved.type_symbol, field) {
+            (Some(type_symbol), Some(field_name)) => {
+                Some(self.blame_member_branch_value(branch_name, type_symbol, field_name, true)?)
+            }
+            _ => None,
+        };
+        let type_blame = match &resolved.type_symbol {
+            Some(type_symbol) => Some(self.blame_type_branch_value(branch_name, type_symbol)?),
+            None => None,
+        };
+        Ok(json!({
+            "schema": WHY_LAYOUT_SCHEMA,
+            "branch": branch_name,
+            "root_hash": branch.root_hash,
+            "history_hash": branch.history_hash,
+            "target_triple": target_triple,
+            "query": {
+                "type": type_or_name,
+                "field": field,
+            },
+            "type_hash": resolved.type_hash,
+            "type_symbol": resolved.type_symbol,
+            "type_def_hash": resolved.type_def_hash,
+            "layout": layout,
+            "field_layout": field_layout,
+            "explanation": layout_explanation(field, &field_layout),
+            "type_blame": type_blame,
+            "field_blame": field_blame,
+        }))
+    }
+
+    pub fn why_drop_branch_json(
+        &mut self,
+        branch_name: &str,
+        type_or_name: &str,
+        target_triple: &str,
+    ) -> Result<String> {
+        let payload = self.why_drop_branch_value(branch_name, type_or_name, target_triple)?;
+        Ok(format!("{}\n", canonical_json(&payload)))
+    }
+
+    pub fn why_drop_branch(
+        &mut self,
+        branch_name: &str,
+        type_or_name: &str,
+        target_triple: &str,
+    ) -> Result<String> {
+        let payload = self.why_drop_branch_value(branch_name, type_or_name, target_triple)?;
+        Ok(format_v2_why(&payload))
+    }
+
+    fn why_drop_branch_value(
+        &mut self,
+        branch_name: &str,
+        type_or_name: &str,
+        target_triple: &str,
+    ) -> Result<JsonValue> {
+        let branch = self.branch(branch_name)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let resolved = self.resolve_type_for_why(&root, type_or_name)?;
+        let layout = self
+            .compute_type_layout(&root, &resolved.type_hash, target_triple)?
+            .metadata;
+        let type_blame = match &resolved.type_symbol {
+            Some(type_symbol) => Some(self.blame_type_branch_value(branch_name, type_symbol)?),
+            None => None,
+        };
+        Ok(json!({
+            "schema": WHY_DROP_SCHEMA,
+            "branch": branch_name,
+            "root_hash": branch.root_hash,
+            "history_hash": branch.history_hash,
+            "target_triple": target_triple,
+            "query": {
+                "type": type_or_name,
+            },
+            "type_hash": resolved.type_hash,
+            "type_symbol": resolved.type_symbol,
+            "type_def_hash": resolved.type_def_hash,
+            "copy_kind": layout.get("copy_kind").cloned().unwrap_or(JsonValue::Null),
+            "drop_kind": layout.get("drop_kind").cloned().unwrap_or(JsonValue::Null),
+            "contains_reference": layout.get("contains_reference").cloned().unwrap_or(JsonValue::Null),
+            "contains_mut_reference": layout.get("contains_mut_reference").cloned().unwrap_or(JsonValue::Null),
+            "contains_box": layout.get("contains_box").cloned().unwrap_or(JsonValue::Null),
+            "contains_owned_resource": layout.get("contains_owned_resource").cloned().unwrap_or(JsonValue::Null),
+            "layout": layout,
+            "reasons": drop_reasons(&layout),
+            "type_blame": type_blame,
+        }))
+    }
+
+    pub fn why_effect_branch_json(
+        &self,
+        branch_name: &str,
+        symbol_or_name: &str,
+    ) -> Result<String> {
+        let payload = self.why_effect_branch_value(branch_name, symbol_or_name)?;
+        Ok(format!("{}\n", canonical_json(&payload)))
+    }
+
+    pub fn why_effect_branch(&self, branch_name: &str, symbol_or_name: &str) -> Result<String> {
+        let payload = self.why_effect_branch_value(branch_name, symbol_or_name)?;
+        Ok(format_v2_why(&payload))
+    }
+
+    fn why_effect_branch_value(
+        &self,
+        branch_name: &str,
+        symbol_or_name: &str,
+    ) -> Result<JsonValue> {
+        let branch = self.branch(branch_name)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let symbol = self.resolve_symbol_for_blame(&branch.root_hash, symbol_or_name)?;
+        let entry = self
+            .root_symbol(&root, &symbol)
+            .ok_or_else(|| anyhow!("symbol is not in root: {symbol}"))?;
+        let binding = self.preferred_binding(&root, &symbol);
+        let declared_effects = self.signature_effect_names(&entry.signature)?;
+        let is_external = self.definition_is_external(&entry.definition)?;
+        let body_hash = if is_external {
+            None
+        } else {
+            Some(self.function_body_hash(&entry.definition)?)
+        };
+        let mut required_by = BTreeMap::<String, Vec<JsonValue>>::new();
+        if is_external {
+            let external = self.external_function_metadata(&entry.definition)?;
+            for effect in self.signature_effects(&entry.signature)? {
+                required_by
+                    .entry(effect.as_str().to_string())
+                    .or_default()
+                    .push(json!({
+                        "kind": "external_function",
+                        "abi": external.abi,
+                        "link_name": external.link_name,
+                        "library": external.library,
+                        "definition_hash": entry.definition,
+                    }));
+            }
+        }
+        if let Some(body_hash) = &body_hash {
+            if self.expr_requires_state(body_hash)? {
+                required_by
+                    .entry(Effect::State.as_str().to_string())
+                    .or_default()
+                    .push(json!({
+                        "kind": "body_expression",
+                        "reason": "assignment or mutable semantic place update",
+                        "body_hash": body_hash,
+                    }));
+            }
+            if self.expr_requires_alloc(body_hash)? {
+                required_by
+                    .entry(Effect::Alloc.as_str().to_string())
+                    .or_default()
+                    .push(json!({
+                        "kind": "body_expression",
+                        "reason": "heap/string/vector allocation expression",
+                        "body_hash": body_hash,
+                    }));
+            }
+            if self.expr_requires_unsafe(body_hash)? {
+                required_by
+                    .entry(Effect::Unsafe.as_str().to_string())
+                    .or_default()
+                    .push(json!({
+                        "kind": "body_expression",
+                        "reason": "raw pointer or unsafe expression",
+                        "body_hash": body_hash,
+                    }));
+            }
+        }
+        for dependency in self.dependencies_for_definition(&root, &entry.definition)? {
+            let Some(callee) = self.root_symbol(&root, &dependency) else {
+                continue;
+            };
+            let callee_name = self
+                .preferred_binding(&root, &dependency)
+                .map(|binding| format!("{}.{}", binding.module, binding.display_name));
+            for effect in self.signature_effects(&callee.signature)? {
+                required_by
+                    .entry(effect.as_str().to_string())
+                    .or_default()
+                    .push(json!({
+                        "kind": "callee",
+                        "symbol_hash": dependency,
+                        "name": callee_name,
+                        "signature_hash": callee.signature,
+                    }));
+            }
+        }
+        let missing_declarations = required_by
+            .keys()
+            .filter(|effect| !declared_effects.iter().any(|declared| declared == *effect))
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "schema": WHY_EFFECT_SCHEMA,
+            "branch": branch_name,
+            "root_hash": branch.root_hash,
+            "history_hash": branch.history_hash,
+            "symbol_hash": symbol,
+            "module": binding.map(|binding| binding.module.as_str()),
+            "name": binding.map(|binding| binding.display_name.as_str()),
+            "signature_hash": entry.signature,
+            "definition_hash": entry.definition,
+            "body_hash": body_hash,
+            "declared_effects": declared_effects,
+            "required_by": required_by,
+            "missing_declarations": missing_declarations,
+            "symbol_blame": self.blame_symbol_branch_value(branch_name, symbol_or_name)?,
+        }))
+    }
+
+    pub fn why_platform_extern_branch_json(
+        &mut self,
+        branch_name: &str,
+        entry_name: &str,
+        extern_name: &str,
+        target_triple: &str,
+    ) -> Result<String> {
+        let payload = self.why_platform_extern_branch_value(
+            branch_name,
+            entry_name,
+            extern_name,
+            target_triple,
+        )?;
+        Ok(format!("{}\n", canonical_json(&payload)))
+    }
+
+    pub fn why_platform_extern_branch(
+        &mut self,
+        branch_name: &str,
+        entry_name: &str,
+        extern_name: &str,
+        target_triple: &str,
+    ) -> Result<String> {
+        let payload = self.why_platform_extern_branch_value(
+            branch_name,
+            entry_name,
+            extern_name,
+            target_triple,
+        )?;
+        Ok(format_v2_why(&payload))
+    }
+
+    fn why_platform_extern_branch_value(
+        &mut self,
+        branch_name: &str,
+        entry_name: &str,
+        extern_name: &str,
+        target_triple: &str,
+    ) -> Result<JsonValue> {
+        let branch = self.branch(branch_name)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let build_plan: JsonValue = serde_json::from_str(
+            self.build_plan_branch(branch_name, entry_name, target_triple)?
+                .trim_end(),
+        )?;
+        let matches = build_plan
+            .get("platform_external_symbols")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|external| {
+                external.get("link_name").and_then(JsonValue::as_str) == Some(extern_name)
+                    || external.get("symbol_hash").and_then(JsonValue::as_str) == Some(extern_name)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            bail!("platform extern {extern_name:?} is not reachable from entry {entry_name:?}");
+        }
+        let semantic_externals = matches
+            .iter()
+            .filter_map(|external| external.get("symbol_hash").and_then(JsonValue::as_str))
+            .filter_map(|symbol| {
+                root.symbols
+                    .iter()
+                    .find(|entry| entry.symbol == symbol)
+                    .map(|entry| (symbol, entry))
+            })
+            .map(|(symbol, entry)| {
+                let metadata = self.external_function_metadata(&entry.definition)?;
+                Ok(json!({
+                    "symbol_hash": symbol,
+                    "definition_hash": entry.definition,
+                    "signature_hash": entry.signature,
+                    "effects": self.signature_effect_names(&entry.signature)?,
+                    "abi": metadata.abi,
+                    "link_name": metadata.link_name,
+                    "library": metadata.library,
+                    "blame": self.blame_symbol_branch_value(branch_name, symbol)?,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(json!({
+            "schema": WHY_PLATFORM_EXTERN_SCHEMA,
+            "branch": branch_name,
+            "root_hash": branch.root_hash,
+            "history_hash": branch.history_hash,
+            "entry_name": entry_name,
+            "target_triple": target_triple,
+            "query": extern_name,
+            "platform_external_symbols": matches,
+            "semantic_externals": semantic_externals,
+            "build_plan": {
+                "schema": build_plan.get("schema").cloned().unwrap_or(JsonValue::Null),
+                "entry_symbol_hash": build_plan.get("entry_symbol_hash").cloned().unwrap_or(JsonValue::Null),
+                "entry_effects": build_plan.get("entry_effects").cloned().unwrap_or(JsonValue::Null),
+                "entry_point": build_plan.get("entry_point").cloned().unwrap_or(JsonValue::Null),
+                "link_plan_input_hash": build_plan.get("link_plan_input_hash").cloned().unwrap_or(JsonValue::Null),
+                "link_plan_cache_key": build_plan.get("link_plan_cache_key").cloned().unwrap_or(JsonValue::Null),
+                "link_plan_hash": build_plan.get("link_plan_hash").cloned().unwrap_or(JsonValue::Null),
+                "capabilities": build_plan.get("capabilities").cloned().unwrap_or(JsonValue::Null),
+                "external_symbols": build_plan.get("external_symbols").cloned().unwrap_or(JsonValue::Null),
+            },
+        }))
+    }
+
+    pub fn why_borrow_branch_json(
+        &mut self,
+        branch_name: &str,
+        symbol_or_name: &str,
+        candidate_body: Option<&str>,
+    ) -> Result<String> {
+        let payload = self.why_candidate_body_branch_value(
+            branch_name,
+            symbol_or_name,
+            candidate_body,
+            CandidateWhyKind::Borrow,
+        )?;
+        Ok(format!("{}\n", canonical_json(&payload)))
+    }
+
+    pub fn why_borrow_branch(
+        &mut self,
+        branch_name: &str,
+        symbol_or_name: &str,
+        candidate_body: Option<&str>,
+    ) -> Result<String> {
+        let payload = self.why_candidate_body_branch_value(
+            branch_name,
+            symbol_or_name,
+            candidate_body,
+            CandidateWhyKind::Borrow,
+        )?;
+        Ok(format_v2_why(&payload))
+    }
+
+    pub fn why_move_branch_json(
+        &mut self,
+        branch_name: &str,
+        symbol_or_name: &str,
+        candidate_body: Option<&str>,
+    ) -> Result<String> {
+        let payload = self.why_candidate_body_branch_value(
+            branch_name,
+            symbol_or_name,
+            candidate_body,
+            CandidateWhyKind::Move,
+        )?;
+        Ok(format!("{}\n", canonical_json(&payload)))
+    }
+
+    pub fn why_move_branch(
+        &mut self,
+        branch_name: &str,
+        symbol_or_name: &str,
+        candidate_body: Option<&str>,
+    ) -> Result<String> {
+        let payload = self.why_candidate_body_branch_value(
+            branch_name,
+            symbol_or_name,
+            candidate_body,
+            CandidateWhyKind::Move,
+        )?;
+        Ok(format_v2_why(&payload))
+    }
+
+    fn why_candidate_body_branch_value(
+        &mut self,
+        branch_name: &str,
+        symbol_or_name: &str,
+        candidate_body: Option<&str>,
+        kind: CandidateWhyKind,
+    ) -> Result<JsonValue> {
+        let branch = self.branch(branch_name)?;
+        let root = self.load_root(&branch.root_hash)?;
+        let symbol = self.resolve_symbol_for_blame(&branch.root_hash, symbol_or_name)?;
+        let entry = self
+            .root_symbol(&root, &symbol)
+            .ok_or_else(|| anyhow!("symbol is not in root: {symbol}"))?;
+        let binding = self
+            .preferred_binding(&root, &symbol)
+            .ok_or_else(|| anyhow!("symbol has no preferred binding {symbol}"))?
+            .clone();
+        let current_body_hash = if self.definition_is_external(&entry.definition)? {
+            None
+        } else {
+            Some(self.function_body_hash(&entry.definition)?)
+        };
+        let candidate = match candidate_body {
+            Some(source) => {
+                let raw = parse_expr_source(source)?;
+                let diagnostic = self.rollback_replace_body_diagnostic(
+                    &branch.root_hash,
+                    &binding.module,
+                    &symbol,
+                    &binding.display_name,
+                    &raw,
+                )?;
+                json!({
+                    "body_source": source,
+                    "status": diagnostic.status,
+                    "diagnostic": diagnostic.message,
+                    "classifications": classify_candidate_diagnostic(kind, diagnostic.message.as_deref()),
+                    "branch_unchanged": self.branch(branch_name)?.root_hash == branch.root_hash,
+                })
+            }
+            None => json!({
+                "status": "current_root_valid",
+                "diagnostic": JsonValue::Null,
+                "classifications": [],
+                "body_hash": current_body_hash,
+            }),
+        };
+        Ok(json!({
+            "schema": kind.schema(),
+            "branch": branch_name,
+            "root_hash": branch.root_hash,
+            "history_hash": branch.history_hash,
+            "symbol_hash": symbol,
+            "module": binding.module,
+            "name": binding.display_name,
+            "signature_hash": entry.signature,
+            "definition_hash": entry.definition,
+            "body_hash": current_body_hash,
+            "candidate": candidate,
+            "symbol_blame": self.blame_symbol_branch_value(branch_name, symbol_or_name)?,
+        }))
+    }
+
+    fn rollback_replace_body_diagnostic(
+        &mut self,
+        input_root: &str,
+        module: &str,
+        symbol: &str,
+        name: &str,
+        body: &crate::expr::RawExpr,
+    ) -> Result<CandidateDiagnostic> {
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = self.apply_replace_body(input_root, module, symbol, name, body);
+        let rollback = self.conn.execute_batch("ROLLBACK");
+        if let Err(rollback_err) = rollback {
+            return Err(match result {
+                Ok(_) => anyhow!("rollback failed after candidate body validation: {rollback_err}"),
+                Err(err) => err.context(format!("rollback failed: {rollback_err}")),
+            });
+        }
+        Ok(match result {
+            Ok(_) => CandidateDiagnostic {
+                status: "valid".to_string(),
+                message: None,
+            },
+            Err(err) => CandidateDiagnostic {
+                status: "invalid".to_string(),
+                message: Some(format!("{err:#}")),
+            },
+        })
+    }
+
+    fn resolve_type_for_why(
+        &mut self,
+        root: &ProgramRootPayload,
+        type_or_name: &str,
+    ) -> Result<ResolvedWhyType> {
+        let type_hash = if type_or_name.starts_with("sha256:") {
+            match self.get_kind(type_or_name)?.as_str() {
+                "Type" => type_or_name.to_string(),
+                "SymbolBirth" => self.named_type_hash_for_symbol(root, type_or_name)?,
+                other => bail!("object {type_or_name} is {other}, not Type or SymbolBirth"),
+            }
+        } else {
+            self.resolve_type_in_root(MAIN_BRANCH, root, type_or_name)?
+        };
+        let type_symbol = match self.type_spec(&type_hash)? {
+            TypeSpec::Named { type_symbol, .. } => Some(type_symbol),
+            _ => None,
+        };
+        let type_def_hash = type_symbol
+            .as_deref()
+            .and_then(|symbol| self.root_type(root, symbol))
+            .map(|entry| entry.type_def.clone());
+        Ok(ResolvedWhyType {
+            type_hash,
+            type_symbol,
+            type_def_hash,
+        })
+    }
+
+    fn named_type_hash_for_symbol(
+        &mut self,
+        root: &ProgramRootPayload,
+        type_symbol: &str,
+    ) -> Result<String> {
+        let entry = self
+            .root_type(root, type_symbol)
+            .ok_or_else(|| anyhow!("type symbol is not in root: {type_symbol}"))?;
+        let definition = self.type_definition(&entry.type_def)?;
+        let region_args = definition
+            .region_params()
+            .iter()
+            .map(|param| param.region.clone())
+            .collect::<Vec<_>>();
+        let payload = type_payload_for_spec(&TypeSpec::Named {
+            type_symbol: type_symbol.to_string(),
+            region_args,
+        })?;
+        self.put_object("Type", &payload)
     }
 
     fn resolve_symbol_for_blame(&self, root_hash: &str, symbol_or_name: &str) -> Result<String> {
@@ -2318,6 +2890,239 @@ fn format_why(payload: &JsonValue) -> String {
         }
     }
     out
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedWhyType {
+    type_hash: String,
+    type_symbol: Option<String>,
+    type_def_hash: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateDiagnostic {
+    status: String,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CandidateWhyKind {
+    Borrow,
+    Move,
+}
+
+impl CandidateWhyKind {
+    fn schema(self) -> &'static str {
+        match self {
+            CandidateWhyKind::Borrow => WHY_BORROW_SCHEMA,
+            CandidateWhyKind::Move => WHY_MOVE_SCHEMA,
+        }
+    }
+}
+
+fn format_v2_why(payload: &JsonValue) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} ok\n",
+        payload
+            .get("schema")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("codedb/why-v2")
+    ));
+    out.push_str(&format!(
+        "root {}\n",
+        payload
+            .get("root_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+    ));
+    out.push_str(&format!(
+        "history {}\n",
+        payload
+            .get("history_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("none")
+    ));
+    for key in [
+        "symbol_hash",
+        "type_hash",
+        "type_symbol",
+        "type_def_hash",
+        "signature_hash",
+        "definition_hash",
+        "body_hash",
+    ] {
+        if let Some(value) = payload.get(key).and_then(JsonValue::as_str) {
+            out.push_str(&format!("{key} {value}\n"));
+        }
+    }
+    if let Some(candidate) = payload.get("candidate") {
+        out.push_str(&format!(
+            "candidate_status {}\n",
+            candidate
+                .get("status")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+        ));
+        if let Some(diagnostic) = candidate.get("diagnostic").and_then(JsonValue::as_str) {
+            out.push_str(&format!("diagnostic {diagnostic}\n"));
+        }
+    }
+    if let Some(field_layout) = payload.get("field_layout")
+        && !field_layout.is_null()
+    {
+        out.push_str(&format!(
+            "field_offset {}\n",
+            field_layout
+                .get("offset_bytes")
+                .and_then(JsonValue::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+    }
+    if let Some(required_by) = payload.get("required_by").and_then(JsonValue::as_object) {
+        for (effect, reasons) in required_by {
+            out.push_str(&format!(
+                "effect {effect} reasons {}\n",
+                reasons.as_array().map(Vec::len).unwrap_or(0)
+            ));
+        }
+    }
+    if let Some(externals) = payload
+        .get("platform_external_symbols")
+        .and_then(JsonValue::as_array)
+    {
+        for external in externals {
+            out.push_str(&format!(
+                "platform_extern {} {}\n",
+                external
+                    .get("symbol_hash")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or(""),
+                external
+                    .get("link_name")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("")
+            ));
+        }
+    }
+    out
+}
+
+fn layout_field_by_name_or_symbol(layout: &JsonValue, field: &str) -> Result<JsonValue> {
+    let fields = layout
+        .get("fields")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| anyhow!("layout has no record fields"))?;
+    fields
+        .iter()
+        .find(|entry| {
+            entry.get("name").and_then(JsonValue::as_str) == Some(field)
+                || entry.get("field_symbol").and_then(JsonValue::as_str) == Some(field)
+        })
+        .cloned()
+        .ok_or_else(|| anyhow!("field {field:?} not found in layout"))
+}
+
+fn layout_explanation(field: Option<&str>, field_layout: &Option<JsonValue>) -> JsonValue {
+    match (field, field_layout) {
+        (Some(field), Some(layout)) => json!({
+            "kind": "field_offset",
+            "field": field,
+            "offset_bytes": layout.get("offset_bytes").cloned().unwrap_or(JsonValue::Null),
+            "rule": "record fields are laid out in semantic field order; each field offset is the previous size rounded up to the field alignment for the target",
+        }),
+        _ => json!({
+            "kind": "type_layout",
+            "rule": "type layout is recomputed from the semantic type hash, target triple, layout version, ABI version, and referenced type definitions",
+        }),
+    }
+}
+
+fn drop_reasons(layout: &JsonValue) -> Vec<JsonValue> {
+    let mut reasons = Vec::new();
+    if layout.get("copy_kind").and_then(JsonValue::as_str) == Some("move_only") {
+        reasons.push(json!({
+            "kind": "move_only",
+            "rule": "values classified move_only cannot be implicitly copied; moves transfer ownership or carried loans",
+        }));
+    }
+    if layout.get("drop_kind").and_then(JsonValue::as_str) == Some("needs_drop") {
+        reasons.push(json!({
+            "kind": "needs_drop",
+            "rule": "layout contains an owned resource whose drop path may release native storage",
+        }));
+    }
+    for (key, rule) in [
+        (
+            "contains_box",
+            "box<T> owns heap storage and makes its containing type move-only",
+        ),
+        (
+            "contains_owned_resource",
+            "owned native resources require generated drop/free handling",
+        ),
+        (
+            "contains_mut_reference",
+            "mutable references carry exclusive loans and make their containing type move-only",
+        ),
+        (
+            "contains_reference",
+            "reference-containing values carry semantic loans through copies or moves",
+        ),
+    ] {
+        if layout.get(key).and_then(JsonValue::as_bool) == Some(true) {
+            reasons.push(json!({
+                "kind": key,
+                "rule": rule,
+            }));
+        }
+    }
+    if reasons.is_empty() {
+        reasons.push(json!({
+            "kind": "trivial",
+            "rule": "layout is Copy and has trivial drop classification",
+        }));
+    }
+    reasons
+}
+
+fn classify_candidate_diagnostic(
+    kind: CandidateWhyKind,
+    message: Option<&str>,
+) -> Vec<&'static str> {
+    let Some(message) = message else {
+        return Vec::new();
+    };
+    let mut classifications = BTreeSet::new();
+    match kind {
+        CandidateWhyKind::Borrow => {
+            if message.contains("exclusive loan conflict") {
+                classifications.insert("exclusive_loan_conflict");
+            }
+            if message.contains("shared read") {
+                classifications.insert("shared_read_conflict");
+            }
+            if message.contains("returns reference to local storage") {
+                classifications.insert("local_borrow_escape");
+            }
+            if message.contains("bad_borrow") {
+                classifications.insert("borrow_rule_violation");
+            }
+        }
+        CandidateWhyKind::Move => {
+            if message.contains("bad_move") || message.contains("use after move") {
+                classifications.insert("use_after_move");
+            }
+            if message.contains("move of") && message.contains("conflicts with live") {
+                classifications.insert("move_conflicts_with_live_borrow");
+            }
+            if message.contains("unsupported_move") {
+                classifications.insert("unsupported_move_shape");
+            }
+        }
+    }
+    classifications.into_iter().collect()
 }
 
 fn push_blame_line(out: &mut String, label: &str, value: &JsonValue) {

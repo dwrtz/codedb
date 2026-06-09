@@ -298,6 +298,73 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Explain a deterministic V2 type layout or record field offset")]
+    WhyLayout {
+        db: PathBuf,
+        type_or_name: String,
+        #[arg(long)]
+        field: Option<String>,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        #[arg(long, default_value = codedb::DEFAULT_NATIVE_TARGET)]
+        target: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Explain borrow-check behavior for a function or candidate body")]
+    WhyBorrow {
+        db: PathBuf,
+        symbol_or_name: String,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Explain move-check behavior for a function or candidate body")]
+    WhyMove {
+        db: PathBuf,
+        symbol_or_name: String,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Explain V2 copy/move/drop classification for a type")]
+    WhyDrop {
+        db: PathBuf,
+        type_or_name: String,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        #[arg(long, default_value = codedb::DEFAULT_NATIVE_TARGET)]
+        target: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Explain why a function declares or requires effects")]
+    WhyEffect {
+        db: PathBuf,
+        symbol_or_name: String,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Explain why a platform extern is reachable from a native build plan")]
+    WhyPlatformExtern {
+        db: PathBuf,
+        entry_name: String,
+        extern_name: String,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        #[arg(long, default_value = codedb::DEFAULT_NATIVE_TARGET)]
+        target: String,
+        #[arg(long)]
+        json: bool,
+    },
     Rename {
         db: PathBuf,
         old_name: String,
@@ -1036,6 +1103,139 @@ fn main() -> Result<()> {
                 print!(
                     "{}",
                     codedb.why_roots_branch(&branch, &entry_name, &args, &from_root, &to_root)?
+                );
+            }
+        }
+        Command::WhyLayout {
+            db,
+            type_or_name,
+            field,
+            branch,
+            target,
+            json,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            if json {
+                print!(
+                    "{}",
+                    codedb.why_layout_branch_json(
+                        &branch,
+                        &type_or_name,
+                        field.as_deref(),
+                        &target,
+                    )?
+                );
+            } else {
+                print!(
+                    "{}",
+                    codedb.why_layout_branch(&branch, &type_or_name, field.as_deref(), &target)?
+                );
+            }
+        }
+        Command::WhyBorrow {
+            db,
+            symbol_or_name,
+            body,
+            branch,
+            json,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            if json {
+                print!(
+                    "{}",
+                    codedb.why_borrow_branch_json(&branch, &symbol_or_name, body.as_deref())?
+                );
+            } else {
+                print!(
+                    "{}",
+                    codedb.why_borrow_branch(&branch, &symbol_or_name, body.as_deref())?
+                );
+            }
+        }
+        Command::WhyMove {
+            db,
+            symbol_or_name,
+            body,
+            branch,
+            json,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            if json {
+                print!(
+                    "{}",
+                    codedb.why_move_branch_json(&branch, &symbol_or_name, body.as_deref())?
+                );
+            } else {
+                print!(
+                    "{}",
+                    codedb.why_move_branch(&branch, &symbol_or_name, body.as_deref())?
+                );
+            }
+        }
+        Command::WhyDrop {
+            db,
+            type_or_name,
+            branch,
+            target,
+            json,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            if json {
+                print!(
+                    "{}",
+                    codedb.why_drop_branch_json(&branch, &type_or_name, &target)?
+                );
+            } else {
+                print!(
+                    "{}",
+                    codedb.why_drop_branch(&branch, &type_or_name, &target)?
+                );
+            }
+        }
+        Command::WhyEffect {
+            db,
+            symbol_or_name,
+            branch,
+            json,
+        } => {
+            let codedb = codedb::CodeDb::open(db)?;
+            if json {
+                print!(
+                    "{}",
+                    codedb.why_effect_branch_json(&branch, &symbol_or_name)?
+                );
+            } else {
+                print!("{}", codedb.why_effect_branch(&branch, &symbol_or_name)?);
+            }
+        }
+        Command::WhyPlatformExtern {
+            db,
+            entry_name,
+            extern_name,
+            branch,
+            target,
+            json,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            if json {
+                print!(
+                    "{}",
+                    codedb.why_platform_extern_branch_json(
+                        &branch,
+                        &entry_name,
+                        &extern_name,
+                        &target,
+                    )?
+                );
+            } else {
+                print!(
+                    "{}",
+                    codedb.why_platform_extern_branch(
+                        &branch,
+                        &entry_name,
+                        &extern_name,
+                        &target,
+                    )?
                 );
             }
         }

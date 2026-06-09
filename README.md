@@ -158,7 +158,11 @@ optional JSON-RPC `id` fields. Responses use the stable
 `modules.list`, `modules.show`, `build.plan`, `build.execute`, `build.artifact_status`, `trace.run`,
 `debug.run`, `tests.list`, `tests.run`, `tests.impact`, `history.list`,
 `history.bisect`, `provenance.blame_symbol`, `provenance.blame_expr`,
-`why.run`, and `verify.run`. It also exposes `workspace.branch.create`,
+`provenance.blame_type`, `provenance.blame_field`,
+`provenance.blame_variant`, `provenance.why_layout`,
+`provenance.why_borrow`, `provenance.why_move`, `provenance.why_drop`,
+`provenance.why_effect`, `provenance.why_platform_extern`, `why.run`, and
+`verify.run`. It also exposes `workspace.branch.create`,
 `workspace.branch.fast_forward`, `workspace.branch.delete`,
 `workspace.branch.compare`, `ops.apply` for atomic `codedb/apply/v1`
 structural writes, and `ops.preview` for rollback-only previews.
@@ -224,6 +228,15 @@ cargo run -- diff <db> <root-a> <root-b> [--json]
 cargo run -- history <db> [--json]
 cargo run -- blame-symbol <db> <symbol-or-name> [--branch main] [--json]
 cargo run -- blame-expr <db> <expr-hash> [--branch main] [--json]
+cargo run -- blame-type <db> <type-or-name> [--branch main] [--json]
+cargo run -- blame-field <db> <type-or-name> <field> [--branch main] [--json]
+cargo run -- blame-variant <db> <type-or-name> <variant> [--branch main] [--json]
+cargo run -- why-layout <db> <type-or-name> [--field <field>] [--target <triple>] [--json]
+cargo run -- why-borrow <db> <symbol-or-name> [--body <expr>] [--branch main] [--json]
+cargo run -- why-move <db> <symbol-or-name> [--body <expr>] [--branch main] [--json]
+cargo run -- why-drop <db> <type-or-name> [--target <triple>] [--json]
+cargo run -- why-effect <db> <symbol-or-name> [--branch main] [--json]
+cargo run -- why-platform-extern <db> <entry-name> <extern-name> [--target <triple>] [--json]
 cargo run -- branches <db> [--json]
 cargo run -- branch list <db> [--json]
 cargo run -- branch create <db> <name> --from main [--json]
