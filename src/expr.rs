@@ -127,6 +127,10 @@ pub struct RawRecordField {
 pub struct RawCaseArm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
+    /// A scalar literal pattern (an `i64` or `bool` literal) for matching on a
+    /// scalar scrutinee (R14). Mutually exclusive with `variant`/`default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub literal: Option<Box<RawExpr>>,
     #[serde(default, skip_serializing_if = "raw_case_arm_default_is_false")]
     pub default: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -136,6 +140,21 @@ pub struct RawCaseArm {
 
 fn raw_case_arm_default_is_false(value: &bool) -> bool {
     !*value
+}
+
+/// Reconstruct a scalar literal case pattern (R14) from a typed case arm payload
+/// (`{"literal_i64": "..."}` / `{"literal_bool": ...}`), or `None` if the arm is
+/// not a scalar literal pattern (a variant or default arm).
+pub(crate) fn scalar_literal_pattern_from_typed_arm(arm: &JsonValue) -> Option<Box<RawExpr>> {
+    if let Some(value) = arm.get("literal_i64").and_then(JsonValue::as_str) {
+        return Some(Box::new(RawExpr::LiteralI64 {
+            value: value.to_string(),
+        }));
+    }
+    if let Some(value) = arm.get("literal_bool").and_then(JsonValue::as_bool) {
+        return Some(Box::new(RawExpr::LiteralBool { value }));
+    }
+    None
 }
 
 fn typed_case_arm_is_default(arm: &JsonValue) -> bool {
@@ -1063,33 +1082,72 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("case missing expr"))?;
                 let value = self.eval_expr_with_locals(root_hash, expr_hash, args, locals)?;
-                let Value::Enum { variant, value } = value else {
-                    bail!("case expression evaluated to non-enum {value}");
-                };
                 let arms = payload
                     .get("arms")
                     .and_then(JsonValue::as_array)
                     .ok_or_else(|| anyhow!("case missing arms"))?;
-                let arm = arms
-                    .iter()
-                    .find(|arm| arm.get("variant").and_then(JsonValue::as_str) == Some(&variant))
-                    .or_else(|| arms.iter().find(|arm| typed_case_arm_is_default(arm)))
-                    .ok_or_else(|| anyhow!("case missing arm for variant {variant}"))?;
-                let body_hash = arm
-                    .get("body")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("case arm missing body"))?;
-                if arm
-                    .get("binding_name")
-                    .and_then(JsonValue::as_str)
-                    .is_some()
-                {
-                    locals.push(value);
-                    let result = self.eval_expr_with_locals(root_hash, body_hash, args, locals);
-                    locals.pop();
-                    result
-                } else {
-                    self.eval_expr_with_locals(root_hash, body_hash, args, locals)
+                match value {
+                    Value::Enum { variant, value } => {
+                        let arm = arms
+                            .iter()
+                            .find(|arm| {
+                                arm.get("variant").and_then(JsonValue::as_str) == Some(&variant)
+                            })
+                            .or_else(|| arms.iter().find(|arm| typed_case_arm_is_default(arm)))
+                            .ok_or_else(|| anyhow!("case missing arm for variant {variant}"))?;
+                        let body_hash = arm
+                            .get("body")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("case arm missing body"))?;
+                        if arm
+                            .get("binding_name")
+                            .and_then(JsonValue::as_str)
+                            .is_some()
+                        {
+                            locals.push(value);
+                            let result =
+                                self.eval_expr_with_locals(root_hash, body_hash, args, locals);
+                            locals.pop();
+                            result
+                        } else {
+                            self.eval_expr_with_locals(root_hash, body_hash, args, locals)
+                        }
+                    }
+                    // Scalar literal `case` (R14): match the scalar value against
+                    // literal-pattern arms, falling back to the `_` wildcard.
+                    Value::I64(scrutinee) => {
+                        let arm = arms
+                            .iter()
+                            .find(|arm| {
+                                arm.get("literal_i64")
+                                    .and_then(JsonValue::as_str)
+                                    .and_then(|literal| literal.parse::<i64>().ok())
+                                    == Some(scrutinee)
+                            })
+                            .or_else(|| arms.iter().find(|arm| typed_case_arm_is_default(arm)))
+                            .ok_or_else(|| anyhow!("scalar case missing arm for value {scrutinee}"))?;
+                        let body_hash = arm
+                            .get("body")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("case arm missing body"))?;
+                        self.eval_expr_with_locals(root_hash, body_hash, args, locals)
+                    }
+                    Value::Bool(scrutinee) => {
+                        let arm = arms
+                            .iter()
+                            .find(|arm| {
+                                arm.get("literal_bool").and_then(JsonValue::as_bool)
+                                    == Some(scrutinee)
+                            })
+                            .or_else(|| arms.iter().find(|arm| typed_case_arm_is_default(arm)))
+                            .ok_or_else(|| anyhow!("scalar case missing arm for value {scrutinee}"))?;
+                        let body_hash = arm
+                            .get("body")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("case arm missing body"))?;
+                        self.eval_expr_with_locals(root_hash, body_hash, args, locals)
+                    }
+                    other => bail!("case expression evaluated to non-enum/scalar {other}"),
                 }
             }
             other => bail!("unknown expression kind {other}"),
@@ -2595,6 +2653,33 @@ impl CodeDb {
                                 )?
                             ));
                         }
+                        // Scalar literal pattern (R14): `0 => ...`, `true => ...`.
+                        if let Some(literal) = scalar_literal_pattern_from_typed_arm(arm) {
+                            if binding.is_some() {
+                                bail!("scalar case arm cannot bind a value");
+                            }
+                            let pattern = match literal.as_ref() {
+                                RawExpr::LiteralI64 { value } => value.clone(),
+                                RawExpr::LiteralBool { value } => value.to_string(),
+                                _ => bail!("invalid scalar case literal pattern"),
+                            };
+                            let body = arm
+                                .get("body")
+                                .and_then(JsonValue::as_str)
+                                .ok_or_else(|| anyhow!("case arm missing body"))?;
+                            return Ok(format!(
+                                "{pattern} => {}",
+                                self.expr_to_source_with_locals(
+                                    body,
+                                    root,
+                                    current_module,
+                                    local_params,
+                                    region_names,
+                                    local_names,
+                                    0,
+                                )?
+                            ));
+                        }
                         let variant = arm
                             .get("variant")
                             .and_then(JsonValue::as_str)
@@ -3470,7 +3555,27 @@ impl CodeDb {
                             )?;
                             return Ok(RawCaseArm {
                                 variant: None,
+                                literal: None,
                                 default: true,
+                                binding: None,
+                                body,
+                            });
+                        }
+                        // Scalar literal pattern (R14): no variant, no binding.
+                        if let Some(literal) = scalar_literal_pattern_from_typed_arm(arm) {
+                            let body = self.typed_expr_to_raw_with_locals(
+                                arm.get("body")
+                                    .and_then(JsonValue::as_str)
+                                    .ok_or_else(|| anyhow!("case arm missing body"))?,
+                                root,
+                                current_module,
+                                region_names,
+                                local_names,
+                            )?;
+                            return Ok(RawCaseArm {
+                                variant: None,
+                                literal: Some(literal),
+                                default: false,
                                 binding: None,
                                 body,
                             });
@@ -3497,6 +3602,7 @@ impl CodeDb {
                         }
                         Ok(RawCaseArm {
                             variant: Some(variant),
+                            literal: None,
                             default: false,
                             binding,
                             body: body?,
@@ -4333,11 +4439,16 @@ impl Parser {
             self.expect_ident_value("of")?;
             let mut arms = Vec::new();
             loop {
-                if self.consume_ident_value("else") || self.consume_ident_value("default") {
+                if self.consume_ident_value("else")
+                    || self.consume_ident_value("default")
+                    || self.consume_ident_value("_")
+                {
+                    // Wildcard / default arm (R14 `_`, or the `else`/`default` keyword).
                     self.expect_symbol("=>")?;
                     let body = self.parse_expr()?;
                     arms.push(RawCaseArm {
                         variant: None,
+                        literal: None,
                         default: true,
                         binding: None,
                         body,
@@ -4346,6 +4457,20 @@ impl Parser {
                         bail!("default case arm must be last");
                     }
                     break;
+                } else if let Some(literal) = self.try_parse_scalar_literal_pattern()? {
+                    // Scalar literal pattern (R14): `0 => ...`, `true => ...`.
+                    self.expect_symbol("=>")?;
+                    let body = self.parse_expr()?;
+                    arms.push(RawCaseArm {
+                        variant: None,
+                        literal: Some(Box::new(literal)),
+                        default: false,
+                        binding: None,
+                        body,
+                    });
+                    if !self.consume_symbol("|") {
+                        break;
+                    }
                 } else {
                     let variant = self.expect_ident()?;
                     let binding = if self.consume_symbol("(") {
@@ -4359,6 +4484,7 @@ impl Parser {
                     let body = self.parse_expr()?;
                     arms.push(RawCaseArm {
                         variant: Some(variant),
+                        literal: None,
                         default: false,
                         binding,
                         body,
@@ -4374,6 +4500,31 @@ impl Parser {
             })
         } else {
             self.parse_assignment()
+        }
+    }
+
+    /// Parse a scalar literal case pattern (R14): a decimal integer (optionally
+    /// negated) or `true`/`false`. Returns `None` if the next token is not a
+    /// literal (so the caller falls back to a variant pattern).
+    fn try_parse_scalar_literal_pattern(&mut self) -> Result<Option<RawExpr>> {
+        match self.peek() {
+            Token::Number(_) => match self.next() {
+                Token::Number(value) => Ok(Some(RawExpr::LiteralI64 { value })),
+                _ => unreachable!(),
+            },
+            Token::Symbol(symbol) if symbol == "-" => {
+                self.next();
+                let value = self.expect_number()?;
+                Ok(Some(RawExpr::LiteralI64 {
+                    value: format!("-{value}"),
+                }))
+            }
+            Token::Ident(name) if name == "true" || name == "false" => {
+                let value = name == "true";
+                self.next();
+                Ok(Some(RawExpr::LiteralBool { value }))
+            }
+            _ => Ok(None),
         }
     }
 

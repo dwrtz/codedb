@@ -243,7 +243,19 @@ Goal: solve drop placement for partial and conditional moves, lifting the v2
 fail-closed rejection. Soundness prerequisite for recursion, early exit, and
 loops ([SPEC_V3.md](SPEC_V3.md) §7).
 
-Status: planned. Resolves the v2 deferred drop-glue gap.
+Status: implemented. Conditional drop glue is realized as compensating drops at
+`if`/`case` merges and field-granular residual drops at scope exit — all static,
+no runtime drop flags (answering the SPEC §8 open question: drops stay
+compiler-generated artifacts in lowering, not semantic objects). The semantic
+checker (`src/types.rs`) now admits asymmetric conditional moves and partial
+record-field moves (adding `ExprUse::ProjectionBase` so reading a sibling field
+of a partially-moved aggregate is allowed); lowering (`src/lowering.rs`) tracks
+per-place move state (`MovedPlace`) and the lowered-IR verifier proves
+exactly-once with per-branch isolation + merge. `tests/drop_glue_conditional.rs`
+runs a `box`-heap program natively (no double-free) confirming exactly-once under
+conditional and field-granular moves; the five former-rejection tests in
+`tests/move_drop.rs` are now acceptance tests. Array-element partial moves stay
+fail-closed (records only).
 
 Deliverables:
 
@@ -276,7 +288,19 @@ Goal: give a mutually-recursive clique a well-defined, replayable content hash �
 the keystone substrate for recursion, function values, self-reference, and
 packages ([SPEC_V3.md](SPEC_V3.md) §6, Pillar 1).
 
-Status: planned. Substrate behind R1, R13, D1, D7.
+Status: implemented (functions). A `RecursionGroup` object kind plus an
+`Operation::CreateRecursionGroup` bind a whole clique's symbols, signatures, and
+names before any body is type-checked, so members may call each other. Member
+birth identities derive deterministically from the creating migration's parent
+history and the member's in-group ordinal (`recursion_group:{ordinal}`), so the
+clique reproduces on rebuild. Recursion groups are an internal representation:
+the importer detects recursive SCCs (`analyze_recursion_groups` + Tarjan) and
+emits the op, while members project back as ordinary `fn`s and non-recursive
+functions keep their original one-op-per-fn lowering (no migration-history
+churn). Verify validates a group (members resolve; each member's definition is a
+`FunctionDef` of its symbol — rejecting inconsistent in-group references) and
+bundle export/import follows group refs. Mutually-recursive *type* definitions
+(D1) remain functions-only follow-on. See `tests/recursion_group.rs`.
 
 Deliverables:
 
@@ -311,8 +335,19 @@ verify accepts a well-formed group and rejects an inconsistent in-group referenc
 Goal: allow a function body to call itself and forward-declared peers, lowering
 through the Phase 5 recursion-group object.
 
-Status: planned. Resolves R1. Depends on Phase 4 (drop across recursive calls)
-and Phase 5 (recursion groups).
+Status: implemented. Self- and mutual recursion compile to native artifacts and
+match the reference evaluator: name resolution admits a function's own symbol and
+in-group peers (via the Phase 5 atomic clique creation); call lowering and the
+backend were already by-symbol; the per-function verify walks are intra-procedural
+and the single inter-procedural effect check is satisfied inductively over the
+clique, so the cyclic call graph needs no fixpoint. `tests/recursion_native.rs`
+covers factorial, fibonacci (two recursive calls), mutual is_even/is_odd, and a
+recursive `box<Node>` builder (recursion + recursive type layout + recursive drop
+glue). A latent overflow — `collect_reference_regions_in_type` lacked a cycle
+guard and recursed forever on a recursive return type — was fixed with a `seen`
+set. Traversing a recursive heap structure *by case* (sum/length over a list,
+full tree-walking evaluator) additionally needs enum-payload field-granular moves
+and is a documented follow-on. Depends on Phase 4 and Phase 5.
 
 Deliverables:
 
@@ -341,7 +376,17 @@ sum/length over a recursive box<Node>, and a tree-walking expression evaluator,
 Goal: extend `case` with literal, wildcard, guard, and nested patterns plus
 exhaustiveness, as required by IR/AST dispatch.
 
-Status: planned. Resolves R14.
+Status: implemented (scalar literal + wildcard + exhaustiveness). `case` now
+dispatches on an `i64`/`bool` scrutinee by literal patterns plus a `_` wildcard,
+preserved as a rich typed node (so the `.cdb` projection round-trips and the
+`FunctionSourceMatches` postcondition holds) and desugared to an `if`/`eq` chain
+at lowering — reusing the existing backend with no new code generation, and
+inheriting Phase 4 conditional drop glue for arm bodies. Exhaustiveness is
+checked with a deterministic diagnostic (an `i64` case needs a `_`; a `bool` case
+must cover true/false or have a `_`; enum coverage as before). `case`-in-arm
+nesting works. Evaluator and native parity in `tests/pattern_match_native.rs`.
+Range patterns, `if` guards, and nested enum-destructuring patterns are
+documented follow-on R14 surface.
 
 Deliverables:
 
@@ -730,6 +775,13 @@ Success: features add with a small edit surface, and concurrent agents build the
 ### Milestone V3.1 — Sound Recursive Frontier
 
 Includes: Phases 4–7 (drop glue, recursion groups, recursion, pattern matching).
+Status: implemented. Recursion (self and mutual) compiles native and matches the
+oracle; conditional and field-granular drop glue is sound (interposer/double-free
+verified); verify accepts recursive call graphs and recursion-group objects;
+scalar literal `case` with `_` and exhaustiveness compiles native. Documented
+follow-on R14/structure surface: range/guard/nested-enum patterns, recursive type
+definitions, and enum-payload field-granular moves (which together unlock
+case-traversal of recursive heap structures).
 
 ```text
 Success: recursion compiles native; drops occur exactly once across conditional

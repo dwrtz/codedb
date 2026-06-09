@@ -17,6 +17,12 @@ pub(crate) struct ProgramRootPayload {
     pub(crate) exports: Vec<ExportBinding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) tests: Vec<RootTestBinding>,
+    /// Content hashes of `RecursionGroup` objects — one per mutually-recursive
+    /// clique created atomically (SPEC_V3 §6). Empty for non-recursive programs,
+    /// so the root hash of existing programs is unchanged (the field is skipped
+    /// when empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) recursion_groups: Vec<String>,
     pub(crate) metadata: BTreeMap<String, JsonValue>,
 }
 
@@ -216,6 +222,7 @@ pub(crate) fn normalize_root(mut root: ProgramRootPayload) -> ProgramRootPayload
         .sort_by(|a, b| (&a.exported_name, &a.symbol).cmp(&(&b.exported_name, &b.symbol)));
     root.tests
         .sort_by(|a, b| (&a.name, &a.test).cmp(&(&b.name, &b.test)));
+    root.recursion_groups.sort();
     root
 }
 

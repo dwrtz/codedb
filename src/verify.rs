@@ -599,6 +599,23 @@ impl CodeDb {
                         errors,
                     )?;
                 }
+                for (idx, entry) in payload
+                    .get("recursion_groups")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("recursion_groups[{idx}]"),
+                        Some(entry),
+                        errors,
+                    )?;
+                }
+            }
+            "RecursionGroup" => {
+                self.verify_recursion_group_references(parent_hash, payload, errors)?;
             }
             "TestCase" => {
                 self.check_hash_ref(
@@ -944,6 +961,97 @@ impl CodeDb {
             }
             Ok(crate::types::TypeSpec::Builtin(_)) | Ok(crate::types::TypeSpec::String) => {}
             Err(err) => errors.push(format!("bad_type_def: {parent_hash}: {err:#}")),
+        }
+        Ok(())
+    }
+
+    /// Validate a `RecursionGroup` object (SPEC_V3 §6): it must list at least one
+    /// member, each member's `symbol`/`definition`/`signature` must reference an
+    /// existing object, and the member's `definition` must be a `FunctionDef`
+    /// whose `symbol`/`function_sig_hash` agree with the member entry. The last
+    /// check rejects an inconsistent in-group reference — a member whose listed
+    /// definition does not actually belong to its claimed symbol/signature.
+    fn verify_recursion_group_references(
+        &self,
+        parent_hash: &str,
+        payload: &JsonValue,
+        errors: &mut Vec<String>,
+    ) -> Result<()> {
+        let Some(members) = payload.get("members").and_then(JsonValue::as_array) else {
+            errors.push(format!(
+                "bad_recursion_group: {parent_hash} missing members array"
+            ));
+            return Ok(());
+        };
+        if members.is_empty() {
+            errors.push(format!("bad_recursion_group: {parent_hash} has no members"));
+            return Ok(());
+        }
+        for (idx, member) in members.iter().enumerate() {
+            self.check_hash_ref(
+                parent_hash,
+                &format!("members[{idx}].symbol"),
+                member.get("symbol"),
+                errors,
+            )?;
+            self.check_hash_ref(
+                parent_hash,
+                &format!("members[{idx}].definition"),
+                member.get("definition"),
+                errors,
+            )?;
+            self.check_hash_ref(
+                parent_hash,
+                &format!("members[{idx}].signature"),
+                member.get("signature"),
+                errors,
+            )?;
+            // Consistency: the listed definition must be the FunctionDef of the
+            // listed symbol with the listed signature.
+            let (symbol, definition, signature) = match (
+                member.get("symbol").and_then(JsonValue::as_str),
+                member.get("definition").and_then(JsonValue::as_str),
+                member.get("signature").and_then(JsonValue::as_str),
+            ) {
+                (Some(symbol), Some(definition), Some(signature)) => {
+                    (symbol, definition, signature)
+                }
+                _ => {
+                    errors.push(format!(
+                        "bad_recursion_group: {parent_hash} members[{idx}] missing symbol/definition/signature"
+                    ));
+                    continue;
+                }
+            };
+            let row: Option<(String, String)> = self
+                .conn
+                .query_row(
+                    "SELECT kind, payload_json FROM objects WHERE hash = ?1",
+                    params![definition],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((kind, payload_json)) = row else {
+                // Missing object already reported by check_hash_ref above.
+                continue;
+            };
+            if kind != "FunctionDef" {
+                errors.push(format!(
+                    "bad_recursion_group: {parent_hash} members[{idx}].definition {definition} is a {kind}, not a FunctionDef"
+                ));
+                continue;
+            }
+            let def: JsonValue = serde_json::from_str(&payload_json)?;
+            if def.get("symbol").and_then(JsonValue::as_str) != Some(symbol) {
+                errors.push(format!(
+                    "bad_recursion_group: {parent_hash} members[{idx}] definition {definition} symbol does not match member symbol {symbol}"
+                ));
+            }
+            if def.get("function_sig_hash").and_then(JsonValue::as_str) != Some(signature) {
+                errors.push(format!(
+                    "bad_recursion_group: {parent_hash} members[{idx}] definition {definition} signature does not match member signature {signature}"
+                ));
+            }
         }
         Ok(())
     }

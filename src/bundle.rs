@@ -230,6 +230,7 @@ impl CodeDb {
             param_names: vec![],
             exports: vec![],
             tests: vec![],
+            recursion_groups: vec![],
             metadata: BTreeMap::new(),
         })?;
         let mut replay_root = genesis_root.clone();
@@ -1530,6 +1531,26 @@ fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<St
                 .flatten()
             {
                 push_hash_ref(binding.get("test"), refs);
+            }
+            for group in payload
+                .get("recursion_groups")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_hash_ref(Some(group), refs);
+            }
+        }
+        "RecursionGroup" => {
+            for member in payload
+                .get("members")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_hash_ref(member.get("symbol"), refs);
+                push_hash_ref(member.get("definition"), refs);
+                push_hash_ref(member.get("signature"), refs);
             }
         }
         "TestCase" => push_hash_ref(payload.get("entry_symbol"), refs),

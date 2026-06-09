@@ -15,11 +15,6 @@ fn run(args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("utf8 stdout")
 }
 
-fn run_fail(args: &[&str]) -> String {
-    let output = bin().args(args).assert().failure().get_output().clone();
-    String::from_utf8(output.stderr).expect("utf8 stderr")
-}
-
 fn path(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
 }
@@ -645,17 +640,16 @@ fn main<'a>() -> i64 =
 }
 
 #[test]
-fn asymmetric_conditional_move_is_rejected_until_conditional_drop() {
-    // Moving an owned (move-only) value in only one branch of an `if` would
-    // leave it live on the other branch, but the drop scaffold emits a single
-    // unconditional drop. The whole-slot drop scaffold can only stay sound
-    // ("drops occur exactly once", SPEC_V2 §20) if such moves are rejected, so
-    // the move checker rejects this fail-closed at the semantic gate (import),
-    // until conditional drop glue exists. The lowering guard remains as a
-    // defense-in-depth backstop for any IR that bypasses the semantic check.
+fn asymmetric_conditional_move_through_if_is_accepted() {
+    // Moving an owned (move-only) value in only one branch of an `if` is now
+    // supported by conditional drop glue (SPEC_V3 §7): lowering emits a
+    // compensating drop in the branch that left the value live, so each path
+    // drops it exactly once. Previously rejected fail-closed; now imports,
+    // verifies, and lowers through the lowered-IR drop verifier.
     let temp = tempdir().unwrap();
     let db = temp.path().join("asym-if-move.sqlite");
     let source = temp.path().join("asym-if-move.cdb");
+    let ir_path = temp.path().join("pick.ir.json");
 
     std::fs::write(
         &source,
@@ -672,27 +666,33 @@ fn pick<'a>(editor: LineEditor<'a>, other: LineEditor<'a>, choose: bool) -> i64 
     .unwrap();
 
     run(&["init", path(&db)]);
-    let stderr = run_fail(&["import", path(&db), path(&source)]);
+    run(&["import", path(&db), path(&source)]);
+    run(&["verify", path(&db)]);
+    // Lowering accepts the asymmetric move and passes the lowered-IR drop
+    // verifier (no double-drop / no drop-after-move across the branches).
+    let ir = read_json(&{
+        run(&["emit-ir", path(&db), "pick", "--out", path(&ir_path)]);
+        ir_path.clone()
+    });
+    // The compensating drop is emitted (mut-ref records take the drop scaffold).
     assert!(
-        stderr.contains("unsupported_move"),
-        "expected structured unsupported_move code, got: {stderr}"
-    );
-    assert!(
-        stderr.contains("asymmetric conditional move"),
-        "expected asymmetric-move rejection, got: {stderr}"
+        op_names(&ir).iter().any(|op| op == "drop"),
+        "expected a compensating drop in the lowered IR, got {:?}",
+        op_names(&ir)
     );
 }
 
 #[test]
-fn partial_field_move_of_move_only_value_is_rejected_until_field_drop() {
+fn partial_field_move_of_move_only_value_is_accepted() {
     // Moving a move-only value out of a record field is a partial move that
-    // leaves the enclosing aggregate with a hole. The whole-slot drop scaffold
-    // would double-drop the moved field, so the move checker rejects this
-    // fail-closed at the semantic gate (import) until field-granular drop glue
-    // exists. The lowering guard remains as a defense-in-depth backstop.
+    // leaves the enclosing aggregate with a hole. Field-granular drop glue
+    // (SPEC_V3 §7) drops the live remainder of the aggregate while skipping the
+    // moved-out field, so this now imports, verifies, and lowers (previously
+    // rejected fail-closed).
     let temp = tempdir().unwrap();
     let db = temp.path().join("partial-field-move.sqlite");
     let source = temp.path().join("partial-field-move.cdb");
+    let ir_path = temp.path().join("main.ir.json");
 
     std::fs::write(
         &source,
@@ -715,31 +715,23 @@ fn main<'a>() -> i64 =
     .unwrap();
 
     run(&["init", path(&db)]);
-    let stderr = run_fail(&["import", path(&db), path(&source)]);
-    assert!(
-        stderr.contains("unsupported_move"),
-        "expected structured unsupported_move code, got: {stderr}"
-    );
-    assert!(
-        stderr.contains("partial move of an owned aggregate"),
-        "expected partial-move rejection, got: {stderr}"
-    );
+    run(&["import", path(&db), path(&source)]);
+    run(&["verify", path(&db)]);
+    run(&["emit-ir", path(&db), "main", "--out", path(&ir_path)]);
 }
 
 #[test]
-fn partial_field_move_of_move_only_aggregate_into_let_is_rejected() {
-    // Regression for the aggregate-init move path: `let c = container.cursor`
-    // where the moved field is a move-only aggregate LARGER than a register
-    // (here Cursor is 16 bytes) routes through `lower_aggregate_place_init_to_address`,
-    // not `lower_place_value`. That path previously emitted a Move of the field
-    // address without bailing or marking it moved, so the whole-`container` drop
-    // scaffold double-dropped the moved-out cursor and `verify` still passed.
-    // The move checker now rejects the partial move fail-closed at the semantic
-    // gate (import), until field-granular drop glue lands; the lowering guard
-    // remains as a defense-in-depth backstop.
+fn partial_field_move_of_move_only_aggregate_into_let_is_accepted() {
+    // The aggregate-init move path: `let c = container.cursor` where the moved
+    // field is a move-only aggregate LARGER than a register (here Cursor is 16
+    // bytes) routes through `lower_aggregate_place_init_to_address`. Field-granular
+    // drop glue (SPEC_V3 §7) now tracks the partial move and drops the live
+    // remainder of `container` (its `tag`) while skipping the moved-out cursor,
+    // so the lowered-IR drop verifier confirms exactly-once (no double-drop).
     let temp = tempdir().unwrap();
     let db = temp.path().join("partial-agg-move-let.sqlite");
     let source = temp.path().join("partial-agg-move-let.cdb");
+    let ir_path = temp.path().join("main.ir.json");
 
     std::fs::write(
         &source,
@@ -760,25 +752,21 @@ fn main<'a>() -> i64 =
     .unwrap();
 
     run(&["init", path(&db)]);
-    let stderr = run_fail(&["import", path(&db), path(&source)]);
-    assert!(
-        stderr.contains("unsupported_move:"),
-        "expected structured unsupported_move code, got: {stderr}"
-    );
-    assert!(
-        stderr.contains("partial move of an owned aggregate"),
-        "expected partial-move rejection, got: {stderr}"
-    );
+    run(&["import", path(&db), path(&source)]);
+    run(&["verify", path(&db)]);
+    run(&["emit-ir", path(&db), "main", "--out", path(&ir_path)]);
 }
 
 #[test]
-fn partial_field_move_of_move_only_aggregate_from_param_is_rejected() {
-    // Same aggregate-init hole, by-value-parameter form: moving a move-only
-    // aggregate field out of a by-value record parameter must also be rejected
-    // fail-closed at the semantic gate (import).
+fn partial_field_move_of_move_only_aggregate_from_param_is_accepted() {
+    // Same aggregate-init partial move, by-value-parameter form: moving a
+    // move-only aggregate field out of a by-value record parameter. Field-granular
+    // drop glue (SPEC_V3 §7) drops the live remainder of the parameter at
+    // function end while skipping the moved-out cursor.
     let temp = tempdir().unwrap();
     let db = temp.path().join("partial-agg-move-param.sqlite");
     let source = temp.path().join("partial-agg-move-param.cdb");
+    let ir_path = temp.path().join("take.ir.json");
 
     std::fs::write(
         &source,
@@ -797,15 +785,9 @@ fn take<'a>(container: Container<'a>) -> i64 =
     .unwrap();
 
     run(&["init", path(&db)]);
-    let stderr = run_fail(&["import", path(&db), path(&source)]);
-    assert!(
-        stderr.contains("unsupported_move"),
-        "expected structured unsupported_move code, got: {stderr}"
-    );
-    assert!(
-        stderr.contains("partial move of an owned aggregate"),
-        "expected partial-move rejection, got: {stderr}"
-    );
+    run(&["import", path(&db), path(&source)]);
+    run(&["verify", path(&db)]);
+    run(&["emit-ir", path(&db), "take", "--out", path(&ir_path)]);
 }
 
 fn op_names(ir: &JsonValue) -> Vec<String> {
@@ -818,14 +800,15 @@ fn op_names(ir: &JsonValue) -> Vec<String> {
 }
 
 #[test]
-fn asymmetric_conditional_move_through_case_is_rejected() {
-    // Moving the move-only `ed` in only one `case` arm leaves the unconditional
-    // whole-slot drop scaffold unable to decide whether to drop it — the same
-    // hazard the `if` arm already rejects. `verify`/`import` must fail closed so
-    // the borrow checker agrees with codegen once enum/case lowering lands.
+fn asymmetric_conditional_move_through_case_is_accepted() {
+    // Moving the move-only `ed` in only one `case` arm is now supported by
+    // conditional drop glue (SPEC_V3 §7): lowering emits a compensating drop in
+    // the arm that left `ed` live, so each arm drops it exactly once. Previously
+    // rejected fail-closed.
     let temp = tempdir().unwrap();
     let db = temp.path().join("case-asymmetric-move.sqlite");
     let source = temp.path().join("case-asymmetric-move.cdb");
+    let ir_path = temp.path().join("drop_in_one_arm.ir.json");
 
     std::fs::write(
         &source,
@@ -854,11 +837,9 @@ fn drop_in_one_arm<'a>(sel: Sel, line: &'a mut Line) -> i64 =
     .unwrap();
 
     run(&["init", path(&db)]);
-    bin()
-        .args(["import", path(&db), path(&source)])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("asymmetric conditional move"));
+    run(&["import", path(&db), path(&source)]);
+    run(&["verify", path(&db)]);
+    run(&["emit-ir", path(&db), "drop_in_one_arm", "--out", path(&ir_path)]);
 }
 
 #[test]

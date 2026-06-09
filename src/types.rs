@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::backend::ArtifactKind;
-use crate::expr::RawExpr;
+use crate::expr::{RawCaseArm, RawExpr};
 use crate::model::{
     ProgramRootPayload, TypeCheckResult, resolve_function_name_in_root, resolve_named_type_in_root,
     validate_projection_identifier,
@@ -359,8 +359,34 @@ struct MoveBorrowState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExprUse {
+    /// The expression's value is read (and, for a move-only type, moved). The
+    /// whole place — and every sub-place — must be live.
     Value,
+    /// The expression names a whole storage location used as-is (a borrow or
+    /// assignment target). The whole place must be live.
     Place,
+    /// The expression names a storage location we will immediately narrow into
+    /// (the base of a `field_access`/`array_index`). With field-granular drop
+    /// glue (SPEC_V3 §7) a *sibling* sub-place may have been moved out, so only
+    /// a move of this place itself or an ancestor invalidates the projection;
+    /// the narrowed leaf place is checked separately at full granularity.
+    ProjectionBase,
+}
+
+/// The scalar type a literal `case` (R14) dispatches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalarCaseKind {
+    I64,
+    Bool,
+}
+
+impl std::fmt::Display for ScalarCaseKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScalarCaseKind::I64 => write!(f, "i64"),
+            ScalarCaseKind::Bool => write!(f, "bool"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2405,6 +2431,43 @@ impl CodeDb {
         )
     }
 
+    /// Build the content-addressed `RecursionGroup` object for a mutually-recursive
+    /// clique (SPEC_V3 §6). Members are sorted by symbol so the clique's identity
+    /// is order-independent (the clique IS its member set). Each member entry
+    /// carries its stable `symbol` identity plus its `definition`/`signature`, so
+    /// the group's content hash covers the members' bodies — and those bodies
+    /// reference in-group peers by their stable SymbolBirth hash (a by-name
+    /// fixpoint edge, never a body-content edge, so the clique stays acyclic).
+    pub(crate) fn put_recursion_group(
+        &mut self,
+        module: &str,
+        members: &[crate::model::RootSymbolPayload],
+    ) -> Result<String> {
+        let mut entries = members
+            .iter()
+            .map(|member| {
+                json!({
+                    "symbol": member.symbol,
+                    "definition": member.definition,
+                    "signature": member.signature,
+                })
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|a, b| {
+            a["symbol"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(b["symbol"].as_str().unwrap_or_default())
+        });
+        self.put_object(
+            "RecursionGroup",
+            &json!({
+                "module": module,
+                "members": entries,
+            }),
+        )
+    }
+
     pub(crate) fn put_external_function(
         &mut self,
         symbol: &str,
@@ -3867,17 +3930,41 @@ impl CodeDb {
                     region_scope,
                     locals,
                 )?;
+                if arms.is_empty() {
+                    bail!("case expression must have at least one arm");
+                }
+                // Scalar literal `case` (R14): dispatch on an `i64`/`bool`
+                // scrutinee by literal patterns plus a `_` wildcard. Produces a
+                // typed `case` node whose arms carry `literal_i64`/`literal_bool`;
+                // lowering desugars it to an `if`/`eq` chain.
+                let scalar_kind = if scrutinee.type_hash == type_hash_for("I64") {
+                    Some(ScalarCaseKind::I64)
+                } else if scrutinee.type_hash == type_hash_for("Bool") {
+                    Some(ScalarCaseKind::Bool)
+                } else {
+                    None
+                };
+                if let Some(scalar_kind) = scalar_kind {
+                    return self.type_scalar_case(
+                        current_module,
+                        &scrutinee,
+                        scalar_kind,
+                        arms,
+                        root,
+                        param_names,
+                        param_types,
+                        region_scope,
+                        locals,
+                    );
+                }
                 let TypeSpec::Enum(variants) =
                     self.type_spec_in_root(root, &scrutinee.type_hash)?
                 else {
                     bail!(
-                        "case expression requires enum type, got {}",
+                        "case expression requires an enum or scalar (i64/bool) scrutinee, got {}",
                         self.type_name(&scrutinee.type_hash)?
                     );
                 };
-                if arms.is_empty() {
-                    bail!("case expression must have at least one arm");
-                }
                 let mut seen = BTreeSet::new();
                 let mut result_type: Option<String> = None;
                 let mut arms_json = Vec::with_capacity(arms.len());
@@ -4001,6 +4088,137 @@ impl CodeDb {
                 })
             }
         }
+    }
+
+    /// Type-check a scalar literal `case` (R14): arms are scalar literal patterns
+    /// (`i64`/`bool`) plus an optional `_` wildcard. Builds a typed `case` node
+    /// whose arms carry `literal_i64`/`literal_bool` (or `default`); lowering
+    /// desugars it to an `if`/`eq` chain. Exhaustiveness: an `i64` case must have
+    /// a `_`; a `bool` case must cover `true` and `false` or have a `_`.
+    #[allow(clippy::too_many_arguments)]
+    fn type_scalar_case(
+        &mut self,
+        current_module: &str,
+        scrutinee: &TypeCheckResult,
+        kind: ScalarCaseKind,
+        arms: &[RawCaseArm],
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
+        locals: &mut Vec<LocalTypeBinding>,
+    ) -> Result<TypeCheckResult> {
+        let mut arms_json = Vec::with_capacity(arms.len());
+        let mut result_type: Option<String> = None;
+        let mut has_default = false;
+        let mut seen_i64: BTreeSet<String> = BTreeSet::new();
+        let mut seen_bool: BTreeSet<bool> = BTreeSet::new();
+        for (index, arm) in arms.iter().enumerate() {
+            if arm.variant.is_some() {
+                bail!("scalar case arm cannot use a variant pattern; use a literal or `_`");
+            }
+            if arm.binding.is_some() {
+                bail!("scalar case arm cannot bind a value");
+            }
+            let mut pattern = serde_json::Map::new();
+            if arm.default {
+                if index + 1 != arms.len() {
+                    bail!("default case arm must be last");
+                }
+                if has_default {
+                    bail!("duplicate default case arm");
+                }
+                has_default = true;
+                pattern.insert("default".to_string(), json!(true));
+            } else {
+                let literal = arm
+                    .literal
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("scalar case arm must be a literal or `_`"))?;
+                match kind {
+                    ScalarCaseKind::I64 => {
+                        let RawExpr::LiteralI64 { value } = literal else {
+                            bail!("scalar case pattern type does not match the i64 scrutinee");
+                        };
+                        value
+                            .parse::<i64>()
+                            .with_context(|| format!("invalid i64 case pattern {value}"))?;
+                        if !seen_i64.insert(value.clone()) {
+                            bail!("duplicate case pattern {value}");
+                        }
+                        pattern.insert("literal_i64".to_string(), json!(value));
+                    }
+                    ScalarCaseKind::Bool => {
+                        let RawExpr::LiteralBool { value } = literal else {
+                            bail!("scalar case pattern type does not match the bool scrutinee");
+                        };
+                        if !seen_bool.insert(*value) {
+                            bail!("duplicate case pattern {value}");
+                        }
+                        pattern.insert("literal_bool".to_string(), json!(value));
+                    }
+                }
+            }
+            let body = self.type_expr_with_locals(
+                current_module,
+                &arm.body,
+                root,
+                param_names,
+                param_types,
+                region_scope,
+                locals,
+            )?;
+            if let Some(expected) = &result_type {
+                if expected != &body.type_hash {
+                    bail!(
+                        "case arm returns {}, expected {}",
+                        self.type_name(&body.type_hash)?,
+                        self.type_name(expected)?
+                    );
+                }
+            } else {
+                result_type = Some(body.type_hash.clone());
+            }
+            pattern.insert("body".to_string(), json!(body.expr_hash));
+            arms_json.push(JsonValue::Object(pattern));
+        }
+        let exhaustive = has_default
+            || match kind {
+                ScalarCaseKind::I64 => false,
+                ScalarCaseKind::Bool => {
+                    seen_bool.contains(&true) && seen_bool.contains(&false)
+                }
+            };
+        if !exhaustive {
+            bail!(
+                "case expression is not exhaustive: a scalar `case` on {kind} must end with a `_` wildcard{}",
+                match kind {
+                    ScalarCaseKind::Bool => " (or cover both true and false)",
+                    ScalarCaseKind::I64 => "",
+                }
+            );
+        }
+        let type_hash = result_type.ok_or_else(|| anyhow!("case expression has no arms"))?;
+        let expr_hash = self.put_object(
+            "Expression",
+            &json!({
+                "expr_kind": "case",
+                "expr": scrutinee.expr_hash,
+                "arms": arms_json,
+                "type": type_hash,
+            }),
+        )?;
+        self.write_cache_json(
+            &expr_hash,
+            "typechecker",
+            "typed-dag",
+            ArtifactKind::TypedExpression,
+            &json!({ "type": type_hash }),
+        )?;
+        Ok(TypeCheckResult {
+            expr_hash,
+            type_hash,
+        })
     }
 
     fn type_field_access(
@@ -5532,7 +5750,8 @@ impl CodeDb {
         type_hash: &str,
     ) -> Result<BTreeSet<String>> {
         let mut regions = BTreeSet::new();
-        self.collect_reference_regions_in_type(root, type_hash, &mut regions)?;
+        let mut seen = BTreeSet::new();
+        self.collect_reference_regions_in_type(root, type_hash, &mut regions, &mut seen)?;
         Ok(regions)
     }
 
@@ -5541,7 +5760,14 @@ impl CodeDb {
         root: &ProgramRootPayload,
         type_hash: &str,
         regions: &mut BTreeSet<String>,
+        seen: &mut BTreeSet<String>,
     ) -> Result<()> {
+        // A recursive type (e.g. `enum Node { next: box<Node> }`) reaches itself
+        // through a `box`/`vec` element, so guard against revisiting a type — the
+        // set of reference regions is finite and a repeat visit adds nothing.
+        if !seen.insert(type_hash.to_string()) {
+            return Ok(());
+        }
         match self.type_spec_in_root(root, type_hash)? {
             TypeSpec::Builtin(_) => Ok(()),
             // `type_spec_in_root` expands named types into their structural
@@ -5562,30 +5788,30 @@ impl CodeDb {
                 region, referent, ..
             } => {
                 regions.insert(region);
-                self.collect_reference_regions_in_type(root, &referent, regions)
+                self.collect_reference_regions_in_type(root, &referent, regions, seen)
             }
             TypeSpec::RawPointer { pointee, .. } => {
-                self.collect_reference_regions_in_type(root, &pointee, regions)
+                self.collect_reference_regions_in_type(root, &pointee, regions, seen)
             }
             TypeSpec::Box { element } => {
-                self.collect_reference_regions_in_type(root, &element, regions)
+                self.collect_reference_regions_in_type(root, &element, regions, seen)
             }
             TypeSpec::Vec { element } => {
-                self.collect_reference_regions_in_type(root, &element, regions)
+                self.collect_reference_regions_in_type(root, &element, regions, seen)
             }
             TypeSpec::String => Ok(()),
             TypeSpec::Slice {
                 region, element, ..
             } => {
                 regions.insert(region);
-                self.collect_reference_regions_in_type(root, &element, regions)
+                self.collect_reference_regions_in_type(root, &element, regions, seen)
             }
             TypeSpec::FixedArray { element, .. } => {
-                self.collect_reference_regions_in_type(root, &element, regions)
+                self.collect_reference_regions_in_type(root, &element, regions, seen)
             }
             TypeSpec::Record(fields) | TypeSpec::Enum(fields) => {
                 for field in fields {
-                    self.collect_reference_regions_in_type(root, &field.type_hash, regions)?;
+                    self.collect_reference_regions_in_type(root, &field.type_hash, regions, seen)?;
                 }
                 Ok(())
             }
@@ -5781,9 +6007,9 @@ impl CodeDb {
         {
             "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" => Ok(()),
             "param_ref" | "local_ref" => match expr_use {
-                ExprUse::Place => {
+                ExprUse::Place | ExprUse::ProjectionBase => {
                     let place = self.loan_place_for_expr(expr_hash, param_types, &state.locals)?;
-                    self.check_place_not_moved(&place, state)
+                    self.check_place_not_moved_for_use(&place, state, expr_use)
                 }
                 ExprUse::Value => self.verify_place_value_use(root, expr_hash, param_types, state),
             },
@@ -6166,20 +6392,14 @@ impl CodeDb {
                     &mut else_state,
                     ExprUse::Value,
                 )?;
-                // An owned value moved in one branch but not the other (an
-                // asymmetric conditional move of a slot that outlives the `if`)
-                // leaves the unconditional whole-slot drop scaffold unable to
-                // decide whether to drop it. Lowering rejects this fail-closed;
-                // reject here too so `verify` agrees with codegen. Branch-local
-                // temporaries (slots minted at or above `boundary`) are dropped
-                // within their branch and are not compared.
-                let then_outer = outer_branch_moves(&then_state, boundary);
-                let else_outer = outer_branch_moves(&else_state, boundary);
-                if !move_sets_match(&then_outer, &else_outer) {
-                    bail!(
-                        "unsupported_move: asymmetric conditional move; a move-only value is moved in only one branch of an if"
-                    );
-                }
+                // Conditional drop glue (SPEC_V3 §7): an owned value moved in one
+                // branch but not the other is now supported — lowering emits
+                // compensating drops so each path drops it exactly once. The
+                // merged move set is the union of both branches, so a use of a
+                // place moved on either path is still rejected as a potential
+                // use-after-move. `boundary` is retained for symmetry with the
+                // branch-local reasoning in lowering.
+                let _ = boundary;
                 merge_branch_state(state, then_state, else_state);
                 Ok(())
             }
@@ -6316,11 +6536,11 @@ impl CodeDb {
                     .get("target")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("field_access missing target"))?;
-                self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
+                self.verify_expr_borrows(root, target, param_types, state, ExprUse::ProjectionBase)?;
                 let place = self.loan_place_for_expr(expr_hash, param_types, &state.locals)?;
-                self.check_place_not_moved(&place, state)?;
+                self.check_place_not_moved_for_use(&place, state, expr_use)?;
                 match expr_use {
-                    ExprUse::Place => Ok(()),
+                    ExprUse::Place | ExprUse::ProjectionBase => Ok(()),
                     ExprUse::Value => {
                         self.check_shared_read_conflicts(&place, &state.active)?;
                         self.verify_place_value_use(root, expr_hash, param_types, state)
@@ -6337,11 +6557,11 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("array_index missing index"))?;
                 self.verify_expr_borrows(root, index, param_types, state, ExprUse::Value)?;
-                self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
+                self.verify_expr_borrows(root, target, param_types, state, ExprUse::ProjectionBase)?;
                 let place = self.loan_place_for_expr(expr_hash, param_types, &state.locals)?;
-                self.check_place_not_moved(&place, state)?;
+                self.check_place_not_moved_for_use(&place, state, expr_use)?;
                 match expr_use {
-                    ExprUse::Place => Ok(()),
+                    ExprUse::Place | ExprUse::ProjectionBase => Ok(()),
                     ExprUse::Value => {
                         self.check_shared_read_conflicts(&place, &state.active)?;
                         self.verify_place_value_use(root, expr_hash, param_types, state)
@@ -6362,14 +6582,11 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("case missing expr"))?;
                 self.verify_expr_borrows(root, expr, param_types, state, ExprUse::Value)?;
                 let base_state = state.clone();
-                // An owned value moved in only some `case` arms leaves the
-                // unconditional whole-slot drop scaffold unable to decide whether
-                // to drop it — the same hazard the `if` arm rejects above. Track
-                // each arm's moves of slots that outlive the `case` and require
-                // them to match, fail-closed (SPEC_V2 §20), so `verify` agrees
-                // with codegen once enum/case lowering lands (PLAN_V2 Phase 10).
-                let boundary = base_state.next_local;
-                let mut arm_outer_moves: Option<Vec<LoanPlace>> = None;
+                // Conditional drop glue (SPEC_V3 §7): an owned value moved in only
+                // some `case` arms is supported — lowering emits compensating
+                // drops so each arm drops it exactly once. The merged move set is
+                // the union across arms, so a later use of a place moved on any
+                // arm is still rejected as a potential use-after-move.
                 let mut merged: Option<MoveBorrowState> = None;
                 for arm in payload
                     .get("arms")
@@ -6445,17 +6662,6 @@ impl CodeDb {
                             &mut arm_state,
                             ExprUse::Value,
                         )?;
-                    }
-                    let this_outer = outer_branch_moves(&arm_state, boundary);
-                    match &arm_outer_moves {
-                        None => arm_outer_moves = Some(this_outer),
-                        Some(first) => {
-                            if !move_sets_match(first, &this_outer) {
-                                bail!(
-                                    "unsupported_move: asymmetric conditional move; a move-only value is moved in only some arms of a case"
-                                );
-                            }
-                        }
                     }
                     merged = Some(match merged {
                         Some(previous) => merged_branch_states(previous, arm_state),
@@ -7130,14 +7336,14 @@ impl CodeDb {
         let type_hash = self.expr_declared_type(expr_hash)?;
         let class = self.value_class_in_root(root, &type_hash)?;
         if class.copy_kind == ValueCopyKind::MoveOnly {
-            // Moving a move-only value out of a record field or array element is
-            // a partial move; the whole-slot drop scaffold cannot express it, so
-            // lowering rejects it fail-closed (field-granular drop glue is a
-            // deferred post-Phase-15 extension). Reject here too so `verify` is a
-            // faithful safety gate rather than deferring the decision to codegen.
-            if !place.fields.is_empty() {
+            // Field-granular drop glue (SPEC_V3 §7): a partial move out of a
+            // record field is supported — lowering drops the live remainder of
+            // the enclosing aggregate while skipping the moved-out field. Moving
+            // out of an array element (`[N]`/`[*]` path segment) or behind a
+            // pointer is not field-granular-droppable, so it stays fail-closed.
+            if place.fields.iter().any(|segment| segment.starts_with('[')) {
                 bail!(
-                    "unsupported_move: partial move of an owned aggregate at {:?}; moving a move-only value out of a record field or array element is not yet supported",
+                    "unsupported_move: partial move of an owned array element at {:?}; field-granular drop glue covers record fields only (SPEC_V3 §7)",
                     place
                 );
             }
@@ -7339,6 +7545,34 @@ impl CodeDb {
             }
         }
         Ok(())
+    }
+
+    /// Not-moved check parameterized by how the place is used. A `Value` or
+    /// whole-`Place` use needs the entire place — every sub-place — live; a
+    /// `ProjectionBase` use only needs the place and its ancestors live, because
+    /// a moved-out *sibling* field does not stop us narrowing into a live field
+    /// (field-granular drop glue, SPEC_V3 §7).
+    fn check_place_not_moved_for_use(
+        &self,
+        place: &LoanPlace,
+        state: &MoveBorrowState,
+        expr_use: ExprUse,
+    ) -> Result<()> {
+        match expr_use {
+            ExprUse::Value | ExprUse::Place => self.check_place_not_moved(place, state),
+            ExprUse::ProjectionBase => {
+                for moved in &state.moved {
+                    if moved.root == place.root && fields_prefix(&moved.fields, &place.fields) {
+                        bail!(
+                            "bad_move: use after move of {:?}; attempted to project into {:?}",
+                            moved,
+                            place
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Map a borrow-target expression to the `LoanPlace` (root slot + field
@@ -7937,6 +8171,86 @@ impl CodeDb {
             allowed_regions,
             &mut Vec::new(),
         )
+    }
+
+    /// Re-verify a scalar literal `case` (R14) typed node: arms are literal
+    /// patterns (`i64`/`bool`) plus an optional `_` wildcard, body types unify to
+    /// the declared type, and the case is exhaustive.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_scalar_case_type(
+        &self,
+        scrutinee_type: &str,
+        arms: &[JsonValue],
+        declared_type: &str,
+        root: &ProgramRootPayload,
+        param_types: &[String],
+        allowed_regions: &BTreeSet<String>,
+        locals: &mut Vec<String>,
+    ) -> Result<String> {
+        let is_i64 = scrutinee_type == type_hash_for("I64");
+        let mut result_type: Option<String> = None;
+        let mut has_default = false;
+        let mut seen_i64: BTreeSet<String> = BTreeSet::new();
+        let mut seen_bool: BTreeSet<bool> = BTreeSet::new();
+        for (index, arm) in arms.iter().enumerate() {
+            if arm.get("binding_name").is_some() {
+                bail!("scalar case arm cannot bind a value");
+            }
+            if arm.get("default").and_then(JsonValue::as_bool) == Some(true) {
+                if index + 1 != arms.len() {
+                    bail!("default case arm must be last");
+                }
+                if has_default {
+                    bail!("duplicate default case arm");
+                }
+                has_default = true;
+            } else if is_i64 {
+                let value = arm
+                    .get("literal_i64")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("scalar i64 case arm must be an integer literal or `_`"))?;
+                value
+                    .parse::<i64>()
+                    .with_context(|| format!("invalid i64 case pattern {value}"))?;
+                if !seen_i64.insert(value.to_string()) {
+                    bail!("duplicate case pattern {value}");
+                }
+            } else {
+                let value = arm
+                    .get("literal_bool")
+                    .and_then(JsonValue::as_bool)
+                    .ok_or_else(|| anyhow!("scalar bool case arm must be a bool literal or `_`"))?;
+                if !seen_bool.insert(value) {
+                    bail!("duplicate case pattern {value}");
+                }
+            }
+            let body_hash = arm
+                .get("body")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("case arm missing body"))?;
+            let body_type = self.verify_expr_type_with_locals(
+                body_hash,
+                root,
+                param_types,
+                allowed_regions,
+                locals,
+            )?;
+            match &result_type {
+                Some(expected) if expected != &body_type => bail!("case arm type mismatch"),
+                Some(_) => {}
+                None => result_type = Some(body_type),
+            }
+        }
+        let exhaustive = has_default
+            || (!is_i64 && seen_bool.contains(&true) && seen_bool.contains(&false));
+        if !exhaustive {
+            bail!("case expression is not exhaustive: a scalar `case` needs a `_` wildcard");
+        }
+        let actual_type = result_type.ok_or_else(|| anyhow!("case expression has no arms"))?;
+        if declared_type != actual_type {
+            bail!("bad_type: case declares {declared_type}, actual {actual_type}");
+        }
+        Ok(actual_type)
     }
 
     fn verify_expr_type_with_locals(
@@ -9226,14 +9540,28 @@ impl CodeDb {
                     allowed_regions,
                     locals,
                 )?;
-                let TypeSpec::Enum(variants) = self.type_spec_in_root(root, &scrutinee_type)?
-                else {
-                    bail!("case scrutinee must be enum");
-                };
                 let arms = payload
                     .get("arms")
                     .and_then(JsonValue::as_array)
                     .ok_or_else(|| anyhow!("case missing arms"))?;
+                // Scalar literal `case` (R14): re-verify the literal-pattern arms.
+                if scrutinee_type == type_hash_for("I64")
+                    || scrutinee_type == type_hash_for("Bool")
+                {
+                    return self.verify_scalar_case_type(
+                        &scrutinee_type,
+                        arms,
+                        &declared_type,
+                        root,
+                        param_types,
+                        allowed_regions,
+                        locals,
+                    );
+                }
+                let TypeSpec::Enum(variants) = self.type_spec_in_root(root, &scrutinee_type)?
+                else {
+                    bail!("case scrutinee must be an enum or scalar (i64/bool)");
+                };
                 let mut seen = BTreeSet::new();
                 let mut result_type = None;
                 let mut has_default = false;
@@ -9459,29 +9787,6 @@ fn places_overlap(left: &LoanPlace, right: &LoanPlace) -> bool {
 /// separately there via [`places_overlap`].
 fn place_is_prefix_of_exact(prefix: &LoanPlace, value: &LoanPlace) -> bool {
     prefix.root == value.root && fields_prefix_exact(&prefix.fields, &value.fields)
-}
-
-/// Moved places that refer to storage outliving the current `if` — parameters
-/// and locals minted before `boundary`. Branch-local temporaries (slots at or
-/// above `boundary`) are dropped within their own branch and excluded.
-fn outer_branch_moves(state: &MoveBorrowState, boundary: usize) -> Vec<LoanPlace> {
-    state
-        .moved
-        .iter()
-        .filter(|place| match place.root {
-            LoanRoot::Local(id) => id < boundary,
-            LoanRoot::Param(_) => true,
-            LoanRoot::Static(_) => false,
-        })
-        .cloned()
-        .collect()
-}
-
-/// Set equality for move place lists (each place is moved at most once).
-fn move_sets_match(left: &[LoanPlace], right: &[LoanPlace]) -> bool {
-    left.len() == right.len()
-        && left.iter().all(|place| right.contains(place))
-        && right.iter().all(|place| left.contains(place))
 }
 
 fn fields_prefix(prefix: &[String], value: &[String]) -> bool {

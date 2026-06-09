@@ -1544,6 +1544,19 @@ impl CodeDb {
                     reasons.insert("name");
                 }
             }
+            Operation::CreateRecursionGroup { module, members } => {
+                // Each member is born — with its body, signature, and name — by
+                // this migration, exactly like `CreateFunction`.
+                if members.iter().any(|member| {
+                    self.resolve_name(&item.output_root, module, &member.name)
+                        .is_ok_and(|created| created == symbol)
+                }) {
+                    reasons.insert("birth");
+                    reasons.insert("body");
+                    reasons.insert("signature");
+                    reasons.insert("name");
+                }
+            }
             Operation::CreateType { .. }
             | Operation::RenameType { .. }
             | Operation::MoveType { .. }

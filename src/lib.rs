@@ -43,7 +43,7 @@ pub use types::{Effect, ParamSpec, TypeDefinitionKind, TypeMemberSpec};
 
 use backend::ArtifactKind;
 use expr::{parse_expr_source, parse_program, parse_signature_source_with_effects};
-use migrations::Operation;
+use migrations::{Operation, RecursionGroupMemberSpec};
 use model::{param_names, preferred_names, preferred_type_names, root_module_names};
 
 pub(crate) const SCHEMA_SQL: &str = include_str!("../schema.sql");
@@ -88,6 +88,55 @@ impl CodeDb {
         self.ensure_initialized()
     }
 
+    /// Recursion analysis of a parsed program: which function items belong to a
+    /// mutually-recursive clique that must be created atomically (SPEC_V3 §6).
+    /// Non-recursive functions are absent, so their import is byte-for-byte
+    /// unchanged (no migration-history churn for existing programs).
+    fn analyze_recursion_groups(items: &[ProgramItem]) -> RecursionAnalysis {
+        // Node space = function items; map their (module, name) for call resolution.
+        let mut func_items: Vec<usize> = Vec::new();
+        let mut name_to_node: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
+        for (idx, item) in items.iter().enumerate() {
+            if let ProgramItem::Function(function) = item {
+                let node = func_items.len();
+                func_items.push(idx);
+                name_to_node.insert((function.module.clone(), function.name.clone()), node);
+            }
+        }
+        let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); func_items.len()];
+        for (node, &item_idx) in func_items.iter().enumerate() {
+            let ProgramItem::Function(function) = &items[item_idx] else {
+                continue;
+            };
+            let mut names = Vec::new();
+            collect_call_names(&function.body, &mut names);
+            for name in names {
+                if let Some(target) = resolve_call_node(&name, &function.module, &name_to_node)
+                    && !adjacency[node].contains(&target)
+                {
+                    adjacency[node].push(target);
+                }
+            }
+        }
+        let mut analysis = RecursionAnalysis::default();
+        for component in tarjan_scc(&adjacency) {
+            let recursive = component.len() > 1
+                || (component.len() == 1 && adjacency[component[0]].contains(&component[0]));
+            if !recursive {
+                continue;
+            }
+            let mut members: Vec<usize> = component.iter().map(|&node| func_items[node]).collect();
+            members.sort_unstable();
+            let group_id = analysis.groups.len();
+            for &member in &members {
+                analysis.group_of.insert(member, group_id);
+            }
+            analysis.groups.push(members);
+        }
+        analysis
+    }
+
     pub fn import_file(&mut self, path: &Path) -> Result<String> {
         self.ensure_initialized()?;
         let source = std::fs::read_to_string(path)
@@ -95,7 +144,13 @@ impl CodeDb {
         let items = parse_program(&source)?;
         let mut report = String::new();
 
-        for (idx, item) in items.into_iter().enumerate() {
+        // Detect mutually-recursive function cliques up front so they can be
+        // created atomically (SPEC_V3 §6). Non-recursive items keep their
+        // original one-op-per-item lowering — unchanged migration history.
+        let recursion = Self::analyze_recursion_groups(&items);
+        let mut emitted_group = vec![false; recursion.groups.len()];
+
+        for (idx, item) in items.iter().enumerate() {
             let branch = self.branch(MAIN_BRANCH)?;
             let op = match item {
                 ProgramItem::TypeDefinition(definition) => {
@@ -104,26 +159,61 @@ impl CodeDb {
                         definition.module, definition.name, idx
                     );
                     Operation::CreateType {
-                        module: definition.module,
-                        name: definition.name,
+                        module: definition.module.clone(),
+                        name: definition.name.clone(),
                         birth_seed,
-                        region_params: definition.region_params,
-                        definition: definition.definition,
-                        identity: definition.identity,
+                        region_params: definition.region_params.clone(),
+                        definition: definition.definition.clone(),
+                        identity: definition.identity.clone(),
                     }
                 }
                 ProgramItem::Function(function) => {
-                    let birth_seed =
-                        format!("import:{}:{}:{}", function.module, function.name, idx);
-                    Operation::CreateFunction {
-                        module: function.module,
-                        name: function.name,
-                        birth_seed,
-                        region_params: function.region_params,
-                        params: function.params,
-                        return_type: function.return_type,
-                        effects: function.effects,
-                        body: function.body,
+                    if let Some(&group_id) = recursion.group_of.get(&idx) {
+                        // A recursive clique is created once, at its first member,
+                        // with every member bound before any body is typed.
+                        if emitted_group[group_id] {
+                            continue;
+                        }
+                        emitted_group[group_id] = true;
+                        let members = &recursion.groups[group_id];
+                        let module = function.module.clone();
+                        let mut member_specs = Vec::with_capacity(members.len());
+                        for &member_idx in members {
+                            let ProgramItem::Function(member) = &items[member_idx] else {
+                                unreachable!("recursion-group member is not a function");
+                            };
+                            if member.module != module {
+                                bail!(
+                                    "cross-module recursion is not supported: clique spans modules {module} and {}",
+                                    member.module
+                                );
+                            }
+                            member_specs.push(RecursionGroupMemberSpec {
+                                name: member.name.clone(),
+                                region_params: member.region_params.clone(),
+                                params: member.params.clone(),
+                                return_type: member.return_type.clone(),
+                                effects: member.effects.clone(),
+                                body: member.body.clone(),
+                            });
+                        }
+                        Operation::CreateRecursionGroup {
+                            module,
+                            members: member_specs,
+                        }
+                    } else {
+                        let birth_seed =
+                            format!("import:{}:{}:{}", function.module, function.name, idx);
+                        Operation::CreateFunction {
+                            module: function.module.clone(),
+                            name: function.name.clone(),
+                            birth_seed,
+                            region_params: function.region_params.clone(),
+                            params: function.params.clone(),
+                            return_type: function.return_type.clone(),
+                            effects: function.effects.clone(),
+                            body: function.body.clone(),
+                        }
                     }
                 }
                 ProgramItem::ExternalFunction(function) => {
@@ -132,16 +222,16 @@ impl CodeDb {
                         function.module, function.name, idx
                     );
                     Operation::CreateExternalFunction {
-                        module: function.module,
-                        name: function.name,
+                        module: function.module.clone(),
+                        name: function.name.clone(),
                         birth_seed,
-                        region_params: function.region_params,
-                        params: function.params,
-                        return_type: function.return_type,
-                        effects: function.effects,
-                        abi: function.abi,
-                        link_name: function.link_name,
-                        library: function.library,
+                        region_params: function.region_params.clone(),
+                        params: function.params.clone(),
+                        return_type: function.return_type.clone(),
+                        effects: function.effects.clone(),
+                        abi: function.abi.clone(),
+                        link_name: function.link_name.clone(),
+                        library: function.library.clone(),
                     }
                 }
             };
@@ -1060,4 +1150,168 @@ fn format_outcome(outcome: migrations::MigrationOutcome, json: bool) -> String {
     } else {
         outcome.format_cli()
     }
+}
+
+/// Which parsed function items form mutually-recursive cliques (SPEC_V3 §6).
+#[derive(Default)]
+struct RecursionAnalysis {
+    /// item index -> group id (only for items in a recursive clique).
+    group_of: std::collections::HashMap<usize, usize>,
+    /// group id -> member item indices, in source order.
+    groups: Vec<Vec<usize>>,
+}
+
+/// Collect every function name called (directly) anywhere in `expr`. Builtin
+/// call names (e.g. `box_new`) are collected too but resolve to no function
+/// item, so they add no call-graph edge.
+fn collect_call_names(expr: &RawExpr, out: &mut Vec<String>) {
+    match expr {
+        RawExpr::Call { name, args } => {
+            out.push(name.clone());
+            for arg in args {
+                collect_call_names(arg, out);
+            }
+        }
+        RawExpr::Binary { left, right, .. } => {
+            collect_call_names(left, out);
+            collect_call_names(right, out);
+        }
+        RawExpr::Unary { expr, .. } => collect_call_names(expr, out),
+        RawExpr::BorrowShared { target, .. } | RawExpr::BorrowMut { target, .. } => {
+            collect_call_names(target, out)
+        }
+        RawExpr::Assign { target, value } => {
+            collect_call_names(target, out);
+            collect_call_names(value, out);
+        }
+        RawExpr::Let { value, body, .. } => {
+            collect_call_names(value, out);
+            collect_call_names(body, out);
+        }
+        RawExpr::If {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            collect_call_names(cond, out);
+            collect_call_names(then_expr, out);
+            collect_call_names(else_expr, out);
+        }
+        RawExpr::Fold {
+            target, init, body, ..
+        } => {
+            collect_call_names(target, out);
+            collect_call_names(init, out);
+            collect_call_names(body, out);
+        }
+        RawExpr::Array { elements } => {
+            for element in elements {
+                collect_call_names(element, out);
+            }
+        }
+        RawExpr::Index { target, index } => {
+            collect_call_names(target, out);
+            collect_call_names(index, out);
+        }
+        RawExpr::Record { fields } => {
+            for field in fields {
+                collect_call_names(&field.value, out);
+            }
+        }
+        RawExpr::FieldAccess { target, .. } => collect_call_names(target, out),
+        RawExpr::EnumConstruct { value, .. } => collect_call_names(value, out),
+        RawExpr::Case { expr, arms } => {
+            collect_call_names(expr, out);
+            for arm in arms {
+                collect_call_names(&arm.body, out);
+            }
+        }
+        RawExpr::LiteralI64 { .. }
+        | RawExpr::LiteralBool { .. }
+        | RawExpr::LiteralString { .. }
+        | RawExpr::LiteralBytes { .. }
+        | RawExpr::Unit
+        | RawExpr::ParamRef { .. }
+        | RawExpr::ParamName { .. } => {}
+    }
+}
+
+/// Resolve a call name to a function node: a qualified `module.name` splits at
+/// the last `.`; an unqualified name resolves in the caller's module.
+fn resolve_call_node(
+    name: &str,
+    current_module: &str,
+    name_to_node: &std::collections::HashMap<(String, String), usize>,
+) -> Option<usize> {
+    if let Some(dot) = name.rfind('.') {
+        let module = &name[..dot];
+        let local = &name[dot + 1..];
+        name_to_node
+            .get(&(module.to_string(), local.to_string()))
+            .copied()
+    } else {
+        name_to_node
+            .get(&(current_module.to_string(), name.to_string()))
+            .copied()
+    }
+}
+
+/// Tarjan's strongly-connected-components algorithm. Returns each SCC as a list
+/// of node indices. Iterative (explicit work stack) so deep call graphs do not
+/// overflow the host stack.
+fn tarjan_scc(adjacency: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let n = adjacency.len();
+    const UNVISITED: usize = usize::MAX;
+    let mut index = vec![UNVISITED; n];
+    let mut lowlink = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut scc_stack: Vec<usize> = Vec::new();
+    let mut counter = 0usize;
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+    // Each work-stack frame is (node, next-neighbor-cursor).
+    let mut work: Vec<(usize, usize)> = Vec::new();
+
+    for start in 0..n {
+        if index[start] != UNVISITED {
+            continue;
+        }
+        work.push((start, 0));
+        while let Some(&(v, cursor)) = work.last() {
+            if cursor == 0 {
+                index[v] = counter;
+                lowlink[v] = counter;
+                counter += 1;
+                scc_stack.push(v);
+                on_stack[v] = true;
+            }
+            if cursor < adjacency[v].len() {
+                let w = adjacency[v][cursor];
+                work.last_mut().unwrap().1 += 1;
+                if index[w] == UNVISITED {
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    lowlink[v] = lowlink[v].min(index[w]);
+                }
+            } else {
+                // All neighbors processed: if v is a root, pop its SCC.
+                if lowlink[v] == index[v] {
+                    let mut component = Vec::new();
+                    loop {
+                        let node = scc_stack.pop().unwrap();
+                        on_stack[node] = false;
+                        component.push(node);
+                        if node == v {
+                            break;
+                        }
+                    }
+                    sccs.push(component);
+                }
+                work.pop();
+                if let Some(&(parent, _)) = work.last() {
+                    lowlink[parent] = lowlink[parent].min(lowlink[v]);
+                }
+            }
+        }
+    }
+    sccs
 }

@@ -3362,6 +3362,7 @@ fn substitute_param_refs(expr: &RawExpr, args: &[RawExpr]) -> Result<RawExpr> {
                 .map(|arm| {
                     Ok(RawCaseArm {
                         variant: arm.variant.clone(),
+                        literal: arm.literal.clone(),
                         default: arm.default,
                         binding: arm.binding.clone(),
                         body: substitute_param_refs(&arm.body, args)?,
@@ -3697,6 +3698,7 @@ fn alpha_rename_let_bindings_with_scope(
                     }
                     RawCaseArm {
                         variant: arm.variant.clone(),
+                        literal: arm.literal.clone(),
                         default: arm.default,
                         binding: renamed_binding,
                         body,

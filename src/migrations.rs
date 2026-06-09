@@ -26,6 +26,21 @@ use crate::{HISTORY_DOMAIN, MAIN_BRANCH, MIGRATION_DOMAIN};
 const HISTORY_EXPORT_SCHEMA: &str = "codedb/history-export/v1";
 const HISTORY_EXPORT_MIGRATION_SCHEMA: &str = "codedb/history-export-migration/v1";
 
+/// One member of a [`Operation::CreateRecursionGroup`]. Like a `CreateFunction`
+/// payload minus the birth seed (which is derived deterministically from the
+/// migration and the member's in-group ordinal, SPEC_V3 §10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecursionGroupMemberSpec {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) region_params: Vec<String>,
+    pub(crate) params: Vec<ParamSpec>,
+    pub(crate) return_type: String,
+    #[serde(default)]
+    pub(crate) effects: Vec<Effect>,
+    pub(crate) body: RawExpr,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum Operation {
@@ -55,6 +70,18 @@ pub(crate) enum Operation {
         link_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         library: Option<String>,
+    },
+    /// Create a mutually-recursive clique atomically (SPEC_V3 §6). All members'
+    /// symbols, signatures, and name bindings are bound before any body is
+    /// type-checked, so each body may call itself and its in-group peers (which
+    /// `CreateFunction` cannot express — it types the body before binding the
+    /// name). Member birth identities are derived deterministically from the
+    /// creating migration's parent history and the member's in-group ordinal
+    /// (SPEC_V3 §10), so the clique reproduces on rebuild. Members project back
+    /// as ordinary `fn`s; the importer re-detects the clique on re-import.
+    CreateRecursionGroup {
+        module: String,
+        members: Vec<RecursionGroupMemberSpec>,
     },
     CreateType {
         module: String,
@@ -235,6 +262,7 @@ impl Operation {
     pub(crate) fn kind_name(&self) -> &'static str {
         match self {
             Operation::CreateFunction { .. } => "create_function",
+            Operation::CreateRecursionGroup { .. } => "create_recursion_group",
             Operation::CreateExternalFunction { .. } => "create_external_function",
             Operation::CreateType { .. } => "create_type",
             Operation::RenameType { .. } => "rename_type",
@@ -1047,6 +1075,7 @@ fn append_default_arg_to_calls(expr: &RawExpr, target_name: &str, default: &RawE
                 .iter()
                 .map(|arm| crate::expr::RawCaseArm {
                     variant: arm.variant.clone(),
+                    literal: arm.literal.clone(),
                     default: arm.default,
                     binding: arm.binding.clone(),
                     body: append_default_arg_to_calls(&arm.body, target_name, default),
@@ -1060,6 +1089,18 @@ fn operation_summary_parts(op: &Operation) -> (String, SemanticImpact, Typecheck
     match op {
         Operation::CreateFunction { module, name, .. } => (
             format!("{module}.{name}"),
+            SemanticImpact::FunctionCreated,
+            TypecheckImpact::Checked,
+        ),
+        Operation::CreateRecursionGroup { module, members } => (
+            format!(
+                "{module}.{{{}}}",
+                members
+                    .iter()
+                    .map(|member| member.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             SemanticImpact::FunctionCreated,
             TypecheckImpact::Checked,
         ),
@@ -1284,7 +1325,9 @@ fn operation_summary_parts(op: &Operation) -> (String, SemanticImpact, Typecheck
 
 fn fallback_build_impact(op: &Operation) -> BuildImpact {
     let (kind, recompile_symbols, relink, changed_symbols, reasons) = match op {
-        Operation::CreateFunction { .. } | Operation::CreateExternalFunction { .. } => (
+        Operation::CreateFunction { .. }
+        | Operation::CreateExternalFunction { .. }
+        | Operation::CreateRecursionGroup { .. } => (
             BuildImpactKind::RecompileSymbols,
             vec![],
             true,
@@ -1657,6 +1700,18 @@ impl CodeDb {
                     name: name.clone(),
                 },
             ],
+            Operation::CreateRecursionGroup { module, members } => {
+                let mut preconditions = vec![Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                }];
+                for member in members {
+                    preconditions.push(Precondition::NameIsAvailable {
+                        module: module.clone(),
+                        name: member.name.clone(),
+                    });
+                }
+                preconditions
+            }
             Operation::CreateType { module, name, .. } => vec![
                 Precondition::RootIsCurrent {
                     root: input_root.to_string(),
@@ -2097,6 +2152,26 @@ impl CodeDb {
                     body: body.clone(),
                 },
             ],
+            Operation::CreateRecursionGroup { module, members } => {
+                // Each member projects back as an ordinary `fn`, so the source of
+                // every member must match — this keeps the checked-view round-trip
+                // (import -> verify -> re-export) honest for recursion groups.
+                let mut postconditions = vec![Postcondition::RootExists {
+                    root: output_root.to_string(),
+                }];
+                for member in members {
+                    postconditions.push(Postcondition::FunctionSourceMatches {
+                        module: module.clone(),
+                        name: member.name.clone(),
+                        region_params: member.region_params.clone(),
+                        params: member.params.clone(),
+                        return_type: member.return_type.clone(),
+                        effects: member.effects.clone(),
+                        body: member.body.clone(),
+                    });
+                }
+                postconditions
+            }
             Operation::CreateExternalFunction {
                 module,
                 name,
@@ -3084,6 +3159,9 @@ impl CodeDb {
                 effects,
                 body,
             ),
+            Operation::CreateRecursionGroup { module, members } => {
+                self.apply_create_recursion_group(input_root, parent_history_hash, module, members)
+            }
             Operation::CreateExternalFunction {
                 module,
                 name,
@@ -3443,6 +3521,166 @@ impl CodeDb {
             symbol,
             names: param_name_list,
         });
+        if module != MAIN_BRANCH
+            || root
+                .metadata
+                .contains_key(crate::model::ROOT_MODULES_METADATA_KEY)
+        {
+            synchronize_module_metadata(&mut root);
+        }
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    /// Create a mutually-recursive clique atomically (SPEC_V3 §6). Unlike
+    /// `apply_create_function`, every member's symbol, signature, and name
+    /// binding is added to the working root in a first pass, BEFORE any body is
+    /// type-checked in a second pass — so a body may resolve its own name and
+    /// its in-group peers (recursion). Member birth identities are derived
+    /// deterministically from `parent_history_hash` and the member's in-group
+    /// ordinal (SPEC_V3 §10), so the clique reproduces on rebuild. A
+    /// content-addressed `RecursionGroup` object records the clique.
+    pub(crate) fn apply_create_recursion_group(
+        &mut self,
+        input_root: &str,
+        parent_history_hash: Option<&str>,
+        module: &str,
+        members: &[RecursionGroupMemberSpec],
+    ) -> Result<String> {
+        validate_module_path("module", module)?;
+        if members.is_empty() {
+            bail!("recursion group requires at least one member");
+        }
+        let mut root = self.load_root(input_root)?;
+        let mut seen_names = std::collections::BTreeSet::new();
+        for member in members {
+            validate_projection_identifier("function name", &member.name)?;
+            validate_param_names(&member.params)?;
+            validate_region_param_names(&member.region_params)?;
+            if !seen_names.insert(member.name.as_str()) {
+                bail!("duplicate function name in recursion group: {}", member.name);
+            }
+            if root
+                .names
+                .iter()
+                .any(|binding| binding.module == module && binding.display_name == member.name)
+            {
+                bail!("name already exists: {module}.{}", member.name);
+            }
+        }
+
+        // Pass 1: mint every member's symbol/signature and bind its name. The
+        // FunctionDef `definition` is unknown until the body is typed in pass 2,
+        // so it is provisionally the signature hash; nothing between the passes
+        // dereferences it (body type-checking reads only signatures).
+        struct PendingMember {
+            symbol: String,
+            signature: String,
+            region_scope: std::collections::BTreeMap<String, String>,
+            param_types: Vec<String>,
+            return_type_hash: String,
+            param_name_list: Vec<String>,
+        }
+        let symbols_base = root.symbols.len();
+        let mut pending = Vec::with_capacity(members.len());
+        for (ordinal, member) in members.iter().enumerate() {
+            let birth_seed = format!("recursion_group:{ordinal}");
+            let symbol = self.put_symbol_birth(parent_history_hash, &birth_seed)?;
+            let region_params = self.function_region_params(
+                parent_history_hash,
+                &symbol,
+                &birth_seed,
+                &member.region_params,
+            )?;
+            let region_scope = region_scope_from_params(&region_params);
+            let param_types = member
+                .params
+                .iter()
+                .map(|param| {
+                    self.resolve_type_in_root_with_regions(module, &root, &param.ty, &region_scope)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let return_type_hash = self.resolve_type_in_root_with_regions(
+                module,
+                &root,
+                &member.return_type,
+                &region_scope,
+            )?;
+            let signature = self.put_signature_with_effects_and_regions(
+                &param_types,
+                &return_type_hash,
+                &member.effects,
+                &region_params,
+            )?;
+            let param_name_list = member
+                .params
+                .iter()
+                .map(|param| param.name.clone())
+                .collect::<Vec<_>>();
+            root.symbols.push(RootSymbolPayload {
+                symbol: symbol.clone(),
+                definition: signature.clone(),
+                signature: signature.clone(),
+            });
+            root.names.push(NameBinding {
+                module: module.to_string(),
+                display_name: member.name.clone(),
+                symbol: symbol.clone(),
+                is_preferred: true,
+            });
+            root.param_names.push(ParamNames {
+                symbol: symbol.clone(),
+                names: param_name_list.clone(),
+            });
+            pending.push(PendingMember {
+                symbol,
+                signature,
+                region_scope,
+                param_types,
+                return_type_hash,
+                param_name_list,
+            });
+        }
+
+        // Pass 2: type each body against the root (all in-group names bound now),
+        // then fix up the member's FunctionDef definition.
+        for (ordinal, member) in members.iter().enumerate() {
+            let pending_member = &pending[ordinal];
+            let typed_body = self.type_expr_in_module_with_regions_expecting(
+                module,
+                &member.body,
+                &root,
+                &pending_member.param_name_list,
+                &pending_member.param_types,
+                &pending_member.region_scope,
+                Some(&pending_member.return_type_hash),
+            )?;
+            if !self.type_assignable_in_root(
+                &root,
+                &typed_body.type_hash,
+                &pending_member.return_type_hash,
+            )? {
+                bail!(
+                    "function {module}.{} body type {} does not match return type {}",
+                    member.name,
+                    self.type_name(&typed_body.type_hash)?,
+                    self.type_name(&pending_member.return_type_hash)?
+                );
+            }
+            let definition = self.put_function_def(
+                &pending_member.symbol,
+                &pending_member.signature,
+                &typed_body.expr_hash,
+            )?;
+            root.symbols[symbols_base + ordinal].definition = definition;
+        }
+
+        let member_entries = root.symbols[symbols_base..symbols_base + members.len()].to_vec();
+        let group_hash = self.put_recursion_group(module, &member_entries)?;
+        root.recursion_groups.push(group_hash);
+
         if module != MAIN_BRANCH
             || root
                 .metadata
@@ -5662,7 +5900,10 @@ impl CodeDb {
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("case arm missing body"))?;
                     let is_default = arm.get("default").and_then(JsonValue::as_bool) == Some(true);
-                    let variant = if is_default {
+                    // Scalar literal patterns (R14) carry no variant to rename;
+                    // reconstruct them verbatim.
+                    let literal = crate::expr::scalar_literal_pattern_from_typed_arm(arm);
+                    let variant = if is_default || literal.is_some() {
                         None
                     } else {
                         let old_variant = arm
@@ -5703,6 +5944,7 @@ impl CodeDb {
                     }
                     rewritten_arms.push(RawCaseArm {
                         variant,
+                        literal,
                         default: is_default,
                         binding,
                         body: body?,
@@ -6450,6 +6692,7 @@ impl CodeDb {
             param_names: vec![],
             exports: vec![],
             tests: vec![],
+            recursion_groups: vec![],
             metadata: BTreeMap::new(),
         })?;
         let mut current_history: Option<String> = None;
@@ -7116,6 +7359,7 @@ fn borrow_call_arg_to_calls(
                 .map(|arm| {
                     Ok(RawCaseArm {
                         variant: arm.variant.clone(),
+                        literal: arm.literal.clone(),
                         default: arm.default,
                         binding: arm.binding.clone(),
                         body: borrow_call_arg_to_calls(
@@ -7343,6 +7587,7 @@ fn normalize_param_refs_scoped(
                     }
                     crate::expr::RawCaseArm {
                         variant: arm.variant.clone(),
+                        literal: arm.literal.clone(),
                         default: arm.default,
                         binding: arm.binding.clone(),
                         body,

@@ -203,6 +203,7 @@ mod tests {
                 exported_name: internal_abi_symbol(&second).unwrap(),
             }],
             tests: vec![],
+            recursion_groups: vec![],
             metadata: Default::default(),
         };
 

@@ -502,6 +502,113 @@ enum RootSlot {
     Local(usize),
 }
 
+/// A move-tracked place: an owned storage slot plus a record-field path into it.
+/// An empty path denotes the whole slot. Field-granular drop glue (Phase 4)
+/// tracks partial moves out of record fields, so the drop scaffold can drop the
+/// live remainder of an aggregate while skipping moved-out fields. Only record
+/// field segments appear here — array elements and box/deref projections are not
+/// field-granular-tracked (their partial move stays fail-closed), so a place
+/// rooted in one is never produced (see `place_moved_path`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct MovedPlace {
+    root: RootSlot,
+    fields: Vec<String>,
+}
+
+impl MovedPlace {
+    fn whole(root: RootSlot) -> Self {
+        Self {
+            root,
+            fields: Vec::new(),
+        }
+    }
+}
+
+/// True when `prefix` denotes `place` or an ancestor of it: same root and a
+/// leading field-path prefix (exact field names — no wildcards, records only).
+fn place_is_ancestor_or_equal(prefix: &MovedPlace, place: &MovedPlace) -> bool {
+    prefix.root == place.root
+        && prefix.fields.len() <= place.fields.len()
+        && prefix
+            .fields
+            .iter()
+            .zip(place.fields.iter())
+            .all(|(a, b)| a == b)
+}
+
+/// True when the two places overlap — one denotes the other or an ancestor of
+/// it (e.g. `x` overlaps `x.a`; `x.a` and `x.b` do not).
+fn places_overlap_lowered(left: &MovedPlace, right: &MovedPlace) -> bool {
+    place_is_ancestor_or_equal(left, right) || place_is_ancestor_or_equal(right, left)
+}
+
+/// Whether `place` (or an ancestor of it) is in `set` — i.e. the move/drop set
+/// already covers this place wholesale.
+fn place_covered_by(set: &BTreeSet<MovedPlace>, place: &MovedPlace) -> bool {
+    set.iter().any(|m| place_is_ancestor_or_equal(m, place))
+}
+
+/// Whether any element of `set` overlaps `place` (ancestor, descendant, or
+/// equal). Used to reject a move/drop that would conflict with an existing one.
+fn place_conflicts(set: &BTreeSet<MovedPlace>, place: &MovedPlace) -> bool {
+    set.iter().any(|m| places_overlap_lowered(m, place))
+}
+
+/// Insert `place` into a normalized move/drop set: drop any descendants it now
+/// subsumes, and skip the insert if an ancestor is already present.
+fn insert_moved_place(set: &mut BTreeSet<MovedPlace>, place: MovedPlace) {
+    if place_covered_by(set, &place) {
+        return;
+    }
+    set.retain(|m| !place_is_ancestor_or_equal(&place, m));
+    set.insert(place);
+}
+
+/// Re-normalize a set of places so no element is an ancestor of another (a
+/// whole-slot move in one branch subsumes a field move of the same slot from
+/// another branch). Order-independent: the broadest place always wins.
+fn normalize_moved_set(set: BTreeSet<MovedPlace>) -> BTreeSet<MovedPlace> {
+    let mut out = BTreeSet::new();
+    for place in set {
+        insert_moved_place(&mut out, place);
+    }
+    out
+}
+
+/// The places newly consumed (moved or dropped) by a branch, relative to the
+/// state before it. Used by the verifier to merge per-branch move/drop state at
+/// an `if`/`case` join (SPEC_V3 §7).
+fn newly_consumed_places(
+    drop_state: &DropTracker,
+    moved_before: &BTreeSet<MovedPlace>,
+    dropped_before: &BTreeSet<MovedPlace>,
+) -> BTreeSet<MovedPlace> {
+    let mut before = moved_before.clone();
+    before.extend(dropped_before.iter().cloned());
+    let before = normalize_moved_set(before);
+    let mut after = drop_state.moved.clone();
+    after.extend(drop_state.dropped.iter().cloned());
+    normalize_moved_set(after)
+        .into_iter()
+        .filter(|place| !place_covered_by(&before, place))
+        .collect()
+}
+
+/// Record as moved every place consumed (moved or dropped) on *every* branch —
+/// it is dead after the join. A place consumed on only some branches is a
+/// branch-local temporary (slots are unique per function) or is normalized away
+/// by the compensating drops the lowering emits, so it is not propagated.
+fn merge_consumed_into_moved(drop_state: &mut DropTracker, branch_consumed: &[BTreeSet<MovedPlace>]) {
+    let Some((first, rest)) = branch_consumed.split_first() else {
+        return;
+    };
+    for place in first {
+        if rest.iter().all(|consumed| place_covered_by(consumed, place)) {
+            insert_moved_place(&mut drop_state.moved, place.clone());
+        }
+    }
+}
+
 /// Verifier-side tracking of whole-slot moves and drops, enforcing that an
 /// owned slot is never dropped after it was moved out and never dropped twice
 /// (SPEC_V2 §20, "drops occur exactly once for owned values"). Address ids and
@@ -510,11 +617,13 @@ enum RootSlot {
 /// `if`/else blocks the verifier recurses into.
 #[derive(Debug, Default)]
 struct DropTracker {
-    /// Address ids that name a whole owned slot (bare `addr_of_param` /
-    /// `addr_of_local`). Field/index/deref addresses are intentionally absent.
-    addr_roots: BTreeMap<String, RootSlot>,
-    moved: BTreeSet<RootSlot>,
-    dropped: BTreeSet<RootSlot>,
+    /// Address ids that name a tracked owned place (a param/local slot, or a
+    /// record-field projection chain rooted in one). Array-element, box-payload,
+    /// and raw-deref addresses are intentionally absent — partial moves through
+    /// them stay fail-closed, so they are never move/drop-tracked here.
+    addr_places: BTreeMap<String, MovedPlace>,
+    moved: BTreeSet<MovedPlace>,
+    dropped: BTreeSet<MovedPlace>,
 }
 
 struct LowerCtx {
@@ -523,7 +632,9 @@ struct LowerCtx {
     next_local: usize,
     local_slots: Vec<LoweredLocalSlot>,
     debug_operations: Vec<LoweredDebugOp>,
-    moved: BTreeSet<RootSlot>,
+    /// Places (whole slots and partial record-field projections) moved out so
+    /// far on the current path. Normalized: no element is an ancestor of another.
+    moved: BTreeSet<MovedPlace>,
 }
 
 impl LowerCtx {
@@ -542,18 +653,14 @@ impl LowerCtx {
         &self.target_triple
     }
 
-    /// Record that the whole value of `root` was moved out of its slot.
-    fn mark_moved(&mut self, root: RootSlot) {
-        self.moved.insert(root);
-    }
-
-    fn mark_initialized(&mut self, root: RootSlot) {
-        self.moved.remove(&root);
+    /// Record that `place` (a whole slot or a record-field projection) was moved.
+    fn mark_moved_place(&mut self, place: MovedPlace) {
+        insert_moved_place(&mut self.moved, place);
     }
 
     /// Whether the whole value of `root` was moved out somewhere in the body.
     fn is_moved(&self, root: RootSlot) -> bool {
-        self.moved.contains(&root)
+        self.moved.contains(&MovedPlace::whole(root))
     }
 
     fn value(&mut self) -> String {
@@ -610,17 +717,17 @@ impl LowerCtx {
 /// the branch are self-contained — their drop is handled inside the branch — so
 /// they are excluded and do not count toward the symmetric-move requirement.
 fn outer_branch_moves(
-    after: &BTreeSet<RootSlot>,
-    before: &BTreeSet<RootSlot>,
+    after: &BTreeSet<MovedPlace>,
+    before: &BTreeSet<MovedPlace>,
     locals_boundary: usize,
-) -> BTreeSet<RootSlot> {
+) -> BTreeSet<MovedPlace> {
     after
         .difference(before)
-        .copied()
-        .filter(|slot| match slot {
+        .filter(|place| match place.root {
             RootSlot::Param(_) => true,
-            RootSlot::Local(index) => *index < locals_boundary,
+            RootSlot::Local(index) => index < locals_boundary,
         })
+        .cloned()
         .collect()
 }
 
@@ -1147,14 +1254,25 @@ impl CodeDb {
                 locals.pop();
                 let body = body?;
                 operations.extend(body.operations);
-                if self.type_requires_drop_scaffold(root, ctx.target_triple(), &binding_type)?
-                    && !ctx.is_moved(RootSlot::Local(slot))
-                {
-                    operations.push(LoweredOp::Drop {
-                        address,
-                        type_hash: binding_type,
-                    });
+                // Drop the binding at scope exit. With field-granular drop glue
+                // (SPEC_V3 §7) the binding may be wholly moved (no drop), partly
+                // moved (drop the live fields only), or untouched (whole-slot
+                // drop). `emit_residual_drops` places exactly the live drops.
+                if self.type_requires_drop_scaffold(root, ctx.target_triple(), &binding_type)? {
+                    let moved = ctx.moved.clone();
+                    let place = MovedPlace::whole(RootSlot::Local(slot));
+                    self.emit_residual_drops(
+                        root,
+                        &place,
+                        &binding_type,
+                        &binding_type,
+                        &moved,
+                        body_hash,
+                        ctx,
+                        &mut operations,
+                    )?;
                 }
+                let _ = address;
                 Ok(LoweredExpr {
                     operations,
                     value: body.value,
@@ -1305,6 +1423,7 @@ impl CodeDb {
                 let target_type = target.type_hash.clone();
                 let target_address = target.address.clone();
                 let target_root_slot = self.place_whole_root_slot(target_hash, locals)?;
+                let target_place = self.place_moved_path(target_hash, locals)?;
                 let mut operations = target.operations;
                 let value =
                     self.lower_expr_as(root, value_hash, &target_type, param_types, ctx, locals)?;
@@ -1317,19 +1436,40 @@ impl CodeDb {
                     bail!("assignment target was moved while lowering assignment value");
                 }
                 operations.extend(value.operations);
+                // Drop the overwritten value before the store. If the target was
+                // partially moved (some fields already gone), drop only the live
+                // remainder (field-granular drop glue, SPEC_V3 §7).
                 if self.type_requires_drop_scaffold(root, ctx.target_triple(), &target_type)? {
-                    operations.push(LoweredOp::Drop {
-                        address: target_address.clone(),
-                        type_hash: target_type.clone(),
-                    });
+                    if let Some(place) = &target_place {
+                        let moved = ctx.moved.clone();
+                        let root_type = self.root_slot_type(place.root, param_types, ctx)?;
+                        let place = place.clone();
+                        self.emit_residual_drops(
+                            root,
+                            &place,
+                            &target_type,
+                            &root_type,
+                            &moved,
+                            target_hash,
+                            ctx,
+                            &mut operations,
+                        )?;
+                    } else {
+                        operations.push(LoweredOp::Drop {
+                            address: target_address.clone(),
+                            type_hash: target_type.clone(),
+                        });
+                    }
                 }
                 operations.push(LoweredOp::Store {
                     address: target_address,
                     value: value.value,
                     type_hash: target_type.clone(),
                 });
-                if let Some(root_slot) = target_root_slot {
-                    ctx.mark_initialized(root_slot);
+                // The store re-initializes the target place: clear any move
+                // recorded for it (and overlapping sub/super-places).
+                if let Some(place) = &target_place {
+                    ctx.moved.retain(|m| !places_overlap_lowered(place, m));
                 }
                 let id = ctx.value();
                 ctx.push_debug_op(expr_hash, "const_unit", &id);
@@ -1388,28 +1528,27 @@ impl CodeDb {
         debug_expr_hash: &str,
         ctx: &mut LowerCtx,
     ) -> Result<Vec<LoweredOp>> {
+        let _ = target_triple;
         let mut operations = Vec::new();
         for (slot, type_hash) in param_types.iter().enumerate() {
-            if !self.type_requires_drop_scaffold(root, target_triple, type_hash)? {
+            if !self.type_requires_drop_scaffold(root, ctx.target_triple(), type_hash)? {
                 continue;
             }
-            if ctx.is_moved(RootSlot::Param(slot)) {
-                continue;
-            }
-            let address = ctx.value();
-            ctx.push_debug_op(debug_expr_hash, "addr_of_param", &address);
-            operations.push(LoweredOp::AddrOfParam {
-                id: address.clone(),
-                place: LoweredPlace::Param {
-                    slot,
-                    type_hash: type_hash.clone(),
-                    indirect: self.type_passes_indirect(root, target_triple, type_hash)?,
-                },
-            });
-            operations.push(LoweredOp::Drop {
-                address,
-                type_hash: type_hash.clone(),
-            });
+            // Drop the live remainder of the parameter at function end: nothing
+            // if wholly moved, the live fields if partly moved (SPEC_V3 §7).
+            let moved = ctx.moved.clone();
+            let type_hash = type_hash.clone();
+            let place = MovedPlace::whole(RootSlot::Param(slot));
+            self.emit_residual_drops(
+                root,
+                &place,
+                &type_hash,
+                &type_hash,
+                &moved,
+                debug_expr_hash,
+                ctx,
+                &mut operations,
+            )?;
         }
         Ok(operations)
     }
@@ -1448,27 +1587,303 @@ impl CodeDb {
         }
     }
 
-    /// A move-only value may only be moved out of a whole owned slot (a
-    /// parameter or local). Moving it out of a field/element/deref projection is
-    /// a partial move that leaves the enclosing aggregate with a moved-out hole;
-    /// because the drop scaffold drops whole slots only, the aggregate's later
-    /// drop would double-drop the moved field. Reject partial moves of owned
-    /// aggregates fail-closed until field-granular drop glue lands (SPEC_V2 §12;
-    /// a deferred post-Phase-15 extension — Phase 15 shipped whole-slot box drop
-    /// glue only). Every move-lowering path routes through here so the
-    /// guard cannot drift between sites; `verify_lowered_ir`'s `Move` check is
-    /// the independent backstop.
-    fn require_whole_slot_move(
+    /// Resolve the move-tracked place a value expression denotes: a whole slot
+    /// (param/local) or a record-field projection chain into one. Returns `None`
+    /// for array-element, box-payload, or raw-deref projections — partial moves
+    /// through those are not field-granular-tracked and stay fail-closed.
+    fn place_moved_path(
         &self,
         expr_hash: &str,
         locals: &[LocalLoweredBinding],
-    ) -> Result<RootSlot> {
-        self.place_whole_root_slot(expr_hash, locals)?
-            .ok_or_else(|| {
-                anyhow!(
-                    "unsupported_move: lowering does not support moving a move-only value out of a field or element projection (partial move of an owned aggregate); field-granular drop glue is not yet implemented (SPEC_V2 §12; deferred post-Phase-15 extension)"
-                )
-            })
+    ) -> Result<Option<MovedPlace>> {
+        let payload = self.get_payload(expr_hash)?;
+        match payload.get("expr_kind").and_then(JsonValue::as_str) {
+            Some("param_ref") => {
+                let slot = payload
+                    .get("index")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("param_ref missing index"))?
+                    as usize;
+                Ok(Some(MovedPlace::whole(RootSlot::Param(slot))))
+            }
+            Some("local_ref") => {
+                let depth = payload
+                    .get("depth")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
+                    as usize;
+                let binding = local_lowered_at_depth(locals, depth)
+                    .ok_or_else(|| anyhow!("local_ref depth out of bounds {depth}"))?;
+                Ok(Some(MovedPlace::whole(RootSlot::Local(binding.slot))))
+            }
+            Some("field_access") => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing target"))?;
+                let field = payload
+                    .get("field")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing field"))?;
+                match self.place_moved_path(target_hash, locals)? {
+                    Some(mut base) => {
+                        base.fields.push(field.to_string());
+                        Ok(Some(base))
+                    }
+                    None => Ok(None),
+                }
+            }
+            // array_index, box payloads, raw deref, etc.: not field-granular.
+            _ => Ok(None),
+        }
+    }
+
+    /// Resolve the place a move-only value is moved out of, recording it in the
+    /// move set. A whole slot or a record-field projection is tracked (the
+    /// enclosing aggregate's drop is then field-granular — see
+    /// `emit_residual_drops`). An array-element/box/deref projection cannot be
+    /// dropped field-granularly, so a partial move through one stays fail-closed
+    /// (SPEC_V3 §7). `verify_lowered_ir`'s `Move` check is the independent backstop.
+    fn mark_moved_source(
+        &self,
+        expr_hash: &str,
+        ctx: &mut LowerCtx,
+        locals: &[LocalLoweredBinding],
+    ) -> Result<()> {
+        let place = self.place_moved_path(expr_hash, locals)?.ok_or_else(|| {
+            anyhow!(
+                "unsupported_move: lowering does not support moving a move-only value out of an array element or pointer projection (partial move of an owned aggregate); field-granular drop glue covers record fields only (SPEC_V3 §7)"
+            )
+        })?;
+        ctx.mark_moved_place(place);
+        Ok(())
+    }
+
+    /// Emit the address-of operations for a tracked place (whole slot or
+    /// record-field chain), returning the final address id and the place's type.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_place_address(
+        &self,
+        root: &ProgramRootPayload,
+        place: &MovedPlace,
+        root_type: &str,
+        debug_expr_hash: &str,
+        ctx: &mut LowerCtx,
+        operations: &mut Vec<LoweredOp>,
+    ) -> Result<(String, String)> {
+        let target_triple = ctx.target_triple().to_string();
+        let mut address = ctx.value();
+        match place.root {
+            RootSlot::Param(slot) => {
+                ctx.push_debug_op(debug_expr_hash, "addr_of_param", &address);
+                operations.push(LoweredOp::AddrOfParam {
+                    id: address.clone(),
+                    place: LoweredPlace::Param {
+                        slot,
+                        type_hash: root_type.to_string(),
+                        indirect: self.type_passes_indirect(root, &target_triple, root_type)?,
+                    },
+                });
+            }
+            RootSlot::Local(slot) => {
+                ctx.push_debug_op(debug_expr_hash, "addr_of_local", &address);
+                operations.push(LoweredOp::AddrOfLocal {
+                    id: address.clone(),
+                    place: LoweredPlace::Local {
+                        slot,
+                        type_hash: root_type.to_string(),
+                    },
+                });
+            }
+        }
+        let mut current_type = root_type.to_string();
+        for field in &place.fields {
+            let field_info = self.lowered_record_field(root, &target_triple, &current_type, field)?;
+            let next = ctx.value();
+            ctx.push_debug_op(debug_expr_hash, "addr_of_field", &next);
+            operations.push(LoweredOp::AddrOfField {
+                id: next.clone(),
+                place: LoweredPlace::Field {
+                    base: address,
+                    field: field.clone(),
+                    field_symbol: field_info.field_symbol,
+                    owner_type_hash: current_type.clone(),
+                    offset_bytes: field_info.offset_bytes,
+                    type_hash: field_info.type_hash.clone(),
+                },
+            });
+            address = next;
+            current_type = field_info.type_hash;
+        }
+        Ok((address, current_type))
+    }
+
+    /// Drop the live remainder of `place` (type `place_type`): every drop-needing
+    /// sub-place not already covered by `moved`. A fully-moved place emits
+    /// nothing; a place with some moved fields recurses into the record and drops
+    /// only the live fields (field-granular drop glue, SPEC_V3 §7); an
+    /// untouched place emits a single whole-slot drop (the backend's per-type
+    /// drop helper recurses into its fields).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_residual_drops(
+        &self,
+        root: &ProgramRootPayload,
+        place: &MovedPlace,
+        place_type: &str,
+        root_type: &str,
+        moved: &BTreeSet<MovedPlace>,
+        debug_expr_hash: &str,
+        ctx: &mut LowerCtx,
+        operations: &mut Vec<LoweredOp>,
+    ) -> Result<()> {
+        let target_triple = ctx.target_triple().to_string();
+        if place_covered_by(moved, place) {
+            return Ok(());
+        }
+        let has_inner_move = moved
+            .iter()
+            .any(|m| place_is_ancestor_or_equal(place, m) && m != place);
+        if !has_inner_move {
+            if self.type_requires_drop_scaffold(root, &target_triple, place_type)? {
+                let (address, _) =
+                    self.emit_place_address(root, place, root_type, debug_expr_hash, ctx, operations)?;
+                operations.push(LoweredOp::Drop {
+                    address,
+                    type_hash: place_type.to_string(),
+                });
+            }
+            return Ok(());
+        }
+        // Some sub-field of `place` was moved; drop the live fields individually.
+        // Only records are field-granular-tracked, so this must be a record.
+        for field in self.aggregate_record_fields(root, place_type)? {
+            let mut child = place.clone();
+            child.fields.push(field.name.clone());
+            self.emit_residual_drops(
+                root,
+                &child,
+                &field.type_hash,
+                root_type,
+                moved,
+                debug_expr_hash,
+                ctx,
+                operations,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// At a branch merge, drop in this branch the parts of `place` that the
+    /// merged post-state (`dead`) treats as moved but this branch left live
+    /// (`branch_moved`). This normalizes every branch to the same move set so a
+    /// single static drop scaffold stays exactly-once across conditional moves
+    /// (SPEC_V3 §7) — no runtime drop flags. Reduces to `emit_residual_drops`
+    /// when `dead` covers `place` wholesale.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_branch_compensation(
+        &self,
+        root: &ProgramRootPayload,
+        place: &MovedPlace,
+        place_type: &str,
+        root_type: &str,
+        dead: &BTreeSet<MovedPlace>,
+        branch_moved: &BTreeSet<MovedPlace>,
+        debug_expr_hash: &str,
+        ctx: &mut LowerCtx,
+        operations: &mut Vec<LoweredOp>,
+    ) -> Result<()> {
+        if place_covered_by(branch_moved, place) {
+            return Ok(());
+        }
+        if place_covered_by(dead, place) {
+            // `dead` wants the whole place gone; this branch kept it (modulo its
+            // own sub-moves) live — drop the residual.
+            return self.emit_residual_drops(
+                root,
+                place,
+                place_type,
+                root_type,
+                branch_moved,
+                debug_expr_hash,
+                ctx,
+                operations,
+            );
+        }
+        // `dead` only marks sub-fields of `place`; recurse (records only).
+        for field in self.aggregate_record_fields(root, place_type)? {
+            let mut child = place.clone();
+            child.fields.push(field.name.clone());
+            self.emit_branch_compensation(
+                root,
+                &child,
+                &field.type_hash,
+                root_type,
+                dead,
+                branch_moved,
+                debug_expr_hash,
+                ctx,
+                operations,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The type of an outer root slot (param or pre-branch local), used to root
+    /// residual/compensation drops at a merge.
+    fn root_slot_type(
+        &self,
+        slot: RootSlot,
+        param_types: &[String],
+        ctx: &LowerCtx,
+    ) -> Result<String> {
+        match slot {
+            RootSlot::Param(index) => param_types
+                .get(index)
+                .cloned()
+                .ok_or_else(|| anyhow!("compensation drop references unknown param slot {index}")),
+            RootSlot::Local(index) => ctx
+                .local_slots
+                .iter()
+                .find(|local| local.slot == index)
+                .map(|local| local.type_hash.clone())
+                .ok_or_else(|| anyhow!("compensation drop references unknown local slot {index}")),
+        }
+    }
+
+    /// Emit compensating drops so each branch of an `if`/`case` exits with the
+    /// same move set (`union`). For every outer root slot touched by the union
+    /// but left (wholly or partly) live by this branch, drop the residual.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_merge_compensation(
+        &self,
+        root: &ProgramRootPayload,
+        union: &BTreeSet<MovedPlace>,
+        branch_moved: &BTreeSet<MovedPlace>,
+        param_types: &[String],
+        debug_expr_hash: &str,
+        ctx: &mut LowerCtx,
+        operations: &mut Vec<LoweredOp>,
+    ) -> Result<()> {
+        let mut roots: BTreeSet<RootSlot> = BTreeSet::new();
+        for place in union {
+            roots.insert(place.root);
+        }
+        for slot in roots {
+            let root_type = self.root_slot_type(slot, param_types, ctx)?;
+            let place = MovedPlace::whole(slot);
+            self.emit_branch_compensation(
+                root,
+                &place,
+                &root_type,
+                &root_type,
+                union,
+                branch_moved,
+                debug_expr_hash,
+                ctx,
+                operations,
+            )?;
+        }
+        Ok(())
     }
 
     fn lower_place_value(
@@ -1482,14 +1897,11 @@ impl CodeDb {
     ) -> Result<LoweredExpr> {
         let lowered = self.lower_place(root, expr_hash, param_types, ctx, locals)?;
         if self.type_is_move_only(root, ctx.target_triple(), type_hash)? {
-            // A move-only value may only be moved out of a whole owned slot (a
-            // parameter or local). Moving it out of a field or element
-            // projection is a partial move that leaves the enclosing aggregate
-            // with a moved-out hole; because the drop scaffold drops whole slots
-            // only, the aggregate's later drop would double-drop the moved
-            // field. Reject partial moves of owned aggregates fail-closed until
-            // field-granular drop glue lands (SPEC_V2 §12; deferred post-Phase-15 extension).
-            let root_slot = self.require_whole_slot_move(expr_hash, locals)?;
+            // Move a move-only value out of a whole slot or a record-field
+            // projection, recording the (possibly partial) move so the enclosing
+            // aggregate's drop becomes field-granular (SPEC_V3 §7). Moving out of
+            // an array element or pointer projection stays fail-closed.
+            self.mark_moved_source(expr_hash, ctx, locals)?;
             let id = ctx.value();
             ctx.push_debug_op(expr_hash, "move", &id);
             let mut operations = lowered.operations;
@@ -1498,7 +1910,6 @@ impl CodeDb {
                 address: lowered.address,
                 type_hash: type_hash.to_string(),
             });
-            ctx.mark_moved(root_slot);
             return Ok(LoweredExpr {
                 operations,
                 value: id,
@@ -3281,14 +3692,13 @@ impl CodeDb {
             let mut operations = source.operations;
             let scaffold_id = ctx.value();
             if self.type_is_move_only(root, ctx.target_triple(), &source_type)? {
-                let root_slot = self.require_whole_slot_move(expr_hash, locals)?;
+                self.mark_moved_source(expr_hash, ctx, locals)?;
                 ctx.push_debug_op(expr_hash, "move", &scaffold_id);
                 operations.push(LoweredOp::Move {
                     id: scaffold_id.clone(),
                     address: source.address,
                     type_hash: source_type.clone(),
                 });
-                ctx.mark_moved(root_slot);
             } else {
                 ctx.push_debug_op(expr_hash, "copy", &scaffold_id);
                 operations.push(LoweredOp::Copy {
@@ -3308,14 +3718,13 @@ impl CodeDb {
         let mut operations = source.operations;
         let scaffold_id = ctx.value();
         if self.type_is_move_only(root, ctx.target_triple(), &source_type)? {
-            let root_slot = self.require_whole_slot_move(expr_hash, locals)?;
+            self.mark_moved_source(expr_hash, ctx, locals)?;
             ctx.push_debug_op(expr_hash, "move", &scaffold_id);
             operations.push(LoweredOp::Move {
                 id: scaffold_id,
                 address: source.address.clone(),
                 type_hash: source_type.clone(),
             });
-            ctx.mark_moved(root_slot);
         } else {
             ctx.push_debug_op(expr_hash, "copy", &scaffold_id);
             operations.push(LoweredOp::Copy {
@@ -3589,31 +3998,47 @@ impl CodeDb {
             bail!("if condition must lower to bool");
         }
         // `if` branches are alternative paths, so a value moved in one branch is
-        // live (and must still be dropped) on the other. The current scaffold
-        // emits a single unconditional drop per owned slot, which is only sound
-        // when both branches move the same set of *outer* slots (a value existing
-        // before the `if`). Track moves per branch and reject an asymmetric
-        // conditional move of an outer slot fail-closed; symmetric moves (both
-        // branches, or neither) and moves of branch-local temporaries are fine.
-        // Conditional drop glue is deferred (SPEC_V2 §12; deferred post-Phase-15 extension).
+        // live (and must still be dropped) on the other. Conditional drop glue
+        // (SPEC_V3 §7): track moves per branch, then normalize both branches to
+        // the union of their outer moves by emitting compensating drops in the
+        // branch that left a unioned place live. Every path then exits the `if`
+        // with the same move set, so the static scaffold drops each owned value
+        // exactly once — no runtime drop flags. Branch-local temporaries (slots
+        // minted at/above `locals_boundary`) drop within their own branch.
         let locals_boundary = ctx.next_local;
         let moved_before = ctx.moved.clone();
-        let then_expr =
+        let mut then_expr =
             self.lower_expr_as(root, then_hash, result_type, param_types, ctx, locals)?;
         let then_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
         ctx.moved = moved_before.clone();
-        let else_expr =
+        let mut else_expr =
             self.lower_expr_as(root, else_hash, result_type, param_types, ctx, locals)?;
         let else_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
-        if then_moved != else_moved {
-            bail!(
-                "unsupported_move: lowering does not support moving an owned value in only one branch of an `if` (asymmetric conditional move); move it in both branches or neither — conditional drop glue is not yet implemented (SPEC_V2 §12; deferred post-Phase-15 extension)"
-            );
-        }
-        // The outer-slot moves match, so `ctx.moved` (now moved_before ∪
-        // else-branch moves) is the correct post-`if` move set.
         if then_expr.type_hash != else_expr.type_hash || then_expr.type_hash != result_type {
             bail!("if branch type mismatch while lowering");
+        }
+        let union = normalize_moved_set(then_moved.union(&else_moved).cloned().collect());
+        self.emit_merge_compensation(
+            root,
+            &union,
+            &then_moved,
+            param_types,
+            then_hash,
+            ctx,
+            &mut then_expr.operations,
+        )?;
+        self.emit_merge_compensation(
+            root,
+            &union,
+            &else_moved,
+            param_types,
+            else_hash,
+            ctx,
+            &mut else_expr.operations,
+        )?;
+        ctx.moved = moved_before;
+        for place in union {
+            ctx.mark_moved_place(place);
         }
         let id = ctx.value();
         ctx.push_debug_op(expr_hash, "if", &id);
@@ -3657,9 +4082,6 @@ impl CodeDb {
             .and_then(JsonValue::as_str)
             .ok_or_else(|| anyhow!("case missing expr"))?;
         let scrutinee = self.lower_expr(root, scrutinee_hash, param_types, ctx, locals)?;
-        let TypeSpec::Enum(variants) = self.type_spec_in_root(root, &scrutinee.type_hash)? else {
-            bail!("case lowering requires enum scrutinee");
-        };
         let arms = payload
             .get("arms")
             .and_then(JsonValue::as_array)
@@ -3667,6 +4089,36 @@ impl CodeDb {
         if arms.is_empty() {
             bail!("case lowering requires at least one arm");
         }
+        // Scalar literal `case` (R14): desugar to an `if`/`eq` chain reusing the
+        // existing backend (no new code generation). Conditional drop glue
+        // (SPEC_V3 §7) handles any owned values consumed in the arm bodies.
+        if scrutinee.type_hash == type_hash_for("I64") {
+            return self.lower_scalar_i64_case(
+                root,
+                scrutinee,
+                arms,
+                result_type,
+                expr_hash,
+                param_types,
+                ctx,
+                locals,
+            );
+        }
+        if scrutinee.type_hash == type_hash_for("Bool") {
+            return self.lower_scalar_bool_case(
+                root,
+                scrutinee,
+                arms,
+                result_type,
+                expr_hash,
+                param_types,
+                ctx,
+                locals,
+            );
+        }
+        let TypeSpec::Enum(variants) = self.type_spec_in_root(root, &scrutinee.type_hash)? else {
+            bail!("case lowering requires enum or scalar scrutinee");
+        };
         let mut explicit_variants = BTreeSet::new();
         let mut expanded_arms: Vec<(String, &JsonValue)> = Vec::new();
         let mut default_arm = None;
@@ -3716,7 +4168,7 @@ impl CodeDb {
 
         let locals_boundary = ctx.next_local;
         let moved_before = ctx.moved.clone();
-        let mut expected_arm_moves: Option<BTreeSet<RootSlot>> = None;
+        let mut arm_move_sets: Vec<BTreeSet<MovedPlace>> = Vec::with_capacity(expanded_arms.len());
         let mut lowered_arms = Vec::with_capacity(expanded_arms.len());
         for (variant, arm) in expanded_arms {
             ctx.moved = moved_before.clone();
@@ -3835,20 +4287,33 @@ impl CodeDb {
             }
 
             let arm_moves = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
-            match &expected_arm_moves {
-                Some(expected) if expected != &arm_moves => {
-                    bail!(
-                        "unsupported_move: lowering does not support moving an owned value in only some arms of a `case`; move it in every arm or none — conditional drop glue is not yet implemented (SPEC_V2 §12; deferred post-Phase-15 extension)"
-                    );
-                }
-                None => expected_arm_moves = Some(arm_moves),
-                _ => {}
+            arm_move_sets.push(arm_moves);
+        }
+        // Conditional drop glue (SPEC_V3 §7): normalize every arm to the union of
+        // their outer moves by emitting compensating drops in arms that left a
+        // unioned place live, so the static scaffold drops each owned value
+        // exactly once across all arms — no runtime drop flags.
+        let mut union = BTreeSet::new();
+        for arm_moves in &arm_move_sets {
+            for place in arm_moves {
+                union.insert(place.clone());
             }
         }
-        if let Some(moves) = expected_arm_moves {
-            ctx.moved = moved_before.union(&moves).copied().collect();
-        } else {
-            ctx.moved = moved_before;
+        let union = normalize_moved_set(union);
+        for (arm, arm_moves) in lowered_arms.iter_mut().zip(arm_move_sets.iter()) {
+            self.emit_merge_compensation(
+                root,
+                &union,
+                arm_moves,
+                param_types,
+                expr_hash,
+                ctx,
+                &mut arm.block.operations,
+            )?;
+        }
+        ctx.moved = moved_before;
+        for place in union {
+            ctx.mark_moved_place(place);
         }
 
         let id = ctx.value();
@@ -3859,6 +4324,245 @@ impl CodeDb {
             scrutinee: scrutinee.value,
             enum_type_hash: scrutinee.type_hash,
             arms: lowered_arms,
+            type_hash: result_type.to_string(),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: result_type.to_string(),
+        })
+    }
+
+    /// Lower a scalar `i64` literal `case` (R14) by desugaring to an `if`/`eq_i64`
+    /// chain — reusing the existing backend with no new code generation.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_scalar_i64_case(
+        &self,
+        root: &ProgramRootPayload,
+        scrutinee: LoweredExpr,
+        arms: &[JsonValue],
+        result_type: &str,
+        expr_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let mut literal_arms: Vec<(String, String)> = Vec::new();
+        let mut default_body: Option<String> = None;
+        for arm in arms {
+            let body = arm
+                .get("body")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("case arm missing body"))?
+                .to_string();
+            if arm.get("default").and_then(JsonValue::as_bool) == Some(true) {
+                default_body = Some(body);
+            } else if let Some(value) = arm.get("literal_i64").and_then(JsonValue::as_str) {
+                literal_arms.push((value.to_string(), body));
+            } else {
+                bail!("scalar i64 case arm must be an integer literal or `_`");
+            }
+        }
+        let default_body = default_body
+            .ok_or_else(|| anyhow!("scalar i64 case lowering requires a `_` wildcard arm"))?;
+        let mut operations = scrutinee.operations;
+        let moved_before = ctx.moved.clone();
+        let chain = self.lower_scalar_i64_chain(
+            root,
+            &scrutinee.value,
+            &literal_arms,
+            &default_body,
+            result_type,
+            expr_hash,
+            param_types,
+            ctx,
+            locals,
+            &moved_before,
+            0,
+        )?;
+        operations.extend(chain.operations);
+        Ok(LoweredExpr {
+            operations,
+            value: chain.value,
+            type_hash: result_type.to_string(),
+        })
+    }
+
+    /// Build the `if`/`eq` chain for [`lower_scalar_i64_case`], one binary `if`
+    /// per literal arm with the wildcard body as the final `else`. Conditional
+    /// drop glue (SPEC_V3 §7) is applied per `if` level exactly as in `lower_if`.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_scalar_i64_chain(
+        &self,
+        root: &ProgramRootPayload,
+        scrutinee_value: &str,
+        literal_arms: &[(String, String)],
+        default_body: &str,
+        result_type: &str,
+        expr_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+        moved_before: &BTreeSet<MovedPlace>,
+        index: usize,
+    ) -> Result<LoweredExpr> {
+        let Some((literal, body_hash)) = literal_arms.get(index) else {
+            // Final `else`: the wildcard arm.
+            ctx.moved = moved_before.clone();
+            let body = self.lower_expr_as(root, default_body, result_type, param_types, ctx, locals)?;
+            if body.type_hash != result_type {
+                bail!("scalar case arm result type mismatch while lowering");
+            }
+            return Ok(body);
+        };
+        // cond = (scrutinee == literal)
+        let const_id = ctx.value();
+        ctx.push_debug_op(expr_hash, "const_i64", &const_id);
+        let mut operations = vec![LoweredOp::ConstI64 {
+            id: const_id.clone(),
+            value: literal.clone(),
+            type_hash: type_hash_for("I64"),
+        }];
+        let cond_id = ctx.value();
+        ctx.push_debug_op(expr_hash, "binary", &cond_id);
+        operations.push(LoweredOp::Binary {
+            id: cond_id.clone(),
+            kind: lower_binary_kind("==", &type_hash_for("I64"), &type_hash_for("I64"), &type_hash_for("Bool"))?,
+            left: scrutinee_value.to_string(),
+            right: const_id,
+            type_hash: type_hash_for("Bool"),
+            trap: None,
+        });
+        let locals_boundary = ctx.next_local;
+        // then = this arm's body
+        ctx.moved = moved_before.clone();
+        let mut then_expr = self.lower_expr_as(root, body_hash, result_type, param_types, ctx, locals)?;
+        if then_expr.type_hash != result_type {
+            bail!("scalar case arm result type mismatch while lowering");
+        }
+        let then_moved = outer_branch_moves(&ctx.moved, moved_before, locals_boundary);
+        // else = the rest of the chain
+        ctx.moved = moved_before.clone();
+        let mut else_expr = self.lower_scalar_i64_chain(
+            root,
+            scrutinee_value,
+            literal_arms,
+            default_body,
+            result_type,
+            expr_hash,
+            param_types,
+            ctx,
+            locals,
+            moved_before,
+            index + 1,
+        )?;
+        let else_moved = outer_branch_moves(&ctx.moved, moved_before, locals_boundary);
+        let union = normalize_moved_set(then_moved.union(&else_moved).cloned().collect());
+        self.emit_merge_compensation(root, &union, &then_moved, param_types, expr_hash, ctx, &mut then_expr.operations)?;
+        self.emit_merge_compensation(root, &union, &else_moved, param_types, expr_hash, ctx, &mut else_expr.operations)?;
+        ctx.moved = moved_before.clone();
+        for place in union {
+            ctx.mark_moved_place(place);
+        }
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "if", &id);
+        operations.push(LoweredOp::If {
+            id: id.clone(),
+            cond: cond_id,
+            then_block: LoweredBlock {
+                operations: then_expr.operations,
+                result: then_expr.value,
+            },
+            else_block: LoweredBlock {
+                operations: else_expr.operations,
+                result: else_expr.value,
+            },
+            type_hash: result_type.to_string(),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: result_type.to_string(),
+        })
+    }
+
+    /// Lower a scalar `bool` literal `case` (R14) to a single `if` (no `eq` —
+    /// bool has no equality operator; the scrutinee IS the condition).
+    #[allow(clippy::too_many_arguments)]
+    fn lower_scalar_bool_case(
+        &self,
+        root: &ProgramRootPayload,
+        scrutinee: LoweredExpr,
+        arms: &[JsonValue],
+        result_type: &str,
+        expr_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let mut true_body: Option<String> = None;
+        let mut false_body: Option<String> = None;
+        let mut default_body: Option<String> = None;
+        for arm in arms {
+            let body = arm
+                .get("body")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("case arm missing body"))?
+                .to_string();
+            if arm.get("default").and_then(JsonValue::as_bool) == Some(true) {
+                default_body = Some(body);
+            } else if let Some(value) = arm.get("literal_bool").and_then(JsonValue::as_bool) {
+                if value {
+                    true_body = Some(body);
+                } else {
+                    false_body = Some(body);
+                }
+            } else {
+                bail!("scalar bool case arm must be a bool literal or `_`");
+            }
+        }
+        let then_body = true_body
+            .or_else(|| default_body.clone())
+            .ok_or_else(|| anyhow!("scalar bool case is missing a true/wildcard arm"))?;
+        let else_body = false_body
+            .or(default_body)
+            .ok_or_else(|| anyhow!("scalar bool case is missing a false/wildcard arm"))?;
+
+        let mut operations = scrutinee.operations;
+        let moved_before = ctx.moved.clone();
+        let locals_boundary = ctx.next_local;
+        ctx.moved = moved_before.clone();
+        let mut then_expr = self.lower_expr_as(root, &then_body, result_type, param_types, ctx, locals)?;
+        if then_expr.type_hash != result_type {
+            bail!("scalar case arm result type mismatch while lowering");
+        }
+        let then_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
+        ctx.moved = moved_before.clone();
+        let mut else_expr = self.lower_expr_as(root, &else_body, result_type, param_types, ctx, locals)?;
+        if else_expr.type_hash != result_type {
+            bail!("scalar case arm result type mismatch while lowering");
+        }
+        let else_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
+        let union = normalize_moved_set(then_moved.union(&else_moved).cloned().collect());
+        self.emit_merge_compensation(root, &union, &then_moved, param_types, expr_hash, ctx, &mut then_expr.operations)?;
+        self.emit_merge_compensation(root, &union, &else_moved, param_types, expr_hash, ctx, &mut else_expr.operations)?;
+        ctx.moved = moved_before;
+        for place in union {
+            ctx.mark_moved_place(place);
+        }
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "if", &id);
+        operations.push(LoweredOp::If {
+            id: id.clone(),
+            cond: scrutinee.value,
+            then_block: LoweredBlock {
+                operations: then_expr.operations,
+                result: then_expr.value,
+            },
+            else_block: LoweredBlock {
+                operations: else_expr.operations,
+                result: else_expr.value,
+            },
             type_hash: result_type.to_string(),
         });
         Ok(LoweredExpr {
@@ -5093,6 +5797,13 @@ impl CodeDb {
                     if value_type(values, cond)? != &type_hash_for("Bool") {
                         bail!("lowered if condition must be bool");
                     }
+                    // Conditional drop glue (SPEC_V3 §7): verify each branch with
+                    // isolated move/drop state (so one branch's compensating drop
+                    // is not mistaken for a conflict with the other's move), then
+                    // merge — a place consumed (moved or dropped) on every branch
+                    // is dead after the `if`. Address/value maps are branch-local.
+                    let moved_before = drop_state.moved.clone();
+                    let dropped_before = drop_state.dropped.clone();
                     let then_type = self.verify_lowered_block(
                         root,
                         then_block,
@@ -5103,6 +5814,10 @@ impl CodeDb {
                         addresses,
                         drop_state,
                     )?;
+                    let then_consumed =
+                        newly_consumed_places(drop_state, &moved_before, &dropped_before);
+                    drop_state.moved = moved_before.clone();
+                    drop_state.dropped = dropped_before.clone();
                     let else_type = self.verify_lowered_block(
                         root,
                         else_block,
@@ -5113,9 +5828,14 @@ impl CodeDb {
                         addresses,
                         drop_state,
                     )?;
+                    let else_consumed =
+                        newly_consumed_places(drop_state, &moved_before, &dropped_before);
                     if then_type != else_type || then_type != *type_hash {
                         bail!("lowered if branch type mismatch");
                     }
+                    drop_state.moved = moved_before;
+                    drop_state.dropped = dropped_before;
+                    merge_consumed_into_moved(drop_state, &[then_consumed, else_consumed]);
                     insert_value(values, id, type_hash)?;
                 }
                 LoweredOp::Case {
@@ -5137,6 +5857,12 @@ impl CodeDb {
                     else {
                         bail!("lowered case requires enum scrutinee");
                     };
+                    // Conditional drop glue (SPEC_V3 §7): isolate each arm's
+                    // move/drop state and merge — a place consumed on every arm is
+                    // dead after the `case`.
+                    let moved_before = drop_state.moved.clone();
+                    let dropped_before = drop_state.dropped.clone();
+                    let mut arm_consumed: Vec<BTreeSet<MovedPlace>> = Vec::with_capacity(arms.len());
                     let mut seen = BTreeSet::new();
                     for arm in arms {
                         if !seen.insert(arm.variant.clone()) {
@@ -5164,6 +5890,8 @@ impl CodeDb {
                         {
                             bail!("lowered case arm layout metadata mismatch");
                         }
+                        drop_state.moved = moved_before.clone();
+                        drop_state.dropped = dropped_before.clone();
                         let arm_type = self.verify_lowered_block(
                             root,
                             &arm.block,
@@ -5177,6 +5905,8 @@ impl CodeDb {
                         if arm_type != *type_hash {
                             bail!("lowered case arm result type mismatch");
                         }
+                        arm_consumed
+                            .push(newly_consumed_places(drop_state, &moved_before, &dropped_before));
                     }
                     let expected = variants
                         .iter()
@@ -5185,6 +5915,9 @@ impl CodeDb {
                     if seen != expected {
                         bail!("lowered case must cover every enum variant");
                     }
+                    drop_state.moved = moved_before;
+                    drop_state.dropped = dropped_before;
+                    merge_consumed_into_moved(drop_state, &arm_consumed);
                     insert_value(values, id, type_hash)?;
                     if self.type_passes_indirect(root, target_triple, type_hash)? {
                         insert_address(addresses, id, type_hash)?;
@@ -5465,8 +6198,8 @@ impl CodeDb {
                     }
                     insert_address(addresses, id, type_hash)?;
                     drop_state
-                        .addr_roots
-                        .insert(id.clone(), RootSlot::Param(*slot));
+                        .addr_places
+                        .insert(id.clone(), MovedPlace::whole(RootSlot::Param(*slot)));
                     if self.type_passes_indirect(root, target_triple, type_hash)? {
                         insert_value(values, id, type_hash)?;
                     }
@@ -5483,8 +6216,8 @@ impl CodeDb {
                     }
                     insert_address(addresses, id, type_hash)?;
                     drop_state
-                        .addr_roots
-                        .insert(id.clone(), RootSlot::Local(*slot));
+                        .addr_places
+                        .insert(id.clone(), MovedPlace::whole(RootSlot::Local(*slot)));
                     if self.is_aggregate_ir_type(root, type_hash)? {
                         insert_value(values, id, type_hash)?;
                     }
@@ -5519,6 +6252,14 @@ impl CodeDb {
                         bail!("lowered addr_of_field offset mismatch");
                     }
                     insert_address(addresses, id, type_hash)?;
+                    // Extend the field-path of the base place (if it is a tracked
+                    // slot/field chain) so field-granular moves and drops resolve
+                    // to the right sub-place (SPEC_V3 §7).
+                    if let Some(base_place) = drop_state.addr_places.get(base).cloned() {
+                        let mut field_place = base_place;
+                        field_place.fields.push(field.clone());
+                        drop_state.addr_places.insert(id.clone(), field_place);
+                    }
                     if self.is_aggregate_ir_type(root, type_hash)? {
                         insert_value(values, id, type_hash)?;
                     }
@@ -5916,9 +6657,13 @@ impl CodeDb {
                             "lowered store reinterprets an aggregate value of type {value_ty} under incompatible destination layout {type_hash}"
                         );
                     }
-                    if let Some(root_slot) = drop_state.addr_roots.get(address).copied() {
-                        drop_state.dropped.remove(&root_slot);
-                        drop_state.moved.remove(&root_slot);
+                    if let Some(place) = drop_state.addr_places.get(address).cloned() {
+                        // Storing into a place re-initializes it: clear any move
+                        // or drop recorded for it or its sub-/super-places.
+                        drop_state
+                            .dropped
+                            .retain(|m| !places_overlap_lowered(&place, m));
+                        drop_state.moved.retain(|m| !places_overlap_lowered(&place, m));
                     }
                 }
                 LoweredOp::Copy {
@@ -5948,26 +6693,25 @@ impl CodeDb {
                     if address_type(addresses, address)? != type_hash {
                         bail!("lowered move type mismatch");
                     }
-                    // SPEC_V2 §20 (fail closed): a move consumes a whole owned
-                    // slot. A move whose address is a field/element/deref
-                    // projection would be a partial move that leaves the
-                    // enclosing aggregate with a moved-out hole the whole-slot
-                    // drop scaffold cannot track, so a later whole-slot drop of
-                    // the aggregate would double-drop the moved field. Reject it
-                    // until field-granular drop glue lands (a deferred
-                    // post-Phase-15 extension; SPEC_V2 §12).
-                    // This is the independent backstop for the lowering guard in
-                    // `require_whole_slot_move`. `addr_roots` holds every
-                    // AddrOfParam/AddrOfLocal id (drop-relevant or not), so a
-                    // bare move-only whole-slot move still passes.
-                    let Some(root_slot) = drop_state.addr_roots.get(address).copied() else {
+                    // A move consumes a tracked place: a whole slot or a
+                    // record-field projection (field-granular partial move,
+                    // SPEC_V3 §7). An untracked address (array element, box
+                    // payload, raw deref) is not field-granular-droppable, so a
+                    // partial move through one stays fail-closed. This is the
+                    // independent backstop for the lowering guard in
+                    // `mark_moved_source`.
+                    let Some(place) = drop_state.addr_places.get(address).cloned() else {
                         bail!(
                             "lowered move of a non-whole-slot place (partial move of an owned aggregate)"
                         );
                     };
-                    // Consuming the slot; record so a later drop of the same
-                    // slot is rejected.
-                    drop_state.moved.insert(root_slot);
+                    if place_conflicts(&drop_state.moved, &place) {
+                        bail!("lowered move of already-moved storage");
+                    }
+                    if place_conflicts(&drop_state.dropped, &place) {
+                        bail!("lowered move of dropped storage");
+                    }
+                    insert_moved_place(&mut drop_state.moved, place);
                     insert_value(values, id, type_hash)?;
                     if self.type_passes_indirect(root, target_triple, type_hash)? {
                         insert_address(addresses, id, type_hash)?;
@@ -5980,15 +6724,18 @@ impl CodeDb {
                     if address_type(addresses, address)? != type_hash {
                         bail!("lowered drop type mismatch");
                     }
-                    // SPEC_V2 §20: an owned slot is dropped exactly once and
-                    // never after being moved out.
-                    if let Some(root_slot) = drop_state.addr_roots.get(address).copied() {
-                        if drop_state.moved.contains(&root_slot) {
+                    // SPEC_V2 §20 / SPEC_V3 §7: an owned place is dropped exactly
+                    // once and never after being moved out. Field-granular: drops
+                    // of disjoint fields (`x.a` then `x.b`) are fine; an
+                    // overlapping move or prior drop is a double-free.
+                    if let Some(place) = drop_state.addr_places.get(address).cloned() {
+                        if place_conflicts(&drop_state.moved, &place) {
                             bail!("lowered drop of moved-out storage");
                         }
-                        if !drop_state.dropped.insert(root_slot) {
+                        if place_conflicts(&drop_state.dropped, &place) {
                             bail!("lowered double drop of storage");
                         }
+                        insert_moved_place(&mut drop_state.dropped, place);
                     }
                 }
                 LoweredOp::BorrowDebug {
