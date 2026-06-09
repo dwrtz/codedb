@@ -72,12 +72,12 @@ Supported replacements are `literal_i64`, `literal_bool`, `unit`, `call`,
 `rename_symbol`, `extract_function`, `inline_function`, `add_parameter`,
 `rename_field`, `rename_variant_and_cases`, `borrow_parameter`,
 `convert_by_value_param_to_ref`, `add_field_with_default`,
-`remove_field_and_update_constructors`, `remove_unused_symbol`, `set_export`,
-and `remove_export`.
+`remove_unused_symbol`, `set_export`, and `remove_export`.
 
 `thread_mut_cursor`, `extract_slice_view`, `extract_record`, `introduce_box`,
-and `replace_raw_pointer_with_safe_reference` are reserved V2 operation names.
-They are parsed by the patch language but fail closed until their whole-program
+`remove_field_and_update_constructors`, and
+`replace_raw_pointer_with_safe_reference` are reserved V2 operation names. They
+are parsed by the patch language but fail closed until their whole-program
 synthesis rules are implemented.
 
 Extract a matched expression into a new function and replace the expression

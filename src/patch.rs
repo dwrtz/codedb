@@ -318,6 +318,13 @@ struct ExportMatch {
 }
 
 #[derive(Debug, Clone)]
+struct ResolvedPatchType {
+    type_hash: String,
+    type_symbol: Option<String>,
+    type_name: String,
+}
+
+#[derive(Debug, Clone)]
 enum ExprReplacement {
     LiteralI64(String),
     LiteralBool(bool),
@@ -716,17 +723,17 @@ impl CodeDb {
     fn collect_type_matches(
         &self,
         root: &ProgramRootPayload,
-        wanted_type_hash: &str,
+        wanted: &ResolvedPatchType,
         matches: &mut MatchSet,
     ) -> Result<()> {
-        if let TypeSpec::Named { type_symbol, .. } = self.type_spec(wanted_type_hash)?
-            && self.root_type(root, &type_symbol).is_some()
+        if let Some(type_symbol) = &wanted.type_symbol
+            && self.root_type(root, type_symbol).is_some()
         {
             matches.types.push(TypeMatch {
-                type_hash: wanted_type_hash.to_string(),
-                type_name: self.type_name_in_root(root, MAIN_BRANCH, wanted_type_hash)?,
+                type_hash: wanted.type_hash.clone(),
+                type_name: wanted.type_name.clone(),
                 owner_kind: "type_definition".to_string(),
-                owner_hash: type_symbol,
+                owner_hash: type_symbol.clone(),
                 symbol_hash: None,
                 symbol_name: None,
             });
@@ -735,7 +742,7 @@ impl CodeDb {
             let symbol_name = self.symbol_display(root, &entry.symbol)?;
             let (params, return_type) = self.signature_parts(&entry.signature)?;
             for type_hash in params.iter().chain(std::iter::once(&return_type)) {
-                if type_hash == wanted_type_hash {
+                if type_hash == &wanted.type_hash {
                     matches.types.push(TypeMatch {
                         type_hash: type_hash.clone(),
                         type_name: self.type_name_in_root(root, MAIN_BRANCH, type_hash)?,
@@ -750,7 +757,7 @@ impl CodeDb {
         self.collect_expression_matches(
             root,
             &PatchMatch::Type {
-                type_hash: Some(wanted_type_hash.to_string()),
+                type_hash: Some(wanted.type_hash.clone()),
                 name: None,
             },
             matches,
@@ -894,10 +901,15 @@ impl CodeDb {
                     payload.get("symbol").and_then(JsonValue::as_str) == Some(wanted)
                 }))
             }
+            PatchMatch::Type {
+                type_hash: Some(wanted),
+                ..
+            } => Ok(payload.get("type").and_then(JsonValue::as_str) == Some(wanted.as_str())),
             PatchMatch::Type { type_hash, name } => {
                 let wanted =
                     self.resolve_patch_type(root, type_hash.as_deref(), name.as_deref())?;
-                Ok(payload.get("type").and_then(JsonValue::as_str) == Some(wanted.as_str()))
+                Ok(payload.get("type").and_then(JsonValue::as_str)
+                    == Some(wanted.type_hash.as_str()))
             }
             PatchMatch::Symbol { .. }
             | PatchMatch::FunctionDefinition { .. }
@@ -1543,7 +1555,7 @@ impl CodeDb {
     ) -> Result<Vec<Operation>> {
         let mut operations = Vec::new();
         for matched in matched_type_definitions(matches) {
-            let type_symbol = self.type_symbol_for_patch_type(root, &matched.type_hash)?;
+            let type_symbol = self.type_symbol_for_patch_type(root, matched)?;
             let field_symbol = match field_symbol {
                 Some(symbol) => symbol.to_string(),
                 None => self.field_symbol_by_name(
@@ -1584,7 +1596,7 @@ impl CodeDb {
         }
         let mut operations = Vec::new();
         for matched in matched_type_definitions(matches) {
-            let type_symbol = self.type_symbol_for_patch_type(root, &matched.type_hash)?;
+            let type_symbol = self.type_symbol_for_patch_type(root, matched)?;
             operations.push(Operation::AddField {
                 module: MAIN_BRANCH.to_string(),
                 type_symbol: type_symbol.clone(),
@@ -1603,39 +1615,14 @@ impl CodeDb {
 
     fn plan_remove_field_and_update_constructors(
         &self,
-        root: &ProgramRootPayload,
-        matches: &MatchSet,
-        field: Option<&str>,
-        field_symbol: Option<&str>,
+        _root: &ProgramRootPayload,
+        _matches: &MatchSet,
+        _field: Option<&str>,
+        _field_symbol: Option<&str>,
     ) -> Result<Vec<Operation>> {
-        let mut operations = Vec::new();
-        for matched in matched_type_definitions(matches) {
-            let type_symbol = self.type_symbol_for_patch_type(root, &matched.type_hash)?;
-            let field_symbol = match field_symbol {
-                Some(symbol) => symbol.to_string(),
-                None => self.field_symbol_by_name(
-                    root,
-                    &type_symbol,
-                    field.ok_or_else(|| {
-                        anyhow!(
-                            "remove_field_and_update_constructors requires field or field_symbol"
-                        )
-                    })?,
-                )?,
-            };
-            let name = match field {
-                Some(name) => name.to_string(),
-                None => self.member_name_by_symbol(root, &type_symbol, &field_symbol, true)?,
-            };
-            operations.push(Operation::RemoveField {
-                module: MAIN_BRANCH.to_string(),
-                type_symbol,
-                type_name: matched.type_name.clone(),
-                field_symbol,
-                name,
-            });
-        }
-        Ok(operations)
+        bail!(
+            "semantic patch operation remove_field_and_update_constructors requires whole-program synthesis and is not yet safely implemented"
+        )
     }
 
     fn plan_rename_variant_and_cases(
@@ -1648,7 +1635,7 @@ impl CodeDb {
     ) -> Result<Vec<Operation>> {
         let mut operations = Vec::new();
         for matched in matched_type_definitions(matches) {
-            let type_symbol = self.type_symbol_for_patch_type(root, &matched.type_hash)?;
+            let type_symbol = self.type_symbol_for_patch_type(root, matched)?;
             let variant_symbol = match variant_symbol {
                 Some(symbol) => symbol.to_string(),
                 None => self.variant_symbol_by_name(
@@ -1704,12 +1691,17 @@ impl CodeDb {
     fn type_symbol_for_patch_type(
         &self,
         root: &ProgramRootPayload,
-        type_hash: &str,
+        matched: &TypeMatch,
     ) -> Result<String> {
-        let TypeSpec::Named { type_symbol, .. } = self.type_spec(type_hash)? else {
+        if matched.owner_kind == "type_definition"
+            && self.root_type(root, &matched.owner_hash).is_some()
+        {
+            return Ok(matched.owner_hash.clone());
+        }
+        let TypeSpec::Named { type_symbol, .. } = self.type_spec(&matched.type_hash)? else {
             bail!(
                 "semantic type patch requires a named v2 type, got {}",
-                self.type_name_in_root(root, MAIN_BRANCH, type_hash)?
+                self.type_name_in_root(root, MAIN_BRANCH, &matched.type_hash)?
             );
         };
         if self.root_type(root, &type_symbol).is_none() {
@@ -2371,15 +2363,29 @@ impl CodeDb {
         root: &ProgramRootPayload,
         type_hash: Option<&str>,
         name: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<ResolvedPatchType> {
         if let Some(type_hash) = type_hash {
-            self.type_name_in_root(root, MAIN_BRANCH, type_hash)?;
-            return Ok(type_hash.to_string());
+            let type_name = self.type_name_in_root(root, MAIN_BRANCH, type_hash)?;
+            let type_symbol = match self.type_spec(type_hash)? {
+                TypeSpec::Named { type_symbol, .. } => Some(type_symbol),
+                _ => None,
+            };
+            return Ok(ResolvedPatchType {
+                type_hash: type_hash.to_string(),
+                type_symbol,
+                type_name,
+            });
         }
         let Some(name) = name else {
             bail!("type match requires type_hash or name");
         };
-        self.type_hash_for_source_in_root(MAIN_BRANCH, root, name)
+        let type_hash = self.type_hash_for_source_in_root(MAIN_BRANCH, root, name)?;
+        let type_symbol = crate::model::resolve_named_type_in_root(root, MAIN_BRANCH, name);
+        Ok(ResolvedPatchType {
+            type_hash,
+            type_symbol,
+            type_name: name.to_string(),
+        })
     }
 }
 

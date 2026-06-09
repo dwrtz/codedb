@@ -19,6 +19,15 @@ fn run(args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("utf8 stdout")
 }
 
+fn run_failure(args: &[&str]) -> String {
+    let output = bin().args(args).assert().failure().get_output().clone();
+    format!(
+        "{}{}",
+        String::from_utf8(output.stdout).expect("utf8 stdout"),
+        String::from_utf8(output.stderr).expect("utf8 stderr")
+    )
+}
+
 fn parse_json(text: &str) -> JsonValue {
     serde_json::from_str(text).unwrap_or_else(|err| panic!("invalid json: {err}\n{text}"))
 }
@@ -140,6 +149,70 @@ fn semantic_patch_rename_field_preserves_identity_and_reports_v2_impact() {
 }
 
 #[test]
+fn semantic_patch_type_match_unused_record_does_not_require_materialized_type_object() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("v2-unused-type-match.sqlite");
+    let source = temp.path().join("unused-line.cdb");
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+fn main() -> i64 = 1
+"#,
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    let root = branch_state(&db).0;
+    let patch = write_patch(
+        temp.path(),
+        "rename-unused-field.patch.json",
+        json!({
+            "schema": "codedb/semantic-patch/v1",
+            "branch": "main",
+            "expected_root": root,
+            "match": {
+                "kind": "type",
+                "name": "Line"
+            },
+            "replace": {
+                "kind": "rename_field",
+                "field": "qty",
+                "new_name": "quantity"
+            }
+        }),
+    );
+
+    let preview = parse_json(&run(&[
+        "patch",
+        "preview",
+        path(&db),
+        "--json",
+        path(&patch),
+    ]));
+    assert_eq!(preview["status"], "planned");
+    assert_eq!(preview["planned_operations"][0]["kind"], "rename_field");
+    assert_eq!(preview["matched_types"][0]["owner_kind"], "type_definition");
+
+    let applied = parse_json(&run(&["patch", "apply", path(&db), "--json", path(&patch)]));
+    assert_eq!(applied["status"], "applied");
+    run(&["verify", path(&db)]);
+
+    let after = list_json(&db);
+    assert!(
+        type_by_name(&after, "Line")["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field["name"] == "quantity")
+    );
+}
+
+#[test]
 fn semantic_patch_rename_variant_updates_constructors_and_cases() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("v2-rename-variant.sqlite");
@@ -208,6 +281,57 @@ fn main() -> i64 = value(Discount::percent(10))
             .unwrap()
             .contains("pct(amount)")
     );
+}
+
+#[test]
+fn semantic_patch_remove_field_and_update_constructors_fails_closed() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("v2-remove-field-reserved.sqlite");
+    let source = temp.path().join("materialized-line.cdb");
+    std::fs::write(
+        &source,
+        r#"
+record Line {
+  price_cents: i64
+  qty: i64
+}
+
+fn use_line(line: Line) -> i64 = 1
+
+fn main() -> i64 = 1
+"#,
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+    let before = branch_state(&db);
+    let patch = write_patch(
+        temp.path(),
+        "remove-field-reserved.patch.json",
+        json!({
+            "schema": "codedb/semantic-patch/v1",
+            "branch": "main",
+            "expected_root": before.0.clone(),
+            "match": {
+                "kind": "type",
+                "name": "Line"
+            },
+            "replace": {
+                "kind": "remove_field_and_update_constructors",
+                "field": "qty"
+            }
+        }),
+    );
+
+    let preview_error = run_failure(&["patch", "preview", path(&db), "--json", path(&patch)]);
+    assert!(preview_error.contains("remove_field_and_update_constructors"));
+    assert!(preview_error.contains("requires whole-program synthesis"));
+    assert_eq!(branch_state(&db), before);
+
+    let apply_error = run_failure(&["patch", "apply", path(&db), "--json", path(&patch)]);
+    assert!(apply_error.contains("remove_field_and_update_constructors"));
+    assert!(apply_error.contains("requires whole-program synthesis"));
+    assert_eq!(branch_state(&db), before);
 }
 
 #[test]
