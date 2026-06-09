@@ -449,6 +449,42 @@ fn main<'a>() -> i64 =
 }
 
 #[test]
+fn partial_move_of_a_field_through_a_box_is_rejected_cleanly() {
+    // Moving a field reached through a `box` auto-deref (`h.inner` where
+    // `h: box<Holder>`) is not field-granular-droppable; it must fail closed at the
+    // checker with a clean `unsupported_move` diagnostic (suggesting `unbox`), never
+    // crash lowering. Regression for the box-auto-deref place-tracking gap (SPEC_V3
+    // §7) — the place flattens away the deref, so a naive lowering treated the box as
+    // a record and panicked.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("box-deref-move.sqlite");
+    let source = temp.path().join("box-deref-move.cdb");
+    std::fs::write(
+        &source,
+        r#"
+record Inner { x: i64 }
+record Holder { inner: box<Inner> }
+
+fn take(b: box<Inner>) -> i64 effects[alloc] = b.x
+
+fn f() -> i64 effects[alloc] =
+  let h: box<Holder> = box_new({ inner: box_new({ x: 5 }) }) in
+  take(h.inner)
+
+fn main() -> i64 effects[alloc] = f()
+"#,
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    bin()
+        .args(["import", path(&db), path(&source)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unsupported_move"))
+        .stderr(predicate::str::contains("box deref"));
+}
+
+#[test]
 fn moving_mutable_reference_record_out_of_inner_let_keeps_loan_live() {
     let temp = tempdir().unwrap();
     let db = temp.path().join("inner-let-move-loan.sqlite");

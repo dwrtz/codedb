@@ -7449,6 +7449,18 @@ impl CodeDb {
                     place
                 );
             }
+            // A partial move out of a field reached through a `box` auto-deref (e.g.
+            // `h.inner` where `h: box<Holder>`) is not field-granular-droppable: the
+            // box's whole-slot drop glue cannot skip a moved-out interior field, and
+            // the place is flattened (the deref is invisible in `place`). Reject it
+            // cleanly here rather than crashing lowering (SPEC_V3 §7; `unbox` first if
+            // you need to move the payload out).
+            if self.move_crosses_box_deref(expr_hash)? {
+                bail!(
+                    "unsupported_move: partial move of an owned value reached through a box deref at {:?}; field-granular drop glue covers record fields rooted in a local or parameter, not behind a box — `unbox` the box first (SPEC_V3 §7)",
+                    place
+                );
+            }
             self.check_move_conflicts(&place, &state.active)?;
             state.moved.push(place);
         } else {
@@ -7710,6 +7722,35 @@ impl CodeDb {
     /// raw-pointer deref), this path-based identity becomes unsound and aliasing
     /// `&mut` would be accepted. Such a form MUST resolve to the pointee's
     /// recorded loan identity (not the syntactic path) instead.
+    /// Whether reaching this place requires dereferencing a `box` (auto-deref). Such
+    /// a partial move is not field-granular-droppable (SPEC_V3 §7), so the move-check
+    /// rejects it. Walks the field/index access chain; true as soon as any access
+    /// target is a `box<T>`.
+    fn move_crosses_box_deref(&self, expr_hash: &str) -> Result<bool> {
+        let payload = self.get_payload(expr_hash)?;
+        match payload.get("expr_kind").and_then(JsonValue::as_str) {
+            Some("field_access") => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("field_access missing target"))?;
+                let target_type = self.expr_declared_type(target)?;
+                if matches!(self.type_spec(&target_type)?, TypeSpec::Box { .. }) {
+                    return Ok(true);
+                }
+                self.move_crosses_box_deref(target)
+            }
+            Some("array_index") => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing target"))?;
+                self.move_crosses_box_deref(target)
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn loan_place_for_expr(
         &self,
         expr_hash: &str,
