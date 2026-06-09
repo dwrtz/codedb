@@ -449,6 +449,7 @@ pub(crate) struct MigrationSummary {
     pub(crate) semantic_impact: SemanticImpact,
     pub(crate) typecheck: TypecheckImpact,
     pub(crate) build_impact: BuildImpact,
+    pub(crate) receipt: MigrationReceipt,
 }
 
 impl MigrationSummary {
@@ -468,8 +469,113 @@ impl MigrationSummary {
             "semantic_impact": self.semantic_impact.as_str(),
             "typecheck": self.typecheck.as_str(),
             "build_impact": self.build_impact.to_json(),
+            "receipt": self.receipt.to_json(),
         })
     }
+}
+
+/// A single symbol's effect-set change between two roots.
+#[derive(Debug, Clone)]
+pub(crate) struct SymbolEffectChange {
+    pub(crate) symbol: String,
+    pub(crate) name: String,
+    pub(crate) added: Vec<String>,
+    pub(crate) removed: Vec<String>,
+}
+
+/// Per-symbol effect-set changes (effects gained/lost) across a structural write.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EffectDelta {
+    pub(crate) changed: Vec<SymbolEffectChange>,
+}
+
+/// Change in the root's declared capability surface — the union over all symbols
+/// of their visible effect names. This is entry-independent (computable on every
+/// write). It is intentionally NOT the entry-relative link-plan capabilities
+/// (`link.rs`: read_file/write_file/stdout/alloc), which require an entry symbol
+/// and a lowered-IR build and are surfaced by the build/link plan; a link-level
+/// capability delta is a documented follow-up gated on an entry symbol.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CapabilityDelta {
+    pub(crate) added: Vec<String>,
+    pub(crate) removed: Vec<String>,
+}
+
+/// Records the borrow/move/drop + effect checking invariant for a write. No new
+/// checking runs here: applying an operation already runs `type_check_root`
+/// (which calls `verify_function_borrows` + `verify_function_effects`) on the new
+/// root, so an applied/already-applied outcome is proof the affected symbols
+/// passed. A conflict produced no new root, so `checked`/`passed` are false.
+#[derive(Debug, Clone)]
+pub(crate) struct BorrowCheckSummary {
+    pub(crate) checked: bool,
+    pub(crate) passed: bool,
+    pub(crate) affected_symbols: Vec<String>,
+}
+
+/// A proof-carrying receipt returned (pre-commit) for a structural write: the
+/// typecheck verdict, the borrow-check invariant, the effect/capability deltas,
+/// the build-impact verdict, and the semantic diff. It lets an agent bind a
+/// change to evidence of its type/borrow/effect/capability/build consequences
+/// without re-deriving them, and is emitted under the summary's `receipt` key.
+#[derive(Debug, Clone)]
+pub(crate) struct MigrationReceipt {
+    pub(crate) typecheck: TypecheckImpact,
+    pub(crate) build_impact: BuildImpact,
+    pub(crate) effect_delta: EffectDelta,
+    pub(crate) capability_delta: CapabilityDelta,
+    pub(crate) borrow_check: BorrowCheckSummary,
+    pub(crate) semantic_diff: Vec<JsonValue>,
+}
+
+impl MigrationReceipt {
+    pub(crate) fn to_json(&self) -> JsonValue {
+        json!({
+            "schema": "codedb/receipt/v1",
+            "typecheck": self.typecheck.as_str(),
+            "borrow_check": {
+                "checked": self.borrow_check.checked,
+                "passed": self.borrow_check.passed,
+                "affected_symbols": &self.borrow_check.affected_symbols,
+            },
+            "effect_delta": {
+                "changed": self
+                    .effect_delta
+                    .changed
+                    .iter()
+                    .map(|change| {
+                        json!({
+                            "symbol": &change.symbol,
+                            "name": &change.name,
+                            "added": &change.added,
+                            "removed": &change.removed,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            },
+            "capability_delta": {
+                "added": &self.capability_delta.added,
+                "removed": &self.capability_delta.removed,
+            },
+            "build_impact": self.build_impact.to_json(),
+            "semantic_diff": &self.semantic_diff,
+        })
+    }
+}
+
+/// Sorted added/removed delta between two effect-name lists.
+fn sorted_name_delta(old: &[String], new: &[String]) -> (Vec<String>, Vec<String>) {
+    let old_set: BTreeSet<&String> = old.iter().collect();
+    let new_set: BTreeSet<&String> = new.iter().collect();
+    let added = new_set
+        .difference(&old_set)
+        .map(|name| name.to_string())
+        .collect();
+    let removed = old_set
+        .difference(&new_set)
+        .map(|name| name.to_string())
+        .collect();
+    (added, removed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2394,12 +2500,29 @@ impl CodeDb {
         let (display, semantic_impact, typecheck) = operation_summary_parts(op);
         let build_impact = fallback_build_impact(op);
 
+        // No roots are available here (conflict / error paths): the operation
+        // produced no new root, so the receipt carries empty deltas and an
+        // unchecked borrow summary rather than claiming a check that never ran.
+        let receipt = MigrationReceipt {
+            typecheck,
+            build_impact: build_impact.clone(),
+            effect_delta: EffectDelta::default(),
+            capability_delta: CapabilityDelta::default(),
+            borrow_check: BorrowCheckSummary {
+                checked: false,
+                passed: false,
+                affected_symbols: build_impact.changed_symbols.clone(),
+            },
+            semantic_diff: Vec::new(),
+        };
+
         MigrationSummary {
             operation_kind: op.kind_name(),
             display,
             semantic_impact,
             typecheck,
             build_impact,
+            receipt,
         }
     }
 
@@ -2411,12 +2534,124 @@ impl CodeDb {
     ) -> Result<MigrationSummary> {
         let (display, semantic_impact, typecheck) = operation_summary_parts(op);
         let build_impact = self.plan_build_impact(old_root, new_root)?;
+        // The full proof-carrying receipt, assembled before commit. Applying the
+        // operation already ran type/borrow/effect checking on `new_root`, so an
+        // applied outcome means the affected symbols passed.
+        let receipt = MigrationReceipt {
+            typecheck,
+            build_impact: build_impact.clone(),
+            effect_delta: self.compute_effect_delta(old_root, new_root)?,
+            capability_delta: self.compute_capability_delta(old_root, new_root)?,
+            borrow_check: BorrowCheckSummary {
+                checked: true,
+                passed: true,
+                affected_symbols: build_impact.changed_symbols.clone(),
+            },
+            semantic_diff: self.diff_change_json(old_root, new_root)?,
+        };
         Ok(MigrationSummary {
             operation_kind: op.kind_name(),
             display,
             semantic_impact,
             typecheck,
             build_impact,
+            receipt,
+        })
+    }
+
+    /// Per-symbol effect-set delta between two roots. A symbol whose signature
+    /// hash is unchanged has unchanged effects (effects are part of the signature
+    /// hash) and is skipped without reading — the pruning that keeps this cheap.
+    fn compute_effect_delta(&self, old_root: &str, new_root: &str) -> Result<EffectDelta> {
+        let old = self.load_root(old_root)?;
+        let new = self.load_root(new_root)?;
+        let old_syms: BTreeMap<&str, _> = old
+            .symbols
+            .iter()
+            .map(|entry| (entry.symbol.as_str(), entry))
+            .collect();
+        let new_syms: BTreeMap<&str, _> = new
+            .symbols
+            .iter()
+            .map(|entry| (entry.symbol.as_str(), entry))
+            .collect();
+        let all: BTreeSet<&str> = old_syms.keys().chain(new_syms.keys()).copied().collect();
+        let mut changed = Vec::new();
+        for symbol in all {
+            match (old_syms.get(symbol), new_syms.get(symbol)) {
+                (Some(old_entry), Some(new_entry)) => {
+                    if old_entry.signature == new_entry.signature {
+                        continue;
+                    }
+                    let (added, removed) = sorted_name_delta(
+                        &self.signature_effect_names(&old_entry.signature)?,
+                        &self.signature_effect_names(&new_entry.signature)?,
+                    );
+                    if !added.is_empty() || !removed.is_empty() {
+                        changed.push(SymbolEffectChange {
+                            symbol: symbol.to_string(),
+                            name: self
+                                .symbol_display(&new, symbol)
+                                .unwrap_or_else(|_| symbol.to_string()),
+                            added,
+                            removed,
+                        });
+                    }
+                }
+                (None, Some(new_entry)) => {
+                    let added = self.signature_effect_names(&new_entry.signature)?;
+                    if !added.is_empty() {
+                        changed.push(SymbolEffectChange {
+                            symbol: symbol.to_string(),
+                            name: self
+                                .symbol_display(&new, symbol)
+                                .unwrap_or_else(|_| symbol.to_string()),
+                            added,
+                            removed: Vec::new(),
+                        });
+                    }
+                }
+                (Some(old_entry), None) => {
+                    let removed = self.signature_effect_names(&old_entry.signature)?;
+                    if !removed.is_empty() {
+                        changed.push(SymbolEffectChange {
+                            symbol: symbol.to_string(),
+                            name: self
+                                .symbol_display(&old, symbol)
+                                .unwrap_or_else(|_| symbol.to_string()),
+                            added: Vec::new(),
+                            removed,
+                        });
+                    }
+                }
+                (None, None) => unreachable!(),
+            }
+        }
+        Ok(EffectDelta { changed })
+    }
+
+    /// The union of every symbol's visible effect names in a root.
+    fn root_effect_surface(&self, root_hash: &str) -> Result<BTreeSet<String>> {
+        let root = self.load_root(root_hash)?;
+        let mut surface = BTreeSet::new();
+        for entry in &root.symbols {
+            for name in self.signature_effect_names(&entry.signature)? {
+                surface.insert(name);
+            }
+        }
+        Ok(surface)
+    }
+
+    fn compute_capability_delta(
+        &self,
+        old_root: &str,
+        new_root: &str,
+    ) -> Result<CapabilityDelta> {
+        let old = self.root_effect_surface(old_root)?;
+        let new = self.root_effect_surface(new_root)?;
+        Ok(CapabilityDelta {
+            added: new.difference(&old).cloned().collect(),
+            removed: old.difference(&new).cloned().collect(),
         })
     }
 

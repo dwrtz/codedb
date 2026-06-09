@@ -146,7 +146,17 @@ Goal: shrink the per-feature edit surface and pin the reference evaluator to the
 native backend, so the many feature phases that follow are cheap to build and
 safe to build concurrently.
 
-Status: planned.
+Status: implemented. `src/op_registry.rs` is the single source of truth for
+built-in operators (one `OPS` row per operator); the evaluator (`expr.rs`), the
+lowering source-op→kind / verify / trap mappings (`lowering.rs`), and the parser
+precedence table all forward to it, collapsing the per-operator surface from six
+sites to one (the backend's machine-code encoders are the irreducible second
+site, guarded by a registry-driven coverage test). `src/oracle.rs` provides the
+determinism-oracle helper (hash / bytes / canonical-JSON identity) for every
+ladder rung, and `tests/oracle_conformance.rs` drives every operator through both
+the reference evaluator and the native backend, with a coverage gate over
+`operator_kinds()` so a new operator without a fixture fails loudly. The refactor
+is output-preserving; the full existing suite stays green.
 
 Rationale: today a language feature touches `migrations.rs` (Operation),
 `patch.rs`, `verify.rs`, `provenance.rs` (blame), the evaluator in `expr.rs`, and
@@ -185,8 +195,20 @@ existing native-required tests still pass
 Goal: establish, early, the editing layer that lets several agents build the
 compiler-in-CodeDB concurrently without falling back to projection text.
 
-Status: planned. Sized to "a few agents build one compiler"; the full
-agent-native platform is v4 ([SPEC_V4.md](SPEC_V4.md)).
+Status: implemented. The semantic-merge substrate (common-ancestor root,
+migration replay, semantic conflict detection, build-impact recomputation) was
+already present and is now joined by a hash-pruned expression tree diff
+(`diff_exprs_json`, exact because node hashes are Merkle hashes). Every
+structural write now returns, pre-commit, a proof-carrying `MigrationReceipt`
+(emitted under the summary's `receipt` key): typecheck verdict, borrow-check
+invariant, per-symbol effect delta and root capability-surface delta,
+build-impact verdict, and the hash-pruned semantic diff — flowing through CLI
+apply, `ops.apply`/`ops.preview`, and merge apply. Merge reports its recomputed
+build impact, consistent with the receipt. `tests/agent_concurrency.rs` proves N
+`--expect-root` writers serialize to exactly one applied (no lost updates) and
+that N identical (same request_id) submissions replay one committed response.
+Sized to "a few agents build one compiler"; the full agent-native platform is v4
+([SPEC_V4.md](SPEC_V4.md)).
 
 Deliverables:
 
@@ -698,7 +720,7 @@ the committed .cdb is a checked view; CI gates import -> verify -> re-export and
 
 ### Milestone V3.0 — Foundations
 
-Includes: Phases 1–3 (docs, architecture paydown, agent spine).
+Includes: Phases 1–3 (docs, architecture paydown, agent spine). Status: complete.
 
 ```text
 Success: features add with a small edit surface, and concurrent agents build them

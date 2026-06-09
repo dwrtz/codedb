@@ -154,6 +154,14 @@ fn conservative_merge_applies_disjoint_symbol_changes() {
     assert_eq!(preview["status"], "mergeable");
     assert_eq!(preview["target_unique_migration_count"], 1);
     assert_eq!(preview["source_unique_migration_count"], 1);
+    // The merge recomputes the build impact of landing the source onto target.
+    assert_eq!(preview["build_impact"]["kind"], "recompile_symbols");
+    assert!(
+        !preview["build_impact"]["recompile"]
+            .as_array()
+            .expect("recompile list")
+            .is_empty()
+    );
 
     let applied = parse_json(&run(&[
         "merge",
@@ -167,6 +175,13 @@ fn conservative_merge_applies_disjoint_symbol_changes() {
     ]));
     assert_eq!(applied["status"], "merged");
     assert_eq!(applied["committed"], true);
+    // Build impact is recomputed for the merge result and is consistent between
+    // the top-level plan and the merge operation's receipt (one source of truth).
+    assert_eq!(applied["build_impact"]["kind"], "recompile_symbols");
+    assert_eq!(
+        applied["operation_result"]["summary"]["receipt"]["build_impact"]["kind"],
+        applied["build_impact"]["kind"]
+    );
     assert_eq!(run(&["eval", path(&db), "main"]).trim(), "119");
     run(&["verify", path(&db)]);
 }

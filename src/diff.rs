@@ -188,7 +188,7 @@ impl CodeDb {
         Ok(format!("{}\n", canonical_json(&payload)))
     }
 
-    fn diff_change_json(&self, root_a: &str, root_b: &str) -> Result<Vec<JsonValue>> {
+    pub(crate) fn diff_change_json(&self, root_a: &str, root_b: &str) -> Result<Vec<JsonValue>> {
         let a = self.load_root(root_a)?;
         let b = self.load_root(root_b)?;
         let a_symbols = a
@@ -267,13 +267,23 @@ impl CodeDb {
                             "to": &b_entry.signature,
                         }));
                     } else if a_entry.definition != b_entry.definition {
+                        let from_body = self.definition_body_hash_opt(&a_entry.definition)?;
+                        let to_body = self.definition_body_hash_opt(&b_entry.definition)?;
+                        // Hash-pruned tree diff: descend into the body only where
+                        // content hashes differ. Identical subtrees are skipped
+                        // (and never loaded) because equal hash => equal subtree.
+                        let mut expr_changes = Vec::new();
+                        if let (Some(from), Some(to)) = (&from_body, &to_body) {
+                            self.diff_exprs_json(&a, &b, from, to, "body", &mut expr_changes)?;
+                        }
                         changes.push(json!({
                             "kind": "implementation_changed",
                             "symbol": &symbol,
                             "function": b_name,
                             "signature_hash_unchanged": true,
-                            "from_body": self.definition_body_hash_opt(&a_entry.definition)?,
-                            "to_body": self.definition_body_hash_opt(&b_entry.definition)?,
+                            "from_body": from_body,
+                            "to_body": to_body,
+                            "expr_changes": expr_changes,
                         }));
                     }
                 }
@@ -662,12 +672,231 @@ impl CodeDb {
         Ok(())
     }
 
+    /// Hash-pruned JSON tree diff of two expression subtrees. Structured sibling
+    /// of `diff_exprs`, emitting records into `changes` with a `path` locating
+    /// each change within the body.
+    ///
+    /// The prune is exact, not heuristic: every node hash is a Merkle hash over
+    /// the node's payload including all transitive child hashes, so `expr_a ==
+    /// expr_b` means the two subtrees are byte-identical — skipped without
+    /// loading either payload. Conversely, any descendant difference forces every
+    /// ancestor hash (up to the body and the symbol's definition hash) to differ,
+    /// so the walk always reaches a real change before pruning. Unrecognized
+    /// expression kinds report a single `expression_replaced` at their path
+    /// rather than descending — conservative, and never dropping a change.
+    fn diff_exprs_json(
+        &self,
+        root_a: &ProgramRootPayload,
+        root_b: &ProgramRootPayload,
+        expr_a: &str,
+        expr_b: &str,
+        path: &str,
+        changes: &mut Vec<JsonValue>,
+    ) -> Result<()> {
+        if expr_a == expr_b {
+            return Ok(());
+        }
+        let a = self.get_payload(expr_a)?;
+        let b = self.get_payload(expr_b)?;
+        let kind_a = a.get("expr_kind").and_then(JsonValue::as_str).unwrap_or("?");
+        let kind_b = b.get("expr_kind").and_then(JsonValue::as_str).unwrap_or("?");
+        if kind_a != kind_b {
+            changes.push(json!({
+                "kind": "expression_replaced",
+                "path": path,
+                "from": kind_a,
+                "to": kind_b,
+            }));
+            return Ok(());
+        }
+        match kind_a {
+            "literal_i64" | "literal_bool" => {
+                changes.push(json!({
+                    "kind": "literal_changed",
+                    "path": path,
+                    "from": a.get("value").cloned().unwrap_or(JsonValue::Null),
+                    "to": b.get("value").cloned().unwrap_or(JsonValue::Null),
+                }));
+            }
+            "literal_unit" => {
+                changes.push(json!({
+                    "kind": "expression_replaced",
+                    "path": path,
+                    "from": "literal_unit",
+                    "to": "literal_unit",
+                }));
+            }
+            "call" => {
+                let sym_a = a.get("symbol").and_then(JsonValue::as_str).unwrap_or("");
+                let sym_b = b.get("symbol").and_then(JsonValue::as_str).unwrap_or("");
+                if sym_a != sym_b {
+                    changes.push(json!({
+                        "kind": "call_target_changed",
+                        "path": path,
+                        "from": self
+                            .symbol_display(root_a, sym_a)
+                            .unwrap_or_else(|_| sym_a.to_string()),
+                        "to": self
+                            .symbol_display(root_b, sym_b)
+                            .unwrap_or_else(|_| sym_b.to_string()),
+                    }));
+                }
+                let args_a = a
+                    .get("args")
+                    .and_then(JsonValue::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let args_b = b
+                    .get("args")
+                    .and_then(JsonValue::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for (idx, (arg_a, arg_b)) in args_a.iter().zip(args_b.iter()).enumerate() {
+                    self.diff_exprs_json(
+                        root_a,
+                        root_b,
+                        arg_a.as_str().unwrap_or(""),
+                        arg_b.as_str().unwrap_or(""),
+                        &child_path(path, &format!("arg{idx}")),
+                        changes,
+                    )?;
+                }
+            }
+            "binary" => {
+                let op_a = a.get("op").and_then(JsonValue::as_str).unwrap_or("");
+                let op_b = b.get("op").and_then(JsonValue::as_str).unwrap_or("");
+                if op_a != op_b {
+                    changes.push(json!({
+                        "kind": "expression_replaced",
+                        "path": path,
+                        "from": format!("binary {op_a}"),
+                        "to": format!("binary {op_b}"),
+                    }));
+                }
+                for key in ["left", "right"] {
+                    self.diff_exprs_json(
+                        root_a,
+                        root_b,
+                        a.get(key).and_then(JsonValue::as_str).unwrap_or(""),
+                        b.get(key).and_then(JsonValue::as_str).unwrap_or(""),
+                        &child_path(path, key),
+                        changes,
+                    )?;
+                }
+            }
+            "unary" => {
+                let op_a = a.get("op").and_then(JsonValue::as_str).unwrap_or("");
+                let op_b = b.get("op").and_then(JsonValue::as_str).unwrap_or("");
+                if op_a != op_b {
+                    changes.push(json!({
+                        "kind": "expression_replaced",
+                        "path": path,
+                        "from": format!("unary {op_a}"),
+                        "to": format!("unary {op_b}"),
+                    }));
+                }
+                self.diff_exprs_json(
+                    root_a,
+                    root_b,
+                    a.get("expr").and_then(JsonValue::as_str).unwrap_or(""),
+                    b.get("expr").and_then(JsonValue::as_str).unwrap_or(""),
+                    &child_path(path, "expr"),
+                    changes,
+                )?;
+            }
+            "let" => {
+                if a.get("binding_type") != b.get("binding_type") {
+                    changes.push(json!({
+                        "kind": "let_binding_type_changed",
+                        "path": path,
+                        "from": a.get("binding_type").cloned().unwrap_or(JsonValue::Null),
+                        "to": b.get("binding_type").cloned().unwrap_or(JsonValue::Null),
+                    }));
+                }
+                if a.get("binding_name") != b.get("binding_name") {
+                    changes.push(json!({
+                        "kind": "let_binding_name_changed",
+                        "path": path,
+                        "from": a.get("binding_name").cloned().unwrap_or(JsonValue::Null),
+                        "to": b.get("binding_name").cloned().unwrap_or(JsonValue::Null),
+                    }));
+                }
+                for key in ["value", "body"] {
+                    self.diff_exprs_json(
+                        root_a,
+                        root_b,
+                        a.get(key).and_then(JsonValue::as_str).unwrap_or(""),
+                        b.get(key).and_then(JsonValue::as_str).unwrap_or(""),
+                        &child_path(path, key),
+                        changes,
+                    )?;
+                }
+            }
+            "if" => {
+                for key in ["cond", "then", "else"] {
+                    self.diff_exprs_json(
+                        root_a,
+                        root_b,
+                        a.get(key).and_then(JsonValue::as_str).unwrap_or(""),
+                        b.get(key).and_then(JsonValue::as_str).unwrap_or(""),
+                        &child_path(path, key),
+                        changes,
+                    )?;
+                }
+            }
+            "param_ref" => {
+                if a.get("index") != b.get("index") {
+                    changes.push(json!({
+                        "kind": "expression_replaced",
+                        "path": path,
+                        "from": a.get("index").cloned().unwrap_or(JsonValue::Null),
+                        "to": b.get("index").cloned().unwrap_or(JsonValue::Null),
+                    }));
+                }
+            }
+            "local_ref" => {
+                if a.get("depth") != b.get("depth") {
+                    changes.push(json!({
+                        "kind": "expression_replaced",
+                        "path": path,
+                        "from": a.get("depth").cloned().unwrap_or(JsonValue::Null),
+                        "to": b.get("depth").cloned().unwrap_or(JsonValue::Null),
+                    }));
+                }
+            }
+            _ => changes.push(json!({
+                "kind": "expression_replaced",
+                "path": path,
+            })),
+        }
+        let type_a = a.get("type").and_then(JsonValue::as_str).unwrap_or("");
+        let type_b = b.get("type").and_then(JsonValue::as_str).unwrap_or("");
+        if type_a != type_b {
+            changes.push(json!({
+                "kind": "type_changed",
+                "path": path,
+                "from": type_a,
+                "to": type_b,
+            }));
+        }
+        Ok(())
+    }
+
     fn definition_body_hash_opt(&self, definition_hash: &str) -> Result<Option<String>> {
         if self.definition_is_external(definition_hash)? {
             Ok(None)
         } else {
             Ok(Some(self.function_body_hash(definition_hash)?))
         }
+    }
+}
+
+/// Join a child segment onto a body path, avoiding a leading separator at the root.
+fn child_path(path: &str, segment: &str) -> String {
+    if path.is_empty() {
+        segment.to_string()
+    } else {
+        format!("{path}/{segment}")
     }
 }
 
