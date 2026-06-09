@@ -6078,80 +6078,24 @@ fn expr_type(payload: &JsonValue, expr_hash: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("expression missing type {expr_hash}"))
 }
 
+// Built-in operator semantics (source-op -> lowered kind, the inverse verify
+// mapping, and trap derivation) live in `crate::op_registry`, the single source
+// of truth shared with the reference evaluator and the parser. These remain thin
+// forwarders so the lowering call sites and `LoweredTrap` plumbing are untouched.
 fn lower_binary_kind(
     source_op: &str,
     left_type: &str,
     right_type: &str,
     result_type: &str,
 ) -> Result<String> {
-    let i64_hash = type_hash_for("I64");
-    let u8_hash = type_hash_for("U8");
-    let bool_hash = type_hash_for("Bool");
-    let kind = match source_op {
-        "+" if left_type == i64_hash && right_type == i64_hash && result_type == i64_hash => {
-            "add_i64"
-        }
-        "-" if left_type == i64_hash && right_type == i64_hash && result_type == i64_hash => {
-            "sub_i64"
-        }
-        "*" if left_type == i64_hash && right_type == i64_hash && result_type == i64_hash => {
-            "mul_i64"
-        }
-        "/" if left_type == i64_hash && right_type == i64_hash && result_type == i64_hash => {
-            "div_i64"
-        }
-        "==" if left_type == i64_hash && right_type == i64_hash && result_type == bool_hash => {
-            "eq_i64"
-        }
-        "!=" if left_type == i64_hash && right_type == i64_hash && result_type == bool_hash => {
-            "ne_i64"
-        }
-        "<" if left_type == i64_hash && right_type == i64_hash && result_type == bool_hash => {
-            "lt_i64"
-        }
-        "<=" if left_type == i64_hash && right_type == i64_hash && result_type == bool_hash => {
-            "le_i64"
-        }
-        ">" if left_type == i64_hash && right_type == i64_hash && result_type == bool_hash => {
-            "gt_i64"
-        }
-        ">=" if left_type == i64_hash && right_type == i64_hash && result_type == bool_hash => {
-            "ge_i64"
-        }
-        "==" if left_type == u8_hash && right_type == u8_hash && result_type == bool_hash => {
-            "eq_u8"
-        }
-        "!=" if left_type == u8_hash && right_type == u8_hash && result_type == bool_hash => {
-            "ne_u8"
-        }
-        "<" if left_type == u8_hash && right_type == u8_hash && result_type == bool_hash => "lt_u8",
-        "<=" if left_type == u8_hash && right_type == u8_hash && result_type == bool_hash => {
-            "le_u8"
-        }
-        ">" if left_type == u8_hash && right_type == u8_hash && result_type == bool_hash => "gt_u8",
-        ">=" if left_type == u8_hash && right_type == u8_hash && result_type == bool_hash => {
-            "ge_u8"
-        }
-        "&&" if left_type == bool_hash && right_type == bool_hash && result_type == bool_hash => {
-            "and_bool"
-        }
-        "||" if left_type == bool_hash && right_type == bool_hash && result_type == bool_hash => {
-            "or_bool"
-        }
-        _ => bail!("cannot lower binary operator {source_op} with operand/result types"),
-    };
-    Ok(kind.to_string())
+    crate::op_registry::lower_binary_kind(source_op, left_type, right_type, result_type)
 }
 
 fn trap_for_binary(kind: &str) -> Option<LoweredTrap> {
-    if kind == "div_i64" {
-        Some(LoweredTrap {
-            condition: "right_operand_zero".to_string(),
-            code: "division_by_zero".to_string(),
-        })
-    } else {
-        None
-    }
+    crate::op_registry::binary_trap(kind).map(|trap| LoweredTrap {
+        condition: trap.condition.to_string(),
+        code: trap.code.to_string(),
+    })
 }
 
 fn verify_binary_kind(
@@ -6161,65 +6105,21 @@ fn verify_binary_kind(
     result_type: &str,
     trap: Option<&LoweredTrap>,
 ) -> Result<()> {
-    let source_op = match kind {
-        "add_i64" => "+",
-        "sub_i64" => "-",
-        "mul_i64" => "*",
-        "div_i64" => "/",
-        "eq_i64" => "==",
-        "ne_i64" => "!=",
-        "lt_i64" => "<",
-        "le_i64" => "<=",
-        "gt_i64" => ">",
-        "ge_i64" => ">=",
-        "eq_u8" => "==",
-        "ne_u8" => "!=",
-        "lt_u8" => "<",
-        "le_u8" => "<=",
-        "gt_u8" => ">",
-        "ge_u8" => ">=",
-        "and_bool" => "&&",
-        "or_bool" => "||",
-        _ => bail!("unknown lowered binary kind {kind}"),
-    };
-    let expected = lower_binary_kind(source_op, left_type, right_type, result_type)?;
-    if expected != kind {
-        bail!("lowered binary kind/type mismatch");
-    }
-    match (kind, trap) {
-        ("div_i64", Some(LoweredTrap { condition, code }))
-            if condition == "right_operand_zero" && code == "division_by_zero" =>
-        {
-            Ok(())
-        }
-        ("div_i64", _) => bail!("lowered div_i64 must include a division_by_zero trap"),
-        (_, None) => Ok(()),
-        (_, Some(_)) => bail!("unexpected trap on lowered binary kind {kind}"),
-    }
+    crate::op_registry::verify_binary_kind(
+        kind,
+        left_type,
+        right_type,
+        result_type,
+        trap.map(|trap| (trap.condition.as_str(), trap.code.as_str())),
+    )
 }
 
 fn lower_unary_kind(source_op: &str, input_type: &str, result_type: &str) -> Result<String> {
-    let i64_hash = type_hash_for("I64");
-    let bool_hash = type_hash_for("Bool");
-    let kind = match source_op {
-        "-" if input_type == i64_hash && result_type == i64_hash => "neg_i64",
-        "!" if input_type == bool_hash && result_type == bool_hash => "not_bool",
-        _ => bail!("cannot lower unary operator {source_op} with operand/result types"),
-    };
-    Ok(kind.to_string())
+    crate::op_registry::lower_unary_kind(source_op, input_type, result_type)
 }
 
 fn verify_unary_kind(kind: &str, input_type: &str, result_type: &str) -> Result<()> {
-    let source_op = match kind {
-        "neg_i64" => "-",
-        "not_bool" => "!",
-        _ => bail!("unknown lowered unary kind {kind}"),
-    };
-    let expected = lower_unary_kind(source_op, input_type, result_type)?;
-    if expected != kind {
-        bail!("lowered unary kind/type mismatch");
-    }
-    Ok(())
+    crate::op_registry::verify_unary_kind(kind, input_type, result_type)
 }
 
 fn insert_value(values: &mut BTreeMap<String, String>, id: &str, type_hash: &str) -> Result<()> {

@@ -16,6 +16,8 @@ mod lowering;
 mod merge;
 mod migrations;
 mod model;
+mod op_registry;
+pub mod oracle;
 mod patch;
 mod provenance;
 pub mod server;
@@ -35,6 +37,7 @@ use serde_json::json;
 pub use expr::{
     ExternalFunctionSource, FunctionSource, ProgramItem, RawExpr, TypeDefinitionSource, Value,
 };
+pub use op_registry::operator_kinds;
 pub use store::CodeDb;
 pub use types::{Effect, ParamSpec, TypeDefinitionKind, TypeMemberSpec};
 

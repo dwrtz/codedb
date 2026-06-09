@@ -3514,52 +3514,19 @@ impl CodeDb {
 }
 
 pub(crate) fn eval_binary(op: &str, left: Value, right: Value) -> Result<Value> {
-    match (op, left, right) {
-        ("+", Value::I64(a), Value::I64(b)) => Ok(Value::I64(a + b)),
-        ("-", Value::I64(a), Value::I64(b)) => Ok(Value::I64(a - b)),
-        ("*", Value::I64(a), Value::I64(b)) => Ok(Value::I64(a * b)),
-        ("/", Value::I64(_), Value::I64(0)) => bail!("division by zero"),
-        ("/", Value::I64(a), Value::I64(b)) => Ok(Value::I64(a / b)),
-        ("==", Value::I64(a), Value::I64(b)) => Ok(Value::Bool(a == b)),
-        ("!=", Value::I64(a), Value::I64(b)) => Ok(Value::Bool(a != b)),
-        ("<", Value::I64(a), Value::I64(b)) => Ok(Value::Bool(a < b)),
-        ("<=", Value::I64(a), Value::I64(b)) => Ok(Value::Bool(a <= b)),
-        (">", Value::I64(a), Value::I64(b)) => Ok(Value::Bool(a > b)),
-        (">=", Value::I64(a), Value::I64(b)) => Ok(Value::Bool(a >= b)),
-        ("==", Value::U8(a), Value::U8(b)) => Ok(Value::Bool(a == b)),
-        ("!=", Value::U8(a), Value::U8(b)) => Ok(Value::Bool(a != b)),
-        ("<", Value::U8(a), Value::U8(b)) => Ok(Value::Bool(a < b)),
-        ("<=", Value::U8(a), Value::U8(b)) => Ok(Value::Bool(a <= b)),
-        (">", Value::U8(a), Value::U8(b)) => Ok(Value::Bool(a > b)),
-        (">=", Value::U8(a), Value::U8(b)) => Ok(Value::Bool(a >= b)),
-        ("&&", Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a && b)),
-        ("||", Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a || b)),
-        (op, left, right) => bail!("invalid operands for {op}: {left}, {right}"),
-    }
+    crate::op_registry::eval_binary(op, left, right)
 }
 
 pub(crate) fn eval_unary(op: &str, value: Value) -> Result<Value> {
-    match (op, value) {
-        ("-", Value::I64(value)) => Ok(Value::I64(-value)),
-        ("!", Value::Bool(value)) => Ok(Value::Bool(!value)),
-        (op, value) => bail!("invalid operand for {op}: {value}"),
-    }
+    crate::op_registry::eval_unary(op, value)
 }
 
 pub(crate) fn op_precedence(op: &str) -> u8 {
-    match op {
-        "||" => 1,
-        "&&" => 2,
-        "==" | "!=" => 3,
-        "<" | "<=" | ">" | ">=" => 4,
-        "+" | "-" => 5,
-        "*" | "/" => 6,
-        _ => 9,
-    }
+    crate::op_registry::binary_precedence(op)
 }
 
 pub(crate) fn unary_precedence() -> u8 {
-    7
+    crate::op_registry::UNARY_PRECEDENCE
 }
 
 fn assignment_precedence() -> u8 {

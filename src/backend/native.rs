@@ -38,6 +38,54 @@ const PLATFORM_FREE_SYMBOL_HASH: &str = "platform:free";
 const PLATFORM_MALLOC_ABI_SYMBOL: &str = "malloc";
 const PLATFORM_FREE_ABI_SYMBOL: &str = "free";
 
+/// A native object backend target.
+// Consumed by the `op_registry` backend-coverage unit test; kept in all builds
+// as a reusable guard rather than gated behind `cfg(test)`.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NativeArch {
+    X86_64,
+    Arm64,
+}
+
+/// Whether the native object backend has a machine-code encoder for a lowered
+/// operator `kind` on `arch`. Both targets currently encode the same operator
+/// set, so `arch` is accepted for API shape and future divergence.
+///
+/// KEEP IN SYNC with `emit_binary`/`emit_unary` on both targets (the x86_64
+/// `Emitter` and the arm64 `Arm64Emitter` `match kind { ... }` arms). This is the
+/// fast, toolchain-free half of the operator coverage guard: `op_registry`'s unit
+/// test asserts every `OPS` row is encodable here, so a new operator without a
+/// backend arm fails loudly. The per-op conformance fixtures
+/// (`tests/oracle_conformance.rs`) then exercise the real encoders end to end.
+#[allow(dead_code)]
+pub(crate) fn backend_encodes_kind(arch: NativeArch, kind: &str) -> bool {
+    let _ = arch;
+    matches!(
+        kind,
+        "add_i64"
+            | "sub_i64"
+            | "mul_i64"
+            | "div_i64"
+            | "eq_i64"
+            | "ne_i64"
+            | "lt_i64"
+            | "le_i64"
+            | "gt_i64"
+            | "ge_i64"
+            | "eq_u8"
+            | "ne_u8"
+            | "lt_u8"
+            | "le_u8"
+            | "gt_u8"
+            | "ge_u8"
+            | "and_bool"
+            | "or_bool"
+            | "neg_i64"
+            | "not_bool"
+    )
+}
+
 pub(crate) struct ElfObjectBackend;
 pub(crate) struct MachOArm64ObjectBackend;
 
