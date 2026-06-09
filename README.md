@@ -191,6 +191,8 @@ caller wants to pin the exact source root.
   track.
 - [docs/PLAN_V2.md](docs/PLAN_V2.md): v2 native semantic programming roadmap
   and phase plan.
+- [docs/ROADMAP.md](docs/ROADMAP.md): forward-looking language/compiler gaps
+  found by writing real programs against the v2 surface.
 - [docs/NATIVE_DONE.md](docs/NATIVE_DONE.md): native-required checklist for v2
   feature completion gates.
 - [examples/v2/README.md](examples/v2/README.md): v2 native acceptance program
