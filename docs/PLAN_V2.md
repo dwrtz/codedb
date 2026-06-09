@@ -1229,6 +1229,16 @@ verify validates effects and platform extern requirements
 
 Goal: expose new v2 program-model changes as intent-preserving semantic operations.
 
+Status: implemented for the initial safe operation surface. Semantic patches can
+now match root type definitions, rename record fields while preserving field
+identity and updating constructors/accesses, rename enum variants while
+preserving variant identity and updating constructors/cases, and convert a
+by-value function parameter to a shared or mutable reference with direct caller
+borrow rewrites in one expected-root-safe migration. Patch preview/apply now
+reports V2-specific region, borrow, layout, and codegen impact. Unsupported
+whole-program synthesis operations parse as reserved operation names and fail
+closed until their safety rules are explicit.
+
 Deliverables:
 
 ```text

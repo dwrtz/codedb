@@ -8,9 +8,9 @@ use serde_json::{Value as JsonValue, json};
 use crate::MAIN_BRANCH;
 use crate::expr::{RawCaseArm, RawExpr, RawRecordField};
 use crate::migrations::{MigrationOutcome, MigrationReport, Operation};
-use crate::model::{ProgramRootPayload, resolve_name_in_root};
+use crate::model::{ProgramRootPayload, param_names, resolve_name_in_root};
 use crate::store::{CodeDb, canonical_json, hash_bytes};
-use crate::types::ParamSpec;
+use crate::types::{ParamSpec, TypeMemberSpec, TypeSpec};
 
 const SEMANTIC_PATCH_SCHEMA: &str = "codedb/semantic-patch/v1";
 const SEMANTIC_PATCH_PREVIEW_SCHEMA: &str = "codedb/semantic-patch-preview/v1";
@@ -165,6 +165,60 @@ enum PatchReplace {
         #[serde(default, alias = "default_arg")]
         default: Option<RawExpr>,
     },
+    RenameField {
+        #[serde(default)]
+        field: Option<String>,
+        #[serde(default)]
+        field_symbol: Option<String>,
+        new_name: String,
+    },
+    AddFieldWithDefault {
+        name: String,
+        #[serde(rename = "type")]
+        ty: String,
+        #[serde(default)]
+        default: Option<RawExpr>,
+        #[serde(default)]
+        field_birth_seed: Option<String>,
+    },
+    RemoveFieldAndUpdateConstructors {
+        #[serde(default)]
+        field: Option<String>,
+        #[serde(default)]
+        field_symbol: Option<String>,
+    },
+    RenameVariantAndCases {
+        #[serde(default)]
+        variant: Option<String>,
+        #[serde(default)]
+        variant_symbol: Option<String>,
+        new_name: String,
+    },
+    BorrowParameter {
+        #[serde(default)]
+        param: Option<String>,
+        #[serde(default)]
+        param_index: Option<usize>,
+        #[serde(default = "default_region_name")]
+        region: String,
+        #[serde(default)]
+        mutable: bool,
+    },
+    ConvertByValueParamToRef {
+        #[serde(default)]
+        param: Option<String>,
+        #[serde(default)]
+        param_index: Option<usize>,
+        #[serde(default = "default_region_name")]
+        region: String,
+        #[serde(default)]
+        mutable: bool,
+    },
+    ThreadMutCursor,
+    ExtractSliceView,
+    ExtractRecord,
+    IntroduceBox,
+    ReplaceRawPointerWithSafeReference,
     RemoveUnusedSymbol,
     SetExport {
         exported_name: String,
@@ -341,6 +395,7 @@ impl CodeDb {
         let status = semantic_patch_preview_status(&matches, apply_preview.as_ref());
         let typecheck = semantic_patch_typecheck_status(apply_preview.as_ref());
         let build_impacts = semantic_patch_build_impacts(apply_preview.as_ref());
+        let v2_impact = semantic_patch_v2_impact(&planned_operations);
         let build_impact = if build_impacts.len() == 1 {
             build_impacts.first().cloned().unwrap_or(JsonValue::Null)
         } else if build_impacts.is_empty() {
@@ -371,6 +426,7 @@ impl CodeDb {
             "typecheck": typecheck,
             "build_impact": build_impact,
             "build_impacts": build_impacts,
+            "v2_impact": v2_impact,
             "conflicts": conflicts,
             "diagnostics": diagnostics,
             "apply_preview": apply_preview,
@@ -477,6 +533,7 @@ impl CodeDb {
             semantic_patch_apply_status(&matches, apply_result.as_ref(), patch.replace.is_some());
         let typecheck = semantic_patch_typecheck_status(apply_result.as_ref());
         let build_impacts = semantic_patch_build_impacts(apply_result.as_ref());
+        let v2_impact = semantic_patch_v2_impact(&planned_operations);
         let build_impact = if build_impacts.len() == 1 {
             build_impacts.first().cloned().unwrap_or(JsonValue::Null)
         } else if build_impacts.is_empty() {
@@ -536,6 +593,7 @@ impl CodeDb {
             "typecheck": typecheck,
             "build_impact": build_impact,
             "build_impacts": build_impacts,
+            "v2_impact": v2_impact,
             "conflicts": conflicts,
             "diagnostics": diagnostics,
             "apply_result": apply_result,
@@ -601,7 +659,8 @@ impl CodeDb {
                 }
             }
             PatchMatch::Type { type_hash, name } => {
-                let wanted = self.resolve_patch_type(type_hash.as_deref(), name.as_deref())?;
+                let wanted =
+                    self.resolve_patch_type(root, type_hash.as_deref(), name.as_deref())?;
                 self.collect_type_matches(root, &wanted, &mut matches)?;
             }
             PatchMatch::Expr { .. }
@@ -660,6 +719,18 @@ impl CodeDb {
         wanted_type_hash: &str,
         matches: &mut MatchSet,
     ) -> Result<()> {
+        if let TypeSpec::Named { type_symbol, .. } = self.type_spec(wanted_type_hash)?
+            && self.root_type(root, &type_symbol).is_some()
+        {
+            matches.types.push(TypeMatch {
+                type_hash: wanted_type_hash.to_string(),
+                type_name: self.type_name_in_root(root, MAIN_BRANCH, wanted_type_hash)?,
+                owner_kind: "type_definition".to_string(),
+                owner_hash: type_symbol,
+                symbol_hash: None,
+                symbol_name: None,
+            });
+        }
         for entry in &root.symbols {
             let symbol_name = self.symbol_display(root, &entry.symbol)?;
             let (params, return_type) = self.signature_parts(&entry.signature)?;
@@ -667,7 +738,7 @@ impl CodeDb {
                 if type_hash == wanted_type_hash {
                     matches.types.push(TypeMatch {
                         type_hash: type_hash.clone(),
-                        type_name: self.type_name(type_hash)?.to_string(),
+                        type_name: self.type_name_in_root(root, MAIN_BRANCH, type_hash)?,
                         owner_kind: "function_signature".to_string(),
                         owner_hash: entry.signature.clone(),
                         symbol_hash: Some(entry.symbol.clone()),
@@ -737,7 +808,7 @@ impl CodeDb {
                 if let Some(type_hash) = &type_hash {
                     matches.types.push(TypeMatch {
                         type_hash: type_hash.clone(),
-                        type_name: self.type_name(type_hash)?.to_string(),
+                        type_name: self.type_name_in_root(root, MAIN_BRANCH, type_hash)?,
                         owner_kind: "expression".to_string(),
                         owner_hash: expr_hash.to_string(),
                         symbol_hash: Some(owner_symbol.to_string()),
@@ -824,7 +895,8 @@ impl CodeDb {
                 }))
             }
             PatchMatch::Type { type_hash, name } => {
-                let wanted = self.resolve_patch_type(type_hash.as_deref(), name.as_deref())?;
+                let wanted =
+                    self.resolve_patch_type(root, type_hash.as_deref(), name.as_deref())?;
                 Ok(payload.get("type").and_then(JsonValue::as_str) == Some(wanted.as_str()))
             }
             PatchMatch::Symbol { .. }
@@ -925,6 +997,79 @@ impl CodeDb {
             PatchReplace::InlineFunction => self.plan_inline_function(root, matches, pattern),
             PatchReplace::AddParameter { name, ty, default } => {
                 self.plan_add_parameter(matches, name, ty, default.as_ref())
+            }
+            PatchReplace::RenameField {
+                field,
+                field_symbol,
+                new_name,
+            } => self.plan_rename_field(
+                root,
+                matches,
+                field.as_deref(),
+                field_symbol.as_deref(),
+                new_name,
+            ),
+            PatchReplace::AddFieldWithDefault {
+                name,
+                ty,
+                default,
+                field_birth_seed,
+            } => self.plan_add_field_with_default(
+                root,
+                matches,
+                name,
+                ty,
+                default.as_ref(),
+                field_birth_seed.as_deref(),
+            ),
+            PatchReplace::RemoveFieldAndUpdateConstructors {
+                field,
+                field_symbol,
+            } => self.plan_remove_field_and_update_constructors(
+                root,
+                matches,
+                field.as_deref(),
+                field_symbol.as_deref(),
+            ),
+            PatchReplace::RenameVariantAndCases {
+                variant,
+                variant_symbol,
+                new_name,
+            } => self.plan_rename_variant_and_cases(
+                root,
+                matches,
+                variant.as_deref(),
+                variant_symbol.as_deref(),
+                new_name,
+            ),
+            PatchReplace::BorrowParameter {
+                param,
+                param_index,
+                region,
+                mutable,
+            }
+            | PatchReplace::ConvertByValueParamToRef {
+                param,
+                param_index,
+                region,
+                mutable,
+            } => self.plan_convert_by_value_param_to_ref(
+                root,
+                matches,
+                param.as_deref(),
+                *param_index,
+                region,
+                *mutable,
+            ),
+            PatchReplace::ThreadMutCursor
+            | PatchReplace::ExtractSliceView
+            | PatchReplace::ExtractRecord
+            | PatchReplace::IntroduceBox
+            | PatchReplace::ReplaceRawPointerWithSafeReference => {
+                bail!(
+                    "semantic patch operation {} requires whole-program synthesis and is not yet safely implemented",
+                    patch_replace_kind_name(replace)
+                )
             }
             PatchReplace::RemoveUnusedSymbol => self.plan_remove_unused_symbol(matches),
             PatchReplace::SetExport { exported_name } => {
@@ -1386,6 +1531,217 @@ impl CodeDb {
             });
         }
         Ok(operations)
+    }
+
+    fn plan_rename_field(
+        &self,
+        root: &ProgramRootPayload,
+        matches: &MatchSet,
+        field: Option<&str>,
+        field_symbol: Option<&str>,
+        new_name: &str,
+    ) -> Result<Vec<Operation>> {
+        let mut operations = Vec::new();
+        for matched in matched_type_definitions(matches) {
+            let type_symbol = self.type_symbol_for_patch_type(root, &matched.type_hash)?;
+            let field_symbol = match field_symbol {
+                Some(symbol) => symbol.to_string(),
+                None => self.field_symbol_by_name(
+                    root,
+                    &type_symbol,
+                    field.ok_or_else(|| anyhow!("rename_field requires field or field_symbol"))?,
+                )?,
+            };
+            let old_name = match field {
+                Some(name) => name.to_string(),
+                None => self.member_name_by_symbol(root, &type_symbol, &field_symbol, true)?,
+            };
+            operations.push(Operation::RenameField {
+                module: MAIN_BRANCH.to_string(),
+                type_symbol,
+                type_name: matched.type_name.clone(),
+                field_symbol,
+                old_name,
+                new_name: new_name.to_string(),
+            });
+        }
+        Ok(operations)
+    }
+
+    fn plan_add_field_with_default(
+        &self,
+        root: &ProgramRootPayload,
+        matches: &MatchSet,
+        name: &str,
+        ty: &str,
+        default: Option<&RawExpr>,
+        field_birth_seed: Option<&str>,
+    ) -> Result<Vec<Operation>> {
+        if default.is_some() {
+            bail!(
+                "add_field_with_default cannot safely update constructors atomically yet; use structural add_field only when no constructors need defaults"
+            );
+        }
+        let mut operations = Vec::new();
+        for matched in matched_type_definitions(matches) {
+            let type_symbol = self.type_symbol_for_patch_type(root, &matched.type_hash)?;
+            operations.push(Operation::AddField {
+                module: MAIN_BRANCH.to_string(),
+                type_symbol: type_symbol.clone(),
+                type_name: matched.type_name.clone(),
+                field: TypeMemberSpec {
+                    name: name.to_string(),
+                    ty: ty.to_string(),
+                },
+                field_birth_seed: field_birth_seed
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("semantic-patch:add-field:{type_symbol}:{name}")),
+            });
+        }
+        Ok(operations)
+    }
+
+    fn plan_remove_field_and_update_constructors(
+        &self,
+        root: &ProgramRootPayload,
+        matches: &MatchSet,
+        field: Option<&str>,
+        field_symbol: Option<&str>,
+    ) -> Result<Vec<Operation>> {
+        let mut operations = Vec::new();
+        for matched in matched_type_definitions(matches) {
+            let type_symbol = self.type_symbol_for_patch_type(root, &matched.type_hash)?;
+            let field_symbol = match field_symbol {
+                Some(symbol) => symbol.to_string(),
+                None => self.field_symbol_by_name(
+                    root,
+                    &type_symbol,
+                    field.ok_or_else(|| {
+                        anyhow!(
+                            "remove_field_and_update_constructors requires field or field_symbol"
+                        )
+                    })?,
+                )?,
+            };
+            let name = match field {
+                Some(name) => name.to_string(),
+                None => self.member_name_by_symbol(root, &type_symbol, &field_symbol, true)?,
+            };
+            operations.push(Operation::RemoveField {
+                module: MAIN_BRANCH.to_string(),
+                type_symbol,
+                type_name: matched.type_name.clone(),
+                field_symbol,
+                name,
+            });
+        }
+        Ok(operations)
+    }
+
+    fn plan_rename_variant_and_cases(
+        &self,
+        root: &ProgramRootPayload,
+        matches: &MatchSet,
+        variant: Option<&str>,
+        variant_symbol: Option<&str>,
+        new_name: &str,
+    ) -> Result<Vec<Operation>> {
+        let mut operations = Vec::new();
+        for matched in matched_type_definitions(matches) {
+            let type_symbol = self.type_symbol_for_patch_type(root, &matched.type_hash)?;
+            let variant_symbol = match variant_symbol {
+                Some(symbol) => symbol.to_string(),
+                None => self.variant_symbol_by_name(
+                    root,
+                    &type_symbol,
+                    variant.ok_or_else(|| {
+                        anyhow!("rename_variant_and_cases requires variant or variant_symbol")
+                    })?,
+                )?,
+            };
+            let old_name = match variant {
+                Some(name) => name.to_string(),
+                None => self.member_name_by_symbol(root, &type_symbol, &variant_symbol, false)?,
+            };
+            operations.push(Operation::RenameVariant {
+                module: MAIN_BRANCH.to_string(),
+                type_symbol,
+                type_name: matched.type_name.clone(),
+                variant_symbol,
+                old_name,
+                new_name: new_name.to_string(),
+            });
+        }
+        Ok(operations)
+    }
+
+    fn plan_convert_by_value_param_to_ref(
+        &self,
+        root: &ProgramRootPayload,
+        matches: &MatchSet,
+        param: Option<&str>,
+        param_index: Option<usize>,
+        region: &str,
+        mutable: bool,
+    ) -> Result<Vec<Operation>> {
+        let mut operations = Vec::new();
+        for matched in &matches.symbols {
+            let names = param_names(root, &matched.symbol_hash);
+            let (index, name) = resolve_patch_param(&names, param, param_index)?;
+            operations.push(Operation::ConvertParamToReference {
+                module: matched.module.clone(),
+                symbol: matched.symbol_hash.clone(),
+                name: matched.name.clone(),
+                param_index: index,
+                param_name: name,
+                region: region.to_string(),
+                mutable,
+            });
+        }
+        Ok(operations)
+    }
+
+    fn type_symbol_for_patch_type(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+    ) -> Result<String> {
+        let TypeSpec::Named { type_symbol, .. } = self.type_spec(type_hash)? else {
+            bail!(
+                "semantic type patch requires a named v2 type, got {}",
+                self.type_name_in_root(root, MAIN_BRANCH, type_hash)?
+            );
+        };
+        if self.root_type(root, &type_symbol).is_none() {
+            bail!("type symbol is not present in patch root: {type_symbol}");
+        }
+        Ok(type_symbol)
+    }
+
+    fn member_name_by_symbol(
+        &self,
+        root: &ProgramRootPayload,
+        type_symbol: &str,
+        member_symbol: &str,
+        field: bool,
+    ) -> Result<String> {
+        let entry = self
+            .root_type(root, type_symbol)
+            .ok_or_else(|| anyhow!("type missing from root {type_symbol}"))?;
+        let definition = self.type_definition(&entry.type_def)?;
+        let members = match (&definition, field) {
+            (crate::types::TypeDefinition::Record { fields, .. }, true) => fields,
+            (crate::types::TypeDefinition::Enum { variants, .. }, false) => variants,
+            _ if field => bail!("rename_field requires record type {type_symbol}"),
+            _ => bail!("rename_variant_and_cases requires enum type {type_symbol}"),
+        };
+        members
+            .iter()
+            .find(|member| member.member_symbol == member_symbol)
+            .map(|member| member.name.clone())
+            .ok_or_else(|| {
+                anyhow!("type member symbol is not present in type {type_symbol}: {member_symbol}")
+            })
     }
 
     fn plan_remove_unused_symbol(&self, matches: &MatchSet) -> Result<Vec<Operation>> {
@@ -2010,15 +2366,20 @@ impl CodeDb {
         ))
     }
 
-    fn resolve_patch_type(&self, type_hash: Option<&str>, name: Option<&str>) -> Result<String> {
+    fn resolve_patch_type(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<String> {
         if let Some(type_hash) = type_hash {
-            self.type_name(type_hash)?;
+            self.type_name_in_root(root, MAIN_BRANCH, type_hash)?;
             return Ok(type_hash.to_string());
         }
         let Some(name) = name else {
             bail!("type match requires type_hash or name");
         };
-        self.type_hash_for_source(name)
+        self.type_hash_for_source_in_root(MAIN_BRANCH, root, name)
     }
 }
 
@@ -2159,7 +2520,8 @@ fn expression_literal_value(expr_kind: &str, payload: &JsonValue) -> Option<Json
 fn expression_child_hashes(expr_kind: &str, payload: &JsonValue) -> Result<Vec<String>> {
     let mut children = Vec::new();
     match expr_kind {
-        "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" | "local_ref" => {}
+        "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref"
+        | "local_ref" => {}
         "call" => {
             for arg in payload
                 .get("args")
@@ -2226,9 +2588,115 @@ fn expression_child_hashes(expr_kind: &str, payload: &JsonValue) -> Result<Vec<S
                 );
             }
         }
+        "borrow_shared" | "borrow_mut" | "slice_from_array" | "slice_len" => {
+            push_child_keys(payload, expr_kind, &["target"], &mut children)?;
+        }
+        "assign" => {
+            push_child_keys(payload, expr_kind, &["target", "value"], &mut children)?;
+        }
+        "record_literal" => {
+            for field in payload
+                .get("fields")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| anyhow!("record_literal missing fields"))?
+            {
+                children.push(
+                    field
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("record field missing value"))?
+                        .to_string(),
+                );
+            }
+        }
+        "array_literal" => {
+            for element in payload
+                .get("elements")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| anyhow!("array_literal missing elements"))?
+            {
+                children.push(
+                    element
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array element missing value"))?
+                        .to_string(),
+                );
+            }
+        }
+        "array_index" | "vec_get" => {
+            push_child_keys(payload, expr_kind, &["target", "index"], &mut children)?;
+        }
+        "field_access" => {
+            push_child_keys(payload, expr_kind, &["target"], &mut children)?;
+        }
+        "enum_construct" | "box_new" | "raw_ptr_cast" | "raw_load" => {
+            let key = if expr_kind == "raw_load" {
+                "pointer"
+            } else {
+                "value"
+            };
+            push_child_keys(payload, expr_kind, &[key], &mut children)?;
+        }
+        "case" => {
+            push_child_keys(payload, expr_kind, &["expr"], &mut children)?;
+            for arm in payload
+                .get("arms")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| anyhow!("case missing arms"))?
+            {
+                children.push(
+                    arm.get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("case arm missing body"))?
+                        .to_string(),
+                );
+            }
+        }
+        "subslice" => {
+            push_child_keys(
+                payload,
+                expr_kind,
+                &["target", "start", "len"],
+                &mut children,
+            )?;
+        }
+        "vec_new" => {
+            push_child_keys(payload, expr_kind, &["capacity"], &mut children)?;
+        }
+        "vec_push" => {
+            push_child_keys(payload, expr_kind, &["target", "value"], &mut children)?;
+        }
+        "vec_len" | "string_len" => {
+            push_child_keys(payload, expr_kind, &["target"], &mut children)?;
+        }
+        "string_new" => {
+            push_child_keys(payload, expr_kind, &["source"], &mut children)?;
+        }
+        "raw_store" => {
+            push_child_keys(payload, expr_kind, &["pointer", "value"], &mut children)?;
+        }
         other => bail!("unknown expression kind {other}"),
     }
     Ok(children)
+}
+
+fn push_child_keys(
+    payload: &JsonValue,
+    expr_kind: &str,
+    keys: &[&str],
+    children: &mut Vec<String>,
+) -> Result<()> {
+    for key in keys {
+        children.push(
+            payload
+                .get(*key)
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("{expr_kind} missing {key}"))?
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_same_args(args: Option<&JsonValue>) -> Result<()> {
@@ -2262,6 +2730,43 @@ fn matched_symbols_for_export_replace(matches: &MatchSet) -> Vec<MatchedSymbolFo
         );
     }
     by_symbol.into_values().collect()
+}
+
+fn matched_type_definitions(matches: &MatchSet) -> Vec<&TypeMatch> {
+    matches
+        .types
+        .iter()
+        .filter(|matched| matched.owner_kind == "type_definition")
+        .collect()
+}
+
+fn resolve_patch_param(
+    names: &[String],
+    param: Option<&str>,
+    param_index: Option<usize>,
+) -> Result<(usize, String)> {
+    match (param, param_index) {
+        (Some(name), Some(index)) => {
+            let actual = names
+                .get(index)
+                .ok_or_else(|| anyhow!("parameter index {index} is out of range"))?;
+            if actual != name {
+                bail!("parameter index {index} is {actual}, not {name}");
+            }
+            Ok((index, name.to_string()))
+        }
+        (Some(name), None) => names
+            .iter()
+            .position(|candidate| candidate == name)
+            .map(|index| (index, name.to_string()))
+            .ok_or_else(|| anyhow!("unknown parameter {name}")),
+        (None, Some(index)) => names
+            .get(index)
+            .cloned()
+            .map(|name| (index, name))
+            .ok_or_else(|| anyhow!("parameter index {index} is out of range")),
+        (None, None) => bail!("parameter patch requires param or param_index"),
+    }
 }
 
 struct MatchedSymbolForExport {
@@ -2450,6 +2955,53 @@ fn semantic_patch_build_impacts(apply_preview: Option<&JsonValue>) -> Vec<JsonVa
         .unwrap_or_default()
 }
 
+fn semantic_patch_v2_impact(operations: &[Operation]) -> JsonValue {
+    let mut region = BTreeSet::new();
+    let mut borrow = BTreeSet::new();
+    let mut layout = BTreeSet::new();
+    let mut codegen = BTreeSet::new();
+    for operation in operations {
+        match operation {
+            Operation::RenameField { .. } | Operation::RenameVariant { .. } => {
+                layout.insert("identity_preserved_no_layout_change");
+                codegen.insert("semantic_member_rewrite");
+            }
+            Operation::AddField { .. }
+            | Operation::RemoveField { .. }
+            | Operation::AddVariant { .. }
+            | Operation::RemoveVariant { .. } => {
+                layout.insert("type_layout_changed");
+                codegen.insert("native_layout_and_codegen_rebuild");
+            }
+            Operation::ConvertParamToReference { mutable, .. } => {
+                region.insert("region_parameter_required");
+                borrow.insert(if *mutable {
+                    "mutable_borrow_introduced"
+                } else {
+                    "shared_borrow_introduced"
+                });
+                layout.insert("signature_abi_changed_to_reference");
+                codegen.insert("callers_rewritten_and_recompiled");
+            }
+            Operation::ChangeFunctionSignature { .. } | Operation::AddParameter { .. } => {
+                layout.insert("signature_abi_changed");
+                codegen.insert("dependents_recompiled");
+            }
+            Operation::ReplaceFunctionBody { .. } => {
+                codegen.insert("function_body_recompiled");
+            }
+            _ => {}
+        }
+    }
+    json!({
+        "schema": "codedb/v2-patch-impact/v1",
+        "region_impact": region.into_iter().collect::<Vec<_>>(),
+        "borrow_impact": borrow.into_iter().collect::<Vec<_>>(),
+        "layout_impact": layout.into_iter().collect::<Vec<_>>(),
+        "codegen_impact": codegen.into_iter().collect::<Vec<_>>(),
+    })
+}
+
 fn semantic_patch_conflicts(apply_preview: Option<&JsonValue>) -> Vec<JsonValue> {
     apply_preview
         .and_then(|preview| preview.get("results"))
@@ -2569,6 +3121,7 @@ fn semantic_patch_agent_metadata(
             "match_count": matches.match_count(),
             "matched_symbols": symbol_matches_json(&matches.symbols),
             "matched_expressions": expression_matches_json(&matches.expressions),
+            "matched_types": type_matches_json(&matches.types),
             "matched_exports": export_matches_json(&matches.exports),
             "planned_operation_count": planned_operations.len(),
             "planned_operation_kinds": planned_operation_kinds,
@@ -2583,6 +3136,37 @@ fn semantic_patch_hash(patch: &SemanticPatch) -> Result<String> {
         SEMANTIC_PATCH_HASH_DOMAIN,
         canonical_json(&patch_json).as_bytes(),
     ))
+}
+
+fn patch_replace_kind_name(replace: &PatchReplace) -> &'static str {
+    match replace {
+        PatchReplace::LiteralI64 { .. } => "literal_i64",
+        PatchReplace::LiteralBool { .. } => "literal_bool",
+        PatchReplace::Unit => "unit",
+        PatchReplace::Call { .. } => "call",
+        PatchReplace::RenameSymbol { .. } => "rename_symbol",
+        PatchReplace::ExtractFunction { .. } => "extract_function",
+        PatchReplace::InlineFunction => "inline_function",
+        PatchReplace::AddParameter { .. } => "add_parameter",
+        PatchReplace::RenameField { .. } => "rename_field",
+        PatchReplace::AddFieldWithDefault { .. } => "add_field_with_default",
+        PatchReplace::RemoveFieldAndUpdateConstructors { .. } => {
+            "remove_field_and_update_constructors"
+        }
+        PatchReplace::RenameVariantAndCases { .. } => "rename_variant_and_cases",
+        PatchReplace::BorrowParameter { .. } => "borrow_parameter",
+        PatchReplace::ConvertByValueParamToRef { .. } => "convert_by_value_param_to_ref",
+        PatchReplace::ThreadMutCursor => "thread_mut_cursor",
+        PatchReplace::ExtractSliceView => "extract_slice_view",
+        PatchReplace::ExtractRecord => "extract_record",
+        PatchReplace::IntroduceBox => "introduce_box",
+        PatchReplace::ReplaceRawPointerWithSafeReference => {
+            "replace_raw_pointer_with_safe_reference"
+        }
+        PatchReplace::RemoveUnusedSymbol => "remove_unused_symbol",
+        PatchReplace::SetExport { .. } => "set_export",
+        PatchReplace::RemoveExport { .. } => "remove_export",
+    }
 }
 
 fn symbol_matches_json(matches: &[SymbolMatch]) -> Vec<JsonValue> {
@@ -3147,4 +3731,8 @@ fn local_at_depth<T>(locals: &[T], depth: usize) -> Option<&T> {
 
 fn default_branch() -> String {
     MAIN_BRANCH.to_string()
+}
+
+fn default_region_name() -> String {
+    "a".to_string()
 }

@@ -158,6 +158,16 @@ pub(crate) enum Operation {
         param: ParamSpec,
         default: Option<RawExpr>,
     },
+    ConvertParamToReference {
+        module: String,
+        symbol: String,
+        name: String,
+        param_index: usize,
+        param_name: String,
+        region: String,
+        #[serde(default)]
+        mutable: bool,
+    },
     DeleteSymbol {
         module: String,
         symbol: String,
@@ -240,6 +250,7 @@ impl Operation {
             Operation::ReplaceFunctionBody { .. } => "replace_function_body",
             Operation::ChangeFunctionSignature { .. } => "change_function_signature",
             Operation::AddParameter { .. } => "add_parameter",
+            Operation::ConvertParamToReference { .. } => "convert_param_to_reference",
             Operation::DeleteSymbol { .. } => "delete_symbol",
             Operation::CreateAlias { .. } => "create_alias",
             Operation::RemoveAlias { .. } => "remove_alias",
@@ -1078,6 +1089,20 @@ fn operation_summary_parts(op: &Operation) -> (String, SemanticImpact, Typecheck
             SemanticImpact::InterfaceChanged,
             TypecheckImpact::RootRechecked,
         ),
+        Operation::ConvertParamToReference {
+            module,
+            name,
+            param_name,
+            mutable,
+            ..
+        } => (
+            format!(
+                "{module}.{name}.{param_name} -> {}reference",
+                if *mutable { "mutable " } else { "" }
+            ),
+            SemanticImpact::InterfaceChanged,
+            TypecheckImpact::RootRechecked,
+        ),
         Operation::DeleteSymbol { module, name, .. } => (
             format!("{module}.{name}"),
             SemanticImpact::SymbolDeleted,
@@ -1207,6 +1232,17 @@ fn fallback_build_impact(op: &Operation) -> BuildImpact {
             true,
             vec![symbol.clone()],
             vec![BuildImpactReason::InterfaceHashChanged],
+        ),
+        Operation::ConvertParamToReference { symbol, .. } => (
+            BuildImpactKind::RecompileDependents,
+            vec![symbol.clone()],
+            true,
+            vec![symbol.clone()],
+            vec![
+                BuildImpactReason::InterfaceHashChanged,
+                BuildImpactReason::BodyExpressionHashChanged,
+                BuildImpactReason::DependencySetChanged,
+            ],
         ),
         Operation::DeleteSymbol { symbol, .. } => (
             BuildImpactKind::RelinkOnly,
@@ -1796,6 +1832,12 @@ impl CodeDb {
                 name,
                 ..
             }
+            | Operation::ConvertParamToReference {
+                module,
+                symbol,
+                name,
+                ..
+            }
             | Operation::DeleteSymbol {
                 module,
                 symbol,
@@ -2242,6 +2284,12 @@ impl CodeDb {
                 },
             ],
             Operation::AddParameter {
+                module,
+                symbol,
+                name,
+                ..
+            }
+            | Operation::ConvertParamToReference {
                 module,
                 symbol,
                 name,
@@ -2990,6 +3038,24 @@ impl CodeDb {
             } => {
                 self.apply_add_parameter(input_root, module, symbol, name, param, default.as_ref())
             }
+            Operation::ConvertParamToReference {
+                module,
+                symbol,
+                name,
+                param_index,
+                param_name,
+                region,
+                mutable,
+            } => self.apply_convert_param_to_reference(
+                input_root,
+                module,
+                symbol,
+                name,
+                *param_index,
+                param_name,
+                region,
+                *mutable,
+            ),
             Operation::DeleteSymbol {
                 module,
                 symbol,
@@ -4158,6 +4224,237 @@ impl CodeDb {
         self.type_check_root(&new_root)
             .context("added parameter invalidates existing root")?;
         Ok(new_root)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_convert_param_to_reference(
+        &mut self,
+        input_root: &str,
+        module: &str,
+        symbol: &str,
+        name: &str,
+        param_index: usize,
+        param_name: &str,
+        region: &str,
+        mutable: bool,
+    ) -> Result<String> {
+        validate_projection_identifier("region parameter", region)?;
+        let mut root = self.load_root(input_root)?;
+        let old_root = root.clone();
+        self.assert_name_points(&root, module, name, symbol)?;
+        let callers = self.reverse_dependencies_for_root(&old_root, symbol)?;
+
+        let idx = root_symbol_index(&root, symbol)?;
+        let old_signature = root.symbols[idx].signature.clone();
+        let old_definition = root.symbols[idx].definition.clone();
+        if self.definition_is_external(&old_definition)? {
+            bail!("cannot convert parameter on external function {module}.{name}");
+        }
+
+        let (mut param_types, return_type) = self.signature_parts(&old_signature)?;
+        let effects = self.signature_effects(&old_signature)?;
+        let param_name_list = param_names(&root, symbol);
+        let actual_param_name = param_name_list
+            .get(param_index)
+            .ok_or_else(|| anyhow!("{module}.{name} has no parameter index {param_index}"))?;
+        if actual_param_name != param_name {
+            bail!(
+                "parameter index {param_index} is {actual_param_name}, not {param_name} on {module}.{name}"
+            );
+        }
+        let old_param_type = param_types
+            .get(param_index)
+            .cloned()
+            .ok_or_else(|| anyhow!("{module}.{name} has no parameter index {param_index}"))?;
+        if matches!(
+            self.type_spec_in_root(&root, &old_param_type)?,
+            TypeSpec::Reference { .. }
+        ) {
+            bail!(
+                "parameter {module}.{name}.{param_name} is already a reference; convert_by_value_param_to_ref requires a by-value parameter"
+            );
+        }
+
+        let mut region_params = self.signature_region_params(&old_signature)?;
+        self.ensure_signature_region_param(&mut region_params, symbol, region)?;
+        let region_scope = region_scope_from_params(&region_params);
+        let referent_source =
+            self.type_name_in_root_with_regions(&root, module, &old_param_type, &region_scope)?;
+        let reference_source = if mutable {
+            format!("&'{region} mut {referent_source}")
+        } else {
+            format!("&'{region} {referent_source}")
+        };
+        param_types[param_index] = self.resolve_type_in_root_with_regions(
+            module,
+            &root,
+            &reference_source,
+            &region_scope,
+        )?;
+        let new_signature = self.put_signature_with_effects_and_regions(
+            &param_types,
+            &return_type,
+            &effects,
+            &region_params,
+        )?;
+        root.symbols[idx].signature = new_signature;
+        upsert_param_names(&mut root, symbol, param_name_list);
+
+        let mut affected = callers.into_iter().collect::<BTreeSet<_>>();
+        affected.insert(symbol.to_string());
+        for affected_symbol in affected {
+            let affected_idx = root_symbol_index(&root, &affected_symbol)?;
+            if self.definition_is_external(&root.symbols[affected_idx].definition)? {
+                continue;
+            }
+            let old_entry = old_root
+                .symbols
+                .iter()
+                .find(|entry| entry.symbol == affected_symbol)
+                .ok_or_else(|| {
+                    anyhow!("affected symbol missing from old root {affected_symbol}")
+                })?;
+            let affected_module = preferred_module_for_symbol(&old_root, &affected_symbol)?;
+            if affected_symbol != symbol {
+                self.ensure_function_signature_region(
+                    &mut root,
+                    &affected_symbol,
+                    &affected_module,
+                    region,
+                )?;
+            }
+
+            let current_signature = root.symbols[affected_idx].signature.clone();
+            let current_region_params = self.signature_region_params(&current_signature)?;
+            let current_region_scope = region_scope_from_params(&current_region_params);
+            let current_region_names = current_region_params
+                .iter()
+                .map(|param| (param.region.clone(), param.name.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let old_region_names = self
+                .signature_region_params(&old_entry.signature)?
+                .into_iter()
+                .map(|param| (param.region, param.name))
+                .collect::<BTreeMap<_, _>>();
+            let old_body_hash = self.function_body_hash(&old_entry.definition)?;
+            let old_raw_body = self.typed_expr_to_raw_in_module_with_regions(
+                &old_body_hash,
+                &old_root,
+                &affected_module,
+                &old_region_names,
+            )?;
+            let target_name = self.symbol_display_for_module(&root, &affected_module, symbol)?;
+            let patched_body = borrow_call_arg_to_calls(
+                &old_raw_body,
+                &target_name,
+                param_index,
+                region,
+                mutable,
+            )?;
+            let (current_param_types, current_return_type) =
+                self.signature_parts(&current_signature)?;
+            let current_param_names = param_names(&root, &affected_symbol);
+            let typed_body = self.type_expr_in_module_with_regions_expecting(
+                &affected_module,
+                &patched_body,
+                &root,
+                &current_param_names,
+                &current_param_types,
+                &current_region_scope,
+                Some(&current_return_type),
+            )?;
+            if !self.type_assignable_in_root(&root, &typed_body.type_hash, &current_return_type)? {
+                bail!(
+                    "converted parameter rewrite changed function {} body type from {} to {}",
+                    self.symbol_display(&root, &affected_symbol)?,
+                    self.type_name_in_root_with_regions(
+                        &root,
+                        &affected_module,
+                        &current_return_type,
+                        &current_region_names,
+                    )?,
+                    self.type_name_in_root_with_regions(
+                        &root,
+                        &affected_module,
+                        &typed_body.type_hash,
+                        &current_region_names,
+                    )?
+                );
+            }
+            root.symbols[affected_idx].definition =
+                self.put_function_def(&affected_symbol, &current_signature, &typed_body.expr_hash)?;
+        }
+
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)
+            .context("converted parameter invalidates existing root")?;
+        Ok(new_root)
+    }
+
+    fn ensure_signature_region_param(
+        &mut self,
+        region_params: &mut Vec<RegionParamDef>,
+        owner_symbol: &str,
+        region: &str,
+    ) -> Result<String> {
+        if let Some(existing) = region_params.iter().find(|param| param.name == region) {
+            return Ok(existing.region.clone());
+        }
+        let region_hash = self.put_region_param_birth(
+            None,
+            owner_symbol,
+            &format!("semantic-patch:region:{owner_symbol}:{region}"),
+        )?;
+        region_params.push(RegionParamDef {
+            region: region_hash.clone(),
+            name: region.to_string(),
+        });
+        Ok(region_hash)
+    }
+
+    fn ensure_function_signature_region(
+        &mut self,
+        root: &mut ProgramRootPayload,
+        symbol: &str,
+        module: &str,
+        region: &str,
+    ) -> Result<()> {
+        let idx = root_symbol_index(root, symbol)?;
+        let signature = root.symbols[idx].signature.clone();
+        let mut region_params = self.signature_region_params(&signature)?;
+        if region_params.iter().any(|param| param.name == region) {
+            return Ok(());
+        }
+        self.ensure_signature_region_param(&mut region_params, symbol, region)?;
+        let (param_types, return_type) = self.signature_parts(&signature)?;
+        let effects = self.signature_effects(&signature)?;
+        let new_signature = self.put_signature_with_effects_and_regions(
+            &param_types,
+            &return_type,
+            &effects,
+            &region_params,
+        )?;
+        root.symbols[idx].signature = new_signature;
+        let names = param_names(root, symbol);
+        validate_param_names(
+            &param_types
+                .iter()
+                .zip(names.iter())
+                .map(|(ty, name)| {
+                    Ok(ParamSpec {
+                        name: name.clone(),
+                        ty: self.type_name_in_root_with_regions(
+                            root,
+                            module,
+                            ty,
+                            &region_scope_from_params(&region_params),
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )?;
+        Ok(())
     }
 
     pub(crate) fn apply_delete_symbol(
@@ -6311,6 +6608,293 @@ impl CodeDb {
             })
             .collect()
     }
+}
+
+fn borrow_call_arg_to_calls(
+    expr: &RawExpr,
+    target_name: &str,
+    param_index: usize,
+    region: &str,
+    mutable: bool,
+) -> Result<RawExpr> {
+    Ok(match expr {
+        RawExpr::LiteralI64 { value } => RawExpr::LiteralI64 {
+            value: value.clone(),
+        },
+        RawExpr::LiteralBool { value } => RawExpr::LiteralBool { value: *value },
+        RawExpr::LiteralString { value } => RawExpr::LiteralString {
+            value: value.clone(),
+        },
+        RawExpr::LiteralBytes { bytes_hex } => RawExpr::LiteralBytes {
+            bytes_hex: bytes_hex.clone(),
+        },
+        RawExpr::Unit => RawExpr::Unit,
+        RawExpr::ParamRef { index } => RawExpr::ParamRef { index: *index },
+        RawExpr::ParamName { name } => RawExpr::ParamName { name: name.clone() },
+        RawExpr::Call { name, args } => {
+            let mut args = args
+                .iter()
+                .map(|arg| borrow_call_arg_to_calls(arg, target_name, param_index, region, mutable))
+                .collect::<Result<Vec<_>>>()?;
+            if name == target_name {
+                let arg = args.get_mut(param_index).ok_or_else(|| {
+                    anyhow!("call to {target_name} has no argument index {param_index}")
+                })?;
+                let target = Box::new(arg.clone());
+                *arg = if mutable {
+                    RawExpr::BorrowMut {
+                        region: Some(region.to_string()),
+                        target,
+                    }
+                } else {
+                    RawExpr::BorrowShared {
+                        region: Some(region.to_string()),
+                        target,
+                    }
+                };
+            }
+            RawExpr::Call {
+                name: name.clone(),
+                args,
+            }
+        }
+        RawExpr::Binary { op, left, right } => RawExpr::Binary {
+            op: op.clone(),
+            left: Box::new(borrow_call_arg_to_calls(
+                left,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+            right: Box::new(borrow_call_arg_to_calls(
+                right,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+        },
+        RawExpr::Unary { op, expr } => RawExpr::Unary {
+            op: op.clone(),
+            expr: Box::new(borrow_call_arg_to_calls(
+                expr,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+        },
+        RawExpr::BorrowShared { region: r, target } => RawExpr::BorrowShared {
+            region: r.clone(),
+            target: Box::new(borrow_call_arg_to_calls(
+                target,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+        },
+        RawExpr::BorrowMut { region: r, target } => RawExpr::BorrowMut {
+            region: r.clone(),
+            target: Box::new(borrow_call_arg_to_calls(
+                target,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+        },
+        RawExpr::Assign { target, value } => RawExpr::Assign {
+            target: Box::new(borrow_call_arg_to_calls(
+                target,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+            value: Box::new(borrow_call_arg_to_calls(
+                value,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+        },
+        RawExpr::Let {
+            name,
+            ty,
+            value,
+            body,
+        } => RawExpr::Let {
+            name: name.clone(),
+            ty: ty.clone(),
+            value: Box::new(borrow_call_arg_to_calls(
+                value,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+            body: Box::new(borrow_call_arg_to_calls(
+                body,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+        },
+        RawExpr::If {
+            cond,
+            then_expr,
+            else_expr,
+        } => RawExpr::If {
+            cond: Box::new(borrow_call_arg_to_calls(
+                cond,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+            then_expr: Box::new(borrow_call_arg_to_calls(
+                then_expr,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+            else_expr: Box::new(borrow_call_arg_to_calls(
+                else_expr,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+        },
+        RawExpr::Fold {
+            item,
+            target,
+            acc,
+            init,
+            body,
+        } => RawExpr::Fold {
+            item: item.clone(),
+            target: Box::new(borrow_call_arg_to_calls(
+                target,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+            acc: acc.clone(),
+            init: Box::new(borrow_call_arg_to_calls(
+                init,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+            body: Box::new(borrow_call_arg_to_calls(
+                body,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+        },
+        RawExpr::Array { elements } => RawExpr::Array {
+            elements: elements
+                .iter()
+                .map(|element| {
+                    borrow_call_arg_to_calls(element, target_name, param_index, region, mutable)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        },
+        RawExpr::Index { target, index } => RawExpr::Index {
+            target: Box::new(borrow_call_arg_to_calls(
+                target,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+            index: Box::new(borrow_call_arg_to_calls(
+                index,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+        },
+        RawExpr::Record { fields } => RawExpr::Record {
+            fields: fields
+                .iter()
+                .map(|field| {
+                    Ok(RawRecordField {
+                        name: field.name.clone(),
+                        value: borrow_call_arg_to_calls(
+                            &field.value,
+                            target_name,
+                            param_index,
+                            region,
+                            mutable,
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        },
+        RawExpr::FieldAccess { target, field } => RawExpr::FieldAccess {
+            target: Box::new(borrow_call_arg_to_calls(
+                target,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+            field: field.clone(),
+        },
+        RawExpr::EnumConstruct {
+            enum_type,
+            variant,
+            value,
+        } => RawExpr::EnumConstruct {
+            enum_type: enum_type.clone(),
+            variant: variant.clone(),
+            value: Box::new(borrow_call_arg_to_calls(
+                value,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+        },
+        RawExpr::Case { expr, arms } => RawExpr::Case {
+            expr: Box::new(borrow_call_arg_to_calls(
+                expr,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+            arms: arms
+                .iter()
+                .map(|arm| {
+                    Ok(RawCaseArm {
+                        variant: arm.variant.clone(),
+                        default: arm.default,
+                        binding: arm.binding.clone(),
+                        body: borrow_call_arg_to_calls(
+                            &arm.body,
+                            target_name,
+                            param_index,
+                            region,
+                            mutable,
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        },
+    })
 }
 
 fn normalize_param_refs(expr: &RawExpr, local_params: &[String]) -> RawExpr {

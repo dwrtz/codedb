@@ -132,8 +132,12 @@ inspection output.
 
 `codedb patch preview <db> --json <file>` accepts a higher-level
 `codedb/semantic-patch/v1` document, matches semantic structure such as
-literals and call targets, returns matched hashes and planned structural
-operations, and rolls back the typecheck/build-impact preview. See
+literals, call targets, V2 type definitions, fields, variants, and reference
+parameter intent, returns matched hashes and planned structural operations, and
+rolls back the typecheck/build-impact preview. Patch results include V2
+region/borrow/layout/codegen impact for supported V2 operations such as
+`rename_field`, `rename_variant_and_cases`, and
+`convert_by_value_param_to_ref`. See
 [docs/PATCH.md](docs/PATCH.md).
 
 For operation-by-operation examples, see [docs/MIGRATIONS.md](docs/MIGRATIONS.md).

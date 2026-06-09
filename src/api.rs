@@ -251,6 +251,20 @@ enum ApiOperation {
         #[serde(default, alias = "expect_root")]
         expect_root_hash: Option<String>,
     },
+    ConvertParamToReference {
+        #[serde(default = "default_module")]
+        module: String,
+        #[serde(default)]
+        symbol: Option<String>,
+        name: String,
+        param_index: usize,
+        param_name: String,
+        region: String,
+        #[serde(default)]
+        mutable: bool,
+        #[serde(default, alias = "expect_root")]
+        expect_root_hash: Option<String>,
+    },
     DeleteSymbol {
         #[serde(default = "default_module")]
         module: String,
@@ -383,6 +397,9 @@ impl ApiOperation {
                 expect_root_hash, ..
             }
             | ApiOperation::AddParameter {
+                expect_root_hash, ..
+            }
+            | ApiOperation::ConvertParamToReference {
                 expect_root_hash, ..
             }
             | ApiOperation::DeleteSymbol {
@@ -992,6 +1009,24 @@ impl CodeDb {
                 name: name.clone(),
                 param: param.clone(),
                 default: default.clone(),
+            }),
+            ApiOperation::ConvertParamToReference {
+                module,
+                symbol,
+                name,
+                param_index,
+                param_name,
+                region,
+                mutable,
+                ..
+            } => Ok(Operation::ConvertParamToReference {
+                module: module.clone(),
+                symbol: self.symbol_or_resolve(expected_root, module, name, symbol)?,
+                name: name.clone(),
+                param_index: *param_index,
+                param_name: param_name.clone(),
+                region: region.clone(),
+                mutable: *mutable,
             }),
             ApiOperation::DeleteSymbol {
                 module,

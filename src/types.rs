@@ -738,6 +738,7 @@ impl CodeDb {
         self.put_type_spec_in_root(current_module, root, &parsed, region_scope)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn type_hash_for_source(&self, ty: &str) -> Result<String> {
         let parsed = parse_type_source(ty)?;
         type_hash_for_spec(&parsed)

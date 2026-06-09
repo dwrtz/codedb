@@ -992,7 +992,7 @@ impl CodeDb {
                     }
                 }
             }
-            Operation::AddParameter { .. } => {
+            Operation::AddParameter { .. } | Operation::ConvertParamToReference { .. } => {
                 let changed_reasons = self.classify_root_symbol_change_between(
                     &item.input_root,
                     &item.output_root,

@@ -70,7 +70,15 @@ Supported match kinds are `symbol`, `function_definition`, `expr`,
 
 Supported replacements are `literal_i64`, `literal_bool`, `unit`, `call`,
 `rename_symbol`, `extract_function`, `inline_function`, `add_parameter`,
-`remove_unused_symbol`, `set_export`, and `remove_export`.
+`rename_field`, `rename_variant_and_cases`, `borrow_parameter`,
+`convert_by_value_param_to_ref`, `add_field_with_default`,
+`remove_field_and_update_constructors`, `remove_unused_symbol`, `set_export`,
+and `remove_export`.
+
+`thread_mut_cursor`, `extract_slice_view`, `extract_record`, `introduce_box`,
+and `replace_raw_pointer_with_safe_reference` are reserved V2 operation names.
+They are parsed by the patch language but fail closed until their whole-program
+synthesis rules are implemented.
 
 Extract a matched expression into a new function and replace the expression
 with a call:
@@ -147,6 +155,71 @@ Remove a symbol only when it has no live references or semantic tests:
 }
 ```
 
+## V2 Type and Borrow Patches
+
+Rename a record field while preserving its stable field identity and updating
+record constructors and field accesses:
+
+```json
+{
+  "schema": "codedb/semantic-patch/v1",
+  "match": {
+    "kind": "type",
+    "name": "Line"
+  },
+  "replace": {
+    "kind": "rename_field",
+    "field": "price_cents",
+    "new_name": "amount_cents"
+  }
+}
+```
+
+Rename an enum variant while preserving its stable variant identity and updating
+constructors and `case` arms:
+
+```json
+{
+  "schema": "codedb/semantic-patch/v1",
+  "match": {
+    "kind": "type",
+    "name": "Discount"
+  },
+  "replace": {
+    "kind": "rename_variant_and_cases",
+    "variant": "percent",
+    "new_name": "pct"
+  }
+}
+```
+
+Convert a by-value parameter to a safe reference and rewrite direct callers to
+borrow the corresponding argument:
+
+```json
+{
+  "schema": "codedb/semantic-patch/v1",
+  "match": {
+    "kind": "symbol",
+    "name": "line_total"
+  },
+  "replace": {
+    "kind": "convert_by_value_param_to_ref",
+    "param": "line",
+    "region": "a"
+  }
+}
+```
+
+`borrow_parameter` is an alias for the same operation. Set `"mutable": true` to
+request a mutable reference rewrite; borrow checking and type checking still
+run before commit.
+
+`add_field_with_default` currently lowers to structural `add_field` only when no
+`default` is supplied. A defaulted constructor rewrite, and
+`remove_field_and_update_constructors`, fail closed because they require an
+atomic type-and-body migration that is not yet exposed safely.
+
 ## Result
 
 Preview returns `codedb/semantic-patch-preview/v1` JSON with:
@@ -159,9 +232,13 @@ matched_exports
 planned_operations
 typecheck
 build_impact
+v2_impact
 apply_preview
 diagnostics
 ```
+
+`v2_impact` reports `region_impact`, `borrow_impact`, `layout_impact`, and
+`codegen_impact` separately from the coarse build impact.
 
 `apply_preview` is the nested rollback-only `codedb/apply-result/v1` report.
 If a patch would fail type checking, preview returns `status: "error"` with a
