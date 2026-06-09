@@ -601,6 +601,7 @@ mod tests {
                 exports: vec![],
                 tests: vec![],
                 recursion_groups: vec![],
+                type_recursion_groups: vec![],
                 metadata: BTreeMap::new(),
             })
             .unwrap();
@@ -634,6 +635,7 @@ mod tests {
                 exports: vec![],
                 tests: vec![],
                 recursion_groups: vec![],
+                type_recursion_groups: vec![],
                 metadata: BTreeMap::new(),
             })
             .unwrap();
@@ -776,6 +778,7 @@ mod tests {
                 exports: vec![],
                 tests: vec![],
                 recursion_groups: vec![],
+                type_recursion_groups: vec![],
                 metadata: BTreeMap::new(),
             })
             .unwrap();
@@ -809,6 +812,7 @@ mod tests {
                 exports: vec![],
                 tests: vec![],
                 recursion_groups: vec![],
+                type_recursion_groups: vec![],
                 metadata: BTreeMap::new(),
             })
             .unwrap();

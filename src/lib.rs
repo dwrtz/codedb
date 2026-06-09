@@ -43,7 +43,8 @@ pub use types::{Effect, ParamSpec, TypeDefinitionKind, TypeMemberSpec};
 
 use backend::ArtifactKind;
 use expr::{parse_expr_source, parse_program, parse_signature_source_with_effects};
-use migrations::{Operation, RecursionGroupMemberSpec};
+use migrations::{Operation, RecursionGroupMemberSpec, TypeGroupMemberSpec};
+use types::collect_named_type_refs;
 use model::{param_names, preferred_names, preferred_type_names, root_module_names};
 
 pub(crate) const SCHEMA_SQL: &str = include_str!("../schema.sql");
@@ -140,6 +141,58 @@ impl CodeDb {
         analysis
     }
 
+    /// Which parsed type items form mutually-recursive cliques (SPEC_V3 §6, D1).
+    /// Only cliques of size > 1 are grouped: a single self-recursive type already
+    /// resolves through `apply_create_type`'s placeholder, so it keeps its plain
+    /// `CreateType` op (no migration-history churn), exactly as non-recursive
+    /// functions keep `CreateFunction`.
+    fn analyze_type_recursion_groups(items: &[ProgramItem]) -> RecursionAnalysis {
+        let mut type_items: Vec<usize> = Vec::new();
+        let mut name_to_node: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
+        for (idx, item) in items.iter().enumerate() {
+            if let ProgramItem::TypeDefinition(definition) = item {
+                let node = type_items.len();
+                type_items.push(idx);
+                name_to_node.insert((definition.module.clone(), definition.name.clone()), node);
+            }
+        }
+        let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); type_items.len()];
+        for (node, &item_idx) in type_items.iter().enumerate() {
+            let ProgramItem::TypeDefinition(definition) = &items[item_idx] else {
+                continue;
+            };
+            // A definition whose member types cannot be parsed here is left to fail
+            // later in `apply_create_type`; it simply contributes no clique edges.
+            let Ok(refs) = collect_named_type_refs(&definition.definition) else {
+                continue;
+            };
+            for name in refs {
+                if let Some(target) = resolve_call_node(&name, &definition.module, &name_to_node)
+                    && !adjacency[node].contains(&target)
+                {
+                    adjacency[node].push(target);
+                }
+            }
+        }
+        let mut analysis = RecursionAnalysis::default();
+        for component in tarjan_scc(&adjacency) {
+            if component.len() <= 1 {
+                continue;
+            }
+            let members: Vec<usize> = component.iter().map(|&node| type_items[node]).collect();
+            // Canonical (structural) member order so the clique's content identity is
+            // independent of source declaration order (SPEC_V3 §6/§10).
+            let members = canonical_type_member_order(items, &members);
+            let group_id = analysis.groups.len();
+            for &member in &members {
+                analysis.group_of.insert(member, group_id);
+            }
+            analysis.groups.push(members);
+        }
+        analysis
+    }
+
     pub fn import_file(&mut self, path: &Path) -> Result<String> {
         self.ensure_initialized()?;
         let source = std::fs::read_to_string(path)
@@ -152,22 +205,59 @@ impl CodeDb {
         // original one-op-per-item lowering — unchanged migration history.
         let recursion = Self::analyze_recursion_groups(&items);
         let mut emitted_group = vec![false; recursion.groups.len()];
+        // Mutually-recursive TYPE cliques (D1) are likewise created atomically.
+        let type_recursion = Self::analyze_type_recursion_groups(&items);
+        let mut emitted_type_group = vec![false; type_recursion.groups.len()];
 
         for (idx, item) in items.iter().enumerate() {
             let branch = self.branch(MAIN_BRANCH)?;
             let op = match item {
                 ProgramItem::TypeDefinition(definition) => {
-                    let birth_seed = format!(
-                        "import:type:{}:{}:{}",
-                        definition.module, definition.name, idx
-                    );
-                    Operation::CreateType {
-                        module: definition.module.clone(),
-                        name: definition.name.clone(),
-                        birth_seed,
-                        region_params: definition.region_params.clone(),
-                        definition: definition.definition.clone(),
-                        identity: definition.identity.clone(),
+                    if let Some(&group_id) = type_recursion.group_of.get(&idx) {
+                        // A mutually-recursive type clique is created once, at its
+                        // first member, with every member's name bound before any
+                        // definition is resolved.
+                        if emitted_type_group[group_id] {
+                            continue;
+                        }
+                        emitted_type_group[group_id] = true;
+                        let members = &type_recursion.groups[group_id];
+                        let module = definition.module.clone();
+                        let mut member_specs = Vec::with_capacity(members.len());
+                        for &member_idx in members {
+                            let ProgramItem::TypeDefinition(member) = &items[member_idx] else {
+                                unreachable!("type-recursion-group member is not a type");
+                            };
+                            if member.module != module {
+                                bail!(
+                                    "cross-module type recursion is not supported: clique spans modules {module} and {}",
+                                    member.module
+                                );
+                            }
+                            member_specs.push(TypeGroupMemberSpec {
+                                name: member.name.clone(),
+                                region_params: member.region_params.clone(),
+                                definition: member.definition.clone(),
+                                identity: member.identity.clone(),
+                            });
+                        }
+                        Operation::CreateTypeGroup {
+                            module,
+                            members: member_specs,
+                        }
+                    } else {
+                        let birth_seed = format!(
+                            "import:type:{}:{}:{}",
+                            definition.module, definition.name, idx
+                        );
+                        Operation::CreateType {
+                            module: definition.module.clone(),
+                            name: definition.name.clone(),
+                            birth_seed,
+                            region_params: definition.region_params.clone(),
+                            definition: definition.definition.clone(),
+                            identity: definition.identity.clone(),
+                        }
                     }
                 }
                 ProgramItem::Function(function) => {
@@ -1387,31 +1477,23 @@ fn distinct_color_count(colors: &[String]) -> usize {
 /// colouring exactly (so a clique that 1-WL already discretizes keeps its prior
 /// order and content hash). The individualization search uses `true` so that a
 /// colour pinned by individualization survives subsequent refinement rounds.
-fn refine_recursion_colors(
-    functions: &[&FunctionSource],
+fn refine_clique_colors(
+    n: usize,
     static_sig: &[String],
-    name_to_local: &std::collections::HashMap<(String, String), usize>,
+    erase: &dyn Fn(usize, &[String]) -> String,
     initial: &[String],
     preserve_own: bool,
 ) -> Vec<String> {
-    let n = functions.len();
     let mut colors = initial.to_vec();
     let mut classes = distinct_color_count(&colors);
     for _ in 0..n {
         let next: Vec<String> = (0..n)
             .map(|local| {
-                let mut body =
-                    serde_json::to_value(&functions[local].body).expect("RawExpr serializes");
-                recolor_peer_calls(&mut body, &functions[local].module, name_to_local, &colors);
+                let erased = erase(local, &colors);
                 let payload = if preserve_own {
-                    format!(
-                        "{}|{}|{}",
-                        colors[local],
-                        static_sig[local],
-                        store::canonical_json(&body)
-                    )
+                    format!("{}|{}|{}", colors[local], static_sig[local], erased)
                 } else {
-                    format!("{}|{}", static_sig[local], store::canonical_json(&body))
+                    format!("{}|{}", static_sig[local], erased)
                 };
                 store::hash_bytes(b"codedb/recursion-order/v1\0", payload.as_bytes())
             })
@@ -1432,30 +1514,19 @@ fn refine_recursion_colors(
 /// ordinal order. Two labelings are compared by this form to choose the canonical
 /// one. The form contains only ordinals (0..n-1) and structure — never member
 /// identities or source positions — so isomorphic cliques produce identical forms.
-fn recursion_clique_form(
-    functions: &[&FunctionSource],
+fn clique_form(
+    n: usize,
     static_sig: &[String],
-    name_to_local: &std::collections::HashMap<(String, String), usize>,
+    erase: &dyn Fn(usize, &[String]) -> String,
     order: &[usize],
 ) -> Vec<String> {
-    let n = functions.len();
     let mut ordinal_color = vec![String::new(); n];
     for (ordinal, &local) in order.iter().enumerate() {
         ordinal_color[local] = ordinal.to_string();
     }
     order
         .iter()
-        .map(|&local| {
-            let mut body =
-                serde_json::to_value(&functions[local].body).expect("RawExpr serializes");
-            recolor_peer_calls(
-                &mut body,
-                &functions[local].module,
-                name_to_local,
-                &ordinal_color,
-            );
-            format!("{}|{}", static_sig[local], store::canonical_json(&body))
-        })
+        .map(|&local| format!("{}|{}", static_sig[local], erase(local, &ordinal_color)))
         .collect()
 }
 
@@ -1468,20 +1539,19 @@ fn recursion_clique_form(
 /// so it is invariant to the order members were tried in — hence to source order.
 /// Members in a genuine automorphism orbit yield equal forms, so the choice among
 /// them does not affect the resulting content hash.
-fn canonical_label_search(
-    functions: &[&FunctionSource],
+fn clique_label_search(
+    n: usize,
     static_sig: &[String],
-    name_to_local: &std::collections::HashMap<(String, String), usize>,
+    erase: &dyn Fn(usize, &[String]) -> String,
     seed_colors: Vec<String>,
     depth: usize,
     best: &mut Option<(Vec<String>, Vec<usize>)>,
 ) {
-    let n = functions.len();
-    let colors = refine_recursion_colors(functions, static_sig, name_to_local, &seed_colors, true);
+    let colors = refine_clique_colors(n, static_sig, erase, &seed_colors, true);
     if distinct_color_count(&colors) == n {
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| colors[a].cmp(&colors[b]));
-        let form = recursion_clique_form(functions, static_sig, name_to_local, &order);
+        let form = clique_form(n, static_sig, erase, &order);
         if best.as_ref().is_none_or(|(best_form, _)| &form < best_form) {
             *best = Some((form, order));
         }
@@ -1504,14 +1574,7 @@ fn canonical_label_search(
         // the choice of marker cannot affect the result because the final selection
         // is by lex-min form over every branch.
         individualized[member] = format!("\u{0}ind:{depth}\u{0}{}", colors[member]);
-        canonical_label_search(
-            functions,
-            static_sig,
-            name_to_local,
-            individualized,
-            depth + 1,
-            best,
-        );
+        clique_label_search(n, static_sig, erase, individualized, depth + 1, best);
     }
 }
 
@@ -1528,6 +1591,41 @@ fn canonical_label_search(
 /// reintroduces the order-dependence. So when refinement does not discretize, we run
 /// individualization-refinement (`canonical_label_search`) to a true canonical
 /// labeling instead.
+/// Canonical member ordering for a clique of `n` members, so a member's ordinal —
+/// and thus its deterministic birth identity (SPEC_V3 §10) — is a property of the
+/// clique's STRUCTURE, not of source declaration order. Without it, two textual
+/// orderings of one clique receive different content hashes and import→export→import
+/// is not a fixpoint.
+///
+/// 1-WL colour refinement yields the order when it discretizes the clique. But 1-WL
+/// is an incomplete graph canonicalization: it can leave distinct (non-automorphic)
+/// members sharing a colour. Falling back to source order there reintroduces the
+/// order-dependence, so when refinement does not discretize we run individualization-
+/// refinement (`clique_label_search`) to a true canonical labeling. `static_sig` is
+/// the per-member name-independent signature; `erase(local, colors)` yields the
+/// member's structural form with in-clique peer references recoloured by `colors`.
+fn canonical_clique_order(
+    n: usize,
+    static_sig: &[String],
+    erase: &dyn Fn(usize, &[String]) -> String,
+) -> Vec<usize> {
+    // Initial 1-WL refinement (own colour NOT folded in), identical to the historical
+    // colouring so cliques that already discretize keep their prior order and hash.
+    let colors = refine_clique_colors(n, static_sig, erase, &vec![String::new(); n], false);
+    if distinct_color_count(&colors) == n {
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| colors[a].cmp(&colors[b]));
+        order
+    } else {
+        let mut best: Option<(Vec<String>, Vec<usize>)> = None;
+        clique_label_search(n, static_sig, erase, colors, 0, &mut best);
+        best.expect("individualization-refinement yields at least one labeling")
+            .1
+    }
+}
+
+/// Canonical, name-independent ordering of a recursion (function) clique's members,
+/// erasing in-clique peer call names to colours (see `canonical_clique_order`).
 fn canonical_recursion_member_order(
     items: &[ProgramItem],
     member_item_indices: &[usize],
@@ -1549,30 +1647,61 @@ fn canonical_recursion_member_order(
         name_to_local.insert((function.module.clone(), function.name.clone()), local);
     }
     let static_sig = recursion_member_static_sigs(&functions);
-
-    // Initial 1-WL refinement (own colour NOT folded in), identical to the historical
-    // colouring so cliques that already discretize keep their prior order and hash.
-    let colors = refine_recursion_colors(
-        &functions,
-        &static_sig,
-        &name_to_local,
-        &vec![String::new(); n],
-        false,
-    );
-
-    let local_order = if distinct_color_count(&colors) == n {
-        // Discrete: colour order is canonical (the historical, unchanged path).
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| colors[a].cmp(&colors[b]));
-        order
-    } else {
-        // Not discretized by 1-WL: individualization-refinement to a canonical label.
-        let mut best: Option<(Vec<String>, Vec<usize>)> = None;
-        canonical_label_search(&functions, &static_sig, &name_to_local, colors, 0, &mut best);
-        best.expect("individualization-refinement yields at least one labeling")
-            .1
+    let erase = |local: usize, colors: &[String]| -> String {
+        let mut body =
+            serde_json::to_value(&functions[local].body).expect("RawExpr serializes");
+        recolor_peer_calls(&mut body, &functions[local].module, &name_to_local, colors);
+        store::canonical_json(&body)
     };
+    let local_order = canonical_clique_order(n, &static_sig, &erase);
+    local_order
+        .into_iter()
+        .map(|local| member_item_indices[local])
+        .collect()
+}
 
+/// Canonical ordering of a mutually-recursive TYPE clique's members (see
+/// `canonical_clique_order`). Erases in-clique peer type references to colours; the
+/// static signature is the kind (record/enum) and region arity. Field/variant
+/// display names are NOT part of the structural form, so rename stays metadata-only.
+fn canonical_type_member_order(
+    items: &[ProgramItem],
+    member_item_indices: &[usize],
+) -> Vec<usize> {
+    let n = member_item_indices.len();
+    if n <= 1 {
+        return member_item_indices.to_vec();
+    }
+    let types: Vec<&TypeDefinitionSource> = member_item_indices
+        .iter()
+        .map(|&idx| match &items[idx] {
+            ProgramItem::TypeDefinition(definition) => definition,
+            _ => unreachable!("type-recursion-group member is not a type"),
+        })
+        .collect();
+    let mut name_to_local: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    for (local, definition) in types.iter().enumerate() {
+        name_to_local.insert((definition.module.clone(), definition.name.clone()), local);
+    }
+    let static_sig: Vec<String> = types
+        .iter()
+        .map(|definition| {
+            store::canonical_json(&serde_json::json!({
+                "kind": definition.definition.kind_name(),
+                "regions": definition.region_params,
+            }))
+        })
+        .collect();
+    let erase = |local: usize, colors: &[String]| -> String {
+        types::recolor_type_definition_form(
+            &types[local].definition,
+            &types[local].module,
+            &name_to_local,
+            colors,
+        )
+    };
+    let local_order = canonical_clique_order(n, &static_sig, &erase);
     local_order
         .into_iter()
         .map(|local| member_item_indices[local])

@@ -23,6 +23,12 @@ pub(crate) struct ProgramRootPayload {
     /// when empty).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) recursion_groups: Vec<String>,
+    /// Content hashes of `TypeRecursionGroup` objects — one per mutually-recursive
+    /// clique of TYPE definitions created atomically (SPEC_V3 §6, D1). Empty for
+    /// programs without mutual type recursion, so existing root hashes are unchanged
+    /// (the field is skipped when empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) type_recursion_groups: Vec<String>,
     pub(crate) metadata: BTreeMap<String, JsonValue>,
 }
 
@@ -223,6 +229,7 @@ pub(crate) fn normalize_root(mut root: ProgramRootPayload) -> ProgramRootPayload
     root.tests
         .sort_by(|a, b| (&a.name, &a.test).cmp(&(&b.name, &b.test)));
     root.recursion_groups.sort();
+    root.type_recursion_groups.sort();
     root
 }
 

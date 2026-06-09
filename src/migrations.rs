@@ -41,6 +41,20 @@ pub(crate) struct RecursionGroupMemberSpec {
     pub(crate) body: RawExpr,
 }
 
+/// One member of a `CreateTypeGroup` clique: a record/enum definition whose
+/// fields/variants may reference in-group peers. The birth seed is derived from the
+/// creating migration and the member's canonical in-group ordinal (SPEC_V3 §10), so
+/// it is not part of the payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TypeGroupMemberSpec {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) region_params: Vec<String>,
+    pub(crate) definition: TypeDefinitionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) identity: Option<TypeDefinitionIdentity>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum Operation {
@@ -82,6 +96,19 @@ pub(crate) enum Operation {
     CreateRecursionGroup {
         module: String,
         members: Vec<RecursionGroupMemberSpec>,
+    },
+    /// Create a mutually-recursive clique of TYPE definitions atomically (SPEC_V3
+    /// §6, D1). Every member's type symbol, region params, and name binding are
+    /// bound (with a placeholder definition) before any member's definition is
+    /// resolved, so a field/variant of one member may reference an in-group peer —
+    /// which `CreateType` cannot express across two ops (it resolves member types
+    /// before the peer exists). Member birth identities derive from the creating
+    /// migration's parent history and the member's canonical in-group ordinal
+    /// (SPEC_V3 §10). Members project back as ordinary `record`/`enum`s; the importer
+    /// re-detects the clique on re-import.
+    CreateTypeGroup {
+        module: String,
+        members: Vec<TypeGroupMemberSpec>,
     },
     CreateType {
         module: String,
@@ -263,6 +290,7 @@ impl Operation {
         match self {
             Operation::CreateFunction { .. } => "create_function",
             Operation::CreateRecursionGroup { .. } => "create_recursion_group",
+            Operation::CreateTypeGroup { .. } => "create_type_group",
             Operation::CreateExternalFunction { .. } => "create_external_function",
             Operation::CreateType { .. } => "create_type",
             Operation::RenameType { .. } => "rename_type",
@@ -1104,6 +1132,18 @@ fn operation_summary_parts(op: &Operation) -> (String, SemanticImpact, Typecheck
             SemanticImpact::FunctionCreated,
             TypecheckImpact::Checked,
         ),
+        Operation::CreateTypeGroup { module, members } => (
+            format!(
+                "{module}.{{{}}}",
+                members
+                    .iter()
+                    .map(|member| member.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            SemanticImpact::TypeCreated,
+            TypecheckImpact::Checked,
+        ),
         Operation::CreateExternalFunction { module, name, .. } => (
             format!("{module}.{name}"),
             SemanticImpact::ExternalFunctionCreated,
@@ -1335,6 +1375,7 @@ fn fallback_build_impact(op: &Operation) -> BuildImpact {
             vec![BuildImpactReason::SymbolAdded],
         ),
         Operation::CreateType { .. }
+        | Operation::CreateTypeGroup { .. }
         | Operation::AddField { .. }
         | Operation::RemoveField { .. }
         | Operation::AddVariant { .. }
@@ -1706,6 +1747,18 @@ impl CodeDb {
                 }];
                 for member in members {
                     preconditions.push(Precondition::NameIsAvailable {
+                        module: module.clone(),
+                        name: member.name.clone(),
+                    });
+                }
+                preconditions
+            }
+            Operation::CreateTypeGroup { module, members } => {
+                let mut preconditions = vec![Precondition::RootIsCurrent {
+                    root: input_root.to_string(),
+                }];
+                for member in members {
+                    preconditions.push(Precondition::TypeNameIsAvailable {
                         module: module.clone(),
                         name: member.name.clone(),
                     });
@@ -2168,6 +2221,23 @@ impl CodeDb {
                         return_type: member.return_type.clone(),
                         effects: member.effects.clone(),
                         body: member.body.clone(),
+                    });
+                }
+                postconditions
+            }
+            Operation::CreateTypeGroup { module, members } => {
+                // Each member projects back as an ordinary `record`/`enum`, so the
+                // source of every member must match — keeping the checked-view
+                // round-trip honest for mutually-recursive type cliques.
+                let mut postconditions = vec![Postcondition::RootExists {
+                    root: output_root.to_string(),
+                }];
+                for member in members {
+                    postconditions.push(Postcondition::TypeSourceMatches {
+                        module: module.clone(),
+                        name: member.name.clone(),
+                        region_params: member.region_params.clone(),
+                        definition: member.definition.clone(),
                     });
                 }
                 postconditions
@@ -3162,6 +3232,9 @@ impl CodeDb {
             Operation::CreateRecursionGroup { module, members } => {
                 self.apply_create_recursion_group(input_root, parent_history_hash, module, members)
             }
+            Operation::CreateTypeGroup { module, members } => {
+                self.apply_create_type_group(input_root, parent_history_hash, module, members)
+            }
             Operation::CreateExternalFunction {
                 module,
                 name,
@@ -3680,6 +3753,142 @@ impl CodeDb {
         let member_entries = root.symbols[symbols_base..symbols_base + members.len()].to_vec();
         let group_hash = self.put_recursion_group(module, &member_entries)?;
         root.recursion_groups.push(group_hash);
+
+        if module != MAIN_BRANCH
+            || root
+                .metadata
+                .contains_key(crate::model::ROOT_MODULES_METADATA_KEY)
+        {
+            synchronize_module_metadata(&mut root);
+        }
+        let new_root = self.put_program_root(&root)?;
+        self.index_root(&new_root)?;
+        self.type_check_root(&new_root)?;
+        Ok(new_root)
+    }
+
+    /// Create a mutually-recursive clique of TYPE definitions atomically (SPEC_V3
+    /// §6, D1). Pass 1 mints every member's symbol + region params and registers a
+    /// placeholder definition + name; pass 2 resolves each real definition against
+    /// the now-fully-bound root and overwrites the placeholder. The placeholder
+    /// trick is exactly `apply_create_type`'s self-reference mechanism, extended to
+    /// the whole clique so cross-references resolve.
+    pub(crate) fn apply_create_type_group(
+        &mut self,
+        input_root: &str,
+        parent_history_hash: Option<&str>,
+        module: &str,
+        members: &[TypeGroupMemberSpec],
+    ) -> Result<String> {
+        validate_module_path("module", module)?;
+        if members.is_empty() {
+            bail!("type recursion group requires at least one member");
+        }
+        let mut root = self.load_root(input_root)?;
+        let mut seen_names = std::collections::BTreeSet::new();
+        for member in members {
+            validate_projection_identifier("type name", &member.name)?;
+            validate_region_param_names(&member.region_params)?;
+            validate_type_member_specs(&member.definition)?;
+            if !seen_names.insert(member.name.as_str()) {
+                bail!("duplicate type name in type recursion group: {}", member.name);
+            }
+            if root
+                .type_names
+                .iter()
+                .any(|binding| binding.module == module && binding.display_name == member.name)
+            {
+                bail!("type name already exists: {module}.{}", member.name);
+            }
+        }
+
+        // Pass 1: mint every member's symbol + region params and register a
+        // placeholder definition + name BEFORE resolving any real definition, so a
+        // field/variant may reference an in-group peer. Only the placeholder's
+        // region arity and the bound name/symbol are consulted during pass-2
+        // resolution; the dummy member is discarded by the overwrite.
+        struct PendingType {
+            type_symbol: String,
+            region_params: Vec<RegionParamDef>,
+            region_scope: std::collections::BTreeMap<String, String>,
+            birth_seed: String,
+        }
+        let types_base = root.types.len();
+        let mut pending = Vec::with_capacity(members.len());
+        for (ordinal, member) in members.iter().enumerate() {
+            let birth_seed = format!("type_recursion_group:{ordinal}");
+            let type_symbol = if let Some(identity) = &member.identity {
+                self.put_symbol_birth_spec(&identity.type_symbol_birth, "type", None)?
+            } else {
+                self.put_type_symbol_birth(parent_history_hash, &birth_seed)?
+            };
+            let (region_params, region_scope) = self.create_region_params(
+                parent_history_hash,
+                &type_symbol,
+                &birth_seed,
+                &member.region_params,
+                member
+                    .identity
+                    .as_ref()
+                    .map(|identity| identity.region_param_births.as_slice()),
+            )?;
+            let placeholder_member = TypeMemberDef {
+                member_symbol: type_symbol.clone(),
+                name: "placeholder".to_string(),
+                type_hash: type_hash_for("I64"),
+            };
+            let placeholder = match member.definition {
+                TypeDefinitionKind::Record { .. } => TypeDefinition::Record {
+                    type_symbol: type_symbol.clone(),
+                    region_params: region_params.clone(),
+                    fields: vec![placeholder_member],
+                },
+                TypeDefinitionKind::Enum { .. } => TypeDefinition::Enum {
+                    type_symbol: type_symbol.clone(),
+                    region_params: region_params.clone(),
+                    variants: vec![placeholder_member],
+                },
+            };
+            let placeholder_def = self.put_type_def(&type_symbol, &placeholder)?;
+            root.types.push(RootTypePayload {
+                type_symbol: type_symbol.clone(),
+                type_def: placeholder_def,
+            });
+            root.type_names.push(TypeNameBinding {
+                module: module.to_string(),
+                display_name: member.name.clone(),
+                type_symbol: type_symbol.clone(),
+                is_preferred: true,
+            });
+            pending.push(PendingType {
+                type_symbol,
+                region_params,
+                region_scope,
+                birth_seed,
+            });
+        }
+
+        // Pass 2: resolve each member's real definition against the fully-bound root
+        // (cross-references now resolve), then overwrite its placeholder.
+        for (ordinal, member) in members.iter().enumerate() {
+            let pending_type = &pending[ordinal];
+            let semantic_definition = self.type_definition_from_source(
+                &root,
+                module,
+                parent_history_hash,
+                &pending_type.birth_seed,
+                &pending_type.type_symbol,
+                pending_type.region_params.clone(),
+                &pending_type.region_scope,
+                &member.definition,
+                member.identity.as_ref(),
+            )?;
+            self.update_type_definition(&mut root, &pending_type.type_symbol, semantic_definition)?;
+        }
+
+        let member_entries = root.types[types_base..types_base + members.len()].to_vec();
+        let group_hash = self.put_type_recursion_group(module, &member_entries)?;
+        root.type_recursion_groups.push(group_hash);
 
         if module != MAIN_BRANCH
             || root
@@ -6693,6 +6902,7 @@ impl CodeDb {
             exports: vec![],
             tests: vec![],
             recursion_groups: vec![],
+            type_recursion_groups: vec![],
             metadata: BTreeMap::new(),
         })?;
         let mut current_history: Option<String> = None;

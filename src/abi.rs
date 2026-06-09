@@ -204,6 +204,7 @@ mod tests {
             }],
             tests: vec![],
             recursion_groups: vec![],
+            type_recursion_groups: vec![],
             metadata: Default::default(),
         };
 

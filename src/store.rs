@@ -75,6 +75,7 @@ impl CodeDb {
             exports: vec![],
             tests: vec![],
             recursion_groups: vec![],
+            type_recursion_groups: vec![],
             metadata: BTreeMap::new(),
         })?;
         self.index_root(&root_hash)?;

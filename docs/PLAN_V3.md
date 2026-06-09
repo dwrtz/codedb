@@ -389,12 +389,21 @@ Note: the deref-by-move blocker is resolved. `unbox(b: box<T>) -> T` (a builtin,
 lowered to a new `UnboxMove` op that copies the payload to an owned slot then frees
 the box shell — heap read strictly before free, on both x86_64 and arm64) and
 move-only `box` case-arm binding together make case-traversal of a recursive
-`box<Node>` heap expressible and native (`tests/recursion_native.rs`). Still
-deferred: a tree-walking evaluator and a per-node-data cons-list `sum` need
-mutually-recursive *type* definitions (D1) — `box` provides the size indirection,
-but the type *names* form a cycle the importer cannot yet resolve (recursion groups
-are functions-only). Inline (non-`box`) move-only enum payloads also stay
-fail-closed. These unblock more of the Phase 8 self-hosted evaluator.
+`box<Node>` heap expressible and native (`tests/recursion_native.rs`).
+
+Mutually-recursive *type* definitions (D1) are now supported too, so per-node-data
+structures work: a `Cons`↔`List` cons-list `sum` and a tree-walking expression
+evaluator (`Expr`↔`Pair`) compile native and match the evaluator
+(`tests/recursive_types.rs`). A `CreateTypeGroup` migration creates a type clique
+atomically — every member's name is bound (with a placeholder definition) before any
+definition is resolved, mirroring `CreateRecursionGroup` for functions; `box` breaks
+the size cycle and members reference each other by symbol (no hash cycle). Member
+ordinals are canonical (individualization-refinement, shared with the function path),
+so the clique hash is source-order-independent and import→export→import is a fixpoint.
+A supporting fix: an enum-variant payload now coerces a structural record/enum/array
+literal to the variant's nominal type (so `List::cons(box_new({ ... }))` works), which
+benefits all enums. Inline (non-`box`) move-only enum payloads still stay fail-closed.
+These unblock more of the Phase 8 self-hosted evaluator.
 
 ## Phase 7 — Pattern Matching Richness (R14)
 
@@ -815,14 +824,19 @@ with `_` and exhaustiveness compiles native, projects round-trip (including a ne
 `case` in a non-last arm), and steps under `trace`/`debug`. Case-traversal of a
 recursive `box<Node>` heap also compiles native: an `unbox` (deref-by-move) builtin
 and move-only `box` case-arm binding free each node exactly once (`0 leaks`,
-double-free verified).
+double-free verified). Mutually-recursive *type* definitions (D1) are also supported
+(a `CreateTypeGroup` clique, mirroring `CreateRecursionGroup`; canonical member
+ordinals; box-broken size cycle), so per-node-data recursive structures — a
+`Cons`↔`List` cons-list `sum` and an `Expr`↔`Pair` tree-walking evaluator — compile
+native and round-trip. A field reached through a `box` deref now fails closed with a
+clean `unsupported_move` diagnostic (was an opaque lowering crash).
 
-Documented follow-on R14/structure surface: range/guard/nested-enum patterns;
-mutually-recursive *type* definitions (D1) and inline (non-`box`) move-only
-enum-payload moves — which together unlock per-node-data recursive structures (a
-cons-list `sum`, a tree-walking evaluator) and more of the Phase 8 self-hosted
-evaluator. Known oracle caveat: the reference evaluator recurses on the host stack,
-so a
+Documented follow-on R14/structure surface: range/guard/nested-enum patterns; inline
+(non-`box`) move-only enum-payload moves; and a deeper `verify` that recomputes a
+recursion/type clique's canonical ordinals (today `verify` does structural + ordinal
+checks but not the full canonical recompute, which needs source reconstruction or
+history walking). Known oracle caveat: the reference evaluator recurses on the host
+stack, so a
 deeply/infinitely recursive program can overflow it (the native backend, on the OS
 stack, is unaffected) — a robustness bound on the oracle, not a language limit.
 

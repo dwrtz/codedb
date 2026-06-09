@@ -231,6 +231,7 @@ impl CodeDb {
             exports: vec![],
             tests: vec![],
             recursion_groups: vec![],
+            type_recursion_groups: vec![],
             metadata: BTreeMap::new(),
         })?;
         let mut replay_root = genesis_root.clone();
@@ -1545,6 +1546,14 @@ fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<St
             {
                 push_hash_ref(Some(group), refs);
             }
+            for group in payload
+                .get("type_recursion_groups")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_hash_ref(Some(group), refs);
+            }
         }
         "RecursionGroup" => {
             for member in payload
@@ -1556,6 +1565,17 @@ fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<St
                 push_hash_ref(member.get("symbol"), refs);
                 push_hash_ref(member.get("definition"), refs);
                 push_hash_ref(member.get("signature"), refs);
+            }
+        }
+        "TypeRecursionGroup" => {
+            for member in payload
+                .get("members")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_hash_ref(member.get("type_symbol"), refs);
+                push_hash_ref(member.get("type_def"), refs);
             }
         }
         "TestCase" => push_hash_ref(payload.get("entry_symbol"), refs),

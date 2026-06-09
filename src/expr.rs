@@ -1319,8 +1319,18 @@ impl CodeDb {
         root_type: &crate::model::RootTypePayload,
     ) -> Result<String> {
         let definition = self.type_definition(&root_type.type_def)?;
+        let type_symbol_birth = self.symbol_birth_spec(definition.type_symbol())?;
+        // A type-recursion-group member re-derives its identity canonically on
+        // re-import (its birth nonce is `type_recursion_group:{ordinal}`), exactly
+        // like a function recursion-group member — so it must NOT emit identity pins.
+        // Otherwise the re-imported clique op would carry pins the original lacked,
+        // changing the op (and every downstream symbol's parent history) and breaking
+        // the import→export→import fixpoint (SPEC_V3 §6/§11).
+        let clique_member = type_symbol_birth
+            .local_nonce
+            .starts_with("type_recursion_group:");
         let type_identity = TypeDefinitionIdentity {
-            type_symbol_birth: self.symbol_birth_spec(definition.type_symbol())?,
+            type_symbol_birth,
             region_param_births: definition
                 .region_params()
                 .iter()
@@ -1328,7 +1338,21 @@ impl CodeDb {
                 .collect::<Result<Vec<_>>>()?,
             member_births: Vec::new(),
         };
-        let type_identity = canonical_json(&serde_json::to_value(&type_identity)?);
+        let type_identity_prefix = if clique_member {
+            String::new()
+        } else {
+            format!(
+                "// codedb:type_identity {}\n",
+                canonical_json(&serde_json::to_value(&type_identity)?)
+            )
+        };
+        let member_identity_prefix = |spec: &str| -> String {
+            if clique_member {
+                String::new()
+            } else {
+                format!("  // codedb:member_identity {spec}\n")
+            }
+        };
         let region_names = definition
             .region_params()
             .iter()
@@ -1356,8 +1380,8 @@ impl CodeDb {
                             self.symbol_birth_spec(&field.member_symbol)?,
                         )?);
                         Ok(format!(
-                            "  // codedb:member_identity {}\n  {}: {}",
-                            member_identity,
+                            "{}  {}: {}",
+                            member_identity_prefix(&member_identity),
                             field.name,
                             self.type_name_in_root_with_regions(
                                 root,
@@ -1369,8 +1393,8 @@ impl CodeDb {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(format!(
-                    "// codedb:type_identity {}\nrecord {}{} {{\n{}\n}}",
-                    type_identity,
+                    "{}record {}{} {{\n{}\n}}",
+                    type_identity_prefix,
                     binding.display_name,
                     region_suffix,
                     rendered_fields.join("\n")
@@ -1384,8 +1408,8 @@ impl CodeDb {
                             self.symbol_birth_spec(&variant.member_symbol)?,
                         )?);
                         Ok(format!(
-                            "  // codedb:member_identity {}\n  {}: {}",
-                            member_identity,
+                            "{}  {}: {}",
+                            member_identity_prefix(&member_identity),
                             variant.name,
                             self.type_name_in_root_with_regions(
                                 root,
@@ -1397,8 +1421,8 @@ impl CodeDb {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(format!(
-                    "// codedb:type_identity {}\nenum {}{} {{\n{}\n}}",
-                    type_identity,
+                    "{}enum {}{} {{\n{}\n}}",
+                    type_identity_prefix,
                     binding.display_name,
                     region_suffix,
                     rendered_variants.join("\n")

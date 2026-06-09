@@ -2468,6 +2468,35 @@ impl CodeDb {
         )
     }
 
+    pub(crate) fn put_type_recursion_group(
+        &mut self,
+        module: &str,
+        members: &[crate::model::RootTypePayload],
+    ) -> Result<String> {
+        let mut entries = members
+            .iter()
+            .map(|member| {
+                json!({
+                    "type_symbol": member.type_symbol,
+                    "type_def": member.type_def,
+                })
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|a, b| {
+            a["type_symbol"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(b["type_symbol"].as_str().unwrap_or_default())
+        });
+        self.put_object(
+            "TypeRecursionGroup",
+            &json!({
+                "module": module,
+                "members": entries,
+            }),
+        )
+    }
+
     pub(crate) fn put_external_function(
         &mut self,
         symbol: &str,
@@ -3894,7 +3923,11 @@ impl CodeDb {
                 )?;
                 let variant_type =
                     self.enum_variant_type_in_root(root, &enum_type_hash, variant)?;
-                let typed_value = self.type_expr_with_locals(
+                // Propagate the variant's payload type as the expected type so a
+                // record/enum/array literal (possibly under `box_new`) is built in
+                // the payload's nominal layout instead of an anonymous structural
+                // one — otherwise `E::v(box_new({ ... }))` fails the payload check.
+                let typed_value = self.type_expr_with_locals_expecting(
                     current_module,
                     value,
                     root,
@@ -3902,13 +3935,22 @@ impl CodeDb {
                     param_types,
                     region_scope,
                     locals,
+                    Some(&variant_type),
                 )?;
-                require_type(
-                    &typed_value.type_hash,
-                    &variant_type,
-                    "enum variant payload",
-                    self,
-                )?;
+                // Accept a structurally-compatible payload (e.g. an anonymous record
+                // literal) for a nominal variant type, mirroring `let`-binding
+                // coercion; lowering builds it in the variant's layout. Fall back to
+                // the strict check for a precise diagnostic when not assignable.
+                if !self
+                    .type_assignable_in_root(root, &typed_value.type_hash, &variant_type)?
+                {
+                    require_type(
+                        &typed_value.type_hash,
+                        &variant_type,
+                        "enum variant payload",
+                        self,
+                    )?;
+                }
                 let expr_hash = self.put_object(
                     "Expression",
                     &json!({
@@ -9703,7 +9745,9 @@ impl CodeDb {
                     allowed_regions,
                     locals,
                 )?;
-                if value_type != variant_type {
+                if value_type != variant_type
+                    && !self.type_assignable_in_root(root, &value_type, &variant_type)?
+                {
                     bail!("enum variant payload type mismatch for {variant}");
                 }
                 enum_type.to_string()
@@ -10310,6 +10354,130 @@ impl ParsedTypeSpec {
                     .collect::<Result<Vec<_>>>()?,
             )),
         }
+    }
+}
+
+/// Collect the (possibly-qualified) type names a type definition's fields/variants
+/// reference — used by the importer to detect mutually-recursive type cliques
+/// (SPEC_V3 §6, D1). Parses each member's declared type and walks it for `Named`
+/// references (region args are lifetimes, not types, so they are not followed).
+pub(crate) fn collect_named_type_refs(definition: &TypeDefinitionKind) -> Result<Vec<String>> {
+    let members = match definition {
+        TypeDefinitionKind::Record { fields } => fields,
+        TypeDefinitionKind::Enum { variants } => variants,
+    };
+    let mut names = Vec::new();
+    for member in members {
+        let parsed = parse_type_source(&member.ty)?;
+        collect_parsed_named_refs(&parsed, &mut names);
+    }
+    Ok(names)
+}
+
+fn collect_parsed_named_refs(spec: &ParsedTypeSpec, out: &mut Vec<String>) {
+    match spec {
+        ParsedTypeSpec::Named { name, .. } => out.push(name.clone()),
+        ParsedTypeSpec::Reference { referent, .. } => collect_parsed_named_refs(referent, out),
+        ParsedTypeSpec::RawPointer { pointee, .. } => collect_parsed_named_refs(pointee, out),
+        ParsedTypeSpec::Box { element }
+        | ParsedTypeSpec::Vec { element }
+        | ParsedTypeSpec::Slice { element, .. }
+        | ParsedTypeSpec::FixedArray { element, .. } => collect_parsed_named_refs(element, out),
+        ParsedTypeSpec::Record(fields) | ParsedTypeSpec::Enum(fields) => {
+            for field in fields {
+                collect_parsed_named_refs(&field.ty, out);
+            }
+        }
+        ParsedTypeSpec::Builtin(_) | ParsedTypeSpec::String => {}
+    }
+}
+
+/// A type definition's canonical structural form with in-clique peer type references
+/// replaced by the peer's `colors` entry — the type analog of `recolor_peer_calls`
+/// for the recursion-clique canonical labeling (SPEC_V3 §6, D1). Field/variant
+/// display names are excluded (rename stays metadata-only); only member types, in
+/// order, contribute. `name_to_local` maps each clique member's `(module, name)` to
+/// its local index, so a peer reference resolves to its current colour.
+pub(crate) fn recolor_type_definition_form(
+    definition: &TypeDefinitionKind,
+    module: &str,
+    name_to_local: &std::collections::HashMap<(String, String), usize>,
+    colors: &[String],
+) -> String {
+    let members = match definition {
+        TypeDefinitionKind::Record { fields } => fields,
+        TypeDefinitionKind::Enum { variants } => variants,
+    };
+    let forms: Vec<JsonValue> = members
+        .iter()
+        .map(|member| match parse_type_source(&member.ty) {
+            Ok(spec) => recolor_parsed_type(&spec, module, name_to_local, colors),
+            // Already validated during clique analysis; fall back to the raw string.
+            Err(_) => JsonValue::String(member.ty.clone()),
+        })
+        .collect();
+    canonical_json(&JsonValue::Array(forms))
+}
+
+fn recolor_parsed_type(
+    spec: &ParsedTypeSpec,
+    module: &str,
+    name_to_local: &std::collections::HashMap<(String, String), usize>,
+    colors: &[String],
+) -> JsonValue {
+    let recolor = |inner: &ParsedTypeSpec| recolor_parsed_type(inner, module, name_to_local, colors);
+    match spec {
+        ParsedTypeSpec::Builtin(kind) => json!({ "k": "builtin", "name": kind }),
+        ParsedTypeSpec::String => json!({ "k": "string" }),
+        ParsedTypeSpec::Named { name, region_args } => {
+            let head = match resolve_clique_type_name(name, module, name_to_local) {
+                Some(local) => format!("@type-peer:{}", colors[local]),
+                None => name.clone(),
+            };
+            json!({ "k": "named", "name": head, "regions": region_args })
+        }
+        ParsedTypeSpec::Reference {
+            region,
+            mutable,
+            referent,
+        } => json!({ "k": "ref", "region": region, "mut": mutable, "referent": recolor(referent) }),
+        ParsedTypeSpec::RawPointer { mutable, pointee } => {
+            json!({ "k": "raw", "mut": mutable, "pointee": recolor(pointee) })
+        }
+        ParsedTypeSpec::Box { element } => json!({ "k": "box", "elem": recolor(element) }),
+        ParsedTypeSpec::Vec { element } => json!({ "k": "vec", "elem": recolor(element) }),
+        ParsedTypeSpec::Slice {
+            region,
+            mutable,
+            element,
+        } => json!({ "k": "slice", "region": region, "mut": mutable, "elem": recolor(element) }),
+        ParsedTypeSpec::FixedArray { element, len } => {
+            json!({ "k": "array", "len": len, "elem": recolor(element) })
+        }
+        ParsedTypeSpec::Record(fields) => json!({
+            "k": "record",
+            "fields": fields.iter().map(|field| recolor(&field.ty)).collect::<Vec<_>>(),
+        }),
+        ParsedTypeSpec::Enum(fields) => json!({
+            "k": "enum",
+            "variants": fields.iter().map(|field| recolor(&field.ty)).collect::<Vec<_>>(),
+        }),
+    }
+}
+
+fn resolve_clique_type_name(
+    name: &str,
+    current_module: &str,
+    name_to_local: &std::collections::HashMap<(String, String), usize>,
+) -> Option<usize> {
+    if let Some(dot) = name.rfind('.') {
+        name_to_local
+            .get(&(name[..dot].to_string(), name[dot + 1..].to_string()))
+            .copied()
+    } else {
+        name_to_local
+            .get(&(current_module.to_string(), name.to_string()))
+            .copied()
     }
 }
 

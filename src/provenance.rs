@@ -1558,6 +1558,7 @@ impl CodeDb {
                 }
             }
             Operation::CreateType { .. }
+            | Operation::CreateTypeGroup { .. }
             | Operation::RenameType { .. }
             | Operation::MoveType { .. }
             | Operation::AddField { .. }

@@ -613,9 +613,26 @@ impl CodeDb {
                         errors,
                     )?;
                 }
+                for (idx, entry) in payload
+                    .get("type_recursion_groups")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("type_recursion_groups[{idx}]"),
+                        Some(entry),
+                        errors,
+                    )?;
+                }
             }
             "RecursionGroup" => {
                 self.verify_recursion_group_references(parent_hash, payload, errors)?;
+            }
+            "TypeRecursionGroup" => {
+                self.verify_type_recursion_group_references(parent_hash, payload, errors)?;
             }
             "TestCase" => {
                 self.check_hash_ref(
@@ -1065,6 +1082,140 @@ impl CodeDb {
                 ));
             }
         }
+        self.check_clique_member_birth_ordinals(
+            parent_hash,
+            members,
+            "symbol",
+            "recursion_group",
+            "bad_recursion_group",
+            errors,
+        )?;
+        Ok(())
+    }
+
+    /// SPEC_V3 §10: a clique's members must carry exactly the canonical birth
+    /// ordinals `{nonce_prefix:0 .. nonce_prefix:n-1}` — the importer/agent mints one
+    /// per member. Reject a forged group whose ordinals are permuted, duplicated,
+    /// missing, or out of range. (Which member is canonically ordinal 0 is fixed by
+    /// the content hash; recomputing that full labeling here is a follow-on.)
+    fn check_clique_member_birth_ordinals(
+        &self,
+        parent_hash: &str,
+        members: &[JsonValue],
+        symbol_key: &str,
+        nonce_prefix: &str,
+        error_tag: &str,
+        errors: &mut Vec<String>,
+    ) -> Result<()> {
+        let mut nonces = std::collections::BTreeSet::new();
+        for member in members {
+            if let Some(symbol) = member.get(symbol_key).and_then(JsonValue::as_str)
+                && let Ok(spec) = self.symbol_birth_spec(symbol)
+            {
+                nonces.insert(spec.local_nonce);
+            }
+        }
+        let expected: std::collections::BTreeSet<String> = (0..members.len())
+            .map(|ordinal| format!("{nonce_prefix}:{ordinal}"))
+            .collect();
+        if nonces != expected {
+            errors.push(format!(
+                "{error_tag}: {parent_hash} member birth ordinals are not the canonical {nonce_prefix}:0..{} sequence",
+                members.len()
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_type_recursion_group_references(
+        &self,
+        parent_hash: &str,
+        payload: &JsonValue,
+        errors: &mut Vec<String>,
+    ) -> Result<()> {
+        let Some(members) = payload.get("members").and_then(JsonValue::as_array) else {
+            errors.push(format!(
+                "bad_type_recursion_group: {parent_hash} missing members array"
+            ));
+            return Ok(());
+        };
+        if members.is_empty() {
+            errors.push(format!(
+                "bad_type_recursion_group: {parent_hash} has no members"
+            ));
+            return Ok(());
+        }
+        // Each member is a distinct type symbol in the clique; a repeat is malformed
+        // (the importer mints one ordinal per member, SPEC_V3 §10).
+        let mut seen_symbols = std::collections::BTreeSet::new();
+        for member in members {
+            if let Some(symbol) = member.get("type_symbol").and_then(JsonValue::as_str)
+                && !seen_symbols.insert(symbol)
+            {
+                errors.push(format!(
+                    "bad_type_recursion_group: {parent_hash} lists member type {symbol} more than once"
+                ));
+            }
+        }
+        for (idx, member) in members.iter().enumerate() {
+            self.check_hash_ref(
+                parent_hash,
+                &format!("members[{idx}].type_symbol"),
+                member.get("type_symbol"),
+                errors,
+            )?;
+            self.check_hash_ref(
+                parent_hash,
+                &format!("members[{idx}].type_def"),
+                member.get("type_def"),
+                errors,
+            )?;
+            // Consistency: the listed type_def must be the TypeDef of the listed
+            // type symbol.
+            let (symbol, type_def) = match (
+                member.get("type_symbol").and_then(JsonValue::as_str),
+                member.get("type_def").and_then(JsonValue::as_str),
+            ) {
+                (Some(symbol), Some(type_def)) => (symbol, type_def),
+                _ => {
+                    errors.push(format!(
+                        "bad_type_recursion_group: {parent_hash} members[{idx}] missing type_symbol/type_def"
+                    ));
+                    continue;
+                }
+            };
+            let row: Option<(String, String)> = self
+                .conn
+                .query_row(
+                    "SELECT kind, payload_json FROM objects WHERE hash = ?1",
+                    params![type_def],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((kind, payload_json)) = row else {
+                continue;
+            };
+            if kind != "TypeDef" {
+                errors.push(format!(
+                    "bad_type_recursion_group: {parent_hash} members[{idx}].type_def {type_def} is a {kind}, not a TypeDef"
+                ));
+                continue;
+            }
+            let def: JsonValue = serde_json::from_str(&payload_json)?;
+            if def.get("type_symbol").and_then(JsonValue::as_str) != Some(symbol) {
+                errors.push(format!(
+                    "bad_type_recursion_group: {parent_hash} members[{idx}] type_def {type_def} symbol does not match member symbol {symbol}"
+                ));
+            }
+        }
+        self.check_clique_member_birth_ordinals(
+            parent_hash,
+            members,
+            "type_symbol",
+            "type_recursion_group",
+            "bad_type_recursion_group",
+            errors,
+        )?;
         Ok(())
     }
 
