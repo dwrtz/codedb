@@ -2083,6 +2083,9 @@ These do not block v0, but should be revisited:
 1. Should v1 use BLAKE3 instead of SHA-256?
 2. Should migration logs be stored inside SQLite only, or also exported as NDJSON?
 3. Should symbol birth seeds be random, agent-provided, or deterministically derived from the creating migration?
+   Resolved (v3): deterministically derived from the creating migration and an
+   in-migration ordinal — name-independent and fixed at birth, so identities and
+   root hashes reproduce on rebuild. See [SPEC_V3.md](SPEC_V3.md) §10 and §11.
 4. Should root metadata changes count as semantic root changes, or should there be separate semantic and presentation roots?
 5. Should function calls bind to symbol hashes, exact definition hashes, or both at different compiler stages?
 6. How should branch merge conflicts be represented?

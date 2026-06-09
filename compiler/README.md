@@ -13,6 +13,15 @@ rung is self-hosted, the Rust implementation of that stage runs (a mixed
 compiler), and the CodeDB and Rust stages meet at a deterministic,
 hash-comparable artifact.
 
+**Source representation.** The `.cdb` under this tree is a *checked view*, never
+the source of truth. The authoritative compiler is the content-addressed object
+DAG, committed as a deterministic export (migration history and/or an object
+snapshot) plus a `root_hash` pin; the SQLite database is a disposable cache and
+is never committed. CI keeps the view honest: `import -> verify -> re-export` is
+byte-stable and the rebuilt root hash matches the pin. This reproduces exactly
+because identities are deterministic — birth seeds derive from the creating
+migration (see docs/SPEC_V3.md §10 and §11).
+
 | Dir | Rung | Stage | Determinism oracle |
 | --- | --- | --- | --- |
 | `eval/` | 0 | reference evaluator (warm-up, off the compile path) | result == Rust evaluator on the corpus |

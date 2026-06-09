@@ -263,6 +263,9 @@ a recursion-group / fixpoint-reference object: by-name edges within the group,
   content edges into it; the clique's content hash canonicalizes internal
   references to stable in-group identities
 stable identity for the clique and for each member
+birth identities are deterministic — derived from the creating migration and its
+  in-migration ordinal — so identities and root hashes reproduce on rebuild
+  (resolves the SPEC §29 open question on birth seeds)
 verify handles recursive call graphs (effects, borrows, moves, drop ordering)
 replay/export/import round-trips a recursion group with a stable hash
 ```
@@ -677,6 +680,8 @@ claim stage self-hosting without the determinism oracle
 claim feature completion without native-required tests
 skip verification for memory/layout/identity features
 delete or bypass the Rust compiler (it stays as stage-0 and oracle)
+treat the committed .cdb projection as authoritative source
+commit the SQLite database as source (it is a disposable cache)
 ```
 
 V3 additions, applied every phase:
@@ -686,6 +691,7 @@ each phase adds a verify check that catches at least one malformed new object
 each new language feature is native-complete before it is counted done
 each new construct defines its stable identity and how provenance attaches
 each ladder rung is gated by the determinism oracle
+the committed .cdb is a checked view; CI gates import -> verify -> re-export and a root_hash pin
 ```
 
 ## Suggested milestone cuts
