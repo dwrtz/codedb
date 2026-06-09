@@ -3000,12 +3000,28 @@ fn format_v2_why(payload: &JsonValue) -> String {
         "type_hash",
         "type_symbol",
         "type_def_hash",
+        "layout_hash",
+        "layout_cache_key",
         "signature_hash",
         "definition_hash",
         "body_hash",
     ] {
         if let Some(value) = payload.get(key).and_then(JsonValue::as_str) {
             out.push_str(&format!("{key} {value}\n"));
+        }
+    }
+    for key in [
+        "copy_kind",
+        "drop_kind",
+        "contains_reference",
+        "contains_mut_reference",
+        "contains_box",
+        "contains_owned_resource",
+    ] {
+        if let Some(value) = payload.get(key)
+            && !value.is_null()
+        {
+            out.push_str(&format!("{key} {}\n", display_json_scalar(value)));
         }
     }
     if let Some(candidate) = payload.get("candidate") {
@@ -3023,6 +3039,9 @@ fn format_v2_why(payload: &JsonValue) -> String {
     if let Some(field_layout) = payload.get("field_layout")
         && !field_layout.is_null()
     {
+        if let Some(field_symbol) = field_layout.get("field_symbol").and_then(JsonValue::as_str) {
+            out.push_str(&format!("field_symbol {field_symbol}\n"));
+        }
         out.push_str(&format!(
             "field_offset {}\n",
             field_layout
@@ -3032,12 +3051,40 @@ fn format_v2_why(payload: &JsonValue) -> String {
                 .unwrap_or_else(|| "unknown".to_string())
         ));
     }
+    if let Some(reasons) = payload.get("reasons").and_then(JsonValue::as_array) {
+        for reason in reasons {
+            if let Some(kind) = reason.get("kind").and_then(JsonValue::as_str) {
+                out.push_str(&format!("reason {kind}\n"));
+            }
+            if let Some(rule) = reason.get("rule").and_then(JsonValue::as_str) {
+                out.push_str(&format!("  rule {rule}\n"));
+            }
+        }
+    }
     if let Some(required_by) = payload.get("required_by").and_then(JsonValue::as_object) {
         for (effect, reasons) in required_by {
             out.push_str(&format!(
                 "effect {effect} reasons {}\n",
                 reasons.as_array().map(Vec::len).unwrap_or(0)
             ));
+        }
+    }
+    if let Some(build_plan) = payload.get("build_plan").and_then(JsonValue::as_object) {
+        for key in [
+            "link_plan_input_hash",
+            "link_plan_cache_key",
+            "link_plan_hash",
+        ] {
+            if let Some(value) = build_plan.get(key).and_then(JsonValue::as_str) {
+                out.push_str(&format!("build_plan_{key} {value}\n"));
+            }
+        }
+        if let Some(capabilities) = build_plan.get("capabilities").and_then(JsonValue::as_array) {
+            for capability in capabilities {
+                if let Some(name) = capability.get("name").and_then(JsonValue::as_str) {
+                    out.push_str(&format!("capability {name}\n"));
+                }
+            }
         }
     }
     if let Some(externals) = payload
@@ -3059,6 +3106,15 @@ fn format_v2_why(payload: &JsonValue) -> String {
         }
     }
     out
+}
+
+fn display_json_scalar(value: &JsonValue) -> String {
+    match value {
+        JsonValue::String(value) => value.clone(),
+        JsonValue::Bool(value) => value.to_string(),
+        JsonValue::Number(value) => value.to_string(),
+        _ => canonical_json(value),
+    }
 }
 
 fn layout_field_by_name_or_symbol(layout: &JsonValue, field: &str) -> Result<JsonValue> {

@@ -94,6 +94,21 @@ fn why_layout_and_drop_cite_type_and_field_history() {
     assert_eq!(api_layout["status"], "ok");
     assert_eq!(api_layout["result"]["field_layout"]["offset_bytes"], 8);
 
+    let layout_text = run(&["why-layout", path(&db), "Line", "--field", "qty"]);
+    assert!(layout_text.contains(&format!(
+        "layout_hash {}\n",
+        layout["layout_hash"].as_str().unwrap()
+    )));
+    assert!(layout_text.contains(&format!(
+        "layout_cache_key {}\n",
+        layout["layout_cache_key"].as_str().unwrap()
+    )));
+    assert!(layout_text.contains(&format!(
+        "field_symbol {}\n",
+        layout["field_layout"]["field_symbol"].as_str().unwrap()
+    )));
+    assert!(layout_text.contains("field_offset 8\n"));
+
     let drop = parse_json(&run(&["why-drop", path(&db), "Node", "--json"]));
     assert_eq!(drop["schema"], "codedb/why-drop/v1");
     assert!(drop["layout_hash"].as_str().unwrap().starts_with("sha256:"));
@@ -118,6 +133,20 @@ fn why_layout_and_drop_cite_type_and_field_history() {
         drop["type_blame"]["birth_migration"]["operation_kind"],
         "create_type"
     );
+
+    let drop_text = run(&["why-drop", path(&db), "Node"]);
+    assert!(drop_text.contains(&format!(
+        "layout_hash {}\n",
+        drop["layout_hash"].as_str().unwrap()
+    )));
+    assert!(drop_text.contains(&format!(
+        "layout_cache_key {}\n",
+        drop["layout_cache_key"].as_str().unwrap()
+    )));
+    assert!(drop_text.contains("copy_kind move_only\n"));
+    assert!(drop_text.contains("drop_kind needs_drop\n"));
+    assert!(drop_text.contains("contains_box true\n"));
+    assert!(drop_text.contains("reason contains_box\n"));
 }
 
 #[test]
@@ -281,4 +310,19 @@ fn why_effect_reports_state_alloc_io_and_platform_extern_reachability() {
             .iter()
             .any(|capability| capability["name"] == "stdout")
     );
+
+    let platform_text = run(&["why-platform-extern", path(&io_db), "main", "write"]);
+    assert!(platform_text.contains(&format!(
+        "build_plan_link_plan_input_hash {}\n",
+        platform["build_plan"]["link_plan_input_hash"]
+            .as_str()
+            .unwrap()
+    )));
+    assert!(platform_text.contains(&format!(
+        "build_plan_link_plan_cache_key {}\n",
+        platform["build_plan"]["link_plan_cache_key"].as_str().unwrap()
+    )));
+    assert!(platform_text.contains("platform_extern "));
+    assert!(platform_text.contains(" write\n"));
+    assert!(platform_text.contains("capability stdout\n"));
 }

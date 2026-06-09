@@ -1239,16 +1239,23 @@ reports V2-specific region, borrow, layout, and codegen impact. Unsupported
 whole-program synthesis operations parse as reserved operation names and fail
 closed until their safety rules are explicit.
 
-Deliverables:
+Implemented safe-surface deliverables:
 
 ```text
-extract_record
 rename_field
-add_field_with_default
-remove_field_and_update_constructors
 rename_variant_and_cases
 borrow_parameter
 convert_by_value_param_to_ref
+add_field_with_default without defaulted constructor rewrites
+reserved whole-program operation parsing with fail-closed diagnostics
+```
+
+Reserved / future whole-program deliverables:
+
+```text
+extract_record
+defaulted add_field_with_default constructor rewrites
+remove_field_and_update_constructors
 thread_mut_cursor
 extract_slice_view
 introduce_box
@@ -1275,6 +1282,7 @@ failed patch leaves branch unchanged
 rename_field preserves field identity
 convert_by_value_param_to_ref updates callers and native tests pass
 build impact distinguishes metadata/layout/codegen changes
+reserved whole-program operations fail closed
 ```
 
 ## Phase 24 — V2 Provenance, Blame, and Why
