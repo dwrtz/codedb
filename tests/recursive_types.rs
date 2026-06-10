@@ -207,6 +207,15 @@ fn automorphic_type_clique_hash_is_source_order_independent() {
         root_hash(&db3),
         "automorphic record clique must round-trip through the projection"
     );
+
+    // `verify` recomputes each type clique's canonical member ordinals from the
+    // re-projected source (SPEC_V3 §10) and rejects a permutation. A->B / B->A is the
+    // hard case (a structural automorphism distinguished only by field NAME), so the
+    // recompute must run individualization-refinement and still reproduce the minted
+    // ordinals — it must NOT false-reject either source ordering or the round-trip.
+    for db in [&db1, &db2, &db3] {
+        bin().args(["verify", path(db)]).assert().success().stdout("verify ok\n");
+    }
 }
 
 #[test]

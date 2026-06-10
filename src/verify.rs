@@ -21,8 +21,8 @@ use crate::lowering::{
 };
 use crate::migrations::{Operation, history_hash, migration_hash};
 use crate::model::{
-    ProgramRootPayload, ROOT_MODULES_METADATA_KEY, preferred_names, qualified_symbol_display,
-    validate_module_path, validate_projection_identifier,
+    ProgramRootPayload, ROOT_MODULES_METADATA_KEY, preferred_names, preferred_type_names,
+    qualified_symbol_display, validate_module_path, validate_projection_identifier,
 };
 use crate::store::{
     CodeDb, cache_key_for_input, canonical_json, extract_hash_strings, function_interface_metadata,
@@ -1095,9 +1095,11 @@ impl CodeDb {
 
     /// SPEC_V3 §10: a clique's members must carry exactly the canonical birth
     /// ordinals `{nonce_prefix:0 .. nonce_prefix:n-1}` — the importer/agent mints one
-    /// per member. Reject a forged group whose ordinals are permuted, duplicated,
-    /// missing, or out of range. (Which member is canonically ordinal 0 is fixed by
-    /// the content hash; recomputing that full labeling here is a follow-on.)
+    /// per member. This object-level check rejects a forged group whose ordinals are
+    /// duplicated, missing, or out of range (the ordinal *set*). Which member is
+    /// canonically ordinal 0 — and so whether a *permutation* of an otherwise-valid
+    /// set is forged — is checked at the root level by `verify_clique_canonical_ordinals`,
+    /// which recomputes the full canonical labeling from the re-projected source.
     fn check_clique_member_birth_ordinals(
         &self,
         parent_hash: &str,
@@ -1555,6 +1557,16 @@ impl CodeDb {
         // definition) across all roots, so the lowered-IR exactly-once proof runs
         // even for functions never natively built (see `verify_lowerable_functions`).
         let mut lowered_definitions: BTreeSet<String> = BTreeSet::new();
+        // Recompute clique member ordinals only when a clique object exists, so the
+        // common clique-free DB pays nothing for the projection-based recompute.
+        let has_cliques: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM objects WHERE kind IN ('RecursionGroup', 'TypeRecursionGroup'))",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
         for root_hash in root_hashes {
             match self.type_check_root(&root_hash) {
                 Ok(()) => {}
@@ -1571,8 +1583,99 @@ impl CodeDb {
                 errors.push(format!("bad_index: root {root_hash}: {err:#}"));
             }
             self.verify_lowerable_functions(&root_hash, &root, &mut lowered_definitions, errors);
+            if has_cliques {
+                self.verify_clique_canonical_ordinals(&root_hash, &root, errors);
+            }
         }
         Ok(())
+    }
+
+    /// Recompute each mutually-recursive clique's canonical member ordinals from the
+    /// re-projected source — the exact computation the importer used — and check that
+    /// every clique member's stored birth ordinal matches (SPEC_V3 §10). This closes
+    /// the gap where `check_clique_member_birth_ordinals` only checks the ordinal *set*
+    /// is `{0..n-1}`: a forged history whose ordinals are *permuted* away from the
+    /// canonical labeling (member symbols self-consistent, set intact) is now rejected.
+    ///
+    /// Best-effort: any reconstruction failure (projection or parse) is skipped, so the
+    /// check only ever strengthens. It cannot false-reject a valid group — clique
+    /// members project without identity pins and re-parse to the same structure (the
+    /// clique projection fixpoint, SPEC_V3 §11), so `analyze_*_recursion_groups`
+    /// reproduces the same canonical member order, hence the same ordinals, that the
+    /// importer minted. `analyze_*` already returns each group's members in canonical
+    /// order, so the member's index in its group IS its canonical ordinal.
+    fn verify_clique_canonical_ordinals(
+        &self,
+        root_hash: &str,
+        root: &ProgramRootPayload,
+        errors: &mut Vec<String>,
+    ) {
+        let Ok(source) = self.render_source(root_hash) else {
+            return;
+        };
+        let Ok(items) = crate::expr::parse_program(&source) else {
+            return;
+        };
+
+        // (module, name) -> canonical ordinal, for function and type cliques.
+        let mut fn_expected: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for group in &CodeDb::analyze_recursion_groups(&items).groups {
+            for (ordinal, &item_idx) in group.iter().enumerate() {
+                if let crate::expr::ProgramItem::Function(function) = &items[item_idx] {
+                    fn_expected.insert((function.module.clone(), function.name.clone()), ordinal);
+                }
+            }
+        }
+        let mut type_expected: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for group in &CodeDb::analyze_type_recursion_groups(&items).groups {
+            for (ordinal, &item_idx) in group.iter().enumerate() {
+                if let crate::expr::ProgramItem::TypeDefinition(definition) = &items[item_idx] {
+                    type_expected
+                        .insert((definition.module.clone(), definition.name.clone()), ordinal);
+                }
+            }
+        }
+
+        let check = |expected: &BTreeMap<(String, String), usize>,
+                     module: &str,
+                     name: &str,
+                     symbol: &str,
+                     nonce_prefix: &str,
+                     errors: &mut Vec<String>| {
+            let Some(&ordinal) = expected.get(&(module.to_string(), name.to_string())) else {
+                return;
+            };
+            let Ok(spec) = self.symbol_birth_spec(symbol) else {
+                return;
+            };
+            let canonical = format!("{nonce_prefix}:{ordinal}");
+            if spec.local_nonce != canonical {
+                errors.push(format!(
+                    "bad_recursion_group: {root_hash} clique member {module}.{name} birth nonce {} is not the canonical {canonical}",
+                    spec.local_nonce
+                ));
+            }
+        };
+        for binding in preferred_names(root) {
+            check(
+                &fn_expected,
+                &binding.module,
+                &binding.display_name,
+                &binding.symbol,
+                "recursion_group",
+                errors,
+            );
+        }
+        for binding in preferred_type_names(root) {
+            check(
+                &type_expected,
+                &binding.module,
+                &binding.display_name,
+                &binding.type_symbol,
+                "type_recursion_group",
+                errors,
+            );
+        }
     }
 
     /// Lowered-IR backstop: lower every internal function (deduped by its

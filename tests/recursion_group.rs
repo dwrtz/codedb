@@ -264,6 +264,16 @@ fn recursion_group_hash_is_canonical_for_a_symmetric_clique() {
         root1, root3,
         "symmetric-clique root hash must round-trip through the projection"
     );
+
+    // `verify` recomputes each clique's canonical member ordinals from the
+    // re-projected source (SPEC_V3 §10) and rejects a permutation. This symmetric
+    // clique is the hard case — 1-WL cannot discretize it, so the recompute must run
+    // individualization-refinement and still reproduce the minted ordinals. All three
+    // valid databases (both source orderings + the round-trip) must `verify ok`, i.e.
+    // the recompute must NOT false-reject a well-formed canonically-ordered clique.
+    for db in [&db1, &db2, &db3] {
+        bin().args(["verify", path(db)]).assert().success().stdout("verify ok\n");
+    }
 }
 
 #[test]
