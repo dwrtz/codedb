@@ -4305,11 +4305,15 @@ impl CodeDb {
                 // Moving a move-only payload out of a case arm is sound only when the
                 // scrutinee is itself consumed, so the payload's single owner becomes
                 // the binding and the scrutinee is never dropped (no double free). A
-                // move-only enum scrutinee that is a place (param/local) is `Move`d
-                // when lowered above, satisfying this. Only a `box<T>` payload is
-                // supported (pointer-sized: moved by copying the pointer out); an
-                // inline move-only aggregate payload, or a non-place scrutinee, stays
-                // fail-closed (SPEC_V3 §7 field-granular enum-payload moves; Phase 6).
+                // move-only enum scrutinee that is a place (param/local) is `Move`d as a
+                // whole when lowered above, satisfying this. The payload then transfers
+                // to the binding by a shallow read of the (abandoned) enum storage: a
+                // `box<T>` payload by loading its pointer, an inline move-only aggregate
+                // payload by `Load`-aliasing the payload pointer and `Store`-memcpying it
+                // into the binding slot (a byte move — inner owned pointers transfer; the
+                // consumed scrutinee is never dropped, so each resource is freed once,
+                // SPEC_V3 §7). A non-place (temporary) scrutinee stays fail-closed: it is
+                // not drop-tracked, so there is no single consumed owner to move from.
                 if binding_is_move_only {
                     let scrutinee_is_consumed_place = matches!(
                         self.get_payload(scrutinee_hash)?
@@ -4317,11 +4321,9 @@ impl CodeDb {
                             .and_then(JsonValue::as_str),
                         Some("param_ref" | "local_ref")
                     );
-                    let payload_is_box =
-                        matches!(self.type_spec(&variant_info.type_hash)?, TypeSpec::Box { .. });
-                    if !scrutinee_is_consumed_place || !payload_is_box {
+                    if !scrutinee_is_consumed_place {
                         bail!(
-                            "unsupported_move: moving a move-only enum payload out of a case arm is supported only for a box<T> payload bound from a consumed (param/local) scrutinee; inline move-only aggregate payloads and non-place scrutinees are not yet supported (SPEC_V3 §7)"
+                            "unsupported_move: moving a move-only enum payload out of a case arm requires a consumed (param/local) scrutinee; moving out of a temporary enum is not yet supported (SPEC_V3 §7)"
                         );
                     }
                 }
@@ -4346,9 +4348,11 @@ impl CodeDb {
                     },
                 });
                 let payload_value = if binding_is_move_only {
-                    // Move the box pointer out of the (consumed) scrutinee into the
-                    // binding: a plain pointer `Load` transfers ownership, since the
-                    // scrutinee is moved and never dropped.
+                    // Read the payload out of the (consumed, never-dropped) scrutinee
+                    // into the binding. `Load` of a `box<T>` loads the pointer; `Load` of
+                    // an inline aggregate aliases the payload pointer and the `Store`
+                    // below memcpys it into the binding slot — a shallow byte move that
+                    // transfers the payload's owned resources exactly once.
                     let pv = ctx.value();
                     ctx.push_debug_op(expr_hash, "load", &pv);
                     arm_operations.push(LoweredOp::Load {

@@ -356,3 +356,59 @@ fn deep_recursion_evaluator_ceiling_is_an_oracle_bound_not_a_native_limit() {
         );
     }
 }
+
+#[test]
+fn inline_move_only_enum_payload_moves_out_of_a_case_arm_native() {
+    // V3.1 fail-closed item #3 lifted: an INLINE (non-box) move-only aggregate payload
+    // — a record owning a box — can now be bound and moved out of a `case` arm when the
+    // scrutinee is a consumed place. Lowering reads it out with a `Load`-aliased pointer
+    // + `Store` memcpy (a shallow byte move); the consumed enum is never dropped, so the
+    // box is freed exactly once (by `consume` via `unbox`). eval == native; a double-free
+    // would abort the run. (Leak-freedom at scale is pinned by tests/leak_interposer.rs.)
+    check_native(
+        "inline_enum_payload",
+        "record Boxed { b: box<i64> }\n\
+         enum E { only: Boxed }\n\
+         fn consume(x: Boxed) -> i64 effects[alloc] = unbox(x.b)\n\
+         fn f(e: E) -> i64 effects[alloc] = case e of only(x) => consume(x)\n\
+         fn main() -> i64 effects[alloc] = f(E::only({ b: box_new(42) }))\n",
+        "main",
+        42,
+    );
+}
+
+#[test]
+fn moving_inline_enum_payload_from_a_temporary_scrutinee_fails_closed() {
+    // The remaining restriction: a non-place (temporary) move-only enum scrutinee is
+    // not drop-tracked, so moving its payload out stays fail-closed with a clean
+    // diagnostic (the checker accepts it; lowering declines). No crash.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("temp_scrut.sqlite");
+    let src = temp.path().join("temp_scrut.cdb");
+    std::fs::write(
+        &src,
+        "record Boxed { b: box<i64> }\n\
+         enum E { only: Boxed }\n\
+         fn consume(x: Boxed) -> i64 effects[alloc] = unbox(x.b)\n\
+         fn g() -> i64 effects[alloc] = case E::only({ b: box_new(1) }) of only(x) => consume(x)\n\
+         fn main() -> i64 effects[alloc] = g()\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+    let ir = temp.path().join("g.ir.json");
+    let stderr = String::from_utf8(
+        bin()
+            .args(["emit-ir", path(&db), "g", "--out", path(&ir)])
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        stderr.contains("consumed (param/local) scrutinee"),
+        "expected a clean fail-closed diagnostic, got: {stderr}"
+    );
+}

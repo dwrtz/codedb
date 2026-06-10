@@ -847,8 +847,13 @@ native and round-trip. A field reached through a `box` deref now fails closed wi
 clean `unsupported_move` diagnostic (was an opaque lowering crash).
 
 Documented follow-on R14/structure surface: `if` guard and nested-enum-destructuring
-patterns (range patterns `lo..hi`/`lo..=hi` are now implemented); and inline
-(non-`box`) move-only enum-payload moves. `verify` recomputes each recursion/type
+patterns (range patterns `lo..hi`/`lo..=hi` are now implemented). Inline (non-`box`)
+move-only enum-payload moves out of a `case` arm are now implemented too — a consumed
+(param/local) move-only enum scrutinee's inline aggregate payload is read out by a
+`Load`-aliased pointer + `Store` memcpy (a shallow byte move; the consumed enum is
+never dropped, so each owned resource transfers exactly once), pinned at runtime scale
+by `tests/leak_interposer.rs`. Moving a payload out of a *temporary* (non-place) enum
+stays fail-closed (a temporary is not drop-tracked). `verify` recomputes each recursion/type
 clique's canonical ordinals from the re-projected source and rejects a permutation —
 covered now on BOTH sides: the positive path (valid automorphic cliques must not
 false-reject) plus a negative regression that mints a clique with non-canonical member
