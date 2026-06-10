@@ -4418,6 +4418,40 @@ impl CodeDb {
                     bail!("case arm {variant} result type mismatch while lowering");
                 }
                 arm_operations.extend(body.operations);
+                // A no-`binding_name` arm — a `default`/`_` arm expanded to cover this
+                // variant — does not bind the payload, but a move-only enum scrutinee
+                // is consumed (a param/local place is `Move`d when lowered above; a
+                // temporary is never otherwise dropped). So if the matched variant's
+                // payload owns resources, this arm must free them here, or the payload
+                // (and its recursive sub-chain) leaks: a drop-requiring payload implies
+                // a move-only — hence consumed — scrutinee, so this is the sole free,
+                // exactly once (SPEC_V3 §7). Mirrors the binding path's residual drop
+                // above; the drop goes through `AddrOfEnumPayload` on the consumed
+                // scrutinee since there is no binding slot to drop.
+                if self.type_requires_drop_scaffold(
+                    root,
+                    ctx.target_triple(),
+                    &variant_info.type_hash,
+                )? {
+                    let payload_address = ctx.value();
+                    ctx.push_debug_op(expr_hash, "addr_of_enum_payload", &payload_address);
+                    arm_operations.push(LoweredOp::AddrOfEnumPayload {
+                        id: payload_address.clone(),
+                        place: LoweredPlace::EnumPayload {
+                            base: scrutinee.value.clone(),
+                            variant: variant.clone(),
+                            variant_symbol: variant_info.variant_symbol.clone(),
+                            owner_type_hash: scrutinee.type_hash.clone(),
+                            tag_value: variant_info.tag_value,
+                            payload_offset_bytes: variant_info.payload_offset_bytes,
+                            type_hash: variant_info.type_hash.clone(),
+                        },
+                    });
+                    arm_operations.push(LoweredOp::Drop {
+                        address: payload_address,
+                        type_hash: variant_info.type_hash.clone(),
+                    });
+                }
                 lowered_arms.push(LoweredCaseArm {
                     variant,
                     variant_symbol: variant_info.variant_symbol,

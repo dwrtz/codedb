@@ -164,6 +164,52 @@ fn type_clique_hash_is_source_order_independent() {
 }
 
 #[test]
+fn automorphic_type_clique_hash_is_source_order_independent() {
+    // Regression (SPEC_V3 §6/§10): a mutually-recursive *record* clique with a
+    // structural automorphism but DISTINCT field names — `A.toB` <-> `B.toA` — must
+    // hash the same regardless of source declaration order. Both members have an
+    // identical recolored type (`{i64, box<peer>}`), so the canonical labeling can
+    // only tell them apart by field NAME. Before the fix the name was erased from the
+    // clique-ordering form, the two members formed one unsplittable orbit, the
+    // member→ordinal mapping fell to source order, and — because the names differ in
+    // the final `TypeDef` identity — the two orderings produced DIFFERENT root hashes
+    // and a non-fixpoint round-trip. (Cons/List can't exercise this: a record and an
+    // enum are discretized by kind, so no automorphism arises.)
+    let a_first = "record A { v: i64\n  toB: box<B> }\n\
+                   record B { v: i64\n  toA: box<A> }\n\
+                   fn main() -> i64 = 0\n";
+    let b_first = "record B { v: i64\n  toA: box<A> }\n\
+                   record A { v: i64\n  toB: box<B> }\n\
+                   fn main() -> i64 = 0\n";
+    let temp = tempdir().unwrap();
+    let db1 = temp.path().join("a_first.sqlite");
+    let db2 = temp.path().join("b_first.sqlite");
+    for (db, src) in [(&db1, a_first), (&db2, b_first)] {
+        let file = temp.path().join(format!("{}.cdb", path(db).len()));
+        std::fs::write(&file, src).unwrap();
+        run(&["init", path(db)]);
+        run(&["import", path(db), path(&file)]);
+    }
+    assert_eq!(
+        root_hash(&db1),
+        root_hash(&db2),
+        "automorphic record clique hash must be source-order-independent"
+    );
+
+    // import -> export -> re-import is a fixpoint (the SPEC_V3 §11 round-trip gate).
+    let export = temp.path().join("auto.export.cdb");
+    run(&["export", path(&db1), "--branch", "main", "--out", path(&export)]);
+    let db3 = temp.path().join("auto.rt.sqlite");
+    run(&["init", path(&db3)]);
+    run(&["import", path(&db3), path(&export)]);
+    assert_eq!(
+        root_hash(&db1),
+        root_hash(&db3),
+        "automorphic record clique must round-trip through the projection"
+    );
+}
+
+#[test]
 fn type_clique_projection_round_trip_is_a_fixpoint() {
     // import -> export -> re-import reproduces the SAME root hash: clique members
     // project back as plain `record`/`enum`s (no identity pins — re-derived

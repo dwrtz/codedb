@@ -10410,10 +10410,25 @@ pub(crate) fn recolor_type_definition_form(
     };
     let forms: Vec<JsonValue> = members
         .iter()
-        .map(|member| match parse_type_source(&member.ty) {
-            Ok(spec) => recolor_parsed_type(&spec, module, name_to_local, colors),
-            // Already validated during clique analysis; fall back to the raw string.
-            Err(_) => JsonValue::String(member.ty.clone()),
+        .map(|member| {
+            let ty_form = match parse_type_source(&member.ty) {
+                Ok(spec) => recolor_parsed_type(&spec, module, name_to_local, colors),
+                // Already validated during clique analysis; fall back to the raw string.
+                Err(_) => JsonValue::String(member.ty.clone()),
+            };
+            // Include the field/variant NAME alongside its (peer-recolored) type. A
+            // member name is part of the stored `TypeDef`'s identity, so two members
+            // that are structurally symmetric (same recolored type) but distinctly
+            // named — e.g. `A.toB` / `B.toA` in an automorphic two-record clique —
+            // must be DISCRETIZED by the canonical labeling. Without the name they
+            // form one orbit the labeling cannot split, the member→ordinal mapping
+            // falls back to source order, and because their names differ in the final
+            // identity the group/root hash becomes source-order-dependent (breaking
+            // content-addressing canonicality and the SPEC_V3 §11 round-trip). Peer
+            // *references* stay erased (recolored above); only the intrinsic member
+            // name — which the function-clique form omits because param names are
+            // out-of-band metadata, but which IS identity for a type — is added.
+            json!({ "name": member.name, "ty": ty_form })
         })
         .collect();
     canonical_json(&JsonValue::Array(forms))

@@ -223,6 +223,65 @@ fn case_arm_that_ignores_a_box_binding_drops_it_exactly_once() {
     );
 }
 
+/// Collect op kinds recursively, descending into `if`/`case` blocks — a default
+/// arm's drop lives inside the arm block, not at the top level.
+fn op_kinds_recursive(ops: &JsonValue, out: &mut Vec<String>) {
+    for op in ops.as_array().unwrap() {
+        out.push(op["op"].as_str().unwrap().to_string());
+        for key in ["then_block", "else_block"] {
+            if let Some(block) = op.get(key) {
+                op_kinds_recursive(&block["operations"], out);
+            }
+        }
+        if let Some(arms) = op.get("arms").and_then(JsonValue::as_array) {
+            for arm in arms {
+                op_kinds_recursive(&arm["block"]["operations"], out);
+            }
+        }
+    }
+}
+
+const DEFAULT_ARM_SOURCE: &str =
+    "enum Node { empty: unit\n  next: box<Node> }\n\
+     fn build(n: i64) -> Node effects[alloc] =\n\
+       if n < 1 then Node::empty(()) else Node::next(box_new(build(n - 1)))\n\
+     fn classify(n: Node) -> i64 effects[alloc] =\n\
+       case n of empty(u) => 0 | _ => 42\n\
+     fn main() -> i64 effects[alloc] = classify(build(5))\n";
+
+#[test]
+fn default_case_arm_over_a_box_variant_frees_its_payload() {
+    // Regression (SPEC_V3 §7 exactly-once): a `case` whose `_`/default arm matches a
+    // move-only `box`-carrying variant must FREE that payload. The move-only enum
+    // scrutinee is consumed (the param place is `Move`d), so nothing else drops it —
+    // before the fix the default arm emitted ZERO drops and the whole `box<Node>`
+    // sub-chain leaked, yet eval/verify/native all "passed" (a leak changes neither
+    // the value nor aborts the run, and `verify` checks only at-most-once). Pin the
+    // fix by asserting the lowered default arm now drops the payload.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("defaultarm.sqlite");
+    let src = temp.path().join("defaultarm.cdb");
+    std::fs::write(&src, DEFAULT_ARM_SOURCE).unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+    run(&["verify", path(&db)]);
+
+    let ir_path = temp.path().join("classify.ir.json");
+    run(&["emit-ir", path(&db), "classify", "--out", path(&ir_path)]);
+    let ir: JsonValue =
+        serde_json::from_str(&std::fs::read_to_string(&ir_path).unwrap()).unwrap();
+    let mut ops = Vec::new();
+    op_kinds_recursive(&ir["ir"]["operations"], &mut ops);
+    assert!(
+        ops.iter().any(|op| op == "drop"),
+        "the `_` arm must free the matched box<Node> payload (leak guard), got {ops:?}"
+    );
+
+    // eval + native: the value is correct and the added drop does not double-free
+    // (a double-free would abort the native run).
+    check_native("defaultarm", DEFAULT_ARM_SOURCE, "main", 42);
+}
+
 #[test]
 fn recursion_members_project_back_to_plain_functions() {
     // A recursion group is an internal representation: members export as ordinary
