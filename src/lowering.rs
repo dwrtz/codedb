@@ -637,6 +637,18 @@ struct DropTracker {
     addr_places: BTreeMap<String, MovedPlace>,
     moved: BTreeSet<MovedPlace>,
     dropped: BTreeSet<MovedPlace>,
+    /// `AddrOfEnumPayload` result id → (base value, variant). The payload of a
+    /// consumed move-only enum is dropped through such an address (e.g. a
+    /// `_`/default arm over a `box`-carrying variant frees its payload) — not a
+    /// storage-slot place, so it is absent from `addr_places` and would otherwise
+    /// escape the exactly-once check (SPEC_V3 §7).
+    enum_payload_addr: BTreeMap<String, (String, String)>,
+    /// (base value, variant) pairs already dropped. Globally unique per function in
+    /// well-formed IR — a consumed move-only enum cannot be reused and each variant
+    /// is matched in exactly one arm — so a repeat is a double free. No branch
+    /// isolation is needed: distinct arms drop distinct variants, and a consumed
+    /// scrutinee is never re-`case`d, so a collision can only be a real double drop.
+    dropped_enum_payloads: BTreeSet<(String, String)>,
 }
 
 struct LowerCtx {
@@ -5573,7 +5585,7 @@ impl CodeDb {
         bail!("lowered IR does not match any indexed root");
     }
 
-    fn verify_lowered_ir(
+    pub(crate) fn verify_lowered_ir(
         &self,
         root: &ProgramRootPayload,
         ir: &LoweredFunctionIr,
@@ -6504,6 +6516,9 @@ impl CodeDb {
                         bail!("lowered addr_of_enum_payload metadata mismatch");
                     }
                     insert_address(addresses, id, type_hash)?;
+                    drop_state
+                        .enum_payload_addr
+                        .insert(id.clone(), (base.clone(), variant.clone()));
                     if self.is_aggregate_ir_type(root, type_hash)? {
                         insert_value(values, id, type_hash)?;
                     }
@@ -6949,6 +6964,15 @@ impl CodeDb {
                             bail!("lowered double drop of storage");
                         }
                         insert_moved_place(&mut drop_state.dropped, place);
+                    }
+                    // An enum-payload drop (a consumed move-only enum's payload, e.g.
+                    // a `_`/default arm freeing a `box` variant) is not a storage-slot
+                    // place; track it by (base, variant) so a repeat is caught as a
+                    // double free (SPEC_V3 §7 exactly-once).
+                    if let Some(payload) = drop_state.enum_payload_addr.get(address).cloned()
+                        && !drop_state.dropped_enum_payloads.insert(payload)
+                    {
+                        bail!("lowered double drop of enum payload");
                     }
                 }
                 LoweredOp::BorrowDebug {

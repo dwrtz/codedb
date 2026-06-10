@@ -250,13 +250,30 @@ impl CodeDb {
                             "import:type:{}:{}:{}",
                             definition.module, definition.name, idx
                         );
+                        // A non-clique type projects with an explicit identity pin so a
+                        // later rename stays metadata-only (SPEC_V3 §10). Drop the pin when
+                        // it is merely the seed-canonical identity (the no-rename case):
+                        // embedding a redundant identity changes this `create_type` op's
+                        // hash vs a pin-less import, shifting every downstream symbol's
+                        // birth history and breaking the import→export→import root-hash
+                        // fixpoint (SPEC_V3 §11) — the same reason recursion/type cliques
+                        // never emit pins. A renamed/moved (or non-import-shaped) pin keeps
+                        // its `local_nonce` mismatch and is retained.
+                        let identity = definition.identity.clone().filter(|identity| {
+                            !type_identity_is_seed_canonical(
+                                identity,
+                                &birth_seed,
+                                branch.history_hash.as_deref(),
+                                &definition.definition,
+                            )
+                        });
                         Operation::CreateType {
                             module: definition.module.clone(),
                             name: definition.name.clone(),
                             birth_seed,
                             region_params: definition.region_params.clone(),
                             definition: definition.definition.clone(),
-                            identity: definition.identity.clone(),
+                            identity,
                         }
                     }
                 }
@@ -1347,6 +1364,61 @@ fn resolve_call_node(
             .get(&(current_module.to_string(), name.to_string()))
             .copied()
     }
+}
+
+/// Whether an explicit type-identity pin is exactly the identity the deterministic
+/// `birth_seed` derivation reproduces — i.e. the type was neither renamed nor moved, so
+/// the pin is redundant. Such a pin is dropped from the `CreateType` op: embedding a
+/// redundant identity changes the op's hash relative to a pin-less import, which shifts
+/// every downstream symbol's birth history and breaks the import→export→import root-hash
+/// fixpoint (SPEC_V3 §10/§11) — the same reason recursion/type cliques never emit pins.
+///
+/// `symbol_kind`, `local_nonce`, and `birth_history_hash` (the full seed-derived spec)
+/// are compared — `birth_history_hash` is `parent_history_hash` (or `"genesis"`), so a
+/// merge-grafted type that retained an original, different birth history is NOT mistaken
+/// for redundant and keeps its pin. A renamed/moved or otherwise non-seed-shaped pin
+/// likewise keeps its mismatch and is retained, preserving rename-as-metadata.
+/// Region-parameterized types keep their pin (their region births are not checked here —
+/// conservative, never a regression).
+fn type_identity_is_seed_canonical(
+    identity: &crate::types::TypeDefinitionIdentity,
+    birth_seed: &str,
+    parent_history_hash: Option<&str>,
+    definition: &TypeDefinitionKind,
+) -> bool {
+    if !identity.region_param_births.is_empty() {
+        return false;
+    }
+    let expected_history = parent_history_hash.unwrap_or("genesis");
+    let birth_is_seed_derived = |birth: &crate::types::SymbolBirthSpec,
+                                 kind: &str,
+                                 nonce: &str|
+     -> bool {
+        birth.symbol_kind == kind
+            && birth.local_nonce == nonce
+            && birth.birth_history_hash == expected_history
+    };
+    if !birth_is_seed_derived(&identity.type_symbol_birth, "type", birth_seed) {
+        return false;
+    }
+    let (members, member_tag, member_kind): (&[TypeMemberSpec], &str, &str) = match definition {
+        TypeDefinitionKind::Record { fields } => (fields, "field", "record_field"),
+        TypeDefinitionKind::Enum { variants } => (variants, "variant", "enum_variant"),
+    };
+    if identity.member_births.len() != members.len() {
+        return false;
+    }
+    members
+        .iter()
+        .zip(identity.member_births.iter())
+        .enumerate()
+        .all(|(idx, (member, birth))| {
+            birth_is_seed_derived(
+                birth,
+                member_kind,
+                &format!("{birth_seed}:{member_tag}:{idx}:{}", member.name),
+            )
+        })
 }
 
 /// Tarjan's strongly-connected-components algorithm. Returns each SCC as a list

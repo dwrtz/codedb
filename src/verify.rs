@@ -1551,6 +1551,10 @@ impl CodeDb {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
 
+        // Lower each internal function once (deduped by content-addressed
+        // definition) across all roots, so the lowered-IR exactly-once proof runs
+        // even for functions never natively built (see `verify_lowerable_functions`).
+        let mut lowered_definitions: BTreeSet<String> = BTreeSet::new();
         for root_hash in root_hashes {
             match self.type_check_root(&root_hash) {
                 Ok(()) => {}
@@ -1566,8 +1570,57 @@ impl CodeDb {
             if let Err(err) = self.verify_root_indexes(&root_hash, &root, errors) {
                 errors.push(format!("bad_index: root {root_hash}: {err:#}"));
             }
+            self.verify_lowerable_functions(&root_hash, &root, &mut lowered_definitions, errors);
         }
         Ok(())
+    }
+
+    /// Lowered-IR backstop: lower every internal function (deduped by its
+    /// content-addressed definition) and run the lowered-IR verifier, so the
+    /// drop-exactly-once proof and shape invariants are checked even for functions
+    /// that were never natively built. Previously only functions with a cached
+    /// native object artifact were re-lowered during verify, so a function that
+    /// merely typechecked and evaluated escaped the lowered-IR exactly-once proof
+    /// (SPEC_V3 §7 / PLAN_V3 Phase 4 — "verify still proves drops occur exactly
+    /// once").
+    ///
+    /// A lowering *failure* is a fail-closed "not native-complete" state (an
+    /// eval-only construct, e.g. an inline move-only enum payload) and is permitted
+    /// — `verify` certifies object-graph integrity and the exactly-once proof for
+    /// every lowerable function, not universal native-lowerability. A lowered IR
+    /// that *verifies invalid* (an exactly-once or shape violation) is a hard error:
+    /// it would otherwise surface only at native build time.
+    fn verify_lowerable_functions(
+        &self,
+        root_hash: &str,
+        root: &ProgramRootPayload,
+        lowered_definitions: &mut BTreeSet<String>,
+        errors: &mut Vec<String>,
+    ) {
+        for entry in &root.symbols {
+            if !lowered_definitions.insert(entry.definition.clone()) {
+                continue;
+            }
+            if !matches!(
+                self.definition_is_internal_function(&entry.definition),
+                Ok(true)
+            ) {
+                continue;
+            }
+            match self.build_lowered_function_ir(root, entry, crate::DEFAULT_NATIVE_TARGET) {
+                Ok(ir) => {
+                    if let Err(err) =
+                        self.verify_lowered_ir(root, &ir, crate::DEFAULT_NATIVE_TARGET)
+                    {
+                        errors.push(format!(
+                            "bad_lowered_ir: {} in root {root_hash}: {err:#}",
+                            entry.symbol
+                        ));
+                    }
+                }
+                Err(_) => {}
+            }
+        }
     }
 
     fn verify_root_indexes(
