@@ -219,6 +219,53 @@ fn automorphic_type_clique_hash_is_source_order_independent() {
 }
 
 #[test]
+fn fully_automorphic_type_clique_hash_is_source_order_independent() {
+    // The harder sibling of the test above: two mutually-pointing records that are
+    // identical down to the FIELD NAME (`link` <-> `link`). With distinct field names the
+    // form distinguishes the members (1-WL discretizes); with identical names they form a
+    // genuine automorphism orbit that only the member-key orbit tiebreak in
+    // `clique_label_search` can canonicalize. Before the fix, A-first and B-first produced
+    // DIFFERENT root hashes and A-first FAILED its own `verify` (the canonical-ordinal
+    // recompute disagreed with the minted ordinals). Both orderings and the round-trip
+    // must now agree and verify.
+    let a_first = "record A { v: i64\n  link: box<B> }\n\
+                   record B { v: i64\n  link: box<A> }\n\
+                   fn main() -> i64 = 0\n";
+    let b_first = "record B { v: i64\n  link: box<A> }\n\
+                   record A { v: i64\n  link: box<B> }\n\
+                   fn main() -> i64 = 0\n";
+    let temp = tempdir().unwrap();
+    let db1 = temp.path().join("a_first.sqlite");
+    let db2 = temp.path().join("b_first.sqlite");
+    for (db, src) in [(&db1, a_first), (&db2, b_first)] {
+        let file = temp.path().join(format!("{}.cdb", path(db).len()));
+        std::fs::write(&file, src).unwrap();
+        run(&["init", path(db)]);
+        run(&["import", path(db), path(&file)]);
+    }
+    assert_eq!(
+        root_hash(&db1),
+        root_hash(&db2),
+        "fully-automorphic record clique hash must be source-order-independent"
+    );
+
+    let export = temp.path().join("fauto.export.cdb");
+    run(&["export", path(&db1), "--branch", "main", "--out", path(&export)]);
+    let db3 = temp.path().join("fauto.rt.sqlite");
+    run(&["init", path(&db3)]);
+    run(&["import", path(&db3), path(&export)]);
+    assert_eq!(
+        root_hash(&db1),
+        root_hash(&db3),
+        "fully-automorphic record clique must round-trip through the projection"
+    );
+
+    for db in [&db1, &db2, &db3] {
+        bin().args(["verify", path(db)]).assert().success().stdout("verify ok\n");
+    }
+}
+
+#[test]
 fn type_clique_projection_round_trip_is_a_fixpoint() {
     // import -> export -> re-import reproduces the SAME root hash: clique members
     // project back as plain `record`/`enum`s (no identity pins — re-derived

@@ -1604,28 +1604,43 @@ fn clique_form(
 
 /// Individualization-refinement search for the canonical labeling of a clique whose
 /// 1-WL refinement did not fully discretize. At each node: refine to stability; if
-/// discrete, rank members by colour to get a labeling and keep it if its
-/// `recursion_clique_form` is the lexicographically smallest seen. Otherwise pick
-/// the lowest-coloured non-singleton cell (a structural choice) and recurse once per
-/// member, individualizing that member. The result is the lex-min over ALL choices,
-/// so it is invariant to the order members were tried in — hence to source order.
-/// Members in a genuine automorphism orbit yield equal forms, so the choice among
-/// them does not affect the resulting content hash.
+/// discrete, rank members by colour to get a labeling and score it by its canonical
+/// `clique_form`. Otherwise pick the lowest-coloured non-singleton cell (a structural
+/// choice) and recurse once per member, individualizing that member. The search visits
+/// every leaf, so the min-`form` it finds is invariant to the order members were tried
+/// in — hence to source order.
+///
+/// The form alone does NOT pin the labeling: a clique with a nontrivial automorphism
+/// has a whole orbit of labelings that tie on the lex-min form, and a "first one wins"
+/// rule resolves that tie by exploration (source) order — the exact order-dependence
+/// this code exists to remove. A name-independent *distinct* ordinal assignment is
+/// impossible for structurally-indistinguishable members, so we break orbit ties with a
+/// stable per-member key (`member_key`, the member's module-qualified name): among all
+/// labelings achieving the lex-min form, keep the one whose key sequence is lex-min.
+/// That makes the labeling a function of the unordered member set, so two source
+/// orderings — and the import / export / verify recompute — all agree. Asymmetric
+/// cliques have no tie, so their labeling and content hash are unchanged.
 fn clique_label_search(
     n: usize,
     static_sig: &[String],
     erase: &dyn Fn(usize, &[String]) -> String,
+    member_key: &[String],
     seed_colors: Vec<String>,
     depth: usize,
-    best: &mut Option<(Vec<String>, Vec<usize>)>,
+    best: &mut Option<(Vec<String>, Vec<String>, Vec<usize>)>,
 ) {
     let colors = refine_clique_colors(n, static_sig, erase, &seed_colors, true);
     if distinct_color_count(&colors) == n {
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| colors[a].cmp(&colors[b]));
         let form = clique_form(n, static_sig, erase, &order);
-        if best.as_ref().is_none_or(|(best_form, _)| &form < best_form) {
-            *best = Some((form, order));
+        let key_seq: Vec<String> = order.iter().map(|&local| member_key[local].clone()).collect();
+        let better = match best.as_ref() {
+            None => true,
+            Some((best_form, best_key, _)) => (&form, &key_seq) < (best_form, best_key),
+        };
+        if better {
+            *best = Some((form, key_seq, order));
         }
         return;
     }
@@ -1644,9 +1659,9 @@ fn clique_label_search(
         // Pin `member` into its own singleton cell with a distinct, ordering-neutral
         // colour. The depth tag keeps individualizations at different levels apart;
         // the choice of marker cannot affect the result because the final selection
-        // is by lex-min form over every branch.
+        // is by lex-min (form, member-key) over every branch.
         individualized[member] = format!("\u{0}ind:{depth}\u{0}{}", colors[member]);
-        clique_label_search(n, static_sig, erase, individualized, depth + 1, best);
+        clique_label_search(n, static_sig, erase, member_key, individualized, depth + 1, best);
     }
 }
 
@@ -1673,13 +1688,17 @@ fn clique_label_search(
 /// is an incomplete graph canonicalization: it can leave distinct (non-automorphic)
 /// members sharing a colour. Falling back to source order there reintroduces the
 /// order-dependence, so when refinement does not discretize we run individualization-
-/// refinement (`clique_label_search`) to a true canonical labeling. `static_sig` is
-/// the per-member name-independent signature; `erase(local, colors)` yields the
-/// member's structural form with in-clique peer references recoloured by `colors`.
+/// refinement (`clique_label_search`) to a canonical labeling, breaking any residual
+/// automorphism-orbit tie by the stable `member_key`. `static_sig` is the per-member
+/// name-independent signature; `erase(local, colors)` yields the member's structural
+/// form with in-clique peer references recoloured by `colors`; `member_key[local]` is
+/// the member's stable (source-order-independent) identity used only as the orbit
+/// tie-breaker.
 fn canonical_clique_order(
     n: usize,
     static_sig: &[String],
     erase: &dyn Fn(usize, &[String]) -> String,
+    member_key: &[String],
 ) -> Vec<usize> {
     // Initial 1-WL refinement (own colour NOT folded in), identical to the historical
     // colouring so cliques that already discretize keep their prior order and hash.
@@ -1689,10 +1708,10 @@ fn canonical_clique_order(
         order.sort_by(|&a, &b| colors[a].cmp(&colors[b]));
         order
     } else {
-        let mut best: Option<(Vec<String>, Vec<usize>)> = None;
-        clique_label_search(n, static_sig, erase, colors, 0, &mut best);
+        let mut best: Option<(Vec<String>, Vec<String>, Vec<usize>)> = None;
+        clique_label_search(n, static_sig, erase, member_key, colors, 0, &mut best);
         best.expect("individualization-refinement yields at least one labeling")
-            .1
+            .2
     }
 }
 
@@ -1725,7 +1744,14 @@ fn canonical_recursion_member_order(
         recolor_peer_calls(&mut body, &functions[local].module, &name_to_local, colors);
         store::canonical_json(&body)
     };
-    let local_order = canonical_clique_order(n, &static_sig, &erase);
+    // Stable per-member key, consulted only to break automorphism-orbit ties
+    // canonically (see `clique_label_search`). The module-qualified name is unique and
+    // source-order-independent; a `\0` separator cannot occur inside an identifier.
+    let member_key: Vec<String> = functions
+        .iter()
+        .map(|function| format!("{}\u{0}{}", function.module, function.name))
+        .collect();
+    let local_order = canonical_clique_order(n, &static_sig, &erase, &member_key);
     local_order
         .into_iter()
         .map(|local| member_item_indices[local])
@@ -1773,7 +1799,12 @@ fn canonical_type_member_order(
             colors,
         )
     };
-    let local_order = canonical_clique_order(n, &static_sig, &erase);
+    // Stable per-member key for canonical orbit-tie-breaking (see `clique_label_search`).
+    let member_key: Vec<String> = types
+        .iter()
+        .map(|definition| format!("{}\u{0}{}", definition.module, definition.name))
+        .collect();
+    let local_order = canonical_clique_order(n, &static_sig, &erase, &member_key);
     local_order
         .into_iter()
         .map(|local| member_item_indices[local])

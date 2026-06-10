@@ -1680,18 +1680,18 @@ impl CodeDb {
 
     /// Lowered-IR backstop: lower every internal function (deduped by its
     /// content-addressed definition) and run the lowered-IR verifier, so the
-    /// drop-exactly-once proof and shape invariants are checked even for functions
-    /// that were never natively built. Previously only functions with a cached
-    /// native object artifact were re-lowered during verify, so a function that
-    /// merely typechecked and evaluated escaped the lowered-IR exactly-once proof
-    /// (SPEC_V3 §7 / PLAN_V3 Phase 4 — "verify still proves drops occur exactly
-    /// once").
+    /// drop-at-most-once (no-double-free) proof and shape invariants are checked even
+    /// for functions that were never natively built. Previously only functions with a
+    /// cached native object artifact were re-lowered during verify, so a function that
+    /// merely typechecked and evaluated escaped the lowered-IR check (SPEC_V3 §7 /
+    /// PLAN_V3 Phase 4). The no-leak half of exactly-once is ensured by lowering's
+    /// static drop placement, not independently re-proven here.
     ///
     /// A lowering *failure* is a fail-closed "not native-complete" state (an
     /// eval-only construct, e.g. an inline move-only enum payload) and is permitted
-    /// — `verify` certifies object-graph integrity and the exactly-once proof for
-    /// every lowerable function, not universal native-lowerability. A lowered IR
-    /// that *verifies invalid* (an exactly-once or shape violation) is a hard error:
+    /// — `verify` certifies object-graph integrity and the at-most-once / shape proof
+    /// for every lowerable function, not universal native-lowerability. A lowered IR
+    /// that *verifies invalid* (a double-free or shape violation) is a hard error:
     /// it would otherwise surface only at native build time.
     fn verify_lowerable_functions(
         &self,

@@ -34,6 +34,29 @@ fn parse_json(text: &str) -> JsonValue {
     serde_json::from_str(text).unwrap_or_else(|err| panic!("invalid json: {err}\n{text}"))
 }
 
+/// Recursively collect the `type_hash` of every `drop` op in a lowered-IR JSON tree
+/// (ops nest inside `case` arm blocks).
+fn collect_drop_types(value: &JsonValue, out: &mut Vec<String>) {
+    match value {
+        JsonValue::Object(map) => {
+            if map.get("op").and_then(|v| v.as_str()) == Some("drop")
+                && let Some(type_hash) = map.get("type_hash").and_then(|v| v.as_str())
+            {
+                out.push(type_hash.to_string());
+            }
+            for child in map.values() {
+                collect_drop_types(child, out);
+            }
+        }
+        JsonValue::Array(items) => {
+            for child in items {
+                collect_drop_types(child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn can_build_default_native_target() -> bool {
     let native_target = (std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64")
         || (std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64");
@@ -146,6 +169,50 @@ fn nested_case_in_non_last_arm_round_trips() {
     run(&["verify", path(&db2)]);
     assert_eq!(run(&["eval", path(&db2), "f", "0"]).trim(), "2");
     assert_eq!(run(&["eval", path(&db2), "f", "5"]).trim(), "3");
+}
+
+#[test]
+fn default_arm_over_multiple_box_variants_drops_each_under_its_own_layout() {
+    // The `_`/default arm covers TWO move-only variants with DIFFERENT payload layouts
+    // (box<A>, a one-field record, vs box<B>, a two-field record). The default arm is
+    // expanded per-uncovered-variant, so each tag-dispatched arm frees its payload under
+    // its OWN variant layout. A single shared drop would mis-lay-out one payload (a
+    // miscompile) or leak it. This pins the multi-variant case the single-variant
+    // default-arm test (recursion_native) does not reach.
+    let source = "record A { a: i64 }\n\
+                  record B { x: i64\n  y: i64 }\n\
+                  enum E { unitv: unit\n  boxa: box<A>\n  boxb: box<B> }\n\
+                  fn mk(tag: i64) -> E effects[alloc] =\n\
+                    if tag < 1 then E::boxa(box_new({ a: 7 })) else E::boxb(box_new({ x: 1, y: 2 }))\n\
+                  fn classify(e: E) -> i64 effects[alloc] =\n\
+                    case e of unitv(u) => 0 | _ => 42\n\
+                  fn main() -> i64 effects[alloc] = classify(mk(0)) + classify(mk(2))\n";
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("multivariant.sqlite");
+    let src = temp.path().join("multivariant.cdb");
+    std::fs::write(&src, source).unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+    run(&["verify", path(&db)]);
+
+    // The default arm drops both uncovered box variants, each under its own payload
+    // layout — two drops with DISTINCT type hashes (box<A> vs box<B>).
+    let ir_path = temp.path().join("classify.ir.json");
+    run(&["emit-ir", path(&db), "classify", "--out", path(&ir_path)]);
+    let ir = parse_json(&std::fs::read_to_string(&ir_path).unwrap());
+    let mut drop_types = Vec::new();
+    collect_drop_types(&ir, &mut drop_types);
+    drop_types.sort();
+    drop_types.dedup();
+    assert_eq!(
+        drop_types.len(),
+        2,
+        "the `_` arm must drop both box variants under DISTINCT layouts, got {drop_types:?}"
+    );
+
+    // eval + native: value correct and the two layout-specific drops do not double-free
+    // (a double-free aborts the native run; a wrong-layout drop corrupts/aborts it).
+    check_native("multivariant_defaultarm", source, "main", 84);
 }
 
 #[test]

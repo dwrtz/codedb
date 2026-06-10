@@ -641,7 +641,7 @@ struct DropTracker {
     /// consumed move-only enum is dropped through such an address (e.g. a
     /// `_`/default arm over a `box`-carrying variant frees its payload) — not a
     /// storage-slot place, so it is absent from `addr_places` and would otherwise
-    /// escape the exactly-once check (SPEC_V3 §7).
+    /// escape the at-most-once (double-free) check (SPEC_V3 §7).
     enum_payload_addr: BTreeMap<String, (String, String)>,
     /// (base value, variant) pairs already dropped. Globally unique per function in
     /// well-formed IR — a consumed move-only enum cannot be reused and each variant
@@ -6952,10 +6952,13 @@ impl CodeDb {
                     if address_type(addresses, address)? != type_hash {
                         bail!("lowered drop type mismatch");
                     }
-                    // SPEC_V2 §20 / SPEC_V3 §7: an owned place is dropped exactly
-                    // once and never after being moved out. Field-granular: drops
-                    // of disjoint fields (`x.a` then `x.b`) are fine; an
-                    // overlapping move or prior drop is a double-free.
+                    // SPEC_V2 §20 / SPEC_V3 §7: an owned place is dropped AT MOST
+                    // once and never after being moved out — the no-double-free half
+                    // of exactly-once. The no-leak half (that a live owned place IS
+                    // dropped) is ensured by lowering's static drop placement, not
+                    // independently re-proven here. Field-granular: drops of disjoint
+                    // fields (`x.a` then `x.b`) are fine; an overlapping move or prior
+                    // drop is a double-free.
                     if let Some(place) = drop_state.addr_places.get(address).cloned() {
                         if place_conflicts(&drop_state.moved, &place) {
                             bail!("lowered drop of moved-out storage");
@@ -6968,7 +6971,7 @@ impl CodeDb {
                     // An enum-payload drop (a consumed move-only enum's payload, e.g.
                     // a `_`/default arm freeing a `box` variant) is not a storage-slot
                     // place; track it by (base, variant) so a repeat is caught as a
-                    // double free (SPEC_V3 §7 exactly-once).
+                    // double free (SPEC_V3 §7; at-most-once, as above).
                     if let Some(payload) = drop_state.enum_payload_addr.get(address).cloned()
                         && !drop_state.dropped_enum_payloads.insert(payload)
                     {

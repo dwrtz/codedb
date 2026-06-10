@@ -266,7 +266,9 @@ Deliverables:
 dataflow that tracks per-place move state across if/case branches and loop edges
 drop placement for values moved in only some branches (conditional drop glue)
 drop placement for partial moves out of record fields / array elements
-verify still proves drops occur exactly once under the new dataflow
+the lowered-IR verifier proves drops occur at most once (no double-free / no
+  use-after-move) under the new dataflow; the no-leak half of exactly-once rests on
+  lowering's static drop placement (see the acceptance note)
 ```
 
 Files likely touched:
@@ -281,8 +283,11 @@ Acceptance fixture and oracle:
 
 ```text
 a native program moves an owned value in only some branches and partially out of
-  a record; it compiles, runs, and an allocation interposer confirms exactly-once
-  drop with no leak or double-free; evaluator agrees
+  a record; it compiles, runs (a double-free would abort the run), and the evaluator
+  agrees. Exactly-once drop placement is checked statically in lowering and pinned by
+  per-fixture lowered-IR drop assertions; a runtime allocation interposer confirming
+  the malloc/free balance is a deferred strengthening (the native harness counts no
+  allocations today, so a pure leak is not caught at runtime — see the V3.1 note)
 ```
 
 ## Phase 5 — Cyclic Content-Addressing: Recursion Groups
@@ -811,15 +816,19 @@ Success: features add with a small edit surface, and concurrent agents build the
 
 Includes: Phases 4–7 (drop glue, recursion groups, recursion, pattern matching).
 Status: implemented. Recursion (self and mutual) compiles native and matches the
-oracle; conditional and field-granular drop glue is sound (interposer/double-free
-verified) — including the two dimensions COMBINED (a record field moved in only
-some branches while a sibling field stays live, which now lowers and is
-double-free-verified); verify accepts recursive call graphs and recursion-group
-objects; recursion-group content identity is canonical — member ordinals derive
-from clique structure via individualization-refinement (a true canonical graph
-labeling, not just incomplete 1-WL colour refinement), so two source orderings of
-one clique — including structurally-symmetric members with byte-identical bodies —
-produce the same hash and import→export→import is a fixpoint; scalar literal `case`
+oracle; conditional and field-granular drop glue is sound (double-free-on-run
+verified; no allocation interposer yet — see the follow-on note) — including the two
+dimensions COMBINED (a record field moved in only some branches while a sibling field
+stays live, which now lowers and is double-free-verified); verify accepts recursive
+call graphs and recursion-group objects; recursion-group content identity is canonical
+— member ordinals derive from clique structure via individualization-refinement (which
+computes an order-invariant canonical FORM), with automorphism-orbit ties broken by a
+stable per-member key (the member's module-qualified name) because a name-independent
+*distinct* ordinal assignment is impossible for structurally-indistinguishable members;
+so two source orderings of one clique — including a vertex-transitive clique of
+byte-identical-bodied members (a true automorphism that 1-WL cannot discretize and an
+argument-slot trick cannot separate) — produce the same hash, both pass verify, and
+import→export→import is a fixpoint; scalar literal `case`
 with `_` and exhaustiveness compiles native, projects round-trip (including a nested
 `case` in a non-last arm), and steps under `trace`/`debug`. Case-traversal of a
 recursive `box<Node>` heap also compiles native: an `unbox` (deref-by-move) builtin
@@ -831,11 +840,14 @@ ordinals; box-broken size cycle), so per-node-data recursive structures — a
 native and round-trip. A field reached through a `box` deref now fails closed with a
 clean `unsupported_move` diagnostic (was an opaque lowering crash).
 
-Documented follow-on R14/structure surface: range/guard/nested-enum patterns; inline
-(non-`box`) move-only enum-payload moves; and a deeper `verify` that recomputes a
-recursion/type clique's canonical ordinals (today `verify` does structural + ordinal
-checks but not the full canonical recompute, which needs source reconstruction or
-history walking). Known oracle caveat: the reference evaluator recurses on the host
+Documented follow-on R14/structure surface: range/guard/nested-enum patterns; and
+inline (non-`box`) move-only enum-payload moves. `verify` recomputes each recursion/type
+clique's canonical ordinals from the re-projected source and rejects a permutation. The
+lowered-IR verifier proves drops occur at most once (no double-free); the no-leak half of
+exactly-once rests on lowering's static drop placement — an independent runtime
+allocation interposer / static leak proof is a deferred strengthening (the native harness
+counts no allocations, so a pure leak is not caught at runtime). Known oracle caveat: the
+reference evaluator recurses on the host
 stack, so a
 deeply/infinitely recursive program can overflow it (the native backend, on the OS
 stack, is unaffected) — a robustness bound on the oracle, not a language limit.

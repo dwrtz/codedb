@@ -277,6 +277,67 @@ fn recursion_group_hash_is_canonical_for_a_symmetric_clique() {
 }
 
 #[test]
+fn recursion_group_hash_is_canonical_for_an_automorphic_clique() {
+    // Regression (SPEC_V3 §6/§10) for a TRUE nontrivial automorphism — the case the
+    // `_symmetric_clique` test above does NOT reach (its `a(n-1)+b(n-2)` bodies make the
+    // members distinguishable by argument slot). Here `f_i` calls `f_{i+1}` and `f_{i-1}`
+    // around a 4-cycle: the clique is vertex-transitive (automorphism group D4), so 1-WL
+    // never discretizes AND no argument-slot trick separates the members — they form one
+    // real orbit. Individualization-refinement computes an order-invariant canonical FORM
+    // but the orbit ties on it; before the member-key orbit tiebreak the retained
+    // labeling fell to source order, so the two orderings below produced DIFFERENT root
+    // hashes and the first one even FAILED its own `verify` (the recompute disagreed with
+    // the minted ordinals). All four orderings/round-trips must now agree and verify.
+    let fwd = "fn f0(n: i64) -> i64 = if n < 1 then 0 else f1(n - 1) + f3(n - 1)\n\
+               fn f1(n: i64) -> i64 = if n < 1 then 0 else f2(n - 1) + f0(n - 1)\n\
+               fn f2(n: i64) -> i64 = if n < 1 then 0 else f3(n - 1) + f1(n - 1)\n\
+               fn f3(n: i64) -> i64 = if n < 1 then 0 else f0(n - 1) + f2(n - 1)\n\
+               fn main() -> i64 = f0(8)\n";
+    let rev = "fn f3(n: i64) -> i64 = if n < 1 then 0 else f0(n - 1) + f2(n - 1)\n\
+               fn f2(n: i64) -> i64 = if n < 1 then 0 else f3(n - 1) + f1(n - 1)\n\
+               fn f1(n: i64) -> i64 = if n < 1 then 0 else f2(n - 1) + f0(n - 1)\n\
+               fn f0(n: i64) -> i64 = if n < 1 then 0 else f1(n - 1) + f3(n - 1)\n\
+               fn main() -> i64 = f0(8)\n";
+    let temp = tempdir().unwrap();
+    let db1 = temp.path().join("fwd.sqlite");
+    let db2 = temp.path().join("rev.sqlite");
+    let root1 = import_root(&db1, fwd);
+    let root2 = import_root(&db2, rev);
+    let (group1, group1_payload) = recursion_group(&db1);
+    let (group2, _) = recursion_group(&db2);
+    assert_eq!(
+        group1_payload["members"].as_array().unwrap().len(),
+        4,
+        "the C4 clique has four members"
+    );
+    assert_eq!(group1, group2, "automorphic clique group hash must be canonical");
+    assert_eq!(root1, root2, "automorphic clique root hash must be canonical");
+    assert_eq!(
+        run(&["eval", path(&db1), "main"]).trim(),
+        run(&["eval", path(&db2), "main"]).trim(),
+    );
+
+    // import → export → re-import fixpoint.
+    let export = temp.path().join("auto.export.cdb");
+    run(&["export", path(&db1), "--branch", "main", "--out", path(&export)]);
+    let db3 = temp.path().join("auto.rt.sqlite");
+    run(&["init", path(&db3)]);
+    let root3 = run(&["import", path(&db3), path(&export)])
+        .lines()
+        .find_map(|line| line.strip_prefix("root "))
+        .expect("import prints root")
+        .trim()
+        .to_string();
+    assert_eq!(root1, root3, "automorphic clique must round-trip through the projection");
+
+    // The soundness gate must accept every well-formed ordering, not just the one whose
+    // source order happens to match the renderer's (the false-rejection the fix removes).
+    for db in [&db1, &db2, &db3] {
+        bin().args(["verify", path(db)]).assert().success().stdout("verify ok\n");
+    }
+}
+
+#[test]
 fn recursion_group_projection_round_trip_is_a_fixpoint() {
     // import → export → re-import reproduces the SAME root hash and group hash: the
     // exported checked-view projection is identity-preserving even though its render
