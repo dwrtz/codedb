@@ -7755,14 +7755,16 @@ impl CodeDb {
         let type_hash = self.expr_declared_type(expr_hash)?;
         let class = self.value_class_in_root(root, &type_hash)?;
         if class.copy_kind == ValueCopyKind::MoveOnly {
-            // Field-granular drop glue (SPEC_V3 §7): a partial move out of a
-            // record field is supported — lowering drops the live remainder of
-            // the enclosing aggregate while skipping the moved-out field. Moving
-            // out of an array element (`[N]`/`[*]` path segment) or behind a
-            // pointer is not field-granular-droppable, so it stays fail-closed.
-            if place.fields.iter().any(|segment| segment.starts_with('[')) {
+            // Granular drop glue (SPEC_V3 §7): a partial move out of a record field
+            // or a CONSTANT-index array element (`[N]`) is supported — lowering drops
+            // the live remainder of the enclosing aggregate (sibling fields / other
+            // elements by index) while skipping the moved-out sub-place. A DYNAMIC
+            // index (`[*]`) names an unknown element, so the static scaffold cannot
+            // tell which element survived; it stays fail-closed (would need a runtime
+            // drop flag the design forbids).
+            if place.fields.iter().any(|segment| segment == "[*]") {
                 bail!(
-                    "unsupported_move: partial move of an owned array element at {:?}; field-granular drop glue covers record fields only (SPEC_V3 §7)",
+                    "unsupported_move: partial move of an owned array element at a dynamic index ({:?}); only constant-index element moves are supported (SPEC_V3 §7)",
                     place
                 );
             }

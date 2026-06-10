@@ -532,24 +532,34 @@ enum RootSlot {
     Local(usize),
 }
 
-/// A move-tracked place: an owned storage slot plus a record-field path into it.
-/// An empty path denotes the whole slot. Field-granular drop glue (Phase 4)
-/// tracks partial moves out of record fields, so the drop scaffold can drop the
-/// live remainder of an aggregate while skipping moved-out fields. Only record
-/// field segments appear here — array elements and box/deref projections are not
-/// field-granular-tracked (their partial move stays fail-closed), so a place
-/// rooted in one is never produced (see `place_moved_path`).
+/// One step of a move-tracked place's path: a record field by name, or a fixed
+/// array element at a CONSTANT index. (A dynamic array index is not statically
+/// trackable — the drop scaffold could not tell which element survived — so it
+/// stays fail-closed and never appears here; see `place_moved_path`.)
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PlaceStep {
+    Field(String),
+    Index(u64),
+}
+
+/// A move-tracked place: an owned storage slot plus a projection path into it. An
+/// empty path denotes the whole slot. Granular drop glue (Phase 4 + R14) tracks
+/// partial moves out of record fields and constant-index array elements, so the
+/// drop scaffold can drop the live remainder of an aggregate while skipping
+/// moved-out sub-places. Only record-field and constant-array-index steps appear
+/// here — box/deref/dynamic-index projections are not granular-tracked (their
+/// partial move stays fail-closed), so a place rooted in one is never produced.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct MovedPlace {
     root: RootSlot,
-    fields: Vec<String>,
+    path: Vec<PlaceStep>,
 }
 
 impl MovedPlace {
     fn whole(root: RootSlot) -> Self {
         Self {
             root,
-            fields: Vec::new(),
+            path: Vec::new(),
         }
     }
 }
@@ -558,11 +568,11 @@ impl MovedPlace {
 /// leading field-path prefix (exact field names — no wildcards, records only).
 fn place_is_ancestor_or_equal(prefix: &MovedPlace, place: &MovedPlace) -> bool {
     prefix.root == place.root
-        && prefix.fields.len() <= place.fields.len()
+        && prefix.path.len() <= place.path.len()
         && prefix
-            .fields
+            .path
             .iter()
-            .zip(place.fields.iter())
+            .zip(place.path.iter())
             .all(|(a, b)| a == b)
 }
 
@@ -648,10 +658,14 @@ fn merge_consumed_into_moved(drop_state: &mut DropTracker, branch_consumed: &[BT
 #[derive(Debug, Default)]
 struct DropTracker {
     /// Address ids that name a tracked owned place (a param/local slot, or a
-    /// record-field projection chain rooted in one). Array-element, box-payload,
-    /// and raw-deref addresses are intentionally absent — partial moves through
-    /// them stay fail-closed, so they are never move/drop-tracked here.
+    /// projection chain of record fields / constant array indices rooted in one).
+    /// Box-payload, raw-deref, and dynamic-index addresses are intentionally absent
+    /// — partial moves through them stay fail-closed, so they are never
+    /// move/drop-tracked here.
     addr_places: BTreeMap<String, MovedPlace>,
+    /// `ConstI64` result id → its constant value, so an `AddrOfIndex` with a constant
+    /// index can be resolved to an `Index` step and tracked (a dynamic index is not).
+    const_i64: BTreeMap<String, i64>,
     moved: BTreeSet<MovedPlace>,
     dropped: BTreeSet<MovedPlace>,
     /// `AddrOfEnumPayload` result id → (base value, variant). The payload of a
@@ -1631,9 +1645,10 @@ impl CodeDb {
     }
 
     /// Resolve the move-tracked place a value expression denotes: a whole slot
-    /// (param/local) or a record-field projection chain into one. Returns `None`
-    /// for array-element, box-payload, or raw-deref projections — partial moves
-    /// through those are not field-granular-tracked and stay fail-closed.
+    /// (param/local) or a projection chain (record fields and constant-index array
+    /// elements) into one. Returns `None` for a dynamic array index, a box payload,
+    /// or a raw deref — partial moves through those are not granular-tracked and stay
+    /// fail-closed.
     fn place_moved_path(
         &self,
         expr_hash: &str,
@@ -1670,23 +1685,49 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("field_access missing field"))?;
                 match self.place_moved_path(target_hash, locals)? {
                     Some(mut base) => {
-                        base.fields.push(field.to_string());
+                        base.path.push(PlaceStep::Field(field.to_string()));
                         Ok(Some(base))
                     }
                     None => Ok(None),
                 }
             }
-            // array_index, box payloads, raw deref, etc.: not field-granular.
+            Some("array_index") => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing target"))?;
+                let index_hash = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_index missing index"))?;
+                // Only a CONSTANT non-negative index is element-granular-trackable; a
+                // dynamic index stays fail-closed (the static scaffold cannot know which
+                // element survived). A constant index is in-bounds (type-check rejects an
+                // out-of-bounds literal). A slice index (no fixed length) also bails to
+                // `None` — `place_moved_path` only reaches here for a fixed array, whose
+                // base resolves to a tracked slot.
+                match (
+                    self.literal_i64_value(index_hash)?,
+                    self.place_moved_path(target_hash, locals)?,
+                ) {
+                    (Some(index), Some(mut base)) if index >= 0 => {
+                        base.path.push(PlaceStep::Index(index as u64));
+                        Ok(Some(base))
+                    }
+                    _ => Ok(None),
+                }
+            }
+            // box payloads, raw deref, etc.: not granular-tracked.
             _ => Ok(None),
         }
     }
 
     /// Resolve the place a move-only value is moved out of, recording it in the
-    /// move set. A whole slot or a record-field projection is tracked (the
-    /// enclosing aggregate's drop is then field-granular — see
-    /// `emit_residual_drops`). An array-element/box/deref projection cannot be
-    /// dropped field-granularly, so a partial move through one stays fail-closed
-    /// (SPEC_V3 §7). `verify_lowered_ir`'s `Move` check is the independent backstop.
+    /// move set. A whole slot, a record-field projection, or a constant-index array
+    /// element is tracked (the enclosing aggregate's drop is then granular — see
+    /// `emit_residual_drops`). A dynamic-index/box/deref projection cannot be dropped
+    /// granularly, so a partial move through one stays fail-closed (SPEC_V3 §7).
+    /// `verify_lowered_ir`'s `Move` check is the independent backstop.
     fn mark_moved_source(
         &self,
         expr_hash: &str,
@@ -1695,7 +1736,7 @@ impl CodeDb {
     ) -> Result<()> {
         let place = self.place_moved_path(expr_hash, locals)?.ok_or_else(|| {
             anyhow!(
-                "unsupported_move: lowering does not support moving a move-only value out of an array element or pointer projection (partial move of an owned aggregate); field-granular drop glue covers record fields only (SPEC_V3 §7)"
+                "unsupported_move: lowering does not support moving a move-only value out of a dynamic array index or pointer projection (partial move of an owned aggregate); granular drop glue covers record fields and constant-index array elements only (SPEC_V3 §7)"
             )
         })?;
         ctx.mark_moved_place(place);
@@ -1740,23 +1781,54 @@ impl CodeDb {
             }
         }
         let mut current_type = root_type.to_string();
-        for field in &place.fields {
-            let field_info = self.lowered_record_field(root, &target_triple, &current_type, field)?;
-            let next = ctx.value();
-            ctx.push_debug_op(debug_expr_hash, "addr_of_field", &next);
-            operations.push(LoweredOp::AddrOfField {
-                id: next.clone(),
-                place: LoweredPlace::Field {
-                    base: address,
-                    field: field.clone(),
-                    field_symbol: field_info.field_symbol,
-                    owner_type_hash: current_type.clone(),
-                    offset_bytes: field_info.offset_bytes,
-                    type_hash: field_info.type_hash.clone(),
-                },
-            });
-            address = next;
-            current_type = field_info.type_hash;
+        for step in &place.path {
+            match step {
+                PlaceStep::Field(field) => {
+                    let field_info =
+                        self.lowered_record_field(root, &target_triple, &current_type, field)?;
+                    let next = ctx.value();
+                    ctx.push_debug_op(debug_expr_hash, "addr_of_field", &next);
+                    operations.push(LoweredOp::AddrOfField {
+                        id: next.clone(),
+                        place: LoweredPlace::Field {
+                            base: address,
+                            field: field.clone(),
+                            field_symbol: field_info.field_symbol,
+                            owner_type_hash: current_type.clone(),
+                            offset_bytes: field_info.offset_bytes,
+                            type_hash: field_info.type_hash.clone(),
+                        },
+                    });
+                    address = next;
+                    current_type = field_info.type_hash;
+                }
+                PlaceStep::Index(index) => {
+                    // A constant array index: materialize it and address the element,
+                    // mirroring `arr[N]` place lowering (the element drop reaches it).
+                    let array_info =
+                        self.lowered_array_info(root, &target_triple, &current_type)?;
+                    let index_id = ctx.value();
+                    ctx.push_debug_op(debug_expr_hash, "const_i64", &index_id);
+                    operations.push(LoweredOp::ConstI64 {
+                        id: index_id.clone(),
+                        value: index.to_string(),
+                        type_hash: type_hash_for("I64"),
+                    });
+                    let next = ctx.value();
+                    ctx.push_debug_op(debug_expr_hash, "addr_of_index", &next);
+                    operations.push(LoweredOp::AddrOfIndex {
+                        id: next.clone(),
+                        place: LoweredPlace::Index {
+                            base: address,
+                            index: index_id,
+                            element_type_hash: array_info.element_type_hash.clone(),
+                            type_hash: array_info.element_type_hash.clone(),
+                        },
+                    });
+                    address = next;
+                    current_type = array_info.element_type_hash;
+                }
+            }
         }
         Ok((address, current_type))
     }
@@ -1797,21 +1869,46 @@ impl CodeDb {
             }
             return Ok(());
         }
-        // Some sub-field of `place` was moved; drop the live fields individually.
-        // Only records are field-granular-tracked, so this must be a record.
-        for field in self.aggregate_record_fields(root, place_type)? {
-            let mut child = place.clone();
-            child.fields.push(field.name.clone());
-            self.emit_residual_drops(
-                root,
-                &child,
-                &field.type_hash,
-                root_type,
-                moved,
-                debug_expr_hash,
-                ctx,
-                operations,
-            )?;
+        // Some sub-place of `place` was moved; drop the live sub-places individually.
+        // Only records (by field) and fixed arrays (by constant index) are
+        // granular-tracked, so `place_type` is one of those.
+        match self.type_spec_in_root(root, place_type)? {
+            TypeSpec::Record(fields) => {
+                for field in fields {
+                    let mut child = place.clone();
+                    child.path.push(PlaceStep::Field(field.name.clone()));
+                    self.emit_residual_drops(
+                        root,
+                        &child,
+                        &field.type_hash,
+                        root_type,
+                        moved,
+                        debug_expr_hash,
+                        ctx,
+                        operations,
+                    )?;
+                }
+            }
+            TypeSpec::FixedArray { element, len } => {
+                for index in 0..len {
+                    let mut child = place.clone();
+                    child.path.push(PlaceStep::Index(index));
+                    self.emit_residual_drops(
+                        root,
+                        &child,
+                        &element,
+                        root_type,
+                        moved,
+                        debug_expr_hash,
+                        ctx,
+                        operations,
+                    )?;
+                }
+            }
+            other => bail!(
+                "granular drop requires a record or array type, got {}",
+                other.to_source(self)?
+            ),
         }
         Ok(())
     }
@@ -1866,23 +1963,49 @@ impl CodeDb {
         if !has_inner_dead {
             return Ok(());
         }
-        // `dead` marks sub-fields of `place`; recurse. Only records are
-        // field-granular-tracked (array/enum-payload partial moves stay
-        // fail-closed), so a place with an inner-dead sub-field is a record.
-        for field in self.aggregate_record_fields(root, place_type)? {
-            let mut child = place.clone();
-            child.fields.push(field.name.clone());
-            self.emit_branch_compensation(
-                root,
-                &child,
-                &field.type_hash,
-                root_type,
-                dead,
-                branch_moved,
-                debug_expr_hash,
-                ctx,
-                operations,
-            )?;
+        // `dead` marks sub-places of `place`; recurse. Only records (by field) and
+        // fixed arrays (by constant index) are granular-tracked (box/deref and
+        // dynamic-index partial moves stay fail-closed), so a place with an
+        // inner-dead sub-place is one of those.
+        match self.type_spec_in_root(root, place_type)? {
+            TypeSpec::Record(fields) => {
+                for field in fields {
+                    let mut child = place.clone();
+                    child.path.push(PlaceStep::Field(field.name.clone()));
+                    self.emit_branch_compensation(
+                        root,
+                        &child,
+                        &field.type_hash,
+                        root_type,
+                        dead,
+                        branch_moved,
+                        debug_expr_hash,
+                        ctx,
+                        operations,
+                    )?;
+                }
+            }
+            TypeSpec::FixedArray { element, len } => {
+                for index in 0..len {
+                    let mut child = place.clone();
+                    child.path.push(PlaceStep::Index(index));
+                    self.emit_branch_compensation(
+                        root,
+                        &child,
+                        &element,
+                        root_type,
+                        dead,
+                        branch_moved,
+                        debug_expr_hash,
+                        ctx,
+                        operations,
+                    )?;
+                }
+            }
+            other => bail!(
+                "granular compensation requires a record or array type, got {}",
+                other.to_source(self)?
+            ),
         }
         Ok(())
     }
@@ -6082,11 +6205,12 @@ impl CodeDb {
                     value,
                     type_hash,
                 } => {
-                    value.parse::<i64>()?;
+                    let parsed = value.parse::<i64>()?;
                     if type_hash != &type_hash_for("I64") {
                         bail!("lowered const_i64 type mismatch");
                     }
                     insert_value(values, id, type_hash)?;
+                    drop_state.const_i64.insert(id.clone(), parsed);
                 }
                 LoweredOp::ConstBool {
                     id,
@@ -6707,7 +6831,7 @@ impl CodeDb {
                     // to the right sub-place (SPEC_V3 §7).
                     if let Some(base_place) = drop_state.addr_places.get(base).cloned() {
                         let mut field_place = base_place;
-                        field_place.fields.push(field.clone());
+                        field_place.path.push(PlaceStep::Field(field.clone()));
                         drop_state.addr_places.insert(id.clone(), field_place);
                     }
                     if self.is_aggregate_ir_type(root, type_hash)? {
@@ -6780,6 +6904,19 @@ impl CodeDb {
                         }
                     }
                     insert_address(addresses, id, type_hash)?;
+                    // A constant array index extends the base's tracked place with an
+                    // `Index` step, so element-granular moves/drops resolve to the right
+                    // element (SPEC_V3 §7). A dynamic index is left untracked — a partial
+                    // move through one then fails closed at the `Move` check below; a
+                    // slice/data base is not in `addr_places`, so it is untracked too.
+                    if let Some(base_place) = drop_state.addr_places.get(base).cloned()
+                        && let Some(&const_index) = drop_state.const_i64.get(index)
+                        && const_index >= 0
+                    {
+                        let mut element_place = base_place;
+                        element_place.path.push(PlaceStep::Index(const_index as u64));
+                        drop_state.addr_places.insert(id.clone(), element_place);
+                    }
                     if self.is_aggregate_ir_type(root, type_hash)? {
                         insert_value(values, id, type_hash)?;
                     }

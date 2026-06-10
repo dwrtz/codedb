@@ -287,6 +287,19 @@ fn go(n: i64) -> i64 effects[alloc] =
 fn main() -> i64 effects[alloc] = go({K})
 "#;
 
+// R14 #1 constant-index array-element partial move: an array of three boxes is built
+// per recursion level, element 0 is moved out and freed by `consume`, and the two
+// live siblings are dropped by element-granular drop glue at scope exit. A missed
+// sibling drop leaks two boxes per level, so net would scale with the count.
+const ARRAY_ELEMENT_MOVE: &str = r#"
+fn consume(b: box<i64>) -> i64 effects[alloc] = unbox(b)
+fn go(n: i64) -> i64 effects[alloc] =
+  if n < 1 then 0
+  else let xs: array<box<i64>, 3> = [box_new(n), box_new(n), box_new(n)] in
+       consume(xs[0]) + go(n - 1)
+fn main() -> i64 effects[alloc] = go({K})
+"#;
+
 fn build_exe(dir: &Path, name: &str, source: &str) -> PathBuf {
     let db = dir.join(format!("{name}.sqlite"));
     let src = dir.join(format!("{name}.cdb"));
@@ -427,4 +440,9 @@ fn nested_destructuring_fallback_drop_frees_every_box_at_runtime() {
 #[test]
 fn nested_destructuring_residual_drop_frees_every_box_at_runtime() {
     assert_balanced_across_scale("nested_binding_residual", NESTED_BINDING_RESIDUAL, 4, 64);
+}
+
+#[test]
+fn array_element_partial_move_frees_every_box_at_runtime() {
+    assert_balanced_across_scale("array_element_move", ARRAY_ELEMENT_MOVE, 4, 64);
 }
