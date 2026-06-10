@@ -1761,19 +1761,43 @@ impl CodeDb {
                         (arm, variant.clone(), Some(value.clone()))
                     }
                     Value::I64(scrutinee_value) => {
-                        let arm = arms
-                            .iter()
-                            .find(|arm| {
-                                crate::expr::scalar_i64_arm_matches(arm, *scrutinee_value)
-                            })
-                            .or_else(|| {
-                                arms.iter().find(|arm| {
-                                    arm.get("default").and_then(JsonValue::as_bool) == Some(true)
-                                })
-                            })
-                            .ok_or_else(|| {
-                                anyhow!("scalar case missing arm for value {scrutinee_value}")
-                            })?;
+                        // First-match over the arms in source order, evaluating each
+                        // `if` guard (R14) — like the reference evaluator. A guard is
+                        // traced (it runs at runtime) and, when false, the arm is
+                        // skipped.
+                        let mut selected = None;
+                        for arm in arms {
+                            let matches = arm.get("default").and_then(JsonValue::as_bool)
+                                == Some(true)
+                                || crate::expr::scalar_i64_arm_matches(arm, *scrutinee_value);
+                            if !matches {
+                                continue;
+                            }
+                            if let Some(guard_hash) = arm.get("guard").and_then(JsonValue::as_str)
+                            {
+                                let guard = self.trace_expr(
+                                    state,
+                                    frame,
+                                    symbol_hash,
+                                    function_def_hash,
+                                    guard_hash,
+                                    args,
+                                    locals,
+                                )?;
+                                match guard {
+                                    Value::Bool(true) => {}
+                                    Value::Bool(false) => continue,
+                                    other => {
+                                        bail!("case guard must evaluate to bool, got {other}")
+                                    }
+                                }
+                            }
+                            selected = Some(arm);
+                            break;
+                        }
+                        let arm = selected.ok_or_else(|| {
+                            anyhow!("scalar case missing arm for value {scrutinee_value}")
+                        })?;
                         (arm, scrutinee_value.to_string(), None)
                     }
                     Value::Bool(scrutinee_value) => {

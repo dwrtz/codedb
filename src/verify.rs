@@ -395,6 +395,14 @@ impl CodeDb {
                             .flatten()
                             .enumerate()
                         {
+                            // `guard` is optional (R14); `check_hash_ref` no-ops on a
+                            // missing field, so this validates it only when present.
+                            self.check_hash_ref(
+                                parent_hash,
+                                &format!("arms[{idx}].guard"),
+                                arm.get("guard"),
+                                errors,
+                            )?;
                             self.check_hash_ref(
                                 parent_hash,
                                 &format!("arms[{idx}].body"),

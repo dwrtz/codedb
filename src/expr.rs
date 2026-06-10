@@ -139,6 +139,13 @@ pub struct RawCaseArm {
     pub default: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<String>,
+    /// An optional `if <expr>` guard (R14): the arm matches only when its pattern
+    /// matches AND this `bool` predicate evaluates true; otherwise control falls
+    /// through to the next arm. A guarded arm never proves exhaustiveness, and a
+    /// guarded wildcard (`_ if g`) need not be last. Guards must be pure (no moves,
+    /// no effects); currently only an `i64` scalar `case` arm may carry one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<Box<RawExpr>>,
     pub body: RawExpr,
 }
 
@@ -1244,14 +1251,37 @@ impl CodeDb {
                             self.eval_expr_with_locals(root_hash, body_hash, args, locals)
                         }
                     }
-                    // Scalar literal `case` (R14): match the scalar value against
-                    // literal-pattern arms, falling back to the `_` wildcard.
+                    // Scalar `i64` `case` (R14): first-match over the arms in source
+                    // order — an arm is taken when its pattern matches AND its `if`
+                    // guard (if present) evaluates true; otherwise control falls
+                    // through to the next arm. The unguarded `_` wildcard is last and
+                    // always matches. This mirrors the native `if`/`eq` chain.
                     Value::I64(scrutinee) => {
-                        let arm = arms
-                            .iter()
-                            .find(|arm| scalar_i64_arm_matches(arm, scrutinee))
-                            .or_else(|| arms.iter().find(|arm| typed_case_arm_is_default(arm)))
-                            .ok_or_else(|| anyhow!("scalar case missing arm for value {scrutinee}"))?;
+                        let mut selected: Option<&JsonValue> = None;
+                        for arm in arms {
+                            let matches = typed_case_arm_is_default(arm)
+                                || scalar_i64_arm_matches(arm, scrutinee);
+                            if !matches {
+                                continue;
+                            }
+                            if let Some(guard_hash) = arm.get("guard").and_then(JsonValue::as_str)
+                            {
+                                match self
+                                    .eval_expr_with_locals(root_hash, guard_hash, args, locals)?
+                                {
+                                    Value::Bool(true) => {}
+                                    Value::Bool(false) => continue,
+                                    other => {
+                                        bail!("case guard must evaluate to bool, got {other}")
+                                    }
+                                }
+                            }
+                            selected = Some(arm);
+                            break;
+                        }
+                        let arm = selected.ok_or_else(|| {
+                            anyhow!("scalar case missing arm for value {scrutinee}")
+                        })?;
                         let body_hash = arm
                             .get("body")
                             .and_then(JsonValue::as_str)
@@ -2809,6 +2839,27 @@ impl CodeDb {
                         // (SPEC_V3 §11 checked-view round-trip).
                         let body_prec = if arm_index + 1 == arm_count { 0 } else { 1 };
                         let binding = arm.get("binding_name").and_then(JsonValue::as_str);
+                        // An `if <guard>` (R14) renders between the pattern and `=>`.
+                        // Scalar arms bind nothing, so the guard renders in the current
+                        // local scope; the variant arm renders its own guard inside the
+                        // binding scope below. Prec 1 parenthesizes a compound guard so
+                        // a trailing `=>`/`|` cannot be captured on re-parse.
+                        let scalar_guard_suffix = match arm.get("guard").and_then(JsonValue::as_str)
+                        {
+                            Some(guard) => format!(
+                                " if {}",
+                                self.expr_to_source_with_locals(
+                                    guard,
+                                    root,
+                                    current_module,
+                                    local_params,
+                                    region_names,
+                                    local_names,
+                                    1,
+                                )?
+                            ),
+                            None => String::new(),
+                        };
                         if typed_case_arm_is_default(arm) {
                             if binding.is_some() {
                                 bail!("default case arm cannot bind a payload");
@@ -2817,18 +2868,21 @@ impl CodeDb {
                                 .get("body")
                                 .and_then(JsonValue::as_str)
                                 .ok_or_else(|| anyhow!("case arm missing body"))?;
-                            return Ok(format!(
-                                "else => {}",
-                                self.expr_to_source_with_locals(
-                                    body,
-                                    root,
-                                    current_module,
-                                    local_params,
-                                    region_names,
-                                    local_names,
-                                    body_prec,
-                                )?
-                            ));
+                            let rendered_body = self.expr_to_source_with_locals(
+                                body,
+                                root,
+                                current_module,
+                                local_params,
+                                region_names,
+                                local_names,
+                                body_prec,
+                            )?;
+                            // A guarded wildcard re-parses as a non-terminal `_` arm;
+                            // the unguarded catch-all renders as `else`.
+                            if scalar_guard_suffix.is_empty() {
+                                return Ok(format!("else => {rendered_body}"));
+                            }
+                            return Ok(format!("_{scalar_guard_suffix} => {rendered_body}"));
                         }
                         // Scalar literal pattern (R14): `0 => ...`, `true => ...`.
                         if let Some(literal) = scalar_literal_pattern_from_typed_arm(arm) {
@@ -2845,7 +2899,7 @@ impl CodeDb {
                                 .and_then(JsonValue::as_str)
                                 .ok_or_else(|| anyhow!("case arm missing body"))?;
                             return Ok(format!(
-                                "{pattern} => {}",
+                                "{pattern}{scalar_guard_suffix} => {}",
                                 self.expr_to_source_with_locals(
                                     body,
                                     root,
@@ -2874,7 +2928,7 @@ impl CodeDb {
                                 .and_then(JsonValue::as_str)
                                 .ok_or_else(|| anyhow!("case arm missing body"))?;
                             return Ok(format!(
-                                "{lo}{dots}{hi} => {}",
+                                "{lo}{dots}{hi}{scalar_guard_suffix} => {}",
                                 self.expr_to_source_with_locals(
                                     body,
                                     root,
@@ -2894,9 +2948,24 @@ impl CodeDb {
                             .get("body")
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("case arm missing body"))?;
+                        let guard_hash = arm.get("guard").and_then(JsonValue::as_str);
                         if let Some(binding) = binding {
                             local_names.push(binding.to_string());
                         }
+                        // The guard (if any) renders inside the binding scope so it can
+                        // reference the bound payload; the body follows.
+                        let rendered_guard = match guard_hash {
+                            Some(guard) => Some(self.expr_to_source_with_locals(
+                                guard,
+                                root,
+                                current_module,
+                                local_params,
+                                region_names,
+                                local_names,
+                                1,
+                            )?),
+                            None => None,
+                        };
                         let rendered_body = self.expr_to_source_with_locals(
                             body,
                             root,
@@ -2909,11 +2978,15 @@ impl CodeDb {
                         if binding.is_some() {
                             local_names.pop();
                         }
+                        let guard_suffix = match rendered_guard {
+                            Some(guard) => format!(" if {guard}"),
+                            None => String::new(),
+                        };
                         Ok(match binding {
                             Some(binding) => {
-                                format!("{variant}({binding}) => {}", rendered_body?)
+                                format!("{variant}({binding}){guard_suffix} => {}", rendered_body?)
                             }
-                            None => format!("{variant} => {}", rendered_body?),
+                            None => format!("{variant}{guard_suffix} => {}", rendered_body?),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -3761,6 +3834,18 @@ impl CodeDb {
                             .get("binding_name")
                             .and_then(JsonValue::as_str)
                             .map(str::to_string);
+                        // A guard (R14) on a scalar/wildcard arm reconstructs in the
+                        // current (no-binding) scope, exactly like the body.
+                        let scalar_guard = match arm.get("guard").and_then(JsonValue::as_str) {
+                            Some(guard) => Some(Box::new(self.typed_expr_to_raw_with_locals(
+                                guard,
+                                root,
+                                current_module,
+                                region_names,
+                                local_names,
+                            )?)),
+                            None => None,
+                        };
                         if typed_case_arm_is_default(arm) {
                             if binding.is_some() {
                                 bail!("default case arm cannot bind a payload");
@@ -3780,6 +3865,7 @@ impl CodeDb {
                                 range: None,
                                 default: true,
                                 binding: None,
+                                guard: scalar_guard,
                                 body,
                             });
                         }
@@ -3800,6 +3886,7 @@ impl CodeDb {
                                 range: None,
                                 default: false,
                                 binding: None,
+                                guard: scalar_guard,
                                 body,
                             });
                         }
@@ -3820,6 +3907,7 @@ impl CodeDb {
                                 range: Some(range),
                                 default: false,
                                 binding: None,
+                                guard: scalar_guard,
                                 body,
                             });
                         }
@@ -3831,6 +3919,19 @@ impl CodeDb {
                         if let Some(binding) = &binding {
                             local_names.push(binding.clone());
                         }
+                        // The guard (if any) reconstructs inside the binding scope, like
+                        // the body (`.map` is eager, so it runs before the pop below);
+                        // both `?`-propagate only after the binding is popped so
+                        // `local_names` stays balanced.
+                        let guard = arm.get("guard").and_then(JsonValue::as_str).map(|guard| {
+                            self.typed_expr_to_raw_with_locals(
+                                guard,
+                                root,
+                                current_module,
+                                region_names,
+                                local_names,
+                            )
+                        });
                         let body = self.typed_expr_to_raw_with_locals(
                             arm.get("body")
                                 .and_then(JsonValue::as_str)
@@ -3843,12 +3944,14 @@ impl CodeDb {
                         if binding.is_some() {
                             local_names.pop();
                         }
+                        let guard = guard.transpose()?.map(Box::new);
                         Ok(RawCaseArm {
                             variant: Some(variant),
                             literal: None,
                             range: None,
                             default: false,
                             binding,
+                            guard,
                             body: body?,
                         })
                     })
@@ -4276,6 +4379,11 @@ impl CodeDb {
                     .and_then(JsonValue::as_array)
                     .ok_or_else(|| anyhow!("case missing arms"))?
                 {
+                    // A guard (R14) is evaluated at runtime, so a call inside it is a
+                    // real build/link dependency — collect it alongside the body.
+                    if let Some(guard) = arm.get("guard").and_then(JsonValue::as_str) {
+                        self.collect_expr_deps(root, guard, deps)?;
+                    }
                     let child = arm
                         .get("body")
                         .and_then(JsonValue::as_str)
@@ -4694,21 +4802,32 @@ impl Parser {
                     || self.consume_ident_value("default")
                     || self.consume_ident_value("_")
                 {
-                    // Wildcard / default arm (R14 `_`, or the `else`/`default` keyword).
+                    // Wildcard arm (R14 `_`, or the `else`/`default` keyword). With an
+                    // `if <guard>` it is a *guarded* wildcard: it may appear before
+                    // other arms and never proves exhaustiveness. Without a guard it is
+                    // the catch-all default and must be last.
+                    let guard = self.parse_optional_case_guard()?;
                     self.expect_symbol("=>")?;
                     let body = self.parse_expr()?;
+                    let guarded = guard.is_some();
                     arms.push(RawCaseArm {
                         variant: None,
                         literal: None,
                         range: None,
                         default: true,
                         binding: None,
+                        guard,
                         body,
                     });
-                    if self.consume_symbol("|") {
-                        bail!("default case arm must be last");
+                    if !guarded {
+                        if self.consume_symbol("|") {
+                            bail!("default case arm must be last");
+                        }
+                        break;
                     }
-                    break;
+                    if !self.consume_symbol("|") {
+                        break;
+                    }
                 } else if let Some(literal) = self.try_parse_scalar_literal_pattern()? {
                     // Scalar literal pattern (R14): `0 => ...`, `true => ...`. An i64
                     // literal may instead open a range pattern `lo..hi` / `lo..=hi`.
@@ -4721,6 +4840,7 @@ impl Parser {
                             Some(expr @ RawExpr::LiteralI64 { .. }) => expr,
                             _ => bail!("range case pattern upper bound must be an integer"),
                         };
+                        let guard = self.parse_optional_case_guard()?;
                         self.expect_symbol("=>")?;
                         let body = self.parse_expr()?;
                         arms.push(RawCaseArm {
@@ -4733,9 +4853,11 @@ impl Parser {
                             }),
                             default: false,
                             binding: None,
+                            guard,
                             body,
                         });
                     } else {
+                        let guard = self.parse_optional_case_guard()?;
                         self.expect_symbol("=>")?;
                         let body = self.parse_expr()?;
                         arms.push(RawCaseArm {
@@ -4744,6 +4866,7 @@ impl Parser {
                             range: None,
                             default: false,
                             binding: None,
+                            guard,
                             body,
                         });
                     }
@@ -4759,6 +4882,7 @@ impl Parser {
                     } else {
                         None
                     };
+                    let guard = self.parse_optional_case_guard()?;
                     self.expect_symbol("=>")?;
                     let body = self.parse_expr()?;
                     arms.push(RawCaseArm {
@@ -4767,6 +4891,7 @@ impl Parser {
                         range: None,
                         default: false,
                         binding,
+                        guard,
                         body,
                     });
                     if !self.consume_symbol("|") {
@@ -4780,6 +4905,17 @@ impl Parser {
             })
         } else {
             self.parse_assignment()
+        }
+    }
+
+    /// Parse an optional `if <expr>` case-arm guard (R14), consumed after the
+    /// pattern and before `=>`. The guard expression stops at `=>` / `|` (neither
+    /// is an operator), so a plain `self.parse_expr()` captures exactly the guard.
+    fn parse_optional_case_guard(&mut self) -> Result<Option<Box<RawExpr>>> {
+        if self.consume_ident_value("if") {
+            Ok(Some(Box::new(self.parse_expr()?)))
+        } else {
+            Ok(None)
         }
     }
 

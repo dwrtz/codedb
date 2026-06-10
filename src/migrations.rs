@@ -1107,6 +1107,9 @@ fn append_default_arg_to_calls(expr: &RawExpr, target_name: &str, default: &RawE
                     range: arm.range.clone(),
                     default: arm.default,
                     binding: arm.binding.clone(),
+                    guard: arm.guard.as_ref().map(|guard| {
+                        Box::new(append_default_arg_to_calls(guard, target_name, default))
+                    }),
                     body: append_default_arg_to_calls(&arm.body, target_name, default),
                 })
                 .collect(),
@@ -6141,6 +6144,25 @@ impl CodeDb {
                     if let Some(binding) = &binding {
                         local_names.push(binding.clone());
                     }
+                    // Reconstruct the guard (R14) inside the binding scope, like the
+                    // body (`.map` is eager, so it runs before the pop below). A guard
+                    // is `bool`, not the case-result type, so it carries no
+                    // expected-type hint (mirroring the scrutinee above); both
+                    // `?`-propagate only after the binding is popped.
+                    let guard = arm
+                        .get("guard")
+                        .and_then(JsonValue::as_str)
+                        .map(|guard_hash| {
+                            self.rewrite_typed_expr_for_member_rename(
+                                old_root,
+                                module,
+                                region_names,
+                                local_names,
+                                guard_hash,
+                                None,
+                                rename,
+                            )
+                        });
                     let body = self.rewrite_typed_expr_for_member_rename(
                         old_root,
                         module,
@@ -6153,12 +6175,14 @@ impl CodeDb {
                     if binding.is_some() {
                         local_names.pop();
                     }
+                    let guard = guard.transpose()?.map(Box::new);
                     rewritten_arms.push(RawCaseArm {
                         variant,
                         literal,
                         range,
                         default: is_default,
                         binding,
+                        guard,
                         body: body?,
                     });
                 }
@@ -7576,6 +7600,16 @@ fn borrow_call_arg_to_calls(
                         range: arm.range.clone(),
                         default: arm.default,
                         binding: arm.binding.clone(),
+                        guard: match &arm.guard {
+                            Some(guard) => Some(Box::new(borrow_call_arg_to_calls(
+                                guard,
+                                target_name,
+                                param_index,
+                                region,
+                                mutable,
+                            )?)),
+                            None => None,
+                        },
                         body: borrow_call_arg_to_calls(
                             &arm.body,
                             target_name,
@@ -7795,6 +7829,13 @@ fn normalize_param_refs_scoped(
                     if let Some(binding) = &arm.binding {
                         local_bindings.push(binding.clone());
                     }
+                    let guard = arm.guard.as_ref().map(|guard| {
+                        Box::new(normalize_param_refs_scoped(
+                            guard,
+                            local_params,
+                            local_bindings,
+                        ))
+                    });
                     let body = normalize_param_refs_scoped(&arm.body, local_params, local_bindings);
                     if arm.binding.is_some() {
                         local_bindings.pop();
@@ -7805,6 +7846,7 @@ fn normalize_param_refs_scoped(
                         range: arm.range.clone(),
                         default: arm.default,
                         binding: arm.binding.clone(),
+                        guard,
                         body,
                     }
                 })

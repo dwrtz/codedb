@@ -3366,6 +3366,10 @@ fn substitute_param_refs(expr: &RawExpr, args: &[RawExpr]) -> Result<RawExpr> {
                         range: arm.range.clone(),
                         default: arm.default,
                         binding: arm.binding.clone(),
+                        guard: match &arm.guard {
+                            Some(guard) => Some(Box::new(substitute_param_refs(guard, args)?)),
+                            None => None,
+                        },
                         body: substitute_param_refs(&arm.body, args)?,
                     })
                 })
@@ -3466,6 +3470,9 @@ fn collect_free_param_names(
             for arm in arms {
                 if let Some(binding) = &arm.binding {
                     bound_locals.push(binding.clone());
+                }
+                if let Some(guard) = &arm.guard {
+                    collect_free_param_names(guard, bound_locals, names);
                 }
                 collect_free_param_names(&arm.body, bound_locals, names);
                 if arm.binding.is_some() {
@@ -3692,6 +3699,13 @@ fn alpha_rename_let_bindings_with_scope(
                         renamed_locals.push((binding.clone(), renamed.clone()));
                         renamed
                     });
+                    let guard = arm.guard.as_ref().map(|guard| {
+                        Box::new(alpha_rename_let_bindings_with_scope(
+                            guard,
+                            used_names,
+                            renamed_locals,
+                        ))
+                    });
                     let body =
                         alpha_rename_let_bindings_with_scope(&arm.body, used_names, renamed_locals);
                     if arm.binding.is_some() {
@@ -3703,6 +3717,7 @@ fn alpha_rename_let_bindings_with_scope(
                         range: arm.range.clone(),
                         default: arm.default,
                         binding: renamed_binding,
+                        guard,
                         body,
                     }
                 })

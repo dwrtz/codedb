@@ -507,8 +507,9 @@ struct LocalLoweredBinding {
 }
 
 /// A scalar `i64` `case` pattern as seen by the desugaring chain (R14): a single
-/// literal, or a `lo..hi` / `lo..=hi` range. Each becomes one `if` level whose
-/// condition is `scrutinee == lit` or `scrutinee >= lo && scrutinee {<,<=} hi`.
+/// literal, a `lo..hi` / `lo..=hi` range, or a guarded wildcard. Each becomes one
+/// `if` level whose condition is `scrutinee == lit` / `scrutinee >= lo && scrutinee
+/// {<,<=} hi` / (for a wildcard) the guard alone.
 enum ScalarArmPattern {
     Literal(String),
     Range {
@@ -516,6 +517,10 @@ enum ScalarArmPattern {
         hi: String,
         inclusive: bool,
     },
+    /// A *guarded* wildcard (`_ if g`): matches any value, so the arm's condition is
+    /// its guard alone. An unguarded wildcard is the chain's terminal `else` and is
+    /// never represented as a `Wildcard` entry.
+    Wildcard,
 }
 
 /// Identifies an addressable owned storage slot (a parameter or a local). Used
@@ -4554,7 +4559,9 @@ impl CodeDb {
         ctx: &mut LowerCtx,
         locals: &mut Vec<LocalLoweredBinding>,
     ) -> Result<LoweredExpr> {
-        let mut literal_arms: Vec<(ScalarArmPattern, String)> = Vec::new();
+        // Each conditional arm carries its pattern, an optional guard (R14) hash, and
+        // its body; the single UNGUARDED wildcard becomes the chain's terminal `else`.
+        let mut chain_arms: Vec<(ScalarArmPattern, Option<String>, String)> = Vec::new();
         let mut default_body: Option<String> = None;
         for arm in arms {
             let body = arm
@@ -4562,10 +4569,19 @@ impl CodeDb {
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| anyhow!("case arm missing body"))?
                 .to_string();
+            let guard = arm
+                .get("guard")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string);
             if arm.get("default").and_then(JsonValue::as_bool) == Some(true) {
-                default_body = Some(body);
+                match guard {
+                    // A guarded wildcard is a conditional arm (its only test is the
+                    // guard); the unguarded wildcard is the terminal default.
+                    Some(_) => chain_arms.push((ScalarArmPattern::Wildcard, guard, body)),
+                    None => default_body = Some(body),
+                }
             } else if let Some(value) = arm.get("literal_i64").and_then(JsonValue::as_str) {
-                literal_arms.push((ScalarArmPattern::Literal(value.to_string()), body));
+                chain_arms.push((ScalarArmPattern::Literal(value.to_string()), guard, body));
             } else if let Some(lo) = arm.get("range_lo").and_then(JsonValue::as_str) {
                 let hi = arm
                     .get("range_hi")
@@ -4575,12 +4591,13 @@ impl CodeDb {
                     .get("range_inclusive")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                literal_arms.push((
+                chain_arms.push((
                     ScalarArmPattern::Range {
                         lo: lo.to_string(),
                         hi: hi.to_string(),
                         inclusive,
                     },
+                    guard,
                     body,
                 ));
             } else {
@@ -4594,7 +4611,7 @@ impl CodeDb {
         let chain = self.lower_scalar_i64_chain(
             root,
             &scrutinee.value,
-            &literal_arms,
+            &chain_arms,
             &default_body,
             result_type,
             expr_hash,
@@ -4612,15 +4629,16 @@ impl CodeDb {
         })
     }
 
-    /// Build the `if`/`eq` chain for [`lower_scalar_i64_case`], one binary `if`
-    /// per literal arm with the wildcard body as the final `else`. Conditional
-    /// drop glue (SPEC_V3 §7) is applied per `if` level exactly as in `lower_if`.
+    /// Build the `if`/`eq` chain for [`lower_scalar_i64_case`], one binary `if` per
+    /// conditional arm (literal / range / guarded wildcard) with the unguarded
+    /// wildcard body as the final `else`. Conditional drop glue (SPEC_V3 §7) is
+    /// applied per `if` level exactly as in `lower_if`.
     #[allow(clippy::too_many_arguments)]
     fn lower_scalar_i64_chain(
         &self,
         root: &ProgramRootPayload,
         scrutinee_value: &str,
-        literal_arms: &[(ScalarArmPattern, String)],
+        chain_arms: &[(ScalarArmPattern, Option<String>, String)],
         default_body: &str,
         result_type: &str,
         expr_hash: &str,
@@ -4630,8 +4648,8 @@ impl CodeDb {
         moved_before: &BTreeSet<MovedPlace>,
         index: usize,
     ) -> Result<LoweredExpr> {
-        let Some((pattern, body_hash)) = literal_arms.get(index) else {
-            // Final `else`: the wildcard arm.
+        let Some((pattern, guard, body_hash)) = chain_arms.get(index) else {
+            // Final `else`: the unguarded wildcard arm.
             ctx.moved = moved_before.clone();
             let body = self.lower_expr_as(root, default_body, result_type, param_types, ctx, locals)?;
             if body.type_hash != result_type {
@@ -4639,13 +4657,13 @@ impl CodeDb {
             }
             return Ok(body);
         };
-        // cond = the arm's match test against the scrutinee. A literal compares with
-        // `==`; a range desugars to `scrutinee >= lo && scrutinee {<,<=} hi`. Both
-        // produce a `Bool` value the `if` below branches on.
+        // pattern_test = the arm's match test against the scrutinee (`None` for a
+        // wildcard, which always matches). A literal compares with `==`; a range
+        // desugars to `scrutinee >= lo && scrutinee {<,<=} hi`.
         let mut operations = Vec::new();
         let i64_type = type_hash_for("I64");
         let bool_type = type_hash_for("Bool");
-        let mut const_i64 = |ctx: &mut LowerCtx, value: &str, ops: &mut Vec<LoweredOp>| {
+        let const_i64 = |ctx: &mut LowerCtx, value: &str, ops: &mut Vec<LoweredOp>| {
             let id = ctx.value();
             ctx.push_debug_op(expr_hash, "const_i64", &id);
             ops.push(LoweredOp::ConstI64 {
@@ -4655,7 +4673,7 @@ impl CodeDb {
             });
             id
         };
-        let cond_id = match pattern {
+        let pattern_test: Option<String> = match pattern {
             ScalarArmPattern::Literal(value) => {
                 let const_id = const_i64(ctx, value, &mut operations);
                 let cond_id = ctx.value();
@@ -4668,7 +4686,7 @@ impl CodeDb {
                     type_hash: bool_type.clone(),
                     trap: None,
                 });
-                cond_id
+                Some(cond_id)
             }
             ScalarArmPattern::Range { lo, hi, inclusive } => {
                 let lo_id = const_i64(ctx, lo, &mut operations);
@@ -4704,8 +4722,70 @@ impl CodeDb {
                     type_hash: bool_type.clone(),
                     trap: None,
                 });
-                cond_id
+                Some(cond_id)
             }
+            ScalarArmPattern::Wildcard => None,
+        };
+        // Fold the guard (R14) into the arm condition with SHORT-CIRCUIT semantics:
+        // the guard must run only when the pattern matched. A pure guard can still
+        // TRAP (e.g. `100/y`), and the evaluator skips an unmatched arm's guard, so an
+        // eager strict-`&&` (`and_bool` pre-computes both operands) would diverge.
+        // Express the short-circuit as a bool-valued `if`:
+        //   guarded literal/range   -> if pattern_test { guard } else { false }
+        //   guarded wildcard        -> guard          (the arm is always reached)
+        //   unguarded literal/range -> pattern_test
+        let cond_id = match guard {
+            Some(guard_hash) => {
+                let moved_snapshot = ctx.moved.clone();
+                let guard_lowered =
+                    self.lower_expr_as(root, guard_hash, &bool_type, param_types, ctx, locals)?;
+                if guard_lowered.type_hash != bool_type {
+                    bail!("case guard must lower to bool");
+                }
+                // The guard must not consume owned values: its conditional,
+                // short-circuit evaluation would otherwise make drop placement
+                // path-dependent. Fail closed (move in the arm body instead).
+                if ctx.moved != moved_snapshot {
+                    bail!("case guard may not move owned values");
+                }
+                match pattern_test {
+                    Some(pattern_id) => {
+                        let false_id = ctx.value();
+                        ctx.push_debug_op(expr_hash, "const_bool", &false_id);
+                        let if_id = ctx.value();
+                        ctx.push_debug_op(expr_hash, "if", &if_id);
+                        operations.push(LoweredOp::If {
+                            id: if_id.clone(),
+                            cond: pattern_id,
+                            then_block: LoweredBlock {
+                                operations: guard_lowered.operations,
+                                result: guard_lowered.value,
+                            },
+                            else_block: LoweredBlock {
+                                operations: vec![LoweredOp::ConstBool {
+                                    id: false_id.clone(),
+                                    value: false,
+                                    type_hash: bool_type.clone(),
+                                }],
+                                result: false_id,
+                            },
+                            type_hash: bool_type.clone(),
+                        });
+                        if_id
+                    }
+                    None => {
+                        // Guarded wildcard: always reached, so evaluate the guard
+                        // directly (mirrors the evaluator evaluating a reached
+                        // wildcard's guard).
+                        operations.extend(guard_lowered.operations);
+                        guard_lowered.value
+                    }
+                }
+            }
+            None => match pattern_test {
+                Some(pattern_id) => pattern_id,
+                None => bail!("scalar i64 case wildcard chain arm requires a guard"),
+            },
         };
         let locals_boundary = ctx.next_local;
         // then = this arm's body
@@ -4720,7 +4800,7 @@ impl CodeDb {
         let mut else_expr = self.lower_scalar_i64_chain(
             root,
             scrutinee_value,
-            literal_arms,
+            chain_arms,
             default_body,
             result_type,
             expr_hash,

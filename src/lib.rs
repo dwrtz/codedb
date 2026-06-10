@@ -1333,6 +1333,11 @@ fn collect_call_names(expr: &RawExpr, out: &mut Vec<String>) {
         RawExpr::Case { expr, arms } => {
             collect_call_names(expr, out);
             for arm in arms {
+                // A guard (R14) is part of the arm's evaluation, so a call inside it
+                // is a real call-graph edge (recursion-group analysis depends on this).
+                if let Some(guard) = &arm.guard {
+                    collect_call_names(guard, out);
+                }
                 collect_call_names(&arm.body, out);
             }
         }

@@ -4023,6 +4023,9 @@ impl CodeDb {
                 let mut arms_json = Vec::with_capacity(arms.len());
                 let mut has_default = false;
                 for (index, arm) in arms.iter().enumerate() {
+                    if arm.guard.is_some() {
+                        bail!("if-guards are only supported on i64 scalar `case` arms");
+                    }
                     let mut binding_was_pushed = false;
                     let body;
                     if arm.default {
@@ -4173,15 +4176,23 @@ impl CodeDb {
             if arm.binding.is_some() {
                 bail!("scalar case arm cannot bind a value");
             }
+            if arm.guard.is_some() && matches!(kind, ScalarCaseKind::Bool) {
+                bail!("if-guards require an i64 scrutinee");
+            }
             let mut pattern = serde_json::Map::new();
             if arm.default {
-                if index + 1 != arms.len() {
-                    bail!("default case arm must be last");
+                // A guarded wildcard (`_ if g`) is a conditional arm: it may appear
+                // before other arms and never proves exhaustiveness. Only the
+                // UNGUARDED catch-all must be unique, last, and prove exhaustiveness.
+                if arm.guard.is_none() {
+                    if index + 1 != arms.len() {
+                        bail!("default case arm must be last");
+                    }
+                    if has_default {
+                        bail!("duplicate default case arm");
+                    }
+                    has_default = true;
                 }
-                if has_default {
-                    bail!("duplicate default case arm");
-                }
-                has_default = true;
                 pattern.insert("default".to_string(), json!(true));
             } else if let Some(range) = &arm.range {
                 // i64 range pattern (R14): `lo..hi` / `lo..=hi`. First-match
@@ -4224,7 +4235,11 @@ impl CodeDb {
                         value
                             .parse::<i64>()
                             .with_context(|| format!("invalid i64 case pattern {value}"))?;
-                        if !seen_i64.insert(value.clone()) {
+                        // Only an UNGUARDED literal fully covers its value; a guarded
+                        // one may legitimately repeat (its guard can fall through).
+                        // Overlap with a later arm is first-match (a redundancy lint,
+                        // not flagged — consistent with range overlaps).
+                        if arm.guard.is_none() && !seen_i64.insert(value.clone()) {
                             bail!("duplicate case pattern {value}");
                         }
                         pattern.insert("literal_i64".to_string(), json!(value));
@@ -4239,6 +4254,32 @@ impl CodeDb {
                         pattern.insert("literal_bool".to_string(), json!(value));
                     }
                 }
+            }
+            // Type-check the `if` guard (R14): a `bool` predicate in the arm's scope.
+            // The guard is SHORT-CIRCUITED (evaluated only when the pattern matched, in
+            // source order), so eval and the native chain agree even on a trapping or
+            // effectful guard; any effect it uses is accounted in the enclosing
+            // function's effect signature (inline via `expr_requires_*`, call-borne via
+            // the dependency graph). The one runtime hazard — moving an owned value out
+            // of the arm's scope in a guard — is rejected at lowering. A guarded arm
+            // never proves exhaustiveness (handled above).
+            if let Some(guard_expr) = &arm.guard {
+                let guard = self.type_expr_with_locals(
+                    current_module,
+                    guard_expr,
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                if guard.type_hash != type_hash_for("Bool") {
+                    bail!(
+                        "case guard must be a bool expression, got {}",
+                        self.type_name(&guard.type_hash)?
+                    );
+                }
+                pattern.insert("guard".to_string(), json!(guard.expr_hash));
             }
             let body = self.type_expr_with_locals(
                 current_module,
@@ -6820,6 +6861,18 @@ impl CodeDb {
                         );
                         arm_state.locals.pop();
                     } else {
+                        // The guard (R14, scalar arms only) runs before the body in the
+                        // same scope; borrow-check it first. A pure, bool-returning
+                        // guard yields only transient loans (none escape into `body`).
+                        if let Some(guard) = arm.get("guard").and_then(JsonValue::as_str) {
+                            self.verify_expr_borrows(
+                                root,
+                                guard,
+                                param_types,
+                                &mut arm_state,
+                                ExprUse::Value,
+                            )?;
+                        }
                         self.verify_expr_borrows(
                             root,
                             body,
@@ -8088,6 +8141,12 @@ impl CodeDb {
                         .and_then(JsonValue::as_array)
                         .ok_or_else(|| anyhow!("case missing arms"))?
                     {
+                        // A guard (R14) is evaluated at runtime, so an inline effect
+                        // inside it requires the enclosing function to declare that
+                        // effect (call-borne effects flow through the dependency graph).
+                        if let Some(guard) = arm.get("guard").and_then(JsonValue::as_str) {
+                            required |= self.expr_requires_state(guard)?;
+                        }
                         let body = arm
                             .get("body")
                             .and_then(JsonValue::as_str)
@@ -8226,6 +8285,9 @@ impl CodeDb {
                         .and_then(JsonValue::as_array)
                         .ok_or_else(|| anyhow!("case missing arms"))?
                     {
+                        if let Some(guard) = arm.get("guard").and_then(JsonValue::as_str) {
+                            required |= self.expr_requires_alloc(guard)?;
+                        }
                         let body = arm
                             .get("body")
                             .and_then(JsonValue::as_str)
@@ -8360,6 +8422,9 @@ impl CodeDb {
                         .and_then(JsonValue::as_array)
                         .ok_or_else(|| anyhow!("case missing arms"))?
                     {
+                        if let Some(guard) = arm.get("guard").and_then(JsonValue::as_str) {
+                            required |= self.expr_requires_unsafe(guard)?;
+                        }
                         let body = arm
                             .get("body")
                             .and_then(JsonValue::as_str)
@@ -8420,14 +8485,22 @@ impl CodeDb {
             if arm.get("binding_name").is_some() {
                 bail!("scalar case arm cannot bind a value");
             }
+            if arm.get("guard").is_some() && !is_i64 {
+                bail!("if-guards require an i64 scrutinee");
+            }
+            let guarded = arm.get("guard").is_some();
             if arm.get("default").and_then(JsonValue::as_bool) == Some(true) {
-                if index + 1 != arms.len() {
-                    bail!("default case arm must be last");
+                // A guarded wildcard is conditional; only the UNGUARDED catch-all must
+                // be unique, last, and prove exhaustiveness (R14).
+                if !guarded {
+                    if index + 1 != arms.len() {
+                        bail!("default case arm must be last");
+                    }
+                    if has_default {
+                        bail!("duplicate default case arm");
+                    }
+                    has_default = true;
                 }
-                if has_default {
-                    bail!("duplicate default case arm");
-                }
-                has_default = true;
             } else if arm.get("range_lo").is_some() {
                 // i64 range pattern (R14). Overlaps are intentionally not flagged
                 // (first-match semantics); only well-formedness is re-checked here.
@@ -8458,7 +8531,9 @@ impl CodeDb {
                 value
                     .parse::<i64>()
                     .with_context(|| format!("invalid i64 case pattern {value}"))?;
-                if !seen_i64.insert(value.to_string()) {
+                // Only an UNGUARDED literal fully covers its value (R14); a guarded one
+                // may repeat. Overlaps are first-match (not flagged).
+                if !guarded && !seen_i64.insert(value.to_string()) {
                     bail!("duplicate case pattern {value}");
                 }
             } else {
@@ -8468,6 +8543,22 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("scalar bool case arm must be a bool literal or `_`"))?;
                 if !seen_bool.insert(value) {
                     bail!("duplicate case pattern {value}");
+                }
+            }
+            // Re-verify the `if` guard (R14): a `bool` predicate in the arm's scope
+            // (mirrors type_scalar_case). Its effects are accounted by the effect
+            // checker; the no-move discipline is enforced at lowering, which `verify`
+            // also runs.
+            if let Some(guard_hash) = arm.get("guard").and_then(JsonValue::as_str) {
+                let guard_type = self.verify_expr_type_with_locals(
+                    guard_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if guard_type != type_hash_for("Bool") {
+                    bail!("case guard must be a bool expression");
                 }
             }
             let body_hash = arm
@@ -9840,6 +9931,9 @@ impl CodeDb {
                 let mut result_type = None;
                 let mut has_default = false;
                 for (index, arm) in arms.iter().enumerate() {
+                    if arm.get("guard").is_some() {
+                        bail!("if-guards are only supported on i64 scalar `case` arms");
+                    }
                     let is_default = arm.get("default").and_then(JsonValue::as_bool) == Some(true);
                     let binding = arm.get("binding_name").and_then(JsonValue::as_str);
                     let mut binding_was_pushed = false;

@@ -367,3 +367,247 @@ fn range_case_on_bool_scrutinee_is_rejected() {
     let err = run_fail(&["import", path(&db), path(&src)]);
     assert!(err.contains("i64 scrutinee"), "expected an i64-scrutinee error, got: {err}");
 }
+
+#[test]
+fn guarded_wildcard_dispatches_native_and_matches_oracle() {
+    // R14 if-guards: guarded wildcards (`_ if g`) appear BEFORE the unguarded
+    // catch-all and fall through when their guard is false. First-match order is
+    // preserved across the native `if`/`eq` chain and the reference evaluator.
+    check_native(
+        "guard_wildcard",
+        "fn classify(n: i64) -> i64 = \
+           case n of _ if n > 10 => 1 | _ if n < 0 => 2 | _ => 0\n\
+         fn main() -> i64 = \
+           classify(20) * 100 + classify(-5) * 10 + classify(5)\n",
+        "main",
+        100 + 20,
+    );
+}
+
+#[test]
+fn guarded_literal_falls_through_to_unguarded_arm() {
+    // A guarded literal (`5 if flag > 0`) that matches the value but FAILS its guard
+    // falls through to a later arm — here the same unguarded literal `5`.
+    check_native(
+        "guard_fallthrough",
+        "fn pick(n: i64, flag: i64) -> i64 = \
+           case n of 5 if flag > 0 => 100 | 5 => 200 | _ => 0\n\
+         fn main() -> i64 = \
+           pick(5, 1) + pick(5, 0) + pick(3, 1)\n",
+        "main",
+        100 + 200,
+    );
+}
+
+#[test]
+fn guarded_range_dispatches_native_and_matches_oracle() {
+    // A guard on a range arm: `1..=100 if n > 50` matches only the upper half;
+    // 40 is in-range but fails the guard and falls through, 200 is out of range.
+    check_native(
+        "guard_range",
+        "fn classify(n: i64) -> i64 = \
+           case n of 1..=100 if n > 50 => 1 | _ => 0\n\
+         fn main() -> i64 = \
+           classify(60) * 100 + classify(40) * 10 + classify(200)\n",
+        "main",
+        100,
+    );
+}
+
+#[test]
+fn guard_can_call_a_pure_function() {
+    // A guard may call a pure (effect-free) function; the call is a real call-graph
+    // edge, so it must survive import/lowering and run natively.
+    check_native(
+        "guard_pure_call",
+        "fn even(n: i64) -> bool = n - (n / 2) * 2 == 0\n\
+         fn classify(n: i64) -> i64 = case n of _ if even(n) => 1 | _ => 0\n\
+         fn main() -> i64 = \
+           classify(4) * 100 + classify(7) * 10 + classify(8)\n",
+        "main",
+        100 + 1,
+    );
+}
+
+#[test]
+fn guarded_arms_do_not_prove_exhaustiveness() {
+    // Two guarded wildcards that semantically cover every i64 STILL need an
+    // unguarded `_`: a guard can never be proven total.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("ge.sqlite");
+    let src = temp.path().join("ge.cdb");
+    std::fs::write(
+        &src,
+        "fn f(n: i64) -> i64 = case n of _ if n > 0 => 1 | _ if n <= 0 => 2\n\
+         fn main() -> i64 = f(5)\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    let err = run_fail(&["import", path(&db), path(&src)]);
+    assert!(
+        err.contains("not exhaustive"),
+        "guarded arms must not prove exhaustiveness, got: {err}"
+    );
+}
+
+#[test]
+fn guard_on_bool_scrutinee_is_rejected() {
+    // if-guards are i64-only for now (like ranges); a bool-scrutinee guard fails closed.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("gb.sqlite");
+    let src = temp.path().join("gb.cdb");
+    std::fs::write(
+        &src,
+        "fn f(b: bool, n: i64) -> i64 = case b of true if n > 0 => 1 | _ => 0\n\
+         fn main() -> i64 = f(1 < 2, 1)\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    let err = run_fail(&["import", path(&db), path(&src)]);
+    assert!(
+        err.contains("i64 scrutinee"),
+        "expected an i64-scrutinee error, got: {err}"
+    );
+}
+
+#[test]
+fn guard_on_enum_scrutinee_is_rejected() {
+    // if-guards on enum arms fail closed (nested-destructuring + guards is a separate
+    // follow-on). The rejection fires before the guard is even type-checked.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("genum.sqlite");
+    let src = temp.path().join("genum.cdb");
+    std::fs::write(
+        &src,
+        "enum E { a: unit\n  b: i64 }\n\
+         fn f(e: E) -> i64 = case e of a if 1 > 0 => 1 | b(v) => v\n\
+         fn main() -> i64 = 0\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    let err = run_fail(&["import", path(&db), path(&src)]);
+    assert!(
+        err.contains("scalar"),
+        "expected a scalar-only-guard error, got: {err}"
+    );
+}
+
+#[test]
+fn guard_case_projection_round_trips() {
+    // A guard renders as ` if <expr>` between the pattern and `=>`; the typed node
+    // round-trips so import -> export -> import reproduces the root hash (SPEC_V3 §11).
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("grt.sqlite");
+    let src = temp.path().join("grt.cdb");
+    std::fs::write(
+        &src,
+        "fn f(n: i64) -> i64 = case n of 5 if n > 0 => 1 | _ if n < 0 => 2 | _ => 0\n\
+         fn main() -> i64 = f(5)\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    let root1 = run(&["import", path(&db), path(&src)])
+        .lines()
+        .find_map(|line| line.strip_prefix("root ").map(str::to_string))
+        .expect("import prints root");
+    run(&["verify", path(&db)]);
+
+    let export = temp.path().join("grt.export.cdb");
+    run(&["export", path(&db), "--branch", "main", "--out", path(&export)]);
+    let exported = std::fs::read_to_string(&export).unwrap();
+    assert!(
+        exported.contains("if n > 0"),
+        "guarded literal projects its guard: {exported}"
+    );
+    assert!(
+        exported.contains("if n < 0"),
+        "guarded wildcard projects its guard: {exported}"
+    );
+
+    let db2 = temp.path().join("grt2.sqlite");
+    run(&["init", path(&db2)]);
+    let root2 = run(&["import", path(&db2), path(&export)])
+        .lines()
+        .find_map(|line| line.strip_prefix("root ").map(str::to_string))
+        .expect("re-import prints root");
+    assert_eq!(
+        root1, root2,
+        "guard case import->export->import must be a fixpoint"
+    );
+    run(&["verify", path(&db2)]);
+    assert_eq!(run(&["eval", path(&db2), "f", "5"]).trim(), "1");
+    assert_eq!(run(&["eval", path(&db2), "f", "3"]).trim(), "0");
+}
+
+#[test]
+fn guard_short_circuits_and_does_not_trap_when_pattern_fails() {
+    // SOUNDNESS (eval/native parity): a guard is evaluated ONLY when its pattern
+    // matches. `100 / d > 0` would divide by zero — and TRAP — if evaluated eagerly,
+    // but for n != 5 the pattern fails and the guard is skipped, so the reference
+    // evaluator and the native `if`/`eq` chain BOTH fall through to `_` instead of
+    // trapping. The chain places the guard in a then-branch gated on the pattern
+    // test (a strict `&&` would have evaluated it eagerly and diverged).
+    check_native(
+        "guard_short_circuit",
+        "fn f(n: i64, d: i64) -> i64 = case n of 5 if 100 / d > 0 => 1 | _ => 0\n\
+         fn main() -> i64 = f(3, 0) * 10 + f(5, 2)\n",
+        "main",
+        1,
+    );
+}
+
+#[test]
+fn effectful_guard_is_allowed_and_accounted_natively() {
+    // A guard may use effects (here an inline `alloc`); the effect is accounted in
+    // the enclosing function's signature and the guard runs — and frees — natively
+    // with eval parity. Short-circuit + balanced alloc/free means no leak, no trap.
+    check_native(
+        "guard_effectful",
+        "fn f(n: i64) -> i64 effects[alloc] = \
+           case n of _ if (let b: box<i64> = box_new(n) in true) => 1 | _ => 0\n\
+         fn main() -> i64 effects[alloc] = f(5) + f(7)\n",
+        "main",
+        2,
+    );
+}
+
+#[test]
+fn guard_inline_effect_must_be_declared() {
+    // No effect hole: an inline effect inside a guard requires the enclosing function
+    // to declare it (`expr_requires_*` walks the guard like the body), and a call-borne
+    // guard effect flows through the dependency graph (`collect_expr_deps`).
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("gd.sqlite");
+    let src = temp.path().join("gd.cdb");
+    std::fs::write(
+        &src,
+        "fn f(n: i64) -> i64 = case n of _ if (let b: box<i64> = box_new(n) in true) => 1 | _ => 0\n\
+         fn main() -> i64 = f(5)\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    let err = run_fail(&["import", path(&db), path(&src)]);
+    assert!(
+        err.contains("undeclared effect alloc"),
+        "an inline guard effect must be declared, got: {err}"
+    );
+}
+
+#[test]
+fn guarded_arm_body_move_compensates_drop_on_guard_failure() {
+    // SOUNDNESS — Phase-4 conditional drop glue UNDER a guard. The guarded arm
+    // `5 if flag > 0` MOVES its owned `box` param (via `unbox`); the `_` arm does
+    // not. When the guard FAILS (flag <= 0) control falls through to `_`, where the
+    // box was never consumed, so a compensating drop (SPEC_V3 §7) must free it
+    // exactly once. A miss here leaks (guard-fail path) or double-frees (if both the
+    // unbox and a compensating drop ran). The native run aborts on a double-free.
+    check_native(
+        "guard_drop_compensation",
+        "fn f(n: i64, flag: i64, b: box<i64>) -> i64 effects[alloc] = \
+           case n of 5 if flag > 0 => unbox(b) | _ => 0\n\
+         fn main() -> i64 effects[alloc] = \
+           f(5, 1, box_new(10)) + f(5, 0, box_new(20)) + f(3, 1, box_new(30))\n",
+        "main",
+        10,
+    );
+}

@@ -1459,6 +1459,9 @@ fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<St
                         .into_iter()
                         .flatten()
                     {
+                        // The guard (R14) is a referenced typed-DAG node; it must be
+                        // bundled alongside the arm body or the bundle is incomplete.
+                        push_hash_ref(arm.get("guard"), refs);
                         push_hash_ref(arm.get("body"), refs);
                     }
                 }
