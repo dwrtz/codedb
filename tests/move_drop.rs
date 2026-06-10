@@ -449,39 +449,87 @@ fn main<'a>() -> i64 =
 }
 
 #[test]
-fn partial_move_of_a_field_through_a_box_is_rejected_cleanly() {
+fn partial_move_of_a_field_through_a_box_lowers_and_runs_native() {
     // Moving a field reached through a `box` auto-deref (`h.inner` where
-    // `h: box<Holder>`) is not field-granular-droppable; it must fail closed at the
-    // checker with a clean `unsupported_move` diagnostic (suggesting `unbox`), never
-    // crash lowering. Regression for the box-auto-deref place-tracking gap (SPEC_V3
-    // §7) — the place flattens away the deref, so a naive lowering treated the box as
-    // a record and panicked.
+    // `h: box<Holder>`) IS field-granular-droppable (SPEC_V3 §7, fail-closed #2
+    // lifted): lowering records a `Deref` step, drops the live pointee siblings
+    // through the deref, and frees the box shell SEPARATELY (a `FreeBoxShell`, not
+    // the whole-box drop helper — which would double-free the moved-out field). The
+    // checker `place` flattens the deref away, but a `box` is a unique owner so the
+    // path identity stays sound. Previously rejected fail-closed (suggesting `unbox`).
     let temp = tempdir().unwrap();
     let db = temp.path().join("box-deref-move.sqlite");
     let source = temp.path().join("box-deref-move.cdb");
+    let ir_path = temp.path().join("f.ir.json");
     std::fs::write(
         &source,
         r#"
 record Inner { x: i64 }
-record Holder { inner: box<Inner> }
+record Holder { inner: box<Inner>
+  other: box<Inner> }
 
 fn take(b: box<Inner>) -> i64 effects[alloc] = b.x
 
+// `h.inner` (owned box behind the `box<Holder>` deref) is moved into `take` and
+// freed there; `h.other` stays owned and is read through the deref. At scope exit
+// the granular drop frees `h.other` (through the deref) and the `box<Holder>`
+// shell, but NOT the moved-out `h.inner`.
 fn f() -> i64 effects[alloc] =
-  let h: box<Holder> = box_new({ inner: box_new({ x: 5 }) }) in
-  take(h.inner)
+  let h: box<Holder> = box_new({ inner: box_new({ x: 5 }), other: box_new({ x: 9 }) }) in
+  let m: i64 = take(h.inner) in
+  m + h.other.x
 
 fn main() -> i64 effects[alloc] = f()
 "#,
     )
     .unwrap();
     run(&["init", path(&db)]);
-    bin()
-        .args(["import", path(&db), path(&source)])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("unsupported_move"))
-        .stderr(predicate::str::contains("box deref"));
+    run(&["import", path(&db), path(&source)]);
+
+    // Value oracle: take(h.inner)=5 + h.other.x=9 = 14.
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "14");
+    run(&["verify", path(&db)]);
+
+    // Exactly one move (h.inner), one sibling drop (h.other, through the deref), one
+    // shell free (the box<Holder>) — and NO whole-box drop (which would double-free
+    // the moved-out h.inner).
+    run(&["emit-ir", path(&db), "f", "--out", path(&ir_path)]);
+    let ops = op_names(&read_json(&ir_path));
+    assert_eq!(
+        ops.iter().filter(|op| *op == "move").count(),
+        1,
+        "expected one move of h.inner, got {ops:?}"
+    );
+    assert_eq!(
+        ops.iter().filter(|op| *op == "free_box_shell").count(),
+        1,
+        "expected one box-shell free, got {ops:?}"
+    );
+    assert_eq!(
+        ops.iter().filter(|op| *op == "drop").count(),
+        1,
+        "expected one sibling drop of h.other, got {ops:?}"
+    );
+
+    // Runtime exactly-once: a double-free of the box shell or a sibling aborts the
+    // process; a passing run with value 14 == eval proves each box freed once.
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "box_deref_move_native",
+            "--entry",
+            "main",
+            "--expect-i64",
+            "14",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["native_mismatches"], 0);
+    }
 }
 
 #[test]

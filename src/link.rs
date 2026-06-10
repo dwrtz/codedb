@@ -1419,6 +1419,10 @@ fn collect_compiler_platform_usage_from_ops(
                     usage.uses_free = true;
                 }
             }
+            // Freeing a box shell always calls the platform `free` (SPEC_V3 §7).
+            LoweredOp::FreeBoxShell { .. } => {
+                usage.uses_free = true;
+            }
             LoweredOp::If {
                 then_block,
                 else_block,

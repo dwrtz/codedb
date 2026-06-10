@@ -4636,6 +4636,7 @@ fn collect_lowered_call_targets(
             | LoweredOp::Copy { .. }
             | LoweredOp::Move { .. }
             | LoweredOp::Drop { .. }
+            | LoweredOp::FreeBoxShell { .. }
             | LoweredOp::BorrowDebug { .. }
             | LoweredOp::Return { .. } => {}
         }

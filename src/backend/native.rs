@@ -717,6 +717,7 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::Copy { .. }
             | LoweredOp::Move { .. }
             | LoweredOp::Drop { .. }
+            | LoweredOp::FreeBoxShell { .. }
             | LoweredOp::BorrowDebug { .. }
             | LoweredOp::Return { .. } => {}
         }
@@ -870,6 +871,12 @@ fn validate_native_ops(
                 let layout = native_type_layout(type_layouts, type_hash)?;
                 if layout.kind != "enum" {
                     bail!("native object backend saw load_enum_tag for non-enum type");
+                }
+            }
+            LoweredOp::FreeBoxShell { box_type_hash, .. } => {
+                let layout = native_type_layout(type_layouts, box_type_hash)?;
+                if layout.kind != "box" {
+                    bail!("native object backend saw free_box_shell for non-box type");
                 }
             }
             LoweredOp::Load { type_hash, .. }
@@ -1757,6 +1764,14 @@ fn validate_native_op_flow(
                 bail!("native object backend saw metadata/drop type mismatch");
             }
         }
+        LoweredOp::FreeBoxShell {
+            address,
+            box_type_hash,
+        } => {
+            if native_address_type(addresses, address)? != box_type_hash {
+                bail!("native object backend saw free_box_shell type mismatch");
+            }
+        }
         LoweredOp::Return { value, type_hash } => {
             let actual = native_value_type(values, value)?;
             if actual != type_hash && !native_layout_compatible(type_layouts, actual, type_hash)? {
@@ -2419,6 +2434,7 @@ fn collect_value_ids_inner(
             LoweredOp::Store { .. }
             | LoweredOp::StoreEnumTag { .. }
             | LoweredOp::Drop { .. }
+            | LoweredOp::FreeBoxShell { .. }
             | LoweredOp::BorrowDebug { .. }
             | LoweredOp::Return { .. } => {}
         }
@@ -3005,6 +3021,9 @@ impl FunctionEmitter {
                 self.mov_rax_stack(self.value_offset(address)?);
                 self.emit_drop_ptr_x86(type_hash)?;
             }
+            LoweredOp::FreeBoxShell { address, .. } => {
+                self.emit_free_box_shell_x86(address)?;
+            }
             LoweredOp::BorrowDebug { .. } => {}
             LoweredOp::Return { .. } => {
                 bail!("return is only valid as the final lowered operation");
@@ -3013,6 +3032,21 @@ impl FunctionEmitter {
         if let Some(value_id) = debug_value_id {
             self.record_debug_range(&value_id, debug_start, self.text.len())?;
         }
+        Ok(())
+    }
+
+    /// Free a box's heap shell only (its pointee was partially moved, so the
+    /// whole-box drop helper would double-free the moved-out interior). `address`
+    /// names the box slot: load the box pointer, null-check, `free`. Mirrors the
+    /// box drop helper's free path minus the pointee drop (SPEC_V3 §7).
+    fn emit_free_box_shell_x86(&mut self, address: &str) -> Result<()> {
+        self.mov_rax_stack(self.value_offset(address)?);
+        self.mov_rax_mem_rax();
+        self.cmp_rax_imm32(0);
+        let done = self.emit_jz_placeholder();
+        self.mov_rdi_rax();
+        self.emit_platform_call_x86(PLATFORM_FREE_SYMBOL_HASH, PLATFORM_FREE_ABI_SYMBOL);
+        self.patch_rel32(done)?;
         Ok(())
     }
 
@@ -4790,6 +4824,9 @@ impl Arm64Emitter {
                 self.ldr_stack(0, self.value_offset(address)?)?;
                 self.emit_drop_ptr_arm64(type_hash)?;
             }
+            LoweredOp::FreeBoxShell { address, .. } => {
+                self.emit_free_box_shell_arm64(address)?;
+            }
             LoweredOp::BorrowDebug { .. } => {}
             LoweredOp::Return { .. } => {
                 bail!("return is only valid as the final lowered operation");
@@ -5214,6 +5251,19 @@ impl Arm64Emitter {
             self.ldr_stack(0, self.value_offset(box_value)?)?;
             self.emit_platform_call_arm64(PLATFORM_FREE_SYMBOL_HASH, PLATFORM_FREE_ABI_SYMBOL);
         }
+        Ok(())
+    }
+
+    /// Free a box's heap shell only (arm64): the pointee was partially moved, so the
+    /// whole-box drop helper would double-free the moved-out interior. `address`
+    /// names the box slot — load the box pointer, null-check, `free`. Mirrors the
+    /// box drop helper's free path minus the pointee drop (SPEC_V3 §7).
+    fn emit_free_box_shell_arm64(&mut self, address: &str) -> Result<()> {
+        self.ldr_stack(0, self.value_offset(address)?)?;
+        self.ldr_reg_addr(0, 0)?;
+        let done = self.emit_cbz_placeholder(0);
+        self.emit_platform_call_arm64(PLATFORM_FREE_SYMBOL_HASH, PLATFORM_FREE_ABI_SYMBOL);
+        self.patch_imm19(done)?;
         Ok(())
     }
 

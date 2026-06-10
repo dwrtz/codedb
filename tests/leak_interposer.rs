@@ -19,7 +19,9 @@
 // the interposer is actually injected (guards against a vacuous pass).
 //
 // Coverage: conditional drop glue, field-granular partial moves, the two combined,
-// and a recursive `box<Node>` heap freed by `case` + `unbox` — each at scale.
+// a recursive `box<Node>` heap freed by `case` + `unbox`, inline/nested enum-payload
+// moves, constant-index array-element moves, and partial moves THROUGH a box deref
+// (single- and two-level heap indirection, freed by `FreeBoxShell`) — each at scale.
 
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
@@ -300,6 +302,44 @@ fn go(n: i64) -> i64 effects[alloc] =
 fn main() -> i64 effects[alloc] = go({K})
 "#;
 
+// #2 partial move through a box deref: a `box<Holder>` is built per recursion level
+// (shell + two pointee boxes), `h.a` is moved out THROUGH the deref and freed by
+// `take`, the sibling `h.c` is dropped through the deref at scope exit, and the box
+// shell is freed by a `FreeBoxShell`. A skipped sibling drop OR a skipped shell free
+// leaks one box per level (net scales with the count); a whole-box drop instead of
+// the granular one would double-free the moved-out `h.a` and abort.
+const BOX_DEREF_PARTIAL_MOVE: &str = r#"
+record Line { v: i64 }
+record Holder { a: box<Line>
+  c: box<Line> }
+fn take(b: box<Line>) -> i64 effects[alloc] = b.v
+fn go(n: i64) -> i64 effects[alloc] =
+  if n < 1 then 0
+  else let h: box<Holder> = box_new({ a: box_new({ v: n }), c: box_new({ v: n }) }) in
+       take(h.a) + h.c.v + go(n - 1)
+fn main() -> i64 effects[alloc] = go({K})
+"#;
+
+// #2 at TWO levels of heap indirection: `h.a.x` (where `h: box<Outer>` and the field
+// `a` is itself a `box<Inner>`) is moved out through two derefs. Scope exit drops the
+// live `h.a.y` (through both derefs) and `h.b` (through one), then frees BOTH the inner
+// `box<Inner>` shell and the outer `box<Outer>` shell — five allocations and five frees
+// per level. A missed shell free at either level leaks one box per level.
+const NESTED_BOX_DEREF_MOVE: &str = r#"
+record Leaf { v: i64 }
+record Inner { x: box<Leaf>
+  y: box<Leaf> }
+record Outer { a: box<Inner>
+  b: box<Leaf> }
+fn take(l: box<Leaf>) -> i64 effects[alloc] = l.v
+fn go(n: i64) -> i64 effects[alloc] =
+  if n < 1 then 0
+  else let h: box<Outer> =
+         box_new({ a: box_new({ x: box_new({ v: n }), y: box_new({ v: n }) }), b: box_new({ v: n }) }) in
+       take(h.a.x) + h.a.y.v + h.b.v + go(n - 1)
+fn main() -> i64 effects[alloc] = go({K})
+"#;
+
 fn build_exe(dir: &Path, name: &str, source: &str) -> PathBuf {
     let db = dir.join(format!("{name}.sqlite"));
     let src = dir.join(format!("{name}.cdb"));
@@ -445,4 +485,14 @@ fn nested_destructuring_residual_drop_frees_every_box_at_runtime() {
 #[test]
 fn array_element_partial_move_frees_every_box_at_runtime() {
     assert_balanced_across_scale("array_element_move", ARRAY_ELEMENT_MOVE, 4, 64);
+}
+
+#[test]
+fn box_deref_partial_move_frees_every_box_at_runtime() {
+    assert_balanced_across_scale("box_deref_partial_move", BOX_DEREF_PARTIAL_MOVE, 4, 64);
+}
+
+#[test]
+fn nested_box_deref_partial_move_frees_every_box_at_runtime() {
+    assert_balanced_across_scale("nested_box_deref_move", NESTED_BOX_DEREF_MOVE, 4, 64);
 }

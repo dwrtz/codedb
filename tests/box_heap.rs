@@ -548,3 +548,176 @@ fn box_owning_functions_schedule_drops_and_emit_free() {
         }
     }
 }
+
+/// Op kinds, descending into `if` branch blocks and `case` arm blocks — a
+/// conditional move's compensating drop is emitted inside those blocks.
+fn op_names_recursive(ops: &JsonValue, out: &mut Vec<String>) {
+    for op in ops.as_array().unwrap() {
+        out.push(op["op"].as_str().unwrap().to_string());
+        for block_key in ["then_block", "else_block"] {
+            if let Some(block) = op.get(block_key) {
+                op_names_recursive(&block["operations"], out);
+            }
+        }
+        if let Some(arms) = op.get("arms").and_then(JsonValue::as_array) {
+            for arm in arms {
+                op_names_recursive(&arm["block"]["operations"], out);
+            }
+        }
+    }
+}
+
+fn op_names_deep(ir: &JsonValue) -> Vec<String> {
+    let mut out = Vec::new();
+    op_names_recursive(&ir["ir"]["operations"], &mut out);
+    out
+}
+
+/// #2 fail-closed lifted (SPEC_V3 §7): a partial move THROUGH a box deref that is
+/// also CONDITIONAL. `h.a` (behind the `box<Holder>` deref) is moved into `take`
+/// on the `then` path only; on the `else` path the merge inserts a compensating
+/// drop reaching through the deref, so `h.a` is freed exactly once on each path.
+/// The sibling `h.c` and the box shell are freed at scope exit on both paths. A
+/// double-free of any box (e.g. a whole-box drop instead of the granular one)
+/// aborts the native run; the value oracle pins behavior.
+#[test]
+fn conditional_partial_move_through_box_deref_runs_native_exactly_once() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("cond-box-deref.sqlite");
+    let source = temp.path().join("cond-box-deref.cdb");
+    let ir_path = temp.path().join("cond.ir.json");
+    std::fs::write(
+        &source,
+        r#"
+record Line { v: i64 }
+record Holder { a: box<Line>
+  c: box<Line> }
+fn take(x: box<Line>) -> i64 effects[alloc] = x.v
+fn cond(h: box<Holder>, flag: bool) -> i64 effects[alloc] =
+  let picked: i64 = if flag then take(h.a) else 99 in
+  picked + h.c.v
+fn make() -> box<Holder> effects[alloc] =
+  box_new({ a: box_new({ v: 7 }), c: box_new({ v: 5 }) })
+fn cond_true() -> i64 effects[alloc] = cond(make(), true)
+fn cond_false() -> i64 effects[alloc] = cond(make(), false)
+fn main() -> i64 effects[alloc] = cond_true() + cond_false()
+"#,
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+
+    // then: take(h.a)=7 + h.c=5 = 12; else: 99 + h.c=5 = 104; main = 116.
+    assert_eq!(run(&["eval", path(&db), "cond_true"]).trim(), "12");
+    assert_eq!(run(&["eval", path(&db), "cond_false"]).trim(), "104");
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "116");
+    run(&["verify", path(&db)]);
+
+    // The else path must carry a compensating drop reaching through the deref, and
+    // the scope exit must free the box shell.
+    run(&["emit-ir", path(&db), "cond", "--out", path(&ir_path)]);
+    let ops = op_names_deep(&read_json(&ir_path));
+    assert!(
+        ops.iter().filter(|op| *op == "drop").count() >= 2,
+        "expected a compensating drop (else) AND a residual sibling drop, got {ops:?}"
+    );
+    assert_eq!(
+        ops.iter().filter(|op| *op == "free_box_shell").count(),
+        1,
+        "expected one box-shell free at scope exit, got {ops:?}"
+    );
+
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "cond_box_deref_native",
+            "--entry",
+            "main",
+            "--expect-i64",
+            "116",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["native_mismatches"], 0);
+        assert_eq!(
+            report["tests"][0]["native"]["comparison"]["actual"],
+            json!({"kind": "i64", "value": "116"})
+        );
+    }
+}
+
+/// #2 at TWO levels of heap indirection: `h.a.x` where `h: box<Outer>` and the
+/// field `a` is itself a `box<Inner>`. The move crosses two box derefs; scope exit
+/// drops the live `h.a.y` (through both) and `h.b` (through one), then frees BOTH
+/// the inner and outer box shells — exactly one move, two sibling drops, two shell
+/// frees. Native exactly-once is the runtime oracle.
+#[test]
+fn nested_two_level_box_deref_move_runs_native() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("nested-box-deref.sqlite");
+    let source = temp.path().join("nested-box-deref.cdb");
+    let ir_path = temp.path().join("nested.ir.json");
+    std::fs::write(
+        &source,
+        r#"
+record Leaf { v: i64 }
+record Inner { x: box<Leaf>
+  y: box<Leaf> }
+record Outer { a: box<Inner>
+  b: box<Leaf> }
+fn take(l: box<Leaf>) -> i64 effects[alloc] = l.v
+fn nested(h: box<Outer>) -> i64 effects[alloc] =
+  let m: i64 = take(h.a.x) in
+  m + h.a.y.v + h.b.v
+fn make() -> box<Outer> effects[alloc] =
+  box_new({ a: box_new({ x: box_new({ v: 1 }), y: box_new({ v: 2 }) }), b: box_new({ v: 3 }) })
+fn main() -> i64 effects[alloc] = nested(make())
+"#,
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "6");
+    run(&["verify", path(&db)]);
+
+    run(&["emit-ir", path(&db), "nested", "--out", path(&ir_path)]);
+    let ops = op_names_deep(&read_json(&ir_path));
+    assert_eq!(
+        ops.iter().filter(|op| *op == "move").count(),
+        1,
+        "expected one move of h.a.x, got {ops:?}"
+    );
+    assert_eq!(
+        ops.iter().filter(|op| *op == "drop").count(),
+        2,
+        "expected two sibling drops (h.a.y, h.b), got {ops:?}"
+    );
+    assert_eq!(
+        ops.iter().filter(|op| *op == "free_box_shell").count(),
+        2,
+        "expected two shell frees (inner box<Inner> and outer box<Outer>), got {ops:?}"
+    );
+
+    if can_build_default_native_target() {
+        let created = parse_json(&run(&[
+            "create-test",
+            path(&db),
+            "nested_box_deref_native",
+            "--entry",
+            "main",
+            "--expect-i64",
+            "6",
+            "--native-required",
+            "--json",
+        ]));
+        assert_eq!(created["status"], "applied");
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["native_mismatches"], 0);
+    }
+}

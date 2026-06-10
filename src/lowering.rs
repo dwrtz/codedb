@@ -452,6 +452,18 @@ pub(crate) enum LoweredOp {
         address: String,
         type_hash: String,
     },
+    /// Free a `box`'s heap shell WITHOUT recursively dropping its pointee. Used by
+    /// field-granular drop glue when an interior place of the pointee was moved out
+    /// (`h.inner` where `h: box<Holder>`): the live siblings are dropped through the
+    /// deref by preceding `Drop`s, then this frees the shell. `address` is the
+    /// address of the box slot (where the box pointer lives); the backend loads the
+    /// pointer, null-checks, and calls `free` — exactly the box drop helper's free
+    /// path minus the pointee drop (SPEC_V3 §7). Distinct from `Drop` of a `box`,
+    /// which would double-free the moved-out interior.
+    FreeBoxShell {
+        address: String,
+        box_type_hash: String,
+    },
     BorrowDebug {
         address: String,
         mutable: bool,
@@ -532,23 +544,30 @@ enum RootSlot {
     Local(usize),
 }
 
-/// One step of a move-tracked place's path: a record field by name, or a fixed
-/// array element at a CONSTANT index. (A dynamic array index is not statically
-/// trackable — the drop scaffold could not tell which element survived — so it
-/// stays fail-closed and never appears here; see `place_moved_path`.)
+/// One step of a move-tracked place's path: a record field by name, a fixed
+/// array element at a CONSTANT index, or a `box` auto-deref into the pointee.
+/// (A dynamic array index is not statically trackable — the drop scaffold could
+/// not tell which element survived — so it stays fail-closed and never appears
+/// here; see `place_moved_path`.) A `Deref` step reaches a field/element living
+/// in a `box`'s heap pointee: the granular drop scaffold reaches the live
+/// remainder THROUGH the deref and frees the box shell separately (it cannot use
+/// the box's whole-slot drop helper, which would recursively drop the moved-out
+/// interior place — SPEC_V3 §7).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum PlaceStep {
     Field(String),
     Index(u64),
+    Deref,
 }
 
 /// A move-tracked place: an owned storage slot plus a projection path into it. An
 /// empty path denotes the whole slot. Granular drop glue (Phase 4 + R14) tracks
-/// partial moves out of record fields and constant-index array elements, so the
-/// drop scaffold can drop the live remainder of an aggregate while skipping
-/// moved-out sub-places. Only record-field and constant-array-index steps appear
-/// here — box/deref/dynamic-index projections are not granular-tracked (their
-/// partial move stays fail-closed), so a place rooted in one is never produced.
+/// partial moves out of record fields, constant-index array elements, and fields
+/// reached through a `box` deref, so the drop scaffold can drop the live remainder
+/// of an aggregate while skipping moved-out sub-places. Record-field,
+/// constant-array-index, and box-`Deref` steps appear here — dynamic-index and
+/// raw-pointer projections are not granular-tracked (their partial move stays
+/// fail-closed), so a place rooted in one is never produced.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct MovedPlace {
     root: RootSlot,
@@ -658,9 +677,9 @@ fn merge_consumed_into_moved(drop_state: &mut DropTracker, branch_consumed: &[BT
 #[derive(Debug, Default)]
 struct DropTracker {
     /// Address ids that name a tracked owned place (a param/local slot, or a
-    /// projection chain of record fields / constant array indices rooted in one).
-    /// Box-payload, raw-deref, and dynamic-index addresses are intentionally absent
-    /// — partial moves through them stay fail-closed, so they are never
+    /// projection chain of record fields / constant array indices / `box` derefs
+    /// rooted in one). Raw-deref and dynamic-index addresses are intentionally
+    /// absent — partial moves through them stay fail-closed, so they are never
     /// move/drop-tracked here.
     addr_places: BTreeMap<String, MovedPlace>,
     /// `ConstI64` result id → its constant value, so an `AddrOfIndex` with a constant
@@ -680,6 +699,18 @@ struct DropTracker {
     /// isolation is needed: distinct arms drop distinct variants, and a consumed
     /// scrutinee is never re-`case`d, so a collision can only be a real double drop.
     dropped_enum_payloads: BTreeSet<(String, String)>,
+    /// `Load` result id → the tracked place the loaded `box<T>` value came from
+    /// (e.g. `h` ⇒ whole slot; `h.b` ⇒ a field chain). Lets a following `DerefBox`
+    /// extend the place with a `Deref` step, so a field-granular move/drop reached
+    /// through a box deref (`h.inner`) resolves to a tracked place rather than
+    /// failing closed at the `Move` check (SPEC_V3 §7).
+    loaded_box_place: BTreeMap<String, MovedPlace>,
+    /// Box places whose heap shell has been freed (`FreeBoxShell`). Tracked for the
+    /// at-most-once (no double-free of the allocation) check; disjoint from the
+    /// pointee sub-place drops, which are tracked in `dropped` — freeing the shell
+    /// does not conflict with the (legitimate) interior moves/drops that motivated
+    /// the granular drop.
+    freed_shells: BTreeSet<MovedPlace>,
 }
 
 struct LowerCtx {
@@ -1685,6 +1716,14 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("field_access missing field"))?;
                 match self.place_moved_path(target_hash, locals)? {
                     Some(mut base) => {
+                        // A field reached through a `box` auto-deref lives in the
+                        // box's heap pointee, not the box slot: record a `Deref`
+                        // step so the granular drop reaches the live siblings
+                        // through the deref and frees the shell separately
+                        // (SPEC_V3 §7).
+                        if self.place_target_is_box(target_hash)? {
+                            base.path.push(PlaceStep::Deref);
+                        }
                         base.path.push(PlaceStep::Field(field.to_string()));
                         Ok(Some(base))
                     }
@@ -1711,15 +1750,29 @@ impl CodeDb {
                     self.place_moved_path(target_hash, locals)?,
                 ) {
                     (Some(index), Some(mut base)) if index >= 0 => {
+                        // A `box<[T; N]>` indexed directly auto-derefs into the
+                        // pointee, exactly like a box field access (see above).
+                        if self.place_target_is_box(target_hash)? {
+                            base.path.push(PlaceStep::Deref);
+                        }
                         base.path.push(PlaceStep::Index(index as u64));
                         Ok(Some(base))
                     }
                     _ => Ok(None),
                 }
             }
-            // box payloads, raw deref, etc.: not granular-tracked.
+            // raw deref, etc.: not granular-tracked.
             _ => Ok(None),
         }
+    }
+
+    /// Whether `target_hash`'s declared type is a `box<T>` — i.e. a field/index
+    /// access on it auto-derefs into the heap pointee (granular drop reaches it
+    /// through a `Deref` step; SPEC_V3 §7).
+    fn place_target_is_box(&self, target_hash: &str) -> Result<bool> {
+        let payload = self.get_payload(target_hash)?;
+        let target_type = expr_type(&payload, target_hash)?;
+        Ok(matches!(self.type_spec(&target_type)?, TypeSpec::Box { .. }))
     }
 
     /// Resolve the place a move-only value is moved out of, recording it in the
@@ -1801,6 +1854,37 @@ impl CodeDb {
                     });
                     address = next;
                     current_type = field_info.type_hash;
+                }
+                PlaceStep::Deref => {
+                    // A `box` auto-deref: load the box pointer out of the slot, then
+                    // `DerefBox` it to the pointee address — mirroring `box` field
+                    // read lowering (`lower_box_payload_place`). The subsequent
+                    // field/index steps address into the heap pointee, and the
+                    // box's shell is freed by a sibling `FreeBoxShell`.
+                    let element_type = match self.type_spec_in_root(root, &current_type)? {
+                        TypeSpec::Box { element } => element,
+                        other => bail!(
+                            "granular drop deref step requires a box type, got {}",
+                            other.to_source(self)?
+                        ),
+                    };
+                    let box_value = ctx.value();
+                    ctx.push_debug_op(debug_expr_hash, "load", &box_value);
+                    operations.push(LoweredOp::Load {
+                        id: box_value.clone(),
+                        address,
+                        type_hash: current_type.clone(),
+                    });
+                    let next = ctx.value();
+                    ctx.push_debug_op(debug_expr_hash, "deref_box", &next);
+                    operations.push(LoweredOp::DerefBox {
+                        id: next.clone(),
+                        box_value,
+                        box_type_hash: current_type.clone(),
+                        element_type_hash: element_type.clone(),
+                    });
+                    address = next;
+                    current_type = element_type;
                 }
                 PlaceStep::Index(index) => {
                     // A constant array index: materialize it and address the element,
@@ -1905,8 +1989,39 @@ impl CodeDb {
                     )?;
                 }
             }
+            TypeSpec::Box { element } => {
+                // The box's pointee was partially moved: drop the live remainder of
+                // the pointee THROUGH the deref, then free the box shell. The
+                // whole-box drop helper cannot be used — it recurses into the
+                // moved-out interior place (double free). Read-before-free order:
+                // the pointee field drops precede the shell free (SPEC_V3 §7).
+                let mut child = place.clone();
+                child.path.push(PlaceStep::Deref);
+                self.emit_residual_drops(
+                    root,
+                    &child,
+                    &element,
+                    root_type,
+                    moved,
+                    debug_expr_hash,
+                    ctx,
+                    operations,
+                )?;
+                let (address, _) = self.emit_place_address(
+                    root,
+                    place,
+                    root_type,
+                    debug_expr_hash,
+                    ctx,
+                    operations,
+                )?;
+                operations.push(LoweredOp::FreeBoxShell {
+                    address,
+                    box_type_hash: place_type.to_string(),
+                });
+            }
             other => bail!(
-                "granular drop requires a record or array type, got {}",
+                "granular drop requires a record, array, or box type, got {}",
                 other.to_source(self)?
             ),
         }
@@ -2002,8 +2117,27 @@ impl CodeDb {
                     )?;
                 }
             }
+            TypeSpec::Box { element } => {
+                // Compensate moved pointee fields THROUGH the deref so every branch
+                // agrees on the pointee's move state. The shell is NOT freed here —
+                // the box is freed exactly once by the scope-exit residual drop
+                // (this only normalizes the per-branch move set; SPEC_V3 §7).
+                let mut child = place.clone();
+                child.path.push(PlaceStep::Deref);
+                self.emit_branch_compensation(
+                    root,
+                    &child,
+                    &element,
+                    root_type,
+                    dead,
+                    branch_moved,
+                    debug_expr_hash,
+                    ctx,
+                    operations,
+                )?;
+            }
             other => bail!(
-                "granular compensation requires a record or array type, got {}",
+                "granular compensation requires a record, array, or box type, got {}",
                 other.to_source(self)?
             ),
         }
@@ -6633,6 +6767,18 @@ impl CodeDb {
                         bail!("lowered deref_box box type mismatch");
                     }
                     insert_address(addresses, id, element_type_hash)?;
+                    // If the box value was loaded out of a tracked place, the pointee
+                    // address is that place plus a `Deref` step — so a field/element
+                    // move/drop reached through this box deref resolves to a tracked
+                    // sub-place (field-granular drop glue through heap indirection;
+                    // SPEC_V3 §7). An untracked box value (e.g. from `box_new` or a
+                    // call) leaves the pointee untracked, so a partial move through it
+                    // fails closed at the `Move` check below — sound, just stricter.
+                    if let Some(place) = drop_state.loaded_box_place.get(box_value).cloned() {
+                        let mut deref_place = place;
+                        deref_place.path.push(PlaceStep::Deref);
+                        drop_state.addr_places.insert(id.clone(), deref_place);
+                    }
                     if self.is_aggregate_ir_type(root, element_type_hash)? {
                         insert_value(values, id, element_type_hash)?;
                     }
@@ -7204,6 +7350,16 @@ impl CodeDb {
                         bail!("lowered load type mismatch");
                     }
                     insert_value(values, id, type_hash)?;
+                    // A `box<T>` loaded out of a tracked slot/field place carries
+                    // that place forward, so a following `DerefBox` can address the
+                    // pointee as a tracked `Deref` sub-place (field-granular move/
+                    // drop through a box deref; SPEC_V3 §7). Harmless when the loaded
+                    // box is never deref'd — the entry is only consumed by `DerefBox`.
+                    if self.type_is_box(root, type_hash)?
+                        && let Some(place) = drop_state.addr_places.get(address).cloned()
+                    {
+                        drop_state.loaded_box_place.insert(id.clone(), place);
+                    }
                 }
                 LoweredOp::Store {
                     address,
@@ -7283,13 +7439,13 @@ impl CodeDb {
                     if address_type(addresses, address)? != type_hash {
                         bail!("lowered move type mismatch");
                     }
-                    // A move consumes a tracked place: a whole slot or a
-                    // record-field projection (field-granular partial move,
-                    // SPEC_V3 §7). An untracked address (array element, box
-                    // payload, raw deref) is not field-granular-droppable, so a
-                    // partial move through one stays fail-closed. This is the
-                    // independent backstop for the lowering guard in
-                    // `mark_moved_source`.
+                    // A move consumes a tracked place: a whole slot, a record-field
+                    // / constant-array-index projection, or a field/element reached
+                    // through a `box` deref (all field-granular, SPEC_V3 §7). An
+                    // untracked address (dynamic array index, raw-pointer deref) is
+                    // not granular-droppable, so a partial move through one stays
+                    // fail-closed. This is the independent backstop for the lowering
+                    // guard in `mark_moved_source`.
                     let Some(place) = drop_state.addr_places.get(address).cloned() else {
                         bail!(
                             "lowered move of a non-whole-slot place (partial move of an owned aggregate)"
@@ -7338,6 +7494,37 @@ impl CodeDb {
                         && !drop_state.dropped_enum_payloads.insert(payload)
                     {
                         bail!("lowered double drop of enum payload");
+                    }
+                }
+                LoweredOp::FreeBoxShell {
+                    address,
+                    box_type_hash,
+                } => {
+                    // Frees a box's heap shell when its pointee was partially moved
+                    // (field-granular drop glue through a box deref; SPEC_V3 §7). The
+                    // address must name the box slot itself.
+                    if address_type(addresses, address)? != box_type_hash {
+                        bail!("lowered free_box_shell type mismatch");
+                    }
+                    if !self.type_is_box(root, box_type_hash)? {
+                        bail!("lowered free_box_shell requires a box type");
+                    }
+                    if let Some(place) = drop_state.addr_places.get(address).cloned() {
+                        // At-most-once for the allocation. Each box place names a
+                        // distinct heap block (a `box` is a unique owner; a nested
+                        // box `h.b` and its container `h` are SEPARATE mallocs), so
+                        // double-free is an EXACT-place repeat — not an overlap, which
+                        // would wrongly flag freeing both `h` and its inner box `h.b`.
+                        if !drop_state.freed_shells.insert(place.clone()) {
+                            bail!("lowered double free of box shell");
+                        }
+                        // A shell whose box (or a containing aggregate) was moved out
+                        // wholesale is no longer ours to free — ancestor-or-equal, NOT
+                        // overlap: a moved pointee SUB-place (`h.inner`) is exactly the
+                        // partial move that motivates this granular shell free.
+                        if place_covered_by(&drop_state.moved, &place) {
+                            bail!("lowered free of moved-out box shell");
+                        }
                     }
                 }
                 LoweredOp::BorrowDebug {
@@ -7556,6 +7743,7 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         LoweredOp::Store { .. }
         | LoweredOp::StoreEnumTag { .. }
         | LoweredOp::Drop { .. }
+        | LoweredOp::FreeBoxShell { .. }
         | LoweredOp::BorrowDebug { .. }
         | LoweredOp::Return { .. } => None,
     }
@@ -7606,6 +7794,7 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::Copy { .. } => "copy",
         LoweredOp::Move { .. } => "move",
         LoweredOp::Drop { .. } => "drop",
+        LoweredOp::FreeBoxShell { .. } => "free_box_shell",
         LoweredOp::BorrowDebug { .. } => "borrow_debug",
         LoweredOp::Return { .. } => "return",
     }
@@ -7736,6 +7925,9 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             } => {
                 out.insert(box_type_hash.clone());
                 out.insert(element_type_hash.clone());
+            }
+            LoweredOp::FreeBoxShell { box_type_hash, .. } => {
+                out.insert(box_type_hash.clone());
             }
             LoweredOp::PtrCast {
                 source_type_hash,
