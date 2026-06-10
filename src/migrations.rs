@@ -1104,6 +1104,7 @@ fn append_default_arg_to_calls(expr: &RawExpr, target_name: &str, default: &RawE
                 .map(|arm| crate::expr::RawCaseArm {
                     variant: arm.variant.clone(),
                     literal: arm.literal.clone(),
+                    range: arm.range.clone(),
                     default: arm.default,
                     binding: arm.binding.clone(),
                     body: append_default_arg_to_calls(&arm.body, target_name, default),
@@ -6112,7 +6113,8 @@ impl CodeDb {
                     // Scalar literal patterns (R14) carry no variant to rename;
                     // reconstruct them verbatim.
                     let literal = crate::expr::scalar_literal_pattern_from_typed_arm(arm);
-                    let variant = if is_default || literal.is_some() {
+                    let range = crate::expr::scalar_range_pattern_from_typed_arm(arm);
+                    let variant = if is_default || literal.is_some() || range.is_some() {
                         None
                     } else {
                         let old_variant = arm
@@ -6154,6 +6156,7 @@ impl CodeDb {
                     rewritten_arms.push(RawCaseArm {
                         variant,
                         literal,
+                        range,
                         default: is_default,
                         binding,
                         body: body?,
@@ -7570,6 +7573,7 @@ fn borrow_call_arg_to_calls(
                     Ok(RawCaseArm {
                         variant: arm.variant.clone(),
                         literal: arm.literal.clone(),
+                        range: arm.range.clone(),
                         default: arm.default,
                         binding: arm.binding.clone(),
                         body: borrow_call_arg_to_calls(
@@ -7798,6 +7802,7 @@ fn normalize_param_refs_scoped(
                     crate::expr::RawCaseArm {
                         variant: arm.variant.clone(),
                         literal: arm.literal.clone(),
+                        range: arm.range.clone(),
                         default: arm.default,
                         binding: arm.binding.clone(),
                         body,

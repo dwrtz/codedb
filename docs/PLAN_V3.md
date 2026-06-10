@@ -427,8 +427,12 @@ checked with a deterministic diagnostic (an `i64` case needs a `_`; a `bool` cas
 must cover true/false or have a `_`; enum coverage as before). `case`-in-arm
 nesting works and round-trips — a nested `case` in a non-last arm is parenthesized
 so the projection re-parses. Evaluator, native, and `trace`/`debug` parity in
-`tests/pattern_match_native.rs` and `tests/trace.rs`. Range patterns, `if` guards,
-and nested enum-destructuring patterns are documented follow-on R14 surface.
+`tests/pattern_match_native.rs` and `tests/trace.rs`. Range patterns (`lo..hi`
+exclusive / `lo..=hi` inclusive on an `i64` scrutinee, negative bounds allowed) are
+now implemented — desugared to a `scrutinee >= lo && scrutinee {<,<=} hi` test in
+the same `if`/`eq` chain, first-match order, projection round-trips, exhaustiveness
+still requires `_` (a finite set of ranges cannot cover `i64`). `if` guards and
+nested enum-destructuring patterns remain documented follow-on R14 surface.
 
 Deliverables:
 
@@ -842,8 +846,9 @@ ordinals; box-broken size cycle), so per-node-data recursive structures — a
 native and round-trip. A field reached through a `box` deref now fails closed with a
 clean `unsupported_move` diagnostic (was an opaque lowering crash).
 
-Documented follow-on R14/structure surface: range/guard/nested-enum patterns; and
-inline (non-`box`) move-only enum-payload moves. `verify` recomputes each recursion/type
+Documented follow-on R14/structure surface: `if` guard and nested-enum-destructuring
+patterns (range patterns `lo..hi`/`lo..=hi` are now implemented); and inline
+(non-`box`) move-only enum-payload moves. `verify` recomputes each recursion/type
 clique's canonical ordinals from the re-projected source and rejects a permutation —
 covered now on BOTH sides: the positive path (valid automorphic cliques must not
 false-reject) plus a negative regression that mints a clique with non-canonical member

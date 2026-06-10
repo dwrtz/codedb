@@ -506,6 +506,18 @@ struct LocalLoweredBinding {
     type_hash: String,
 }
 
+/// A scalar `i64` `case` pattern as seen by the desugaring chain (R14): a single
+/// literal, or a `lo..hi` / `lo..=hi` range. Each becomes one `if` level whose
+/// condition is `scrutinee == lit` or `scrutinee >= lo && scrutinee {<,<=} hi`.
+enum ScalarArmPattern {
+    Literal(String),
+    Range {
+        lo: String,
+        hi: String,
+        inclusive: bool,
+    },
+}
+
 /// Identifies an addressable owned storage slot (a parameter or a local). Used
 /// to track which slots have had their whole value moved out, so the drop
 /// scaffold does not drop moved-out (or already-dropped) storage.
@@ -4538,7 +4550,7 @@ impl CodeDb {
         ctx: &mut LowerCtx,
         locals: &mut Vec<LocalLoweredBinding>,
     ) -> Result<LoweredExpr> {
-        let mut literal_arms: Vec<(String, String)> = Vec::new();
+        let mut literal_arms: Vec<(ScalarArmPattern, String)> = Vec::new();
         let mut default_body: Option<String> = None;
         for arm in arms {
             let body = arm
@@ -4549,9 +4561,26 @@ impl CodeDb {
             if arm.get("default").and_then(JsonValue::as_bool) == Some(true) {
                 default_body = Some(body);
             } else if let Some(value) = arm.get("literal_i64").and_then(JsonValue::as_str) {
-                literal_arms.push((value.to_string(), body));
+                literal_arms.push((ScalarArmPattern::Literal(value.to_string()), body));
+            } else if let Some(lo) = arm.get("range_lo").and_then(JsonValue::as_str) {
+                let hi = arm
+                    .get("range_hi")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("range case arm missing range_hi"))?;
+                let inclusive = arm
+                    .get("range_inclusive")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                literal_arms.push((
+                    ScalarArmPattern::Range {
+                        lo: lo.to_string(),
+                        hi: hi.to_string(),
+                        inclusive,
+                    },
+                    body,
+                ));
             } else {
-                bail!("scalar i64 case arm must be an integer literal or `_`");
+                bail!("scalar i64 case arm must be an integer literal, range, or `_`");
             }
         }
         let default_body = default_body
@@ -4587,7 +4616,7 @@ impl CodeDb {
         &self,
         root: &ProgramRootPayload,
         scrutinee_value: &str,
-        literal_arms: &[(String, String)],
+        literal_arms: &[(ScalarArmPattern, String)],
         default_body: &str,
         result_type: &str,
         expr_hash: &str,
@@ -4597,7 +4626,7 @@ impl CodeDb {
         moved_before: &BTreeSet<MovedPlace>,
         index: usize,
     ) -> Result<LoweredExpr> {
-        let Some((literal, body_hash)) = literal_arms.get(index) else {
+        let Some((pattern, body_hash)) = literal_arms.get(index) else {
             // Final `else`: the wildcard arm.
             ctx.moved = moved_before.clone();
             let body = self.lower_expr_as(root, default_body, result_type, param_types, ctx, locals)?;
@@ -4606,24 +4635,74 @@ impl CodeDb {
             }
             return Ok(body);
         };
-        // cond = (scrutinee == literal)
-        let const_id = ctx.value();
-        ctx.push_debug_op(expr_hash, "const_i64", &const_id);
-        let mut operations = vec![LoweredOp::ConstI64 {
-            id: const_id.clone(),
-            value: literal.clone(),
-            type_hash: type_hash_for("I64"),
-        }];
-        let cond_id = ctx.value();
-        ctx.push_debug_op(expr_hash, "binary", &cond_id);
-        operations.push(LoweredOp::Binary {
-            id: cond_id.clone(),
-            kind: lower_binary_kind("==", &type_hash_for("I64"), &type_hash_for("I64"), &type_hash_for("Bool"))?,
-            left: scrutinee_value.to_string(),
-            right: const_id,
-            type_hash: type_hash_for("Bool"),
-            trap: None,
-        });
+        // cond = the arm's match test against the scrutinee. A literal compares with
+        // `==`; a range desugars to `scrutinee >= lo && scrutinee {<,<=} hi`. Both
+        // produce a `Bool` value the `if` below branches on.
+        let mut operations = Vec::new();
+        let i64_type = type_hash_for("I64");
+        let bool_type = type_hash_for("Bool");
+        let mut const_i64 = |ctx: &mut LowerCtx, value: &str, ops: &mut Vec<LoweredOp>| {
+            let id = ctx.value();
+            ctx.push_debug_op(expr_hash, "const_i64", &id);
+            ops.push(LoweredOp::ConstI64 {
+                id: id.clone(),
+                value: value.to_string(),
+                type_hash: i64_type.clone(),
+            });
+            id
+        };
+        let cond_id = match pattern {
+            ScalarArmPattern::Literal(value) => {
+                let const_id = const_i64(ctx, value, &mut operations);
+                let cond_id = ctx.value();
+                ctx.push_debug_op(expr_hash, "binary", &cond_id);
+                operations.push(LoweredOp::Binary {
+                    id: cond_id.clone(),
+                    kind: lower_binary_kind("==", &i64_type, &i64_type, &bool_type)?,
+                    left: scrutinee_value.to_string(),
+                    right: const_id,
+                    type_hash: bool_type.clone(),
+                    trap: None,
+                });
+                cond_id
+            }
+            ScalarArmPattern::Range { lo, hi, inclusive } => {
+                let lo_id = const_i64(ctx, lo, &mut operations);
+                let ge_id = ctx.value();
+                ctx.push_debug_op(expr_hash, "binary", &ge_id);
+                operations.push(LoweredOp::Binary {
+                    id: ge_id.clone(),
+                    kind: lower_binary_kind(">=", &i64_type, &i64_type, &bool_type)?,
+                    left: scrutinee_value.to_string(),
+                    right: lo_id,
+                    type_hash: bool_type.clone(),
+                    trap: None,
+                });
+                let hi_id = const_i64(ctx, hi, &mut operations);
+                let upper = if *inclusive { "<=" } else { "<" };
+                let le_id = ctx.value();
+                ctx.push_debug_op(expr_hash, "binary", &le_id);
+                operations.push(LoweredOp::Binary {
+                    id: le_id.clone(),
+                    kind: lower_binary_kind(upper, &i64_type, &i64_type, &bool_type)?,
+                    left: scrutinee_value.to_string(),
+                    right: hi_id,
+                    type_hash: bool_type.clone(),
+                    trap: None,
+                });
+                let cond_id = ctx.value();
+                ctx.push_debug_op(expr_hash, "binary", &cond_id);
+                operations.push(LoweredOp::Binary {
+                    id: cond_id.clone(),
+                    kind: lower_binary_kind("&&", &bool_type, &bool_type, &bool_type)?,
+                    left: ge_id,
+                    right: le_id,
+                    type_hash: bool_type.clone(),
+                    trap: None,
+                });
+                cond_id
+            }
+        };
         let locals_boundary = ctx.next_local;
         // then = this arm's body
         ctx.moved = moved_before.clone();

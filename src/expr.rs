@@ -128,14 +128,30 @@ pub struct RawCaseArm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
     /// A scalar literal pattern (an `i64` or `bool` literal) for matching on a
-    /// scalar scrutinee (R14). Mutually exclusive with `variant`/`default`.
+    /// scalar scrutinee (R14). Mutually exclusive with `variant`/`default`/`range`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub literal: Option<Box<RawExpr>>,
+    /// A scalar `i64` range pattern (`lo..hi` / `lo..=hi`, R14). Mutually exclusive
+    /// with `variant`/`default`/`literal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<RawCaseRange>,
     #[serde(default, skip_serializing_if = "raw_case_arm_default_is_false")]
     pub default: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<String>,
     pub body: RawExpr,
+}
+
+/// An `i64` range case pattern (R14): `lo..hi` (exclusive) or `lo..=hi` (inclusive).
+/// `lo`/`hi` are `i64` literals (a number, optionally negated), held as `RawExpr`
+/// so the projection round-trips structurally (SPEC_V3 §11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawCaseRange {
+    pub lo: Box<RawExpr>,
+    pub hi: Box<RawExpr>,
+    #[serde(default, skip_serializing_if = "raw_case_arm_default_is_false")]
+    pub inclusive: bool,
 }
 
 fn raw_case_arm_default_is_false(value: &bool) -> bool {
@@ -159,6 +175,56 @@ pub(crate) fn scalar_literal_pattern_from_typed_arm(arm: &JsonValue) -> Option<B
 
 fn typed_case_arm_is_default(arm: &JsonValue) -> bool {
     arm.get("default").and_then(JsonValue::as_bool) == Some(true)
+}
+
+/// Reconstruct an `i64` range case pattern (R14) from a typed case arm payload
+/// (`{"range_lo": "..", "range_hi": "..", "range_inclusive": bool}`), or `None` if
+/// the arm is not a range pattern.
+pub(crate) fn scalar_range_pattern_from_typed_arm(arm: &JsonValue) -> Option<RawCaseRange> {
+    let lo = arm.get("range_lo").and_then(JsonValue::as_str)?;
+    let hi = arm.get("range_hi").and_then(JsonValue::as_str)?;
+    let inclusive = arm
+        .get("range_inclusive")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    Some(RawCaseRange {
+        lo: Box::new(RawExpr::LiteralI64 {
+            value: lo.to_string(),
+        }),
+        hi: Box::new(RawExpr::LiteralI64 {
+            value: hi.to_string(),
+        }),
+        inclusive,
+    })
+}
+
+/// Does a typed scalar-`case` arm match an `i64` scrutinee? True for a `literal_i64`
+/// equal to `scrutinee`, or a `range_lo..range_hi` pattern (inclusive when
+/// `range_inclusive`) that contains it. Shared by the evaluator, tracer, and
+/// debugger so first-match order is identical everywhere.
+pub(crate) fn scalar_i64_arm_matches(arm: &JsonValue, scrutinee: i64) -> bool {
+    if let Some(value) = arm
+        .get("literal_i64")
+        .and_then(JsonValue::as_str)
+        .and_then(|value| value.parse::<i64>().ok())
+    {
+        return value == scrutinee;
+    }
+    if let (Some(lo), Some(hi)) = (
+        arm.get("range_lo")
+            .and_then(JsonValue::as_str)
+            .and_then(|value| value.parse::<i64>().ok()),
+        arm.get("range_hi")
+            .and_then(JsonValue::as_str)
+            .and_then(|value| value.parse::<i64>().ok()),
+    ) {
+        let inclusive = arm
+            .get("range_inclusive")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        return scrutinee >= lo && if inclusive { scrutinee <= hi } else { scrutinee < hi };
+    }
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1183,12 +1249,7 @@ impl CodeDb {
                     Value::I64(scrutinee) => {
                         let arm = arms
                             .iter()
-                            .find(|arm| {
-                                arm.get("literal_i64")
-                                    .and_then(JsonValue::as_str)
-                                    .and_then(|literal| literal.parse::<i64>().ok())
-                                    == Some(scrutinee)
-                            })
+                            .find(|arm| scalar_i64_arm_matches(arm, scrutinee))
                             .or_else(|| arms.iter().find(|arm| typed_case_arm_is_default(arm)))
                             .ok_or_else(|| anyhow!("scalar case missing arm for value {scrutinee}"))?;
                         let body_hash = arm
@@ -2796,6 +2857,35 @@ impl CodeDb {
                                 )?
                             ));
                         }
+                        // Scalar range pattern (R14): `lo..hi` / `lo..=hi`.
+                        if let Some(range) = scalar_range_pattern_from_typed_arm(arm) {
+                            if binding.is_some() {
+                                bail!("scalar case arm cannot bind a value");
+                            }
+                            let bound = |expr: &RawExpr| match expr {
+                                RawExpr::LiteralI64 { value } => Ok(value.clone()),
+                                _ => bail!("invalid range case bound"),
+                            };
+                            let lo = bound(range.lo.as_ref())?;
+                            let hi = bound(range.hi.as_ref())?;
+                            let dots = if range.inclusive { "..=" } else { ".." };
+                            let body = arm
+                                .get("body")
+                                .and_then(JsonValue::as_str)
+                                .ok_or_else(|| anyhow!("case arm missing body"))?;
+                            return Ok(format!(
+                                "{lo}{dots}{hi} => {}",
+                                self.expr_to_source_with_locals(
+                                    body,
+                                    root,
+                                    current_module,
+                                    local_params,
+                                    region_names,
+                                    local_names,
+                                    body_prec,
+                                )?
+                            ));
+                        }
                         let variant = arm
                             .get("variant")
                             .and_then(JsonValue::as_str)
@@ -3687,6 +3777,7 @@ impl CodeDb {
                             return Ok(RawCaseArm {
                                 variant: None,
                                 literal: None,
+                                range: None,
                                 default: true,
                                 binding: None,
                                 body,
@@ -3706,6 +3797,27 @@ impl CodeDb {
                             return Ok(RawCaseArm {
                                 variant: None,
                                 literal: Some(literal),
+                                range: None,
+                                default: false,
+                                binding: None,
+                                body,
+                            });
+                        }
+                        // Scalar range pattern (R14): no variant, no binding.
+                        if let Some(range) = scalar_range_pattern_from_typed_arm(arm) {
+                            let body = self.typed_expr_to_raw_with_locals(
+                                arm.get("body")
+                                    .and_then(JsonValue::as_str)
+                                    .ok_or_else(|| anyhow!("case arm missing body"))?,
+                                root,
+                                current_module,
+                                region_names,
+                                local_names,
+                            )?;
+                            return Ok(RawCaseArm {
+                                variant: None,
+                                literal: None,
+                                range: Some(range),
                                 default: false,
                                 binding: None,
                                 body,
@@ -3734,6 +3846,7 @@ impl CodeDb {
                         Ok(RawCaseArm {
                             variant: Some(variant),
                             literal: None,
+                            range: None,
                             default: false,
                             binding,
                             body: body?,
@@ -4587,6 +4700,7 @@ impl Parser {
                     arms.push(RawCaseArm {
                         variant: None,
                         literal: None,
+                        range: None,
                         default: true,
                         binding: None,
                         body,
@@ -4596,16 +4710,43 @@ impl Parser {
                     }
                     break;
                 } else if let Some(literal) = self.try_parse_scalar_literal_pattern()? {
-                    // Scalar literal pattern (R14): `0 => ...`, `true => ...`.
-                    self.expect_symbol("=>")?;
-                    let body = self.parse_expr()?;
-                    arms.push(RawCaseArm {
-                        variant: None,
-                        literal: Some(Box::new(literal)),
-                        default: false,
-                        binding: None,
-                        body,
-                    });
+                    // Scalar literal pattern (R14): `0 => ...`, `true => ...`. An i64
+                    // literal may instead open a range pattern `lo..hi` / `lo..=hi`.
+                    if self.consume_symbol("..") {
+                        let RawExpr::LiteralI64 { .. } = literal else {
+                            bail!("range case pattern requires integer bounds");
+                        };
+                        let inclusive = self.consume_symbol("=");
+                        let hi = match self.try_parse_scalar_literal_pattern()? {
+                            Some(expr @ RawExpr::LiteralI64 { .. }) => expr,
+                            _ => bail!("range case pattern upper bound must be an integer"),
+                        };
+                        self.expect_symbol("=>")?;
+                        let body = self.parse_expr()?;
+                        arms.push(RawCaseArm {
+                            variant: None,
+                            literal: None,
+                            range: Some(RawCaseRange {
+                                lo: Box::new(literal),
+                                hi: Box::new(hi),
+                                inclusive,
+                            }),
+                            default: false,
+                            binding: None,
+                            body,
+                        });
+                    } else {
+                        self.expect_symbol("=>")?;
+                        let body = self.parse_expr()?;
+                        arms.push(RawCaseArm {
+                            variant: None,
+                            literal: Some(Box::new(literal)),
+                            range: None,
+                            default: false,
+                            binding: None,
+                            body,
+                        });
+                    }
                     if !self.consume_symbol("|") {
                         break;
                     }
@@ -4623,6 +4764,7 @@ impl Parser {
                     arms.push(RawCaseArm {
                         variant: Some(variant),
                         literal: None,
+                        range: None,
                         default: false,
                         binding,
                         body,
@@ -5159,7 +5301,7 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             let two = [chars[i], chars[i + 1]].iter().collect::<String>();
             if matches!(
                 two.as_str(),
-                "->" | "==" | "!=" | "<=" | ">=" | "&&" | "||" | "::" | "=>"
+                "->" | "==" | "!=" | "<=" | ">=" | "&&" | "||" | "::" | "=>" | ".."
             ) {
                 tokens.push(Token::Symbol(two));
                 i += 2;

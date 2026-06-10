@@ -1764,10 +1764,7 @@ impl CodeDb {
                         let arm = arms
                             .iter()
                             .find(|arm| {
-                                arm.get("literal_i64")
-                                    .and_then(JsonValue::as_str)
-                                    .and_then(|literal| literal.parse::<i64>().ok())
-                                    == Some(*scrutinee_value)
+                                crate::expr::scalar_i64_arm_matches(arm, *scrutinee_value)
                             })
                             .or_else(|| {
                                 arms.iter().find(|arm| {

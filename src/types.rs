@@ -4183,6 +4183,34 @@ impl CodeDb {
                 }
                 has_default = true;
                 pattern.insert("default".to_string(), json!(true));
+            } else if let Some(range) = &arm.range {
+                // i64 range pattern (R14): `lo..hi` / `lo..=hi`. First-match
+                // semantics — overlapping ranges are not flagged (a redundancy lint,
+                // not a soundness concern). Exhaustiveness still requires a `_` arm
+                // for i64 (a finite set of ranges cannot prove full i64 coverage).
+                if !matches!(kind, ScalarCaseKind::I64) {
+                    bail!("range case patterns require an i64 scrutinee");
+                }
+                let bound = |expr: &RawExpr| -> Result<i64> {
+                    match expr {
+                        RawExpr::LiteralI64 { value } => value
+                            .parse::<i64>()
+                            .with_context(|| format!("invalid i64 range bound {value}")),
+                        _ => bail!("range case bound must be an integer literal"),
+                    }
+                };
+                let lo = bound(&range.lo)?;
+                let hi = bound(&range.hi)?;
+                let empty = if range.inclusive { lo > hi } else { lo >= hi };
+                if empty {
+                    bail!(
+                        "empty range case pattern {lo}..{}{hi}",
+                        if range.inclusive { "=" } else { "" }
+                    );
+                }
+                pattern.insert("range_lo".to_string(), json!(lo.to_string()));
+                pattern.insert("range_hi".to_string(), json!(hi.to_string()));
+                pattern.insert("range_inclusive".to_string(), json!(range.inclusive));
             } else {
                 let literal = arm
                     .literal
@@ -8400,6 +8428,28 @@ impl CodeDb {
                     bail!("duplicate default case arm");
                 }
                 has_default = true;
+            } else if arm.get("range_lo").is_some() {
+                // i64 range pattern (R14). Overlaps are intentionally not flagged
+                // (first-match semantics); only well-formedness is re-checked here.
+                if !is_i64 {
+                    bail!("range case patterns require an i64 scrutinee");
+                }
+                let bound = |key: &str| -> Result<i64> {
+                    arm.get(key)
+                        .and_then(JsonValue::as_str)
+                        .and_then(|value| value.parse::<i64>().ok())
+                        .ok_or_else(|| anyhow!("range case bound {key} must be an integer"))
+                };
+                let lo = bound("range_lo")?;
+                let hi = bound("range_hi")?;
+                let inclusive = arm
+                    .get("range_inclusive")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                let empty = if inclusive { lo > hi } else { lo >= hi };
+                if empty {
+                    bail!("empty range case pattern");
+                }
             } else if is_i64 {
                 let value = arm
                     .get("literal_i64")

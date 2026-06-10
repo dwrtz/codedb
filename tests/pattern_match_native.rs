@@ -264,3 +264,106 @@ fn scalar_case_projection_round_trips() {
     assert_eq!(run(&["eval", path(&db2), "classify", "5"]).trim(), "999");
     assert_eq!(run(&["eval", path(&db2), "classify", "0"]).trim(), "100");
 }
+
+#[test]
+fn range_case_dispatches_native_and_matches_oracle() {
+    // R14 range patterns: an inclusive `lo..=hi`, an exclusive `lo..hi`, a
+    // negative-bound range, and a bare literal in one i64 `case` with a `_` arm.
+    // Boundaries are significant: classify(9) hits the inclusive upper of `1..=9`,
+    // classify(100) falls THROUGH the exclusive upper of `10..100` to `_`, and
+    // classify(-5) hits the inclusive lower of `-5..0`.
+    check_native(
+        "range_case",
+        "fn classify(n: i64) -> i64 = \
+           case n of 0 => 100 | 1..=9 => 1 | 10..100 => 2 | -5..0 => 9 | _ => 0\n\
+         fn main() -> i64 = \
+           classify(0) + classify(9) + classify(10) + classify(100) + classify(-5) + classify(999)\n",
+        "main",
+        100 + 1 + 2 + 0 + 9 + 0,
+    );
+}
+
+#[test]
+fn range_case_projection_round_trips() {
+    // The range pattern is a rich typed node, so the `.cdb` projection re-parses and
+    // import -> export -> import reproduces the same root hash (SPEC_V3 §11).
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("rt.sqlite");
+    let src = temp.path().join("rt.cdb");
+    std::fs::write(
+        &src,
+        "fn f(n: i64) -> i64 = case n of 1..=9 => 1 | 10..100 => 2 | -5..0 => 9 | _ => 0\n\
+         fn main() -> i64 = f(5)\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    let root1 = run(&["import", path(&db), path(&src)])
+        .lines()
+        .find_map(|line| line.strip_prefix("root ").map(str::to_string))
+        .expect("import prints root");
+    run(&["verify", path(&db)]);
+
+    let export = temp.path().join("rt.export.cdb");
+    run(&["export", path(&db), "--branch", "main", "--out", path(&export)]);
+    let exported = std::fs::read_to_string(&export).unwrap();
+    assert!(exported.contains("1..=9 => 1"), "inclusive range projects: {exported}");
+    assert!(exported.contains("10..100 => 2"), "exclusive range projects: {exported}");
+    assert!(exported.contains("-5..0 => 9"), "negative-bound range projects: {exported}");
+
+    let db2 = temp.path().join("rt2.sqlite");
+    run(&["init", path(&db2)]);
+    let root2 = run(&["import", path(&db2), path(&export)])
+        .lines()
+        .find_map(|line| line.strip_prefix("root ").map(str::to_string))
+        .expect("re-import prints root");
+    assert_eq!(root1, root2, "range case import->export->import must be a fixpoint");
+    run(&["verify", path(&db2)]);
+    assert_eq!(run(&["eval", path(&db2), "f", "9"]).trim(), "1");
+    assert_eq!(run(&["eval", path(&db2), "f", "100"]).trim(), "0");
+}
+
+#[test]
+fn range_only_i64_case_without_wildcard_is_rejected() {
+    // A finite set of ranges cannot prove full i64 coverage, so a `_` is still required.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("ne.sqlite");
+    let src = temp.path().join("ne.cdb");
+    std::fs::write(
+        &src,
+        "fn f(n: i64) -> i64 = case n of 1..=9 => 1 | 10..100 => 2\nfn main() -> i64 = f(5)\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    let err = run_fail(&["import", path(&db), path(&src)]);
+    assert!(err.contains("not exhaustive"), "expected a non-exhaustive error, got: {err}");
+}
+
+#[test]
+fn empty_range_case_is_rejected() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("em.sqlite");
+    let src = temp.path().join("em.cdb");
+    std::fs::write(
+        &src,
+        "fn f(n: i64) -> i64 = case n of 9..1 => 1 | _ => 0\nfn main() -> i64 = f(5)\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    let err = run_fail(&["import", path(&db), path(&src)]);
+    assert!(err.contains("empty range case pattern"), "expected an empty-range error, got: {err}");
+}
+
+#[test]
+fn range_case_on_bool_scrutinee_is_rejected() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("bl.sqlite");
+    let src = temp.path().join("bl.cdb");
+    std::fs::write(
+        &src,
+        "fn f(b: bool) -> i64 = case b of 1..=2 => 1 | _ => 0\nfn main() -> i64 = f(true)\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    let err = run_fail(&["import", path(&db), path(&src)]);
+    assert!(err.contains("i64 scrutinee"), "expected an i64-scrutinee error, got: {err}");
+}
