@@ -235,6 +235,56 @@ pub enum Value {
 
 pub type ValueCell = Rc<RefCell<Value>>;
 
+/// Reference-evaluator call-recursion ceiling. The evaluator is a host-stack
+/// tree-walker (`eval_symbol` -> `eval_expr` -> ... -> `eval_symbol`), so a deeply
+/// or non-terminating recursive program would overflow the OS thread stack and
+/// abort the whole process (SIGABRT) instead of returning an error. This ceiling
+/// converts that crash into a clean, recoverable `Result::Err`.
+///
+/// It is an ORACLE robustness bound, not a language limit: the native backend runs
+/// on the OS stack with no such ceiling, so a program that exceeds this still
+/// compiles and runs natively — only the reference evaluator declines it. Sized
+/// below the empirical overflow depth on the default main-thread stack (where the
+/// CLI / oracle evaluates); debug stack frames are ~10x larger than release, hence
+/// the split. This bounds call recursion (the real unbounded hazard); pure
+/// expression nesting is bounded by source size.
+const MAX_EVAL_CALL_DEPTH: usize = if cfg!(debug_assertions) { 120 } else { 1000 };
+
+thread_local! {
+    static EVAL_CALL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard that bounds reference-evaluator call recursion (see
+/// [`MAX_EVAL_CALL_DEPTH`]). Increments the per-thread depth on `enter` and
+/// decrements on `Drop`, so the count is restored on every return path — including
+/// `?` early returns and the bail below. On overflow it returns an error WITHOUT
+/// incrementing, so a rejected entry leaves the counter untouched.
+struct EvalCallDepthGuard;
+
+impl EvalCallDepthGuard {
+    fn enter() -> Result<Self> {
+        EVAL_CALL_DEPTH.with(|depth| {
+            let next = depth.get() + 1;
+            if next > MAX_EVAL_CALL_DEPTH {
+                bail!(
+                    "reference evaluator exceeded its call-recursion ceiling of \
+                     {MAX_EVAL_CALL_DEPTH} nested calls (deep or non-terminating recursion); \
+                     this is an oracle robustness bound — the native backend evaluates on the \
+                     OS stack and is unaffected"
+                );
+            }
+            depth.set(next);
+            Ok(EvalCallDepthGuard)
+        })
+    }
+}
+
+impl Drop for EvalCallDepthGuard {
+    fn drop(&mut self) {
+        EVAL_CALL_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -403,6 +453,10 @@ impl CodeDb {
         symbol: &str,
         args: Vec<Value>,
     ) -> Result<Value> {
+        // Bound host-stack recursion so a deep / non-terminating program yields a
+        // clean error instead of overflowing the stack and aborting the process
+        // (see `MAX_EVAL_CALL_DEPTH`). The guard decrements on return.
+        let _call_depth = EvalCallDepthGuard::enter()?;
         let root = self.load_root(root_hash)?;
         let root_symbol = self
             .root_symbol(&root, symbol)

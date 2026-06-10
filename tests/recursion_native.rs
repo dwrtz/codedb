@@ -308,3 +308,51 @@ fn recursion_members_project_back_to_plain_functions() {
     run(&["import", path(&db2), path(&export)]);
     run(&["verify", path(&db2)]);
 }
+
+#[test]
+fn deep_recursion_evaluator_ceiling_is_an_oracle_bound_not_a_native_limit() {
+    // The reference evaluator walks the HOST stack, so a deep / non-terminating
+    // program would overflow it and abort the process (SIGABRT) instead of returning
+    // an error. A call-recursion ceiling now converts that into a clean, recoverable
+    // error. Crucially it is an ORACLE bound, not a language limit: the native backend
+    // runs on the OS stack and compiles + runs the SAME program. A depth well past the
+    // evaluator ceiling (debug 120 / release 1000) but trivial for the OS stack
+    // exercises both halves.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("deep.sqlite");
+    let src = temp.path().join("deep.cdb");
+    std::fs::write(
+        &src,
+        "fn deep(n: i64) -> i64 = if n < 1 then 0 else 1 + deep(n - 1)\n\
+         fn main() -> i64 = deep(2000)\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+
+    // Evaluator: a clean ceiling error, NOT a stack-overflow abort.
+    let output = bin()
+        .args(["eval", path(&db), "main"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("call-recursion ceiling"),
+        "expected a clean evaluator ceiling error, got: {stderr}"
+    );
+
+    // Native: the same program compiles and runs (deep(2000) = 2000; the executable's
+    // exit status is the result truncated to a byte, 2000 & 0xff = 208).
+    if can_build_default_native_target() {
+        let exe = temp.path().join("deep.exe");
+        run(&["build", path(&db), "main", "--out", path(&exe)]);
+        let status = StdCommand::new(&exe).status().unwrap();
+        assert_eq!(
+            status.code(),
+            Some(2000 & 0xff),
+            "native deep recursion should run on the OS stack unaffected by the oracle ceiling"
+        );
+    }
+}

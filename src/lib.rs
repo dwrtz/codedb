@@ -1810,3 +1810,89 @@ fn canonical_type_member_order(
         .map(|local| member_item_indices[local])
         .collect()
 }
+
+#[cfg(test)]
+mod recursion_group_ordinal_verify_tests {
+    use crate::MAIN_BRANCH;
+    use crate::expr::{ProgramItem, parse_program};
+    use crate::migrations::{Operation, RecursionGroupMemberSpec};
+    use crate::store::CodeDb;
+    use anyhow::Result;
+    use std::path::Path;
+
+    /// Parse a mutually-recursive source into its members' creation specs.
+    fn clique_member_specs(source: &str) -> (String, Vec<RecursionGroupMemberSpec>) {
+        let items = parse_program(source).expect("parse clique source");
+        let mut module = String::new();
+        let mut specs = Vec::new();
+        for item in &items {
+            if let ProgramItem::Function(function) = item {
+                module = function.module.clone();
+                specs.push(RecursionGroupMemberSpec {
+                    name: function.name.clone(),
+                    region_params: function.region_params.clone(),
+                    params: function.params.clone(),
+                    return_type: function.return_type.clone(),
+                    effects: function.effects.clone(),
+                    body: function.body.clone(),
+                });
+            }
+        }
+        (module, specs)
+    }
+
+    /// Mint a recursion group whose members are created in `order` (indices into the
+    /// parsed member list), then run `verify`. `apply_create_recursion_group` assigns
+    /// each member's birth ordinal by POSITION, so a non-canonical `order` stores
+    /// non-canonical ordinals — exactly what the importer never emits (it canonicalizes
+    /// first) and what `verify_clique_canonical_ordinals` must reject.
+    fn build_clique_and_verify(db_path: &Path, source: &str, order: &[usize]) -> Result<String> {
+        let mut db = CodeDb::open(db_path)?;
+        db.init()?;
+        let (module, specs) = clique_member_specs(source);
+        let members: Vec<RecursionGroupMemberSpec> =
+            order.iter().map(|&i| specs[i].clone()).collect();
+        let branch = db.branch(MAIN_BRANCH)?;
+        db.apply_and_record(branch, Operation::CreateRecursionGroup { module, members })?;
+        db.verify()
+    }
+
+    #[test]
+    fn verify_rejects_non_canonical_recursion_group_ordinals() {
+        // is_even/is_odd is an ASYMMETRIC clique: their differing base cases let 1-WL
+        // discretize the call graph, so the canonical member order is a strict total
+        // order — exactly ONE of the two orderings is canonical. The importer always
+        // mints the canonical one; here we mint BOTH directly through the create path.
+        // The canonical ordering must `verify ok`; the permuted one must be rejected by
+        // the root-level canonical-ordinal recompute (SPEC_V3 §10) — the defense-in-depth
+        // check that a corrupted store or a buggy agent op cannot smuggle in non-canonical
+        // birth identities. (Forging this via direct object-store edits would require
+        // re-pointing every content hash that references the swapped member symbols, so it
+        // is exercised here through the create path instead.)
+        let source = "fn is_even(n: i64) -> i64 = if n < 1 then 1 else is_odd(n - 1)\n\
+                      fn is_odd(n: i64) -> i64 = if n < 1 then 0 else is_even(n - 1)\n";
+        let temp = tempfile::tempdir().unwrap();
+        let forward =
+            build_clique_and_verify(&temp.path().join("forward.sqlite"), source, &[0, 1]);
+        let reversed =
+            build_clique_and_verify(&temp.path().join("reversed.sqlite"), source, &[1, 0]);
+
+        // Both orderings type-check and create successfully (only the birth ordinals
+        // differ), so exactly one verifies and the other is rejected.
+        let ok_count = [&forward, &reversed].iter().filter(|result| result.is_ok()).count();
+        assert_eq!(
+            ok_count, 1,
+            "exactly one member ordering is canonical: forward={forward:?} reversed={reversed:?}"
+        );
+
+        let rejection = [&forward, &reversed]
+            .into_iter()
+            .find_map(|result| result.as_ref().err())
+            .expect("one ordering must be rejected");
+        let message = rejection.to_string();
+        assert!(
+            message.contains("bad_recursion_group") && message.contains("is not the canonical"),
+            "expected a canonical-ordinal rejection, got: {message}"
+        );
+    }
+}

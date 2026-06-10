@@ -268,7 +268,8 @@ drop placement for values moved in only some branches (conditional drop glue)
 drop placement for partial moves out of record fields / array elements
 the lowered-IR verifier proves drops occur at most once (no double-free / no
   use-after-move) under the new dataflow; the no-leak half of exactly-once rests on
-  lowering's static drop placement (see the acceptance note)
+  lowering's static drop placement and is now confirmed at runtime by an allocation
+  interposer (see the acceptance note)
 ```
 
 Files likely touched:
@@ -276,7 +277,7 @@ Files likely touched:
 ```text
 src/lowering.rs, src/verify.rs, src/layout.rs, src/backend/native.rs
 src/expr.rs (evaluator drop parity)
-tests/drop_glue_conditional.rs
+tests/drop_glue_conditional.rs, tests/leak_interposer.rs
 ```
 
 Acceptance fixture and oracle:
@@ -284,10 +285,11 @@ Acceptance fixture and oracle:
 ```text
 a native program moves an owned value in only some branches and partially out of
   a record; it compiles, runs (a double-free would abort the run), and the evaluator
-  agrees. Exactly-once drop placement is checked statically in lowering and pinned by
-  per-fixture lowered-IR drop assertions; a runtime allocation interposer confirming
-  the malloc/free balance is a deferred strengthening (the native harness counts no
-  allocations today, so a pure leak is not caught at runtime — see the V3.1 note)
+  agrees. Exactly-once drop placement is checked statically in lowering, pinned by
+  per-fixture lowered-IR drop assertions, and confirmed at runtime by an allocation
+  interposer (`tests/leak_interposer.rs`) that counts malloc/free in the built binary:
+  for a tunable box program the net (alloc - free) is invariant to the allocation
+  count, so a skipped-drop leak — which the double-free guard cannot see — is caught
 ```
 
 ## Phase 5 — Cyclic Content-Addressing: Recursion Groups
@@ -842,15 +844,22 @@ clean `unsupported_move` diagnostic (was an opaque lowering crash).
 
 Documented follow-on R14/structure surface: range/guard/nested-enum patterns; and
 inline (non-`box`) move-only enum-payload moves. `verify` recomputes each recursion/type
-clique's canonical ordinals from the re-projected source and rejects a permutation. The
-lowered-IR verifier proves drops occur at most once (no double-free); the no-leak half of
-exactly-once rests on lowering's static drop placement — an independent runtime
-allocation interposer / static leak proof is a deferred strengthening (the native harness
-counts no allocations, so a pure leak is not caught at runtime). Known oracle caveat: the
-reference evaluator recurses on the host
-stack, so a
-deeply/infinitely recursive program can overflow it (the native backend, on the OS
-stack, is unaffected) — a robustness bound on the oracle, not a language limit.
+clique's canonical ordinals from the re-projected source and rejects a permutation —
+covered now on BOTH sides: the positive path (valid automorphic cliques must not
+false-reject) plus a negative regression that mints a clique with non-canonical member
+ordinals through the create path and asserts `verify` rejects it
+(`recursion_group_ordinal_verify_tests`). The lowered-IR verifier proves drops occur at
+most once (no double-free); the no-leak half of exactly-once rests on lowering's static
+drop placement and is now independently confirmed at runtime by an allocation interposer
+(`tests/leak_interposer.rs`): it counts malloc/free in the built native binary and asserts
+the net (alloc - free) is invariant to a program's allocation count, so a skipped-drop
+leak — invisible to the double-free guard — makes the net grow and is caught (verified
+discriminating against a simulated skipped-drop). Former oracle caveat, now bounded: the
+reference evaluator recurses on the host stack, so a deeply/infinitely recursive program
+would overflow it; a call-recursion ceiling (`MAX_EVAL_CALL_DEPTH`) now converts that
+process abort into a clean error. It is an oracle robustness bound, not a language limit —
+the native backend runs on the OS stack and compiles + runs the same program (pinned by
+`deep_recursion_evaluator_ceiling_is_an_oracle_bound_not_a_native_limit`).
 
 ```text
 Success: recursion compiles native; drops occur exactly once across conditional
