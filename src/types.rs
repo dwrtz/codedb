@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::backend::ArtifactKind;
-use crate::expr::{RawCaseArm, RawExpr};
+use crate::expr::{RawCaseArm, RawExpr, RawPattern};
 use crate::model::{
     ProgramRootPayload, TypeCheckResult, resolve_function_name_in_root, resolve_named_type_in_root,
     validate_projection_identifier,
@@ -4019,6 +4019,14 @@ impl CodeDb {
                     );
                 };
                 let mut seen = BTreeSet::new();
+                // Per outer variant: `true` once it carries nested destructuring
+                // arms, `false` once it carries a simple binding/no-binding arm. Used
+                // to reject duplicate simple arms and mixing the two for one variant.
+                let mut variant_kind: BTreeMap<String, bool> = BTreeMap::new();
+                let mut has_nested = false;
+                // Each non-default arm as a pattern over the *scrutinee* enum, for the
+                // recursive nested-exhaustiveness check (R14).
+                let mut arm_patterns: Vec<RawPattern> = Vec::new();
                 let mut result_type: Option<String> = None;
                 let mut arms_json = Vec::with_capacity(arms.len());
                 let mut has_default = false;
@@ -4026,7 +4034,6 @@ impl CodeDb {
                     if arm.guard.is_some() {
                         bail!("if-guards are only supported on i64 scalar `case` arms");
                     }
-                    let mut binding_was_pushed = false;
                     let body;
                     if arm.default {
                         if index + 1 != arms.len() {
@@ -4051,29 +4058,71 @@ impl CodeDb {
                             region_scope,
                             locals,
                         )?;
+                        arms_json.push(json!({
+                            "default": true,
+                            "body": body.expr_hash,
+                        }));
                     } else {
                         let variant = arm
                             .variant
                             .as_deref()
                             .ok_or_else(|| anyhow!("case arm missing variant"))?;
                         validate_projection_identifier("enum variant", variant)?;
-                        if !seen.insert(variant.to_string()) {
-                            bail!("duplicate case arm {variant}");
-                        }
                         let variant_type = variants
                             .iter()
                             .find(|candidate| candidate.name == variant)
                             .map(|candidate| candidate.type_hash.clone())
                             .ok_or_else(|| anyhow!("case arm uses unknown variant {variant}"))?;
-                        if let Some(binding) = &arm.binding {
-                            validate_projection_identifier("case binding", binding)?;
+                        // The (at most one) leaf binding the arm body sees in scope, and
+                        // the typed nested pattern node (R14), if any.
+                        let scoped: Option<(String, String)>;
+                        let mut payload_pattern_json: Option<JsonValue> = None;
+                        if let Some(pattern) = &arm.payload_pattern {
+                            // Nested destructuring arm: `variant(inner(..))`. Multiple
+                            // nested arms may share an outer variant (they dispatch on
+                            // the payload); mixing with a simple binding is rejected.
+                            has_nested = true;
+                            match variant_kind.get(variant) {
+                                Some(true) => {}
+                                Some(false) => bail!(
+                                    "case arm {variant} cannot mix a binding pattern with nested destructuring patterns"
+                                ),
+                                None => {
+                                    variant_kind.insert(variant.to_string(), true);
+                                }
+                            }
+                            let (node, leaf) =
+                                self.type_payload_pattern(root, pattern, &variant_type)?;
+                            payload_pattern_json = Some(node);
+                            scoped = leaf;
+                        } else {
+                            // Simple arm: at most one per variant, never mixed with a
+                            // nested arm.
+                            match variant_kind.get(variant) {
+                                Some(true) => bail!(
+                                    "case arm {variant} cannot mix a binding pattern with nested destructuring patterns"
+                                ),
+                                Some(false) => bail!("duplicate case arm {variant}"),
+                                None => {
+                                    variant_kind.insert(variant.to_string(), false);
+                                }
+                            }
+                            if let Some(binding) = &arm.binding {
+                                validate_projection_identifier("case binding", binding)?;
+                                scoped = Some((binding.clone(), variant_type.clone()));
+                            } else if variant_type != type_hash_for("Unit") {
+                                bail!("case arm {variant} must bind its payload");
+                            } else {
+                                scoped = None;
+                            }
+                        }
+                        seen.insert(variant.to_string());
+                        arm_patterns.push(arm_scrutinee_pattern(arm, variant));
+                        if let Some((name, type_hash)) = &scoped {
                             locals.push(LocalTypeBinding {
-                                name: binding.clone(),
-                                type_hash: variant_type.clone(),
+                                name: name.clone(),
+                                type_hash: type_hash.clone(),
                             });
-                            binding_was_pushed = true;
-                        } else if variant_type != type_hash_for("Unit") {
-                            bail!("case arm {variant} must bind its payload");
                         }
                         let typed_body = self.type_expr_with_locals(
                             current_module,
@@ -4084,10 +4133,22 @@ impl CodeDb {
                             region_scope,
                             locals,
                         );
-                        if binding_was_pushed {
+                        if scoped.is_some() {
                             locals.pop();
                         }
                         body = typed_body?;
+                        match payload_pattern_json {
+                            Some(pattern) => arms_json.push(json!({
+                                "variant": variant,
+                                "payload_pattern": pattern,
+                                "body": body.expr_hash,
+                            })),
+                            None => arms_json.push(json!({
+                                "variant": arm.variant.as_deref(),
+                                "binding_name": &arm.binding,
+                                "body": body.expr_hash,
+                            })),
+                        }
                     }
                     if let Some(expected) = &result_type {
                         if expected != &body.type_hash {
@@ -4100,25 +4161,28 @@ impl CodeDb {
                     } else {
                         result_type = Some(body.type_hash.clone());
                     }
-                    if arm.default {
-                        arms_json.push(json!({
-                            "default": true,
-                            "body": body.expr_hash,
-                        }));
-                    } else {
-                        arms_json.push(json!({
-                            "variant": arm.variant.as_deref(),
-                            "binding_name": &arm.binding,
-                            "body": body.expr_hash,
-                        }));
-                    }
                 }
                 let expected_variants = variants
                     .iter()
                     .map(|variant| variant.name.clone())
                     .collect::<BTreeSet<_>>();
-                if !has_default && seen != expected_variants {
-                    bail!("case expression must cover every enum variant");
+                if has_nested {
+                    // Reject ill-formed pattern trees (mixing/duplicate at any level)
+                    // so the decision-tree lowering sees homogeneous variant groups.
+                    self.check_patterns_well_formed(root, &scrutinee.type_hash, &arm_patterns)?;
+                }
+                if !has_default {
+                    if has_nested {
+                        // Nested patterns: every variant — and within it every nested
+                        // sub-pattern path — must be covered, recursively (R14).
+                        if !self.patterns_exhaustive(root, &scrutinee.type_hash, &arm_patterns)? {
+                            bail!(
+                                "case expression is not exhaustive: every variant and nested sub-pattern must be covered, or add a `_` arm"
+                            );
+                        }
+                    } else if seen != expected_variants {
+                        bail!("case expression must cover every enum variant");
+                    }
                 }
                 let type_hash =
                     result_type.ok_or_else(|| anyhow!("case expression has no arms"))?;
@@ -4144,6 +4208,144 @@ impl CodeDb {
                 })
             }
         }
+    }
+
+    /// Type-check a nested destructuring payload pattern (R14) against the type it
+    /// matches (`match_type`, an enum), returning the typed pattern node
+    /// (`{"variant": v, "binding_name"?: x, "payload_pattern"?: {..}}`) plus the
+    /// chain's single leaf binding `(name, type)` to put in scope for the arm body.
+    fn type_payload_pattern(
+        &self,
+        root: &ProgramRootPayload,
+        pattern: &RawPattern,
+        match_type: &str,
+    ) -> Result<(JsonValue, Option<(String, String)>)> {
+        let RawPattern::Variant { variant, sub } = pattern else {
+            // The parser only stores a `Variant` here (a `Binding`/`Wildcard`
+            // becomes the arm's `binding`/no-binding); defensive.
+            bail!("nested payload pattern must be a variant pattern");
+        };
+        let TypeSpec::Enum(variants) = self.type_spec_in_root(root, match_type)? else {
+            bail!(
+                "nested pattern `{variant}(..)` requires an enum payload, got {}",
+                self.type_name(match_type)?
+            );
+        };
+        validate_projection_identifier("enum variant", variant)?;
+        let payload_type = variants
+            .iter()
+            .find(|candidate| &candidate.name == variant)
+            .map(|candidate| candidate.type_hash.clone())
+            .ok_or_else(|| anyhow!("nested pattern uses unknown variant {variant}"))?;
+        let mut node = serde_json::Map::new();
+        node.insert("variant".to_string(), json!(variant));
+        let leaf = match sub.as_ref() {
+            RawPattern::Binding(name) => {
+                validate_projection_identifier("case binding", name)?;
+                node.insert("binding_name".to_string(), json!(name));
+                Some((name.clone(), payload_type))
+            }
+            RawPattern::Wildcard => None,
+            inner @ RawPattern::Variant { .. } => {
+                let (inner_node, leaf) = self.type_payload_pattern(root, inner, &payload_type)?;
+                node.insert("payload_pattern".to_string(), inner_node);
+                leaf
+            }
+        };
+        Ok((JsonValue::Object(node), leaf))
+    }
+
+    /// Reject ill-formed nested pattern sets (R14): at any level a binding/wildcard
+    /// catch-all cannot coexist with a variant pattern, nor two catch-alls — both
+    /// would leave an arm dead (first-match) and make the decision tree ambiguous.
+    /// Guarantees each variant group is homogeneous (one catch-all xor all-deeper),
+    /// which the decision-tree lowering relies on.
+    fn check_patterns_well_formed(
+        &self,
+        root: &ProgramRootPayload,
+        match_type: &str,
+        patterns: &[RawPattern],
+    ) -> Result<()> {
+        let catch_alls = patterns
+            .iter()
+            .filter(|pattern| matches!(pattern, RawPattern::Binding(_) | RawPattern::Wildcard))
+            .count();
+        let variant_patterns: Vec<&RawPattern> = patterns
+            .iter()
+            .filter(|pattern| matches!(pattern, RawPattern::Variant { .. }))
+            .collect();
+        if catch_alls > 1 {
+            bail!("duplicate catch-all pattern: a binding or `_` already matches every value here");
+        }
+        if catch_alls >= 1 && !variant_patterns.is_empty() {
+            bail!(
+                "a binding/`_` pattern cannot be mixed with variant patterns at the same level (to match a nullary variant use `v(_)`)"
+            );
+        }
+        if variant_patterns.is_empty() {
+            return Ok(());
+        }
+        let TypeSpec::Enum(variants) = self.type_spec_in_root(root, match_type)? else {
+            bail!("variant pattern requires an enum payload");
+        };
+        for variant in &variants {
+            let subs: Vec<RawPattern> = variant_patterns
+                .iter()
+                .filter_map(|pattern| match pattern {
+                    RawPattern::Variant { variant: name, sub } if name == &variant.name => {
+                        Some((**sub).clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !subs.is_empty() {
+                self.check_patterns_well_formed(root, &variant.type_hash, &subs)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `patterns` (each matching `match_type`) cover every value of
+    /// `match_type` (R14 nested exhaustiveness). A `Binding`/`Wildcard` is a
+    /// catch-all; otherwise every variant of the enum must be covered recursively
+    /// by the sub-patterns of the arms naming it. Terminates: each recursion
+    /// descends into a strictly inner *inline* enum payload (a `box` breaks the
+    /// type cycle and cannot itself be pattern-matched).
+    fn patterns_exhaustive(
+        &self,
+        root: &ProgramRootPayload,
+        match_type: &str,
+        patterns: &[RawPattern],
+    ) -> Result<bool> {
+        if patterns
+            .iter()
+            .any(|pattern| matches!(pattern, RawPattern::Binding(_) | RawPattern::Wildcard))
+        {
+            return Ok(true);
+        }
+        let TypeSpec::Enum(variants) = self.type_spec_in_root(root, match_type)? else {
+            // Only variant patterns remain but the type is not an enum — type
+            // checking already rejected that; treat as non-exhaustive defensively.
+            return Ok(false);
+        };
+        for variant in &variants {
+            let subs: Vec<RawPattern> = patterns
+                .iter()
+                .filter_map(|pattern| match pattern {
+                    RawPattern::Variant { variant: name, sub } if name == &variant.name => {
+                        Some((**sub).clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if subs.is_empty() {
+                return Ok(false);
+            }
+            if !self.patterns_exhaustive(root, &variant.type_hash, &subs)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Type-check a scalar literal `case` (R14): arms are scalar literal patterns
@@ -5740,18 +5942,16 @@ impl CodeDb {
                         .get("body")
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("case arm missing body"))?;
-                    if arm
-                        .get("binding_name")
-                        .is_some_and(|value| !value.is_null())
-                    {
+                    // A nested pattern's leaf binding (R14) reaches through the
+                    // scrutinee's payload, so it inherits the scrutinee's local-borrow
+                    // status exactly like a simple binding.
+                    let bound = crate::expr::typed_arm_binding_name(arm).is_some();
+                    if bound {
                         locals_with_local_borrows.push(scrutinee_has_local_borrow);
                     }
                     let body_result =
                         self.expr_escapes_local_borrow(root, body_hash, locals_with_local_borrows);
-                    if arm
-                        .get("binding_name")
-                        .is_some_and(|value| !value.is_null())
-                    {
+                    if bound {
                         locals_with_local_borrows.pop();
                     }
                     if body_result? {
@@ -6803,10 +7003,10 @@ impl CodeDb {
                         .get("body")
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("case arm missing body"))?;
-                    let pushed = arm
-                        .get("binding_name")
-                        .and_then(JsonValue::as_str)
-                        .is_some();
+                    // A nested pattern's leaf binding (R14) is a local too; it owns a
+                    // sub-component of the fully-consumed scrutinee, so the loan
+                    // modeling below (sourced from the scrutinee `expr`) covers it.
+                    let pushed = crate::expr::typed_arm_binding_name(arm).is_some();
                     let mut arm_state = base_state.clone();
                     if pushed {
                         let local_id = arm_state.next_local;
@@ -7135,11 +7335,8 @@ impl CodeDb {
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("case arm missing body"))?;
                     let mut arm_state = base_state.clone();
-                    if arm
-                        .get("binding_name")
-                        .and_then(JsonValue::as_str)
-                        .is_some()
-                    {
+                    // A nested pattern's leaf binding (R14) is a scoped local too.
+                    if crate::expr::typed_arm_binding_name(arm).is_some() {
                         let local_id = arm_state.next_local;
                         arm_state.next_local += 1;
                         let local_owner = LoanPlace {
@@ -7342,11 +7539,8 @@ impl CodeDb {
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("case arm missing body"))?;
                     let mut arm_state = state.clone();
-                    if arm
-                        .get("binding_name")
-                        .and_then(JsonValue::as_str)
-                        .is_some()
-                    {
+                    // A nested pattern's leaf binding (R14) is a scoped local too.
+                    if crate::expr::typed_arm_binding_name(arm).is_some() {
                         let local_id = arm_state.next_local;
                         arm_state.next_local += 1;
                         let local_owner = LoanPlace {
@@ -8460,6 +8654,39 @@ impl CodeDb {
             allowed_regions,
             &mut Vec::new(),
         )
+    }
+
+    /// Re-verify a typed nested destructuring payload pattern node (R14) against the
+    /// type it matches (`match_type`, an enum), returning the chain's leaf binding
+    /// `(name, type)` to scope for the arm body. Node shape mirrors the type-check
+    /// encoding: `{"variant": v, "binding_name"?: x, "payload_pattern"?: {..}}`.
+    fn verify_payload_pattern(
+        &self,
+        root: &ProgramRootPayload,
+        node: &JsonValue,
+        match_type: &str,
+    ) -> Result<Option<(String, String)>> {
+        let TypeSpec::Enum(variants) = self.type_spec_in_root(root, match_type)? else {
+            bail!("nested pattern requires an enum payload");
+        };
+        let variant = node
+            .get("variant")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("nested pattern node missing variant"))?;
+        validate_projection_identifier("enum variant", variant)?;
+        let payload_type = variants
+            .iter()
+            .find(|candidate| candidate.name == variant)
+            .map(|candidate| candidate.type_hash.clone())
+            .ok_or_else(|| anyhow!("nested pattern uses unknown variant {variant}"))?;
+        if let Some(name) = node.get("binding_name").and_then(JsonValue::as_str) {
+            validate_projection_identifier("case binding", name)?;
+            Ok(Some((name.to_string(), payload_type)))
+        } else if let Some(inner) = node.get("payload_pattern") {
+            self.verify_payload_pattern(root, inner, &payload_type)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Re-verify a scalar literal `case` (R14) typed node: arms are literal
@@ -9928,6 +10155,9 @@ impl CodeDb {
                     bail!("case scrutinee must be an enum or scalar (i64/bool)");
                 };
                 let mut seen = BTreeSet::new();
+                let mut variant_kind: BTreeMap<String, bool> = BTreeMap::new();
+                let mut has_nested = false;
+                let mut arm_patterns: Vec<RawPattern> = Vec::new();
                 let mut result_type = None;
                 let mut has_default = false;
                 for (index, arm) in arms.iter().enumerate() {
@@ -9935,8 +10165,8 @@ impl CodeDb {
                         bail!("if-guards are only supported on i64 scalar `case` arms");
                     }
                     let is_default = arm.get("default").and_then(JsonValue::as_bool) == Some(true);
-                    let binding = arm.get("binding_name").and_then(JsonValue::as_str);
-                    let mut binding_was_pushed = false;
+                    // The type of the (at most one) leaf binding the arm body scopes.
+                    let scoped_type: Option<String>;
                     if is_default {
                         if index + 1 != arms.len() {
                             bail!("default case arm must be last");
@@ -9947,36 +10177,74 @@ impl CodeDb {
                         if arm.get("variant").is_some() {
                             bail!("default case arm cannot specify a variant");
                         }
-                        if binding.is_some() {
+                        if arm.get("binding_name").is_some() {
                             bail!("default case arm cannot bind a payload");
                         }
+                        if arm.get("payload_pattern").is_some() {
+                            bail!("default case arm cannot carry a pattern");
+                        }
                         has_default = true;
+                        scoped_type = None;
                     } else {
                         let variant = arm
                             .get("variant")
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("case arm missing variant"))?;
                         validate_projection_identifier("enum variant", variant)?;
-                        if !seen.insert(variant.to_string()) {
-                            bail!("duplicate case arm {variant}");
-                        }
                         let variant_type = variants
                             .iter()
                             .find(|candidate| candidate.name == variant)
                             .map(|candidate| candidate.type_hash.clone())
                             .ok_or_else(|| anyhow!("case arm uses unknown variant {variant}"))?;
-                        if let Some(binding) = binding {
-                            validate_projection_identifier("case binding", binding)?;
-                            locals.push(variant_type.clone());
-                            binding_was_pushed = true;
-                        } else if variant_type != type_hash_for("Unit") {
-                            bail!("case arm {variant} must bind its payload");
+                        if let Some(node) = arm.get("payload_pattern") {
+                            // Nested destructuring arm (R14): re-verify the chain and
+                            // scope its leaf. Multiple share an outer variant; a simple
+                            // arm for the same variant is rejected as a mix.
+                            has_nested = true;
+                            match variant_kind.get(variant) {
+                                Some(true) => {}
+                                Some(false) => bail!(
+                                    "case arm {variant} cannot mix a binding pattern with nested destructuring patterns"
+                                ),
+                                None => {
+                                    variant_kind.insert(variant.to_string(), true);
+                                }
+                            }
+                            scoped_type = self
+                                .verify_payload_pattern(root, node, &variant_type)?
+                                .map(|(_, type_hash)| type_hash);
+                        } else {
+                            match variant_kind.get(variant) {
+                                Some(true) => bail!(
+                                    "case arm {variant} cannot mix a binding pattern with nested destructuring patterns"
+                                ),
+                                Some(false) => bail!("duplicate case arm {variant}"),
+                                None => {
+                                    variant_kind.insert(variant.to_string(), false);
+                                }
+                            }
+                            if let Some(binding) = arm.get("binding_name").and_then(JsonValue::as_str)
+                            {
+                                validate_projection_identifier("case binding", binding)?;
+                                scoped_type = Some(variant_type.clone());
+                            } else if variant_type != type_hash_for("Unit") {
+                                bail!("case arm {variant} must bind its payload");
+                            } else {
+                                scoped_type = None;
+                            }
+                        }
+                        seen.insert(variant.to_string());
+                        if let Some(pattern) = crate::expr::typed_arm_scrutinee_pattern(arm) {
+                            arm_patterns.push(pattern);
                         }
                     }
                     let body_hash = arm
                         .get("body")
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("case arm missing body"))?;
+                    if let Some(type_hash) = &scoped_type {
+                        locals.push(type_hash.clone());
+                    }
                     let body_type = self.verify_expr_type_with_locals(
                         body_hash,
                         root,
@@ -9984,7 +10252,7 @@ impl CodeDb {
                         allowed_regions,
                         locals,
                     );
-                    if binding_was_pushed {
+                    if scoped_type.is_some() {
                         locals.pop();
                     }
                     let body_type = body_type?;
@@ -10000,8 +10268,19 @@ impl CodeDb {
                     .iter()
                     .map(|variant| variant.name.clone())
                     .collect::<BTreeSet<_>>();
-                if !has_default && seen != expected_variants {
-                    bail!("case expression must cover every enum variant");
+                if has_nested {
+                    self.check_patterns_well_formed(root, &scrutinee_type, &arm_patterns)?;
+                }
+                if !has_default {
+                    if has_nested {
+                        if !self.patterns_exhaustive(root, &scrutinee_type, &arm_patterns)? {
+                            bail!(
+                                "case expression is not exhaustive: every variant and nested sub-pattern must be covered, or add a `_` arm"
+                            );
+                        }
+                    } else if seen != expected_variants {
+                        bail!("case expression must cover every enum variant");
+                    }
                 }
                 result_type.ok_or_else(|| anyhow!("case expression has no arms"))?
             }
@@ -10247,6 +10526,24 @@ fn record_call_region_substitution(
             substitutions.insert(expected_region, actual_region);
             Ok(())
         }
+    }
+}
+
+/// An enum `case` arm as a pattern over the *scrutinee* enum (R14): the outer
+/// `variant` wrapping its payload matcher — a nested `payload_pattern`, a simple
+/// `binding` (a catch-all on the payload), or a no-binding wildcard. Drives the
+/// recursive nested-exhaustiveness check.
+fn arm_scrutinee_pattern(arm: &RawCaseArm, variant: &str) -> RawPattern {
+    let sub = if let Some(pattern) = &arm.payload_pattern {
+        pattern.clone()
+    } else if let Some(binding) = &arm.binding {
+        RawPattern::Binding(binding.clone())
+    } else {
+        RawPattern::Wildcard
+    };
+    RawPattern::Variant {
+        variant: variant.to_string(),
+        sub: Box::new(sub),
     }
 }
 

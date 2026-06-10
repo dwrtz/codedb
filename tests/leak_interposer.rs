@@ -238,6 +238,55 @@ fn go(n: i64) -> i64 effects[alloc] =
 fn main() -> i64 effects[alloc] = go({K})
 "#;
 
+// R14 nested enum-destructuring, move-out path: a move-only payload (a record owning
+// a box) is destructured TWO levels deep and moved out of a consumed-place scrutinee,
+// then freed by `consume`/`unbox`, once per recursion level. Exercises the nested
+// binding-move + shallow-byte-move drop placement at scale.
+const NESTED_MOVE_OUT: &str = r#"
+record Boxed { b: box<i64> }
+enum Inner { has: Boxed
+  none: unit }
+enum Outer { wrap: Inner }
+fn consume(x: Boxed) -> i64 effects[alloc] = unbox(x.b)
+fn go(n: i64) -> i64 effects[alloc] =
+  if n < 1 then 0
+  else let o: Outer = Outer::wrap(Inner::has({ b: box_new(n) })) in
+       (case o of wrap(has(x)) => consume(x) | wrap(none(u)) => 0) + go(n - 1)
+fn main() -> i64 effects[alloc] = go({K})
+"#;
+
+// R14 nested destructuring, fallback-drop path: the constructed inner variant (`other`)
+// is NOT covered by the explicit nested arm, so the `_` fallback fires and must free
+// `other`'s box payload, once per recursion level. Exercises the inner no-binding-arm
+// payload drop at scale (a missed drop leaks one box per level).
+const NESTED_FALLBACK_DROP: &str = r#"
+record Boxed { b: box<i64> }
+enum Inner { has: Boxed
+  other: Boxed }
+enum Outer { wrap: Inner }
+fn consume(x: Boxed) -> i64 effects[alloc] = unbox(x.b)
+fn go(n: i64) -> i64 effects[alloc] =
+  if n < 1 then 0
+  else let o: Outer = Outer::wrap(Inner::other({ b: box_new(n) })) in
+       (case o of wrap(has(x)) => consume(x) | _ => 0) + go(n - 1)
+fn main() -> i64 effects[alloc] = go({K})
+"#;
+
+// R14 nested destructuring, residual-drop path: the nested leaf `x` is bound but the
+// body never consumes it, so a residual drop at arm-scope exit frees its box, once per
+// recursion level (mirrors `let`-binding drop placement).
+const NESTED_BINDING_RESIDUAL: &str = r#"
+record Boxed { b: box<i64> }
+enum Inner { has: Boxed
+  none: unit }
+enum Outer { wrap: Inner }
+fn go(n: i64) -> i64 effects[alloc] =
+  if n < 1 then 0
+  else let o: Outer = Outer::wrap(Inner::has({ b: box_new(n) })) in
+       (case o of wrap(has(x)) => 0 | wrap(none(u)) => 0) + go(n - 1)
+fn main() -> i64 effects[alloc] = go({K})
+"#;
+
 fn build_exe(dir: &Path, name: &str, source: &str) -> PathBuf {
     let db = dir.join(format!("{name}.sqlite"));
     let src = dir.join(format!("{name}.cdb"));
@@ -363,4 +412,19 @@ fn recursive_box_heap_unbox_frees_every_node_at_runtime() {
 #[test]
 fn inline_enum_payload_move_frees_every_box_at_runtime() {
     assert_balanced_across_scale("inline_enum_payload", INLINE_ENUM_PAYLOAD, 4, 64);
+}
+
+#[test]
+fn nested_destructuring_move_out_frees_every_box_at_runtime() {
+    assert_balanced_across_scale("nested_move_out", NESTED_MOVE_OUT, 4, 64);
+}
+
+#[test]
+fn nested_destructuring_fallback_drop_frees_every_box_at_runtime() {
+    assert_balanced_across_scale("nested_fallback_drop", NESTED_FALLBACK_DROP, 4, 64);
+}
+
+#[test]
+fn nested_destructuring_residual_drop_frees_every_box_at_runtime() {
+    assert_balanced_across_scale("nested_binding_residual", NESTED_BINDING_RESIDUAL, 4, 64);
 }

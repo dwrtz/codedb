@@ -8,7 +8,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::abi::validate_exported_abi_name;
 use crate::build_plan::{BuildImpact, BuildImpactKind, BuildImpactReason, projection_artifacts};
-use crate::expr::{RawCaseArm, RawExpr, RawRecordField};
+use crate::expr::{RawCaseArm, RawExpr, RawPattern, RawRecordField};
 use crate::model::{
     BranchState, ExportBinding, NameBinding, ParamNames, ProgramRootPayload, RootSymbolPayload,
     RootTestBinding, RootTypePayload, TestCasePayload, TestCategory, TestMode, TestValue,
@@ -1110,6 +1110,8 @@ fn append_default_arg_to_calls(expr: &RawExpr, target_name: &str, default: &RawE
                     guard: arm.guard.as_ref().map(|guard| {
                         Box::new(append_default_arg_to_calls(guard, target_name, default))
                     }),
+                    // A nested pattern holds no calls, so it is preserved verbatim.
+                    payload_pattern: arm.payload_pattern.clone(),
                     body: append_default_arg_to_calls(&arm.body, target_name, default),
                 })
                 .collect(),
@@ -6141,8 +6143,41 @@ impl CodeDb {
                         .get("binding_name")
                         .and_then(JsonValue::as_str)
                         .map(str::to_string);
-                    if let Some(binding) = &binding {
-                        local_names.push(binding.clone());
+                    // A nested pattern (R14) is reconstructed here; its leaf binding
+                    // is scoped for the body exactly like a simple `binding`. Inner
+                    // variants of the pattern are rewritten too when `rename` targets
+                    // them (matched by variant symbol, not just name), descending the
+                    // payload-type chain — the pattern matches the OUTER variant's
+                    // payload type. Without this a rename reaching an inner-pattern
+                    // variant fails the re-type-check ("unknown variant") and rolls back.
+                    let payload_pattern = match crate::expr::nested_pattern_from_typed_arm(arm) {
+                        Some(pattern) => {
+                            let outer_variant = arm
+                                .get("variant")
+                                .and_then(JsonValue::as_str)
+                                .ok_or_else(|| anyhow!("nested case arm missing variant"))?;
+                            let payload_type = self.enum_variant_type_in_root(
+                                old_root,
+                                &scrutinee_type,
+                                outer_variant,
+                            )?;
+                            Some(self.rewrite_pattern_for_member_rename(
+                                old_root,
+                                &payload_type,
+                                &pattern,
+                                rename,
+                            )?)
+                        }
+                        None => None,
+                    };
+                    let scoped_binding = binding.clone().or_else(|| {
+                        payload_pattern
+                            .as_ref()
+                            .and_then(crate::expr::pattern_leaf_binding)
+                            .map(str::to_string)
+                    });
+                    if let Some(name) = &scoped_binding {
+                        local_names.push(name.clone());
                     }
                     // Reconstruct the guard (R14) inside the binding scope, like the
                     // body (`.map` is eager, so it runs before the pop below). A guard
@@ -6172,7 +6207,7 @@ impl CodeDb {
                         expected_type,
                         rename,
                     );
-                    if binding.is_some() {
+                    if scoped_binding.is_some() {
                         local_names.pop();
                     }
                     let guard = guard.transpose()?.map(Box::new);
@@ -6183,6 +6218,7 @@ impl CodeDb {
                         default: is_default,
                         binding,
                         guard,
+                        payload_pattern,
                         body: body?,
                     });
                 }
@@ -6191,6 +6227,43 @@ impl CodeDb {
             _ => {}
         }
         Ok(raw)
+    }
+
+    /// Rewrite the inner variants of a nested destructuring pattern (R14) when a member
+    /// rename targets them, descending the payload-type chain in lockstep with the
+    /// pattern: a `Variant` level matches `match_type` (an enum), and its sub-pattern
+    /// matches that variant's payload type. A `Binding`/`Wildcard` leaf carries no
+    /// variant and is returned verbatim (and stops the descent before any non-enum
+    /// payload type). Mirrors how the outer arm variant is rewritten, matching by
+    /// variant symbol so only the renamed variant — not a same-named one elsewhere — is
+    /// touched.
+    fn rewrite_pattern_for_member_rename(
+        &self,
+        old_root: &ProgramRootPayload,
+        match_type: &str,
+        pattern: &RawPattern,
+        rename: &MemberRename,
+    ) -> Result<RawPattern> {
+        match pattern {
+            RawPattern::Binding(_) | RawPattern::Wildcard => Ok(pattern.clone()),
+            RawPattern::Variant { variant, sub } => {
+                let new_variant =
+                    if self.enum_variant_matches_rename(old_root, match_type, variant, rename)? {
+                        rename.new_name().to_string()
+                    } else {
+                        variant.clone()
+                    };
+                // The sub-pattern matches this variant's payload type, resolved by the
+                // OLD variant name in `old_root` (the rename has not been applied yet).
+                let payload_type = self.enum_variant_type_in_root(old_root, match_type, variant)?;
+                let sub =
+                    self.rewrite_pattern_for_member_rename(old_root, &payload_type, sub, rename)?;
+                Ok(RawPattern::Variant {
+                    variant: new_variant,
+                    sub: Box::new(sub),
+                })
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7610,6 +7683,8 @@ fn borrow_call_arg_to_calls(
                             )?)),
                             None => None,
                         },
+                        // A nested pattern holds no calls, so it is preserved verbatim.
+                        payload_pattern: arm.payload_pattern.clone(),
                         body: borrow_call_arg_to_calls(
                             &arm.body,
                             target_name,
@@ -7826,8 +7901,17 @@ fn normalize_param_refs_scoped(
             let arms = arms
                 .iter()
                 .map(|arm| {
-                    if let Some(binding) = &arm.binding {
-                        local_bindings.push(binding.clone());
+                    // Both a simple `binding` and a nested pattern's leaf binding
+                    // (R14) introduce a local that shadows for the arm body; scope it
+                    // so the body's param/local refs normalize correctly.
+                    let scoped_binding = arm.binding.clone().or_else(|| {
+                        arm.payload_pattern
+                            .as_ref()
+                            .and_then(crate::expr::pattern_leaf_binding)
+                            .map(str::to_string)
+                    });
+                    if let Some(name) = &scoped_binding {
+                        local_bindings.push(name.clone());
                     }
                     let guard = arm.guard.as_ref().map(|guard| {
                         Box::new(normalize_param_refs_scoped(
@@ -7837,7 +7921,7 @@ fn normalize_param_refs_scoped(
                         ))
                     });
                     let body = normalize_param_refs_scoped(&arm.body, local_params, local_bindings);
-                    if arm.binding.is_some() {
+                    if scoped_binding.is_some() {
                         local_bindings.pop();
                     }
                     crate::expr::RawCaseArm {
@@ -7847,6 +7931,8 @@ fn normalize_param_refs_scoped(
                         default: arm.default,
                         binding: arm.binding.clone(),
                         guard,
+                        // No param refs inside a pattern — preserved verbatim.
+                        payload_pattern: arm.payload_pattern.clone(),
                         body,
                     }
                 })

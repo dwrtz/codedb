@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::MAIN_BRANCH;
-use crate::expr::{RawCaseArm, RawExpr, RawRecordField};
+use crate::expr::{RawCaseArm, RawExpr, RawPattern, RawRecordField};
 use crate::migrations::{MigrationOutcome, MigrationReport, Operation};
 use crate::model::{ProgramRootPayload, param_names, resolve_name_in_root};
 use crate::store::{CodeDb, canonical_json, hash_bytes};
@@ -3370,6 +3370,9 @@ fn substitute_param_refs(expr: &RawExpr, args: &[RawExpr]) -> Result<RawExpr> {
                             Some(guard) => Some(Box::new(substitute_param_refs(guard, args)?)),
                             None => None,
                         },
+                        // A nested pattern holds only variant + binding names (no
+                        // param refs), so it is preserved verbatim.
+                        payload_pattern: arm.payload_pattern.clone(),
                         body: substitute_param_refs(&arm.body, args)?,
                     })
                 })
@@ -3468,14 +3471,22 @@ fn collect_free_param_names(
         RawExpr::Case { expr, arms } => {
             collect_free_param_names(expr, bound_locals, names);
             for arm in arms {
-                if let Some(binding) = &arm.binding {
-                    bound_locals.push(binding.clone());
+                // A simple `binding` or a nested pattern's leaf binding (R14) is a
+                // bound local for the arm body, not a free param.
+                let scoped_binding = arm.binding.clone().or_else(|| {
+                    arm.payload_pattern
+                        .as_ref()
+                        .and_then(crate::expr::pattern_leaf_binding)
+                        .map(str::to_string)
+                });
+                if let Some(name) = &scoped_binding {
+                    bound_locals.push(name.clone());
                 }
                 if let Some(guard) = &arm.guard {
                     collect_free_param_names(guard, bound_locals, names);
                 }
                 collect_free_param_names(&arm.body, bound_locals, names);
-                if arm.binding.is_some() {
+                if scoped_binding.is_some() {
                     bound_locals.pop();
                 }
             }
@@ -3699,6 +3710,16 @@ fn alpha_rename_let_bindings_with_scope(
                         renamed_locals.push((binding.clone(), renamed.clone()));
                         renamed
                     });
+                    // A nested pattern's leaf binding (R14) is an inline local too:
+                    // alpha-rename it like `binding` so the body's references follow.
+                    let (renamed_pattern, pattern_pushed) = match &arm.payload_pattern {
+                        Some(pattern) => {
+                            let (rewritten, pushed) =
+                                alpha_rename_pattern(pattern, used_names, renamed_locals);
+                            (Some(rewritten), pushed)
+                        }
+                        None => (None, false),
+                    };
                     let guard = arm.guard.as_ref().map(|guard| {
                         Box::new(alpha_rename_let_bindings_with_scope(
                             guard,
@@ -3708,6 +3729,11 @@ fn alpha_rename_let_bindings_with_scope(
                     });
                     let body =
                         alpha_rename_let_bindings_with_scope(&arm.body, used_names, renamed_locals);
+                    // Pop in reverse push order (pattern leaf was pushed after `binding`;
+                    // the two are mutually exclusive, so at most one pops).
+                    if pattern_pushed {
+                        renamed_locals.pop();
+                    }
                     if arm.binding.is_some() {
                         renamed_locals.pop();
                     }
@@ -3718,6 +3744,7 @@ fn alpha_rename_let_bindings_with_scope(
                         default: arm.default,
                         binding: renamed_binding,
                         guard,
+                        payload_pattern: renamed_pattern,
                         body,
                     }
                 })
@@ -3726,6 +3753,36 @@ fn alpha_rename_let_bindings_with_scope(
                 expr: Box::new(expr),
                 arms,
             }
+        }
+    }
+}
+
+/// Alpha-rename the (at most one) leaf binding inside a nested case pattern (R14)
+/// during inlining, registering the rename on `renamed_locals` so the arm body's
+/// references follow — exactly like a simple `binding`. Returns the rewritten
+/// pattern and whether a binding was pushed (the caller pops it after the body).
+fn alpha_rename_pattern(
+    pattern: &RawPattern,
+    used_names: &mut BTreeSet<String>,
+    renamed_locals: &mut Vec<(String, String)>,
+) -> (RawPattern, bool) {
+    match pattern {
+        RawPattern::Wildcard => (RawPattern::Wildcard, false),
+        RawPattern::Binding(name) => {
+            let renamed = unique_inline_local_name(name, used_names);
+            used_names.insert(renamed.clone());
+            renamed_locals.push((name.clone(), renamed.clone()));
+            (RawPattern::Binding(renamed), true)
+        }
+        RawPattern::Variant { variant, sub } => {
+            let (sub, pushed) = alpha_rename_pattern(sub, used_names, renamed_locals);
+            (
+                RawPattern::Variant {
+                    variant: variant.clone(),
+                    sub: Box::new(sub),
+                },
+                pushed,
+            )
         }
     }
 }

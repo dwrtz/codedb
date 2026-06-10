@@ -146,7 +146,32 @@ pub struct RawCaseArm {
     /// no effects); currently only an `i64` scalar `case` arm may carry one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<Box<RawExpr>>,
+    /// A nested enum-destructuring payload pattern (R14): the matched variant's
+    /// payload is itself matched against an inner variant pattern (e.g.
+    /// `some(inner(x))` / `some(inner(_))`), recursively. Present only for a
+    /// nested arm; mutually exclusive with `binding` (a nested chain binds its one
+    /// leaf name inside the pattern). Absent (skip-if-none) for every simple arm,
+    /// so existing typed nodes are byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_pattern: Option<RawPattern>,
     pub body: RawExpr,
+}
+
+/// A nested enum-destructuring pattern (R14). A variant carries exactly one
+/// payload, so a pattern *chain* binds at most one leaf name (the deepest
+/// `Binding`); the intermediate `Variant` levels are pure variant tests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum RawPattern {
+    /// `x` — bind the matched value to a fresh local (the chain's leaf).
+    Binding(String),
+    /// `_` — match anything, bind nothing (a leaf wildcard).
+    Wildcard,
+    /// `v(sub)` — match enum variant `v`, then match its payload against `sub`.
+    Variant {
+        variant: String,
+        sub: Box<RawPattern>,
+    },
 }
 
 /// An `i64` range case pattern (R14): `lo..hi` (exclusive) or `lo..=hi` (inclusive).
@@ -232,6 +257,127 @@ pub(crate) fn scalar_i64_arm_matches(arm: &JsonValue, scrutinee: i64) -> bool {
         return scrutinee >= lo && if inclusive { scrutinee <= hi } else { scrutinee < hi };
     }
     false
+}
+
+/// Reconstruct a nested enum-destructuring pattern (R14) from a typed `case` arm,
+/// or `None` when the arm carries no nested `payload_pattern`. A pattern node
+/// mirrors the arm shape — `{"variant": v, "binding_name"?: x, "payload_pattern"?:
+/// {..}}` — with a `binding_name` leaf, a deeper `payload_pattern` level, or
+/// neither (a `_` wildcard leaf). Shared by the projector, `typed→raw`, and the
+/// rename rewriter so the surface form round-trips identically everywhere.
+pub(crate) fn nested_pattern_from_typed_arm(arm: &JsonValue) -> Option<RawPattern> {
+    arm.get("payload_pattern").map(nested_pattern_from_node)
+}
+
+/// A typed enum `case` arm as a pattern over the *scrutinee* enum (R14), or `None`
+/// for a `default` arm. Mirrors `arm_scrutinee_pattern` on the raw side; drives the
+/// re-verify exhaustiveness check.
+pub(crate) fn typed_arm_scrutinee_pattern(arm: &JsonValue) -> Option<RawPattern> {
+    if typed_case_arm_is_default(arm) {
+        return None;
+    }
+    let variant = arm.get("variant").and_then(JsonValue::as_str)?.to_string();
+    let sub = if let Some(pattern) = nested_pattern_from_typed_arm(arm) {
+        pattern
+    } else if let Some(name) = arm.get("binding_name").and_then(JsonValue::as_str) {
+        RawPattern::Binding(name.to_string())
+    } else {
+        RawPattern::Wildcard
+    };
+    Some(RawPattern::Variant {
+        variant,
+        sub: Box::new(sub),
+    })
+}
+
+/// First-match an enum `case` arm/pattern node against a scrutinee value (R14).
+/// `node` is `{"variant", "binding_name"?, "payload_pattern"?}`; returns `None` when
+/// the value's variant chain doesn't match, or `Some(leaf)` when it does — `leaf`
+/// being the value cell to bind for the body (`Some` for a `binding_name` leaf,
+/// `None` for a wildcard/no-binding leaf). Recurses through nested patterns,
+/// mirroring the decision-tree lowering so first-match order is identical.
+/// Wrap an enum value (variant + payload cell) in a fresh value cell — the scrutinee
+/// form `match_typed_pattern` matches against.
+pub(crate) fn enum_cell(variant: String, value: ValueCell) -> ValueCell {
+    Rc::new(RefCell::new(Value::Enum { variant, value }))
+}
+
+pub(crate) fn match_typed_pattern(node: &JsonValue, value: &ValueCell) -> Option<Option<ValueCell>> {
+    let payload = {
+        let borrowed = value.borrow();
+        let Value::Enum { variant, value: payload } = &*borrowed else {
+            return None;
+        };
+        if Some(variant.as_str()) != node.get("variant").and_then(JsonValue::as_str) {
+            return None;
+        }
+        payload.clone()
+    };
+    if node.get("binding_name").and_then(JsonValue::as_str).is_some() {
+        Some(Some(payload))
+    } else if let Some(inner) = node.get("payload_pattern") {
+        match_typed_pattern(inner, &payload)
+    } else {
+        Some(None)
+    }
+}
+
+fn nested_pattern_from_node(node: &JsonValue) -> RawPattern {
+    let variant = node
+        .get("variant")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let sub = if let Some(name) = node.get("binding_name").and_then(JsonValue::as_str) {
+        RawPattern::Binding(name.to_string())
+    } else if let Some(inner) = node.get("payload_pattern") {
+        nested_pattern_from_node(inner)
+    } else {
+        RawPattern::Wildcard
+    };
+    RawPattern::Variant {
+        variant,
+        sub: Box::new(sub),
+    }
+}
+
+/// The single leaf binding name of a nested pattern chain (`None` for a wildcard
+/// leaf). A variant has one payload, so a chain binds at most one name — the one
+/// the arm body sees in scope.
+pub(crate) fn pattern_leaf_binding(pattern: &RawPattern) -> Option<&str> {
+    match pattern {
+        RawPattern::Binding(name) => Some(name),
+        RawPattern::Wildcard => None,
+        RawPattern::Variant { sub, .. } => pattern_leaf_binding(sub),
+    }
+}
+
+/// Render a nested case pattern (R14) to its re-parseable surface form: `x`, `_`,
+/// or `v(sub)` (recursively). The projector wraps this in the arm's outer variant.
+pub(crate) fn render_pattern(pattern: &RawPattern) -> String {
+    match pattern {
+        RawPattern::Binding(name) => name.clone(),
+        RawPattern::Wildcard => "_".to_string(),
+        RawPattern::Variant { variant, sub } => format!("{variant}({})", render_pattern(sub)),
+    }
+}
+
+/// The local binding name a typed enum `case` arm puts in scope for its body — the
+/// simple `binding_name`, or (R14) a nested `payload_pattern` chain's leaf
+/// `binding_name`. `None` when the arm binds nothing. Shared by every typed-arm
+/// walker that scopes the arm body (re-verify, borrow/effect/loan/escape analysis,
+/// the evaluator, the tracer) so nested bindings are seen identically everywhere.
+pub(crate) fn typed_arm_binding_name(arm: &JsonValue) -> Option<&str> {
+    if let Some(name) = arm.get("binding_name").and_then(JsonValue::as_str) {
+        return Some(name);
+    }
+    let mut node = arm.get("payload_pattern")?;
+    loop {
+        if let Some(name) = node.get("binding_name").and_then(JsonValue::as_str) {
+            return Some(name);
+        }
+        node = node.get("payload_pattern")?;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1226,23 +1372,36 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("case missing arms"))?;
                 match value {
                     Value::Enum { variant, value } => {
-                        let arm = arms
-                            .iter()
-                            .find(|arm| {
-                                arm.get("variant").and_then(JsonValue::as_str) == Some(&variant)
-                            })
-                            .or_else(|| arms.iter().find(|arm| typed_case_arm_is_default(arm)))
-                            .ok_or_else(|| anyhow!("case missing arm for variant {variant}"))?;
+                        // First-match over the arms: an arm is taken when its (possibly
+                        // nested, R14) pattern matches the scrutinee, binding the
+                        // chain's leaf; a `default` arm matches anything. Mirrors the
+                        // decision-tree lowering.
+                        let scrutinee_cell: ValueCell =
+                            Rc::new(RefCell::new(Value::Enum { variant, value }));
+                        let mut selected: Option<(&JsonValue, Option<ValueCell>)> = None;
+                        for arm in arms {
+                            if typed_case_arm_is_default(arm) {
+                                selected = Some((arm, None));
+                                break;
+                            }
+                            if let Some(leaf) = match_typed_pattern(arm, &scrutinee_cell) {
+                                selected = Some((arm, leaf));
+                                break;
+                            }
+                        }
+                        let (arm, leaf) = selected.ok_or_else(|| {
+                            let variant = match &*scrutinee_cell.borrow() {
+                                Value::Enum { variant, .. } => variant.clone(),
+                                _ => String::new(),
+                            };
+                            anyhow!("case missing arm for variant {variant}")
+                        })?;
                         let body_hash = arm
                             .get("body")
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("case arm missing body"))?;
-                        if arm
-                            .get("binding_name")
-                            .and_then(JsonValue::as_str)
-                            .is_some()
-                        {
-                            locals.push(value);
+                        if let Some(leaf) = leaf {
+                            locals.push(leaf);
                             let result =
                                 self.eval_expr_with_locals(root_hash, body_hash, args, locals);
                             locals.pop();
@@ -2949,8 +3108,18 @@ impl CodeDb {
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("case arm missing body"))?;
                         let guard_hash = arm.get("guard").and_then(JsonValue::as_str);
-                        if let Some(binding) = binding {
-                            local_names.push(binding.to_string());
+                        // A nested destructuring pattern (R14) renders as
+                        // `outer(inner(..))`; its leaf binding (like a simple binding)
+                        // is in scope for the guard and body.
+                        let payload_pattern = nested_pattern_from_typed_arm(arm);
+                        let scoped_binding = binding.map(str::to_string).or_else(|| {
+                            payload_pattern
+                                .as_ref()
+                                .and_then(pattern_leaf_binding)
+                                .map(str::to_string)
+                        });
+                        if let Some(name) = &scoped_binding {
+                            local_names.push(name.clone());
                         }
                         // The guard (if any) renders inside the binding scope so it can
                         // reference the bound payload; the body follows.
@@ -2975,19 +3144,21 @@ impl CodeDb {
                             local_names,
                             body_prec,
                         );
-                        if binding.is_some() {
+                        if scoped_binding.is_some() {
                             local_names.pop();
                         }
                         let guard_suffix = match rendered_guard {
                             Some(guard) => format!(" if {guard}"),
                             None => String::new(),
                         };
-                        Ok(match binding {
-                            Some(binding) => {
-                                format!("{variant}({binding}){guard_suffix} => {}", rendered_body?)
-                            }
-                            None => format!("{variant}{guard_suffix} => {}", rendered_body?),
-                        })
+                        let pattern_text = if let Some(pattern) = &payload_pattern {
+                            format!("{variant}({})", render_pattern(pattern))
+                        } else if let Some(binding) = binding {
+                            format!("{variant}({binding})")
+                        } else {
+                            variant.to_string()
+                        };
+                        Ok(format!("{pattern_text}{guard_suffix} => {}", rendered_body?))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let expr = format!(
@@ -3866,6 +4037,7 @@ impl CodeDb {
                                 default: true,
                                 binding: None,
                                 guard: scalar_guard,
+                                payload_pattern: None,
                                 body,
                             });
                         }
@@ -3887,6 +4059,7 @@ impl CodeDb {
                                 default: false,
                                 binding: None,
                                 guard: scalar_guard,
+                                payload_pattern: None,
                                 body,
                             });
                         }
@@ -3908,6 +4081,7 @@ impl CodeDb {
                                 default: false,
                                 binding: None,
                                 guard: scalar_guard,
+                                payload_pattern: None,
                                 body,
                             });
                         }
@@ -3916,8 +4090,17 @@ impl CodeDb {
                             .and_then(JsonValue::as_str)
                             .ok_or_else(|| anyhow!("case arm missing variant"))?
                             .to_string();
-                        if let Some(binding) = &binding {
-                            local_names.push(binding.clone());
+                        // Reconstruct a nested destructuring pattern (R14); its leaf
+                        // binding (like a simple binding) is in scope for the guard/body.
+                        let payload_pattern = nested_pattern_from_typed_arm(arm);
+                        let scoped_binding = binding.clone().or_else(|| {
+                            payload_pattern
+                                .as_ref()
+                                .and_then(pattern_leaf_binding)
+                                .map(str::to_string)
+                        });
+                        if let Some(name) = &scoped_binding {
+                            local_names.push(name.clone());
                         }
                         // The guard (if any) reconstructs inside the binding scope, like
                         // the body (`.map` is eager, so it runs before the pop below);
@@ -3941,7 +4124,7 @@ impl CodeDb {
                             region_names,
                             local_names,
                         );
-                        if binding.is_some() {
+                        if scoped_binding.is_some() {
                             local_names.pop();
                         }
                         let guard = guard.transpose()?.map(Box::new);
@@ -3952,6 +4135,7 @@ impl CodeDb {
                             default: false,
                             binding,
                             guard,
+                            payload_pattern,
                             body: body?,
                         })
                     })
@@ -4817,6 +5001,7 @@ impl Parser {
                         default: true,
                         binding: None,
                         guard,
+                        payload_pattern: None,
                         body,
                     });
                     if !guarded {
@@ -4854,6 +5039,7 @@ impl Parser {
                             default: false,
                             binding: None,
                             guard,
+                            payload_pattern: None,
                             body,
                         });
                     } else {
@@ -4867,6 +5053,7 @@ impl Parser {
                             default: false,
                             binding: None,
                             guard,
+                            payload_pattern: None,
                             body,
                         });
                     }
@@ -4875,12 +5062,21 @@ impl Parser {
                     }
                 } else {
                     let variant = self.expect_ident()?;
-                    let binding = if self.consume_symbol("(") {
-                        let binding = self.expect_ident()?;
+                    // Parse the payload pattern (R14): a bare ident `x` binds the
+                    // payload; `_` ignores it; a nested `inner(...)` destructures it
+                    // recursively. Bare-ident-vs-nullary-variant is disambiguated
+                    // syntactically by the parens (`inner(...)` is nested), so a
+                    // nullary inner variant is matched with `inner(_)`.
+                    let (binding, payload_pattern) = if self.consume_symbol("(") {
+                        let pattern = self.parse_case_pattern()?;
                         self.expect_symbol(")")?;
-                        Some(binding)
+                        match pattern {
+                            RawPattern::Binding(name) => (Some(name), None),
+                            RawPattern::Wildcard => (None, None),
+                            nested @ RawPattern::Variant { .. } => (None, Some(nested)),
+                        }
                     } else {
-                        None
+                        (None, None)
                     };
                     let guard = self.parse_optional_case_guard()?;
                     self.expect_symbol("=>")?;
@@ -4892,6 +5088,7 @@ impl Parser {
                         default: false,
                         binding,
                         guard,
+                        payload_pattern,
                         body,
                     });
                     if !self.consume_symbol("|") {
@@ -4905,6 +5102,29 @@ impl Parser {
             })
         } else {
             self.parse_assignment()
+        }
+    }
+
+    /// Parse a nested enum-destructuring payload pattern (R14), inside the parens
+    /// of a `case` arm (e.g. the `inner(x)` of `some(inner(x))`). A bare ident is a
+    /// `Binding`; `_` is a `Wildcard`; an ident immediately followed by `(` is a
+    /// nested `Variant` whose sub-pattern is parsed recursively. The presence of
+    /// the inner parens is what distinguishes a nested variant from a binding, so a
+    /// nullary inner variant is written `inner(_)` (its unit payload ignored).
+    fn parse_case_pattern(&mut self) -> Result<RawPattern> {
+        if self.consume_ident_value("_") {
+            return Ok(RawPattern::Wildcard);
+        }
+        let ident = self.expect_ident()?;
+        if self.consume_symbol("(") {
+            let sub = self.parse_case_pattern()?;
+            self.expect_symbol(")")?;
+            Ok(RawPattern::Variant {
+                variant: ident,
+                sub: Box::new(sub),
+            })
+        } else {
+            Ok(RawPattern::Binding(ident))
         }
     }
 

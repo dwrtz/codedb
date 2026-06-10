@@ -4237,100 +4237,187 @@ impl CodeDb {
                 locals,
             );
         }
-        let TypeSpec::Enum(variants) = self.type_spec_in_root(root, &scrutinee.type_hash)? else {
-            bail!("case lowering requires enum or scalar scrutinee");
-        };
-        let mut explicit_variants = BTreeSet::new();
-        let mut expanded_arms: Vec<(String, &JsonValue)> = Vec::new();
-        let mut default_arm = None;
-        for (index, arm) in arms.iter().enumerate() {
-            let is_default = arm.get("default").and_then(JsonValue::as_bool) == Some(true);
-            if is_default {
-                if index + 1 != arms.len() {
-                    bail!("default case arm must be last");
-                }
-                if default_arm.replace(arm).is_some() {
-                    bail!("duplicate default case arm");
-                }
-                if arm.get("variant").is_some() {
-                    bail!("default case arm cannot specify a variant");
-                }
-                if arm
-                    .get("binding_name")
-                    .and_then(JsonValue::as_str)
-                    .is_some()
-                {
-                    bail!("default case arm cannot bind a payload");
-                }
+        // Enum `case` (R14): collect the non-default arms (each a pattern node
+        // carrying its body) and the optional default body, then dispatch —
+        // recursively for nested destructuring patterns.
+        let mut node_arms: Vec<(&JsonValue, &str)> = Vec::new();
+        let mut fallback: Option<&str> = None;
+        for arm in arms {
+            if arm.get("default").and_then(JsonValue::as_bool) == Some(true) {
+                fallback = Some(
+                    arm.get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("case arm missing body"))?,
+                );
                 continue;
             }
-            let variant = arm
+            let body = arm
+                .get("body")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("case arm missing body"))?;
+            node_arms.push((arm, body));
+        }
+        // A move-only payload can be moved out of a case arm only from a consumed
+        // (param/local) scrutinee; nested levels inherit this (an inner payload lives
+        // inside the consumed outer enum).
+        let scrutinee_consumed = matches!(
+            self.get_payload(scrutinee_hash)?
+                .get("expr_kind")
+                .and_then(JsonValue::as_str),
+            Some("param_ref" | "local_ref")
+        );
+        let mut operations = scrutinee.operations;
+        let dispatch = self.lower_enum_dispatch(
+            root,
+            expr_hash,
+            &scrutinee.value,
+            &scrutinee.type_hash,
+            scrutinee_consumed,
+            &node_arms,
+            fallback,
+            result_type,
+            param_types,
+            ctx,
+            locals,
+        )?;
+        operations.extend(dispatch.operations);
+        Ok(LoweredExpr {
+            operations,
+            value: dispatch.value,
+            type_hash: result_type.to_string(),
+        })
+    }
+
+    /// Lower an enum dispatch (R14): match `scrutinee_value` (a *pointer* to an enum
+    /// of `scrutinee_type`) against `node_arms` — each a `(pattern node, body)` pair
+    /// whose node is `{"variant", "binding_name"?, "payload_pattern"?}` — falling
+    /// back to `fallback` (the case `_`/default body, which binds nothing) for any
+    /// uncovered variant. `scrutinee_consumed` is true when the scrutinee is a
+    /// consumed place, so a move-only payload has a single owner to move from.
+    ///
+    /// For a nested-destructuring group the payload's *address* becomes the inner
+    /// scrutinee and this recurses; the inner enum shell lives inside the consumed
+    /// outer enum (never separately dropped), so each level is an ordinary tag switch
+    /// and the per-level binding + residual/merge drop glue keeps every owned value
+    /// dropped exactly once (SPEC_V3 §7).
+    #[allow(clippy::too_many_arguments)]
+    fn lower_enum_dispatch(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        scrutinee_value: &str,
+        scrutinee_type: &str,
+        scrutinee_consumed: bool,
+        node_arms: &[(&JsonValue, &str)],
+        fallback: Option<&str>,
+        result_type: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let TypeSpec::Enum(variants) = self.type_spec_in_root(root, scrutinee_type)? else {
+            bail!("case lowering requires enum or scalar scrutinee");
+        };
+        // Group arms by variant in first-appearance order (a nested variant may carry
+        // several arms, dispatched on its payload), then append the default-filled
+        // missing variants in declaration order — preserving the previous arm order.
+        let mut groups: Vec<(String, Vec<(&JsonValue, &str)>)> = Vec::new();
+        for &(node, body) in node_arms {
+            let variant = node
                 .get("variant")
                 .and_then(JsonValue::as_str)
-                .ok_or_else(|| anyhow!("case arm missing variant"))?;
-            if !explicit_variants.insert(variant.to_string()) {
-                bail!("duplicate case arm {variant}");
+                .ok_or_else(|| anyhow!("case arm missing variant"))?
+                .to_string();
+            if let Some(group) = groups.iter_mut().find(|(name, _)| *name == variant) {
+                group.1.push((node, body));
+            } else {
+                groups.push((variant, vec![(node, body)]));
             }
-            expanded_arms.push((variant.to_string(), arm));
         }
-        let expected_variants = variants
-            .iter()
-            .map(|variant| variant.name.clone())
-            .collect::<BTreeSet<_>>();
-        if let Some(default_arm) = default_arm {
-            for variant in &variants {
-                if !explicit_variants.contains(&variant.name) {
-                    expanded_arms.push((variant.name.clone(), default_arm));
-                }
+        let covered: BTreeSet<String> = groups.iter().map(|(name, _)| name.clone()).collect();
+        for variant in &variants {
+            if !covered.contains(&variant.name) {
+                groups.push((variant.name.clone(), Vec::new()));
             }
-        } else if explicit_variants != expected_variants {
-            bail!("case expression must cover every enum variant");
         }
 
         let locals_boundary = ctx.next_local;
         let moved_before = ctx.moved.clone();
-        let mut arm_move_sets: Vec<BTreeSet<MovedPlace>> = Vec::with_capacity(expanded_arms.len());
-        let mut lowered_arms = Vec::with_capacity(expanded_arms.len());
-        for (variant, arm) in expanded_arms {
+        let mut arm_move_sets: Vec<BTreeSet<MovedPlace>> = Vec::with_capacity(groups.len());
+        let mut lowered_arms = Vec::with_capacity(groups.len());
+        for (variant, group) in groups {
             ctx.moved = moved_before.clone();
-            let variant_info = self.lowered_enum_variant(
-                root,
-                ctx.target_triple(),
-                &scrutinee.type_hash,
-                &variant,
-            )?;
+            let variant_info =
+                self.lowered_enum_variant(root, ctx.target_triple(), scrutinee_type, &variant)?;
             let mut arm_operations = Vec::new();
-            if arm
-                .get("binding_name")
-                .and_then(JsonValue::as_str)
-                .is_some()
+            // A nested-destructuring group: every arm carries a `payload_pattern`
+            // (well-formedness, enforced in type-check, makes a group homogeneous).
+            let nested = group
+                .first()
+                .is_some_and(|(node, _)| node.get("payload_pattern").is_some());
+            let result = if nested {
+                // Bind the payload's address and recurse on it.
+                let payload_address = ctx.value();
+                ctx.push_debug_op(expr_hash, "addr_of_enum_payload", &payload_address);
+                arm_operations.push(LoweredOp::AddrOfEnumPayload {
+                    id: payload_address.clone(),
+                    place: LoweredPlace::EnumPayload {
+                        base: scrutinee_value.to_string(),
+                        variant: variant.clone(),
+                        variant_symbol: variant_info.variant_symbol.clone(),
+                        owner_type_hash: scrutinee_type.to_string(),
+                        tag_value: variant_info.tag_value,
+                        payload_offset_bytes: variant_info.payload_offset_bytes,
+                        type_hash: variant_info.type_hash.clone(),
+                    },
+                });
+                let inner_arms: Vec<(&JsonValue, &str)> = group
+                    .iter()
+                    .map(|(node, body)| {
+                        Ok((
+                            node.get("payload_pattern")
+                                .ok_or_else(|| anyhow!("nested case arm missing payload_pattern"))?,
+                            *body,
+                        ))
+                    })
+                    .collect::<Result<_>>()?;
+                let inner = self.lower_enum_dispatch(
+                    root,
+                    expr_hash,
+                    &payload_address,
+                    &variant_info.type_hash,
+                    scrutinee_consumed,
+                    &inner_arms,
+                    fallback,
+                    result_type,
+                    param_types,
+                    ctx,
+                    locals,
+                )?;
+                arm_operations.extend(inner.operations);
+                inner.value
+            } else if let Some(binding) = group
+                .first()
+                .and_then(|(node, _)| node.get("binding_name").and_then(JsonValue::as_str))
             {
+                let _ = binding;
+                let body_hash = group[0].1;
                 let binding_is_move_only =
                     self.type_is_move_only(root, ctx.target_triple(), &variant_info.type_hash)?;
                 // Moving a move-only payload out of a case arm is sound only when the
                 // scrutinee is itself consumed, so the payload's single owner becomes
-                // the binding and the scrutinee is never dropped (no double free). A
-                // move-only enum scrutinee that is a place (param/local) is `Move`d as a
-                // whole when lowered above, satisfying this. The payload then transfers
-                // to the binding by a shallow read of the (abandoned) enum storage: a
-                // `box<T>` payload by loading its pointer, an inline move-only aggregate
-                // payload by `Load`-aliasing the payload pointer and `Store`-memcpying it
-                // into the binding slot (a byte move — inner owned pointers transfer; the
-                // consumed scrutinee is never dropped, so each resource is freed once,
-                // SPEC_V3 §7). A non-place (temporary) scrutinee stays fail-closed: it is
-                // not drop-tracked, so there is no single consumed owner to move from.
-                if binding_is_move_only {
-                    let scrutinee_is_consumed_place = matches!(
-                        self.get_payload(scrutinee_hash)?
-                            .get("expr_kind")
-                            .and_then(JsonValue::as_str),
-                        Some("param_ref" | "local_ref")
+                // the binding and the scrutinee is never dropped (no double free). The
+                // payload then transfers to the binding by a shallow read of the
+                // (abandoned) enum storage: a `box<T>` payload by loading its pointer,
+                // an inline move-only aggregate by `Load`-aliasing the payload pointer
+                // and `Store`-memcpying it into the binding slot (a byte move — inner
+                // owned pointers transfer; the consumed scrutinee is never dropped, so
+                // each resource is freed once, SPEC_V3 §7). A non-place (temporary)
+                // scrutinee stays fail-closed: there is no single consumed owner.
+                if binding_is_move_only && !scrutinee_consumed {
+                    bail!(
+                        "unsupported_move: moving a move-only enum payload out of a case arm requires a consumed (param/local) scrutinee; moving out of a temporary enum is not yet supported (SPEC_V3 §7)"
                     );
-                    if !scrutinee_is_consumed_place {
-                        bail!(
-                            "unsupported_move: moving a move-only enum payload out of a case arm requires a consumed (param/local) scrutinee; moving out of a temporary enum is not yet supported (SPEC_V3 §7)"
-                        );
-                    }
                 }
                 let slot_size = stack_slot_size_bytes(self.layout_size_bytes(
                     root,
@@ -4343,21 +4430,16 @@ impl CodeDb {
                 arm_operations.push(LoweredOp::AddrOfEnumPayload {
                     id: payload_address.clone(),
                     place: LoweredPlace::EnumPayload {
-                        base: scrutinee.value.clone(),
+                        base: scrutinee_value.to_string(),
                         variant: variant.clone(),
                         variant_symbol: variant_info.variant_symbol.clone(),
-                        owner_type_hash: scrutinee.type_hash.clone(),
+                        owner_type_hash: scrutinee_type.to_string(),
                         tag_value: variant_info.tag_value,
                         payload_offset_bytes: variant_info.payload_offset_bytes,
                         type_hash: variant_info.type_hash.clone(),
                     },
                 });
                 let payload_value = if binding_is_move_only {
-                    // Read the payload out of the (consumed, never-dropped) scrutinee
-                    // into the binding. `Load` of a `box<T>` loads the pointer; `Load` of
-                    // an inline aggregate aliases the payload pointer and the `Store`
-                    // below memcpys it into the binding slot — a shallow byte move that
-                    // transfers the payload's owned resources exactly once.
                     let pv = ctx.value();
                     ctx.push_debug_op(expr_hash, "load", &pv);
                     arm_operations.push(LoweredOp::Load {
@@ -4394,14 +4476,6 @@ impl CodeDb {
                     slot,
                     type_hash: variant_info.type_hash.clone(),
                 });
-                let body_hash = arm
-                    .get("body")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("case arm missing body"))?;
-                // Build the arm into `result_type` so a record/enum/array-literal
-                // arm constructs directly in the destination layout (see
-                // `lower_expr_as`). The exact-type assertion below keeps a
-                // non-buildable arm fail-closed.
                 let body =
                     self.lower_expr_as(root, body_hash, result_type, param_types, ctx, locals);
                 locals.pop();
@@ -4410,12 +4484,13 @@ impl CodeDb {
                     bail!("case arm {variant} result type mismatch while lowering");
                 }
                 arm_operations.extend(body.operations);
-                // Drop the binding at arm-scope exit if the body did not consume it.
-                // A move-only `box` binding requires drop glue (free the box); a
-                // copyable binding requires none. Mirrors `let`-binding drop placement
-                // (SPEC_V3 §7): a consumed binding emits no drop, an untouched one a
-                // whole-slot drop.
-                if self.type_requires_drop_scaffold(root, ctx.target_triple(), &variant_info.type_hash)? {
+                // Drop the binding at arm-scope exit if the body did not consume it
+                // (mirrors `let`-binding drop placement, SPEC_V3 §7).
+                if self.type_requires_drop_scaffold(
+                    root,
+                    ctx.target_triple(),
+                    &variant_info.type_hash,
+                )? {
                     let moved = ctx.moved.clone();
                     let place = MovedPlace::whole(RootSlot::Local(slot));
                     self.emit_residual_drops(
@@ -4429,38 +4504,25 @@ impl CodeDb {
                         &mut arm_operations,
                     )?;
                 }
-                lowered_arms.push(LoweredCaseArm {
-                    variant,
-                    variant_symbol: variant_info.variant_symbol,
-                    tag_value: variant_info.tag_value,
-                    payload_type_hash: variant_info.type_hash,
-                    payload_offset_bytes: variant_info.payload_offset_bytes,
-                    block: LoweredBlock {
-                        operations: arm_operations,
-                        result: body.value,
-                    },
-                });
+                body.value
             } else {
-                let body_hash = arm
-                    .get("body")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("case arm missing body"))?;
+                // No-binding arm: either a simple `_`-ignored / unit-payload arm, or a
+                // default-filled missing variant (empty group → the `fallback` body).
+                // The body binds nothing; a drop-requiring payload is freed here (the
+                // matched variant's payload would otherwise leak, since a move-only
+                // scrutinee is consumed — the sole free, exactly once, SPEC_V3 §7).
+                let body_hash = match group.first() {
+                    Some((_, body)) => *body,
+                    None => fallback.ok_or_else(|| {
+                        anyhow!("non-exhaustive case: variant {variant} has no arm and no default")
+                    })?,
+                };
                 let body =
                     self.lower_expr_as(root, body_hash, result_type, param_types, ctx, locals)?;
                 if body.type_hash != result_type {
                     bail!("case arm {variant} result type mismatch while lowering");
                 }
                 arm_operations.extend(body.operations);
-                // A no-`binding_name` arm — a `default`/`_` arm expanded to cover this
-                // variant — does not bind the payload, but a move-only enum scrutinee
-                // is consumed (a param/local place is `Move`d when lowered above; a
-                // temporary is never otherwise dropped). So if the matched variant's
-                // payload owns resources, this arm must free them here, or the payload
-                // (and its recursive sub-chain) leaks: a drop-requiring payload implies
-                // a move-only — hence consumed — scrutinee, so this is the sole free,
-                // exactly once (SPEC_V3 §7). Mirrors the binding path's residual drop
-                // above; the drop goes through `AddrOfEnumPayload` on the consumed
-                // scrutinee since there is no binding slot to drop.
                 if self.type_requires_drop_scaffold(
                     root,
                     ctx.target_triple(),
@@ -4471,10 +4533,10 @@ impl CodeDb {
                     arm_operations.push(LoweredOp::AddrOfEnumPayload {
                         id: payload_address.clone(),
                         place: LoweredPlace::EnumPayload {
-                            base: scrutinee.value.clone(),
+                            base: scrutinee_value.to_string(),
                             variant: variant.clone(),
                             variant_symbol: variant_info.variant_symbol.clone(),
-                            owner_type_hash: scrutinee.type_hash.clone(),
+                            owner_type_hash: scrutinee_type.to_string(),
                             tag_value: variant_info.tag_value,
                             payload_offset_bytes: variant_info.payload_offset_bytes,
                             type_hash: variant_info.type_hash.clone(),
@@ -4485,26 +4547,28 @@ impl CodeDb {
                         type_hash: variant_info.type_hash.clone(),
                     });
                 }
-                lowered_arms.push(LoweredCaseArm {
-                    variant,
-                    variant_symbol: variant_info.variant_symbol,
-                    tag_value: variant_info.tag_value,
-                    payload_type_hash: variant_info.type_hash,
-                    payload_offset_bytes: variant_info.payload_offset_bytes,
-                    block: LoweredBlock {
-                        operations: arm_operations,
-                        result: body.value,
-                    },
-                });
-            }
+                body.value
+            };
+
+            lowered_arms.push(LoweredCaseArm {
+                variant,
+                variant_symbol: variant_info.variant_symbol,
+                tag_value: variant_info.tag_value,
+                payload_type_hash: variant_info.type_hash,
+                payload_offset_bytes: variant_info.payload_offset_bytes,
+                block: LoweredBlock {
+                    operations: arm_operations,
+                    result,
+                },
+            });
 
             let arm_moves = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
             arm_move_sets.push(arm_moves);
         }
         // Conditional drop glue (SPEC_V3 §7): normalize every arm to the union of
-        // their outer moves by emitting compensating drops in arms that left a
-        // unioned place live, so the static scaffold drops each owned value
-        // exactly once across all arms — no runtime drop flags.
+        // their outer moves by emitting compensating drops in arms that left a unioned
+        // place live, so the static scaffold drops each owned value exactly once across
+        // all arms — no runtime drop flags.
         let mut union = BTreeSet::new();
         for arm_moves in &arm_move_sets {
             for place in arm_moves {
@@ -4530,16 +4594,14 @@ impl CodeDb {
 
         let id = ctx.value();
         ctx.push_debug_op(expr_hash, "case", &id);
-        let mut operations = scrutinee.operations;
-        operations.push(LoweredOp::Case {
-            id: id.clone(),
-            scrutinee: scrutinee.value,
-            enum_type_hash: scrutinee.type_hash,
-            arms: lowered_arms,
-            type_hash: result_type.to_string(),
-        });
         Ok(LoweredExpr {
-            operations,
+            operations: vec![LoweredOp::Case {
+                id: id.clone(),
+                scrutinee: scrutinee_value.to_string(),
+                enum_type_hash: scrutinee_type.to_string(),
+                arms: lowered_arms,
+                type_hash: result_type.to_string(),
+            }],
             value: id,
             type_hash: result_type.to_string(),
         })

@@ -1747,18 +1747,26 @@ impl CodeDb {
                 // mirroring the reference evaluator (R14). Scalars never bind.
                 let (arm, selected_label, binding_value) = match &scrutinee {
                     Value::Enum { variant, value } => {
-                        let arm = arms
-                            .iter()
-                            .find(|arm| {
-                                arm.get("variant").and_then(JsonValue::as_str) == Some(variant)
-                            })
-                            .or_else(|| {
-                                arms.iter().find(|arm| {
-                                    arm.get("default").and_then(JsonValue::as_bool) == Some(true)
-                                })
-                            })
+                        // First-match over the arms with nested-pattern matching (R14),
+                        // binding the chain's leaf — mirroring the reference evaluator.
+                        let scrutinee_cell =
+                            crate::expr::enum_cell(variant.clone(), value.clone());
+                        let mut selected = None;
+                        for arm in arms {
+                            if arm.get("default").and_then(JsonValue::as_bool) == Some(true) {
+                                selected = Some((arm, None));
+                                break;
+                            }
+                            if let Some(leaf) =
+                                crate::expr::match_typed_pattern(arm, &scrutinee_cell)
+                            {
+                                selected = Some((arm, leaf));
+                                break;
+                            }
+                        }
+                        let (arm, leaf) = selected
                             .ok_or_else(|| anyhow!("case missing arm for variant {variant}"))?;
-                        (arm, variant.clone(), Some(value.clone()))
+                        (arm, variant.clone(), leaf)
                     }
                     Value::I64(scrutinee_value) => {
                         // First-match over the arms in source order, evaluating each
