@@ -4602,6 +4602,7 @@ fn collect_lowered_call_targets(
             | LoweredOp::ConstBool { .. }
             | LoweredOp::ConstUnit { .. }
             | LoweredOp::Unary { .. }
+            | LoweredOp::IntCast { .. }
             | LoweredOp::Binary { .. }
             | LoweredOp::AddrOfParam { .. }
             | LoweredOp::AddrOfLocal { .. }

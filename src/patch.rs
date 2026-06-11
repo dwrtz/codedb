@@ -2636,7 +2636,7 @@ fn expression_child_hashes(expr_kind: &str, payload: &JsonValue) -> Result<Vec<S
         "field_access" => {
             push_child_keys(payload, expr_kind, &["target"], &mut children)?;
         }
-        "enum_construct" | "box_new" | "unbox" | "raw_ptr_cast" | "raw_load" => {
+        "enum_construct" | "box_new" | "unbox" | "raw_ptr_cast" | "raw_load" | "int_cast" => {
             let key = if expr_kind == "raw_load" {
                 "pointer"
             } else {

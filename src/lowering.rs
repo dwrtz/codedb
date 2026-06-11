@@ -200,6 +200,14 @@ pub(crate) enum LoweredOp {
         value: String,
         type_hash: String,
     },
+    /// Sized-integer cast (R6): re-normalize `value` to the canonical slot form of
+    /// `type_hash`'s width/signedness (truncate on narrowing, sign-/zero-extend on
+    /// widening). The operand is already in its own width's canonical form.
+    IntCast {
+        id: String,
+        value: String,
+        type_hash: String,
+    },
     Binary {
         id: String,
         kind: String,
@@ -1040,12 +1048,16 @@ impl CodeDb {
             .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?;
         match expr_kind {
             "literal_i64" => {
-                let value = payload
+                let value_text = payload
                     .get("value")
                     .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("literal_i64 missing value"))?
-                    .to_string();
-                value.parse::<i64>()?;
+                    .ok_or_else(|| anyhow!("literal_i64 missing value"))?;
+                // Normalize to the canonical i64 bit pattern (decimal): the literal
+                // carries its width in `type_hash` and may be hex, but the backend
+                // and constant-index map want one decimal i64 form.
+                let int = crate::types::scalar_int_type_by_hash(&type_hash)
+                    .ok_or_else(|| anyhow!("integer literal has non-integer type"))?;
+                let value = crate::expr::int_literal_const_i64(value_text, int)?.to_string();
                 let id = ctx.value();
                 ctx.push_debug_op(expr_hash, "const_i64", &id);
                 Ok(LoweredExpr {
@@ -1487,6 +1499,26 @@ impl CodeDb {
             }
             "box_new" => self.lower_box_new(root, expr_hash, &type_hash, param_types, ctx, locals),
             "unbox" => self.lower_unbox(root, expr_hash, &type_hash, param_types, ctx, locals),
+            "int_cast" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("int_cast missing value"))?;
+                let source = self.lower_expr(root, value_hash, param_types, ctx, locals)?;
+                let id = ctx.value();
+                ctx.push_debug_op(expr_hash, "int_cast", &id);
+                let mut operations = source.operations;
+                operations.push(LoweredOp::IntCast {
+                    id: id.clone(),
+                    value: source.value,
+                    type_hash: type_hash.clone(),
+                });
+                Ok(LoweredExpr {
+                    operations,
+                    value: id,
+                    type_hash,
+                })
+            }
             "vec_new" => self.lower_vec_new(root, expr_hash, &type_hash, param_types, ctx, locals),
             "vec_push" => self.lower_vec_push(root, expr_hash, param_types, ctx, locals),
             "vec_get" => self.lower_vec_get(root, expr_hash, &type_hash, param_types, ctx, locals),
@@ -6340,13 +6372,27 @@ impl CodeDb {
                     type_hash,
                 } => {
                     // An integer constant of the width given by `type_hash` — i64 or
-                    // any sized integer (R5) — whose text must fit that width.
+                    // any sized integer (R5). Lowering normalizes the literal to its
+                    // canonical i64 bit pattern, so re-derive that the type is a sized
+                    // integer and the bit pattern is within that width's canonical
+                    // range (a u64 with the high bit set is a negative i64 pattern).
                     let TypeSpec::Builtin(name) = self.type_spec(type_hash)? else {
                         bail!("lowered const_i64 requires an integer type");
                     };
                     let int = crate::types::scalar_int_type(&name)
                         .ok_or_else(|| anyhow!("lowered const_i64 non-integer type {name}"))?;
-                    if !crate::types::int_literal_in_range(value, int) {
+                    let bits = int.width * 8;
+                    let bit_pattern: i64 = value
+                        .parse()
+                        .map_err(|_| anyhow!("lowered const_i64 value {value} is not an i64"))?;
+                    let in_range = if bits >= 64 {
+                        true
+                    } else if int.signed {
+                        bit_pattern >= -(1i64 << (bits - 1)) && bit_pattern < (1i64 << (bits - 1))
+                    } else {
+                        bit_pattern >= 0 && bit_pattern < (1i64 << bits)
+                    };
+                    if !in_range {
                         bail!("lowered const_i64 value {value} out of range for {}", int.name);
                     }
                     insert_value(values, id, type_hash)?;
@@ -6380,6 +6426,20 @@ impl CodeDb {
                 } => {
                     let value_type = value_type(values, value)?;
                     verify_unary_kind(kind, value_type, type_hash)?;
+                    insert_value(values, id, type_hash)?;
+                }
+                LoweredOp::IntCast {
+                    id,
+                    value,
+                    type_hash,
+                } => {
+                    let value_type = value_type(values, value)?;
+                    if crate::types::scalar_int_type_by_hash(value_type).is_none() {
+                        bail!("lowered int_cast operand is not a sized integer");
+                    }
+                    if crate::types::scalar_int_type_by_hash(type_hash).is_none() {
+                        bail!("lowered int_cast target is not a sized integer");
+                    }
                     insert_value(values, id, type_hash)?;
                 }
                 LoweredOp::Binary {
@@ -7715,6 +7775,7 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::ConstBool { id, .. }
         | LoweredOp::ConstUnit { id, .. }
         | LoweredOp::Unary { id, .. }
+        | LoweredOp::IntCast { id, .. }
         | LoweredOp::Binary { id, .. }
         | LoweredOp::Call { id, .. }
         | LoweredOp::If { id, .. }
@@ -7766,6 +7827,7 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::ConstBool { .. } => "const_bool",
         LoweredOp::ConstUnit { .. } => "const_unit",
         LoweredOp::Unary { .. } => "unary",
+        LoweredOp::IntCast { .. } => "int_cast",
         LoweredOp::Binary { .. } => "binary",
         LoweredOp::Call { .. } => "call",
         LoweredOp::If { .. } => "if",
@@ -7896,6 +7958,7 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::ConstBool { type_hash, .. }
             | LoweredOp::ConstUnit { type_hash, .. }
             | LoweredOp::Unary { type_hash, .. }
+            | LoweredOp::IntCast { type_hash, .. }
             | LoweredOp::Binary { type_hash, .. }
             | LoweredOp::Call { type_hash, .. }
             | LoweredOp::If { type_hash, .. }

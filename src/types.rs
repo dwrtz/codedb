@@ -508,6 +508,22 @@ pub(crate) fn scalar_int_source_name_for_hash(hash: &str) -> Option<String> {
         .map(|t| t.name.to_ascii_lowercase())
 }
 
+/// The [`ScalarIntType`] a content hash names, or `None` if `hash` is not a
+/// scalar integer type. The operator type-checker/verifier route their
+/// "is this a sized integer operand" gate through this so the set of integer
+/// operand types is exactly `SCALAR_INT_TYPES`.
+pub(crate) fn scalar_int_type_by_hash(hash: &str) -> Option<&'static ScalarIntType> {
+    SCALAR_INT_TYPES.iter().find(|t| hash == type_hash_for(t.name))
+}
+
+/// The target [`ScalarIntType`] of an integer cast builtin (`to_u32`, `to_i8`, …),
+/// or `None` if `name` is not one. A cast is `to_<lowercase-width>(value)` — the
+/// width in the name keeps casts to a single builtin per target without any new
+/// type-argument syntax (R6, Phase 9).
+pub(crate) fn int_cast_target(name: &str) -> Option<&'static ScalarIntType> {
+    name.strip_prefix("to_").and_then(scalar_int_name_for_source).and_then(scalar_int_type)
+}
+
 /// Whether the decimal/`0x`-hex literal text `value` is in range for `int`'s width
 /// and signedness. The single check both the type-checker (context-typed literals)
 /// and the evaluator route through, so "fits the width" means exactly one thing.
@@ -3039,9 +3055,12 @@ impl CodeDb {
             }
             return Ok(expected.to_string());
         }
-        value
-            .parse::<i64>()
-            .with_context(|| format!("invalid i64 literal {value}"))?;
+        // Default width is i64; accept a `0x` hex literal here too (the sized path
+        // above already does, via `int_literal_in_range`).
+        let i64_int = scalar_int_type("I64").expect("I64 is a scalar int");
+        if !int_literal_in_range(value, i64_int) {
+            bail!("invalid i64 literal {value}");
+        }
         Ok(type_hash_for("I64"))
     }
 
@@ -3311,6 +3330,18 @@ impl CodeDb {
                         locals,
                     );
                 }
+                if let Some(target) = int_cast_target(name) {
+                    return self.type_builtin_int_cast(
+                        current_module,
+                        target.name,
+                        args,
+                        root,
+                        param_names,
+                        param_types,
+                        region_scope,
+                        locals,
+                    );
+                }
                 let symbol = resolve_function_name_in_root(root, current_module, name)
                     .ok_or_else(|| anyhow!("unknown function {name}"))?;
                 let callee = self
@@ -3393,7 +3424,26 @@ impl CodeDb {
                 })
             }
             RawExpr::Binary { op, left, right } => {
-                let left = self.type_expr_with_locals(
+                // Sized-integer operand inference (R5). For the arithmetic/bitwise/
+                // shift operators (result type == operand type), a sized-integer
+                // result expectation is pushed into the operands so two bare
+                // literals take the width (`let m: u32 = 0xff00 | 0x00ff`). Then the
+                // left operand's sized type becomes the expectation for the right
+                // (`x >> 7`, `x & 0xff`); and if the left is a bare literal while the
+                // right resolved to a sized integer, the left is re-typed at that
+                // width (`32 - n`). A literal only adopts a width — non-literal
+                // operands keep their own type, so a genuine width mismatch still
+                // errors below. Comparisons/logical ops expect Bool, which must not
+                // reach the operands, so they propagate nothing.
+                let arith_like = matches!(
+                    op.as_str(),
+                    "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>"
+                );
+                let operand_expected = match expected_type {
+                    Some(t) if arith_like && scalar_int_type_by_hash(t).is_some() => Some(t),
+                    _ => None,
+                };
+                let left_typed = self.type_expr_with_locals_expecting(
                     current_module,
                     left,
                     root,
@@ -3401,8 +3451,12 @@ impl CodeDb {
                     param_types,
                     region_scope,
                     locals,
+                    operand_expected,
                 )?;
-                let right = self.type_expr_with_locals(
+                let right_expected = scalar_int_type_by_hash(&left_typed.type_hash)
+                    .map(|_| left_typed.type_hash.clone())
+                    .or_else(|| operand_expected.map(str::to_string));
+                let right = self.type_expr_with_locals_expecting(
                     current_module,
                     right,
                     root,
@@ -3410,14 +3464,48 @@ impl CodeDb {
                     param_types,
                     region_scope,
                     locals,
+                    right_expected.as_deref(),
                 )?;
+                let left = if matches!(left.as_ref(), RawExpr::LiteralI64 { .. })
+                    && left_typed.type_hash != right.type_hash
+                    && scalar_int_type_by_hash(&right.type_hash).is_some()
+                {
+                    self.type_expr_with_locals_expecting(
+                        current_module,
+                        left,
+                        root,
+                        param_names,
+                        param_types,
+                        region_scope,
+                        locals,
+                        Some(&right.type_hash),
+                    )?
+                } else {
+                    left_typed
+                };
                 let bool_hash = type_hash_for("Bool");
                 let result_type = match op.as_str() {
-                    "+" | "-" | "*" | "/" | "%" => {
-                        let i64_hash = type_hash_for("I64");
-                        require_type(&left.type_hash, &i64_hash, "left operand", self)?;
-                        require_type(&right.type_hash, &i64_hash, "right operand", self)?;
-                        i64_hash
+                    "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>" => {
+                        if scalar_int_type_by_hash(&left.type_hash).is_none() {
+                            bail!(
+                                "integer operator {op} expected a sized integer left operand, got {}",
+                                self.type_name(&left.type_hash)?
+                            );
+                        }
+                        if scalar_int_type_by_hash(&right.type_hash).is_none() {
+                            bail!(
+                                "integer operator {op} expected a sized integer right operand, got {}",
+                                self.type_name(&right.type_hash)?
+                            );
+                        }
+                        if left.type_hash != right.type_hash {
+                            bail!(
+                                "integer operator {op} operands differ: {} vs {}",
+                                self.type_name(&left.type_hash)?,
+                                self.type_name(&right.type_hash)?
+                            );
+                        }
+                        left.type_hash.clone()
                     }
                     "==" | "!=" | "<" | "<=" | ">" | ">=" => {
                         if left.type_hash != right.type_hash {
@@ -3427,11 +3515,9 @@ impl CodeDb {
                                 self.type_name(&right.type_hash)?
                             );
                         }
-                        if left.type_hash != type_hash_for("I64")
-                            && left.type_hash != type_hash_for("U8")
-                        {
+                        if scalar_int_type_by_hash(&left.type_hash).is_none() {
                             bail!(
-                                "comparison operand expected i64 or u8, got {}",
+                                "comparison operand expected a sized integer, got {}",
                                 self.type_name(&left.type_hash)?
                             );
                         }
@@ -3467,7 +3553,14 @@ impl CodeDb {
                 })
             }
             RawExpr::Unary { op, expr } => {
-                let typed = self.type_expr_with_locals(
+                // For the arithmetic unary operators, push the expected type into
+                // the operand so a sized literal takes its width (`let x: i32 = -5`,
+                // `~mask` where the result position is u32).
+                let operand_expected = match op.as_str() {
+                    "-" | "~" => expected_type,
+                    _ => None,
+                };
+                let typed = self.type_expr_with_locals_expecting(
                     current_module,
                     expr,
                     root,
@@ -3475,13 +3568,18 @@ impl CodeDb {
                     param_types,
                     region_scope,
                     locals,
+                    operand_expected,
                 )?;
-                let i64_hash = type_hash_for("I64");
                 let bool_hash = type_hash_for("Bool");
                 let result_type = match op.as_str() {
-                    "-" => {
-                        require_type(&typed.type_hash, &i64_hash, "unary operand", self)?;
-                        i64_hash
+                    "-" | "~" => {
+                        if scalar_int_type_by_hash(&typed.type_hash).is_none() {
+                            bail!(
+                                "unary operator {op} expected a sized integer operand, got {}",
+                                self.type_name(&typed.type_hash)?
+                            );
+                        }
+                        typed.type_hash.clone()
                     }
                     "!" => {
                         require_type(&typed.type_hash, &bool_hash, "unary operand", self)?;
@@ -3851,9 +3949,20 @@ impl CodeDb {
                 if elements.is_empty() {
                     bail!("array literal must have at least one element");
                 }
+                // When the result position expects a fixed array, push its element
+                // type into each element so sized-integer literals take that width
+                // (`let w: array<u32, 64> = [0x61626380, 0, ..]`); otherwise an
+                // element would default to i64 and the structural array would not be
+                // assignable to the named element width.
+                let expected_element = expected_type
+                    .and_then(|hash| self.type_spec_in_root(root, hash).ok())
+                    .and_then(|spec| match spec {
+                        TypeSpec::FixedArray { element, .. } => Some(element),
+                        _ => None,
+                    });
                 let mut typed_elements = Vec::with_capacity(elements.len());
                 for element in elements {
-                    typed_elements.push(self.type_expr_with_locals(
+                    typed_elements.push(self.type_expr_with_locals_expecting(
                         current_module,
                         element,
                         root,
@@ -3861,6 +3970,7 @@ impl CodeDb {
                         param_types,
                         region_scope,
                         locals,
+                        expected_element.as_deref(),
                     )?);
                 }
                 let element_type = typed_elements
@@ -3937,6 +4047,22 @@ impl CodeDb {
                 if fields.is_empty() {
                     bail!("record literal must have at least one field");
                 }
+                // When the result position expects a record type, push each field's
+                // expected type into its value so a sized-integer literal in a field
+                // takes that width (`let s: State = { a: 0x6a09e667, .. }` with
+                // `State.a: u32`); otherwise the field would default to i64 and the
+                // structural literal would not be assignable to the named record.
+                let expected_fields: Option<BTreeMap<String, String>> = expected_type
+                    .and_then(|hash| self.type_spec_in_root(root, hash).ok())
+                    .and_then(|spec| match spec {
+                        TypeSpec::Record(field_specs) => Some(
+                            field_specs
+                                .into_iter()
+                                .map(|f| (f.name, f.type_hash))
+                                .collect(),
+                        ),
+                        _ => None,
+                    });
                 let mut names = BTreeSet::new();
                 let mut typed_values = Vec::with_capacity(fields.len());
                 for field in fields {
@@ -3944,7 +4070,11 @@ impl CodeDb {
                     if !names.insert(field.name.clone()) {
                         bail!("duplicate record field {}", field.name);
                     }
-                    let typed = self.type_expr_with_locals(
+                    let field_expected = expected_fields
+                        .as_ref()
+                        .and_then(|m| m.get(&field.name))
+                        .map(String::as_str);
+                    let typed = self.type_expr_with_locals_expecting(
                         current_module,
                         &field.value,
                         root,
@@ -3952,6 +4082,7 @@ impl CodeDb {
                         param_types,
                         region_scope,
                         locals,
+                        field_expected,
                     )?;
                     typed_values.push((field.name.clone(), typed));
                 }
@@ -5013,6 +5144,60 @@ impl CodeDb {
         Ok(TypeCheckResult {
             expr_hash,
             type_hash: element_type,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn type_builtin_int_cast(
+        &mut self,
+        current_module: &str,
+        target_name: &str,
+        args: &[RawExpr],
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
+        locals: &mut Vec<LocalTypeBinding>,
+    ) -> Result<TypeCheckResult> {
+        if args.len() != 1 {
+            bail!("to_{} expects 1 arg, got {}", target_name.to_ascii_lowercase(), args.len());
+        }
+        let value = self.type_expr_with_locals(
+            current_module,
+            &args[0],
+            root,
+            param_names,
+            param_types,
+            region_scope,
+            locals,
+        )?;
+        if scalar_int_type_by_hash(&value.type_hash).is_none() {
+            bail!(
+                "to_{} expects a sized integer argument, got {}",
+                target_name.to_ascii_lowercase(),
+                self.type_name(&value.type_hash)?
+            );
+        }
+        let target = type_hash_for(target_name);
+        let expr_hash = self.put_object(
+            "Expression",
+            &json!({
+                "expr_kind": "int_cast",
+                "value": value.expr_hash,
+                "source_type": value.type_hash,
+                "type": target.clone(),
+            }),
+        )?;
+        self.write_cache_json(
+            &expr_hash,
+            "typechecker",
+            "typed-dag",
+            ArtifactKind::TypedExpression,
+            &json!({ "type": target.clone() }),
+        )?;
+        Ok(TypeCheckResult {
+            expr_hash,
+            type_hash: target,
         })
     }
 
@@ -6100,7 +6285,7 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("enum_construct missing value"))?;
                 self.expr_escapes_local_borrow(root, value, locals_with_local_borrows)
             }
-            "binary" | "unary" => Ok(false),
+            "binary" | "unary" | "int_cast" => Ok(false),
             other => bail!("unknown expression kind {other}"),
         }
     }
@@ -6543,6 +6728,15 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("unary missing expr"))?;
                 self.verify_expr_borrows(root, child, param_types, state, ExprUse::Value)
+            }
+            "int_cast" => {
+                // A cast reads its (Copy scalar) argument as a value; it never moves
+                // or borrows, so it just borrow-checks the operand.
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("int_cast missing value"))?;
+                self.verify_expr_borrows(root, value, param_types, state, ExprUse::Value)
             }
             "borrow_shared" | "borrow_mut" => {
                 let target = payload
@@ -7278,6 +7472,15 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("unbox missing value"))?;
                 out.extend(self.collect_value_loans(root, value, param_types, state)?);
             }
+            "int_cast" => {
+                // The cast result is a scalar (carries no loan); propagate any loan
+                // produced while evaluating the operand.
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("int_cast missing value"))?;
+                out.extend(self.collect_value_loans(root, value, param_types, state)?);
+            }
             "raw_ptr_cast" => {
                 // Converting a borrow of a place into a raw pointer erases its
                 // region (SPEC §15), but the raw pointer still points into that
@@ -8009,6 +8212,15 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("unbox missing value"))?;
                 self.move_source_places_for_expr(root, value, param_types, locals)
             }
+            Some("int_cast") => {
+                // A cast does not move its (Copy scalar) operand, but the operand
+                // sub-expression might (e.g. `to_u32(unbox(b))`); propagate it.
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("int_cast missing value"))?;
+                self.move_source_places_for_expr(root, value, param_types, locals)
+            }
             Some("subslice") => {
                 let target = payload
                     .get("target")
@@ -8343,7 +8555,7 @@ impl CodeDb {
                 "vec_len" => self.expr_child_requires_state(&payload, "target")?,
                 "string_new" => self.expr_child_requires_state(&payload, "source")?,
                 "string_len" => self.expr_child_requires_state(&payload, "target")?,
-                "raw_ptr_cast" => self.expr_child_requires_state(&payload, "value")?,
+                "raw_ptr_cast" | "int_cast" => self.expr_child_requires_state(&payload, "value")?,
                 "raw_load" => self.expr_child_requires_state(&payload, "pointer")?,
                 "raw_store" => true,
                 "let" => {
@@ -8469,7 +8681,7 @@ impl CodeDb {
                 "borrow_shared" | "borrow_mut" | "slice_from_array" | "slice_len" => {
                     self.expr_child_requires_alloc(&payload, "target")?
                 }
-                "raw_ptr_cast" => self.expr_child_requires_alloc(&payload, "value")?,
+                "raw_ptr_cast" | "int_cast" => self.expr_child_requires_alloc(&payload, "value")?,
                 "raw_load" => self.expr_child_requires_alloc(&payload, "pointer")?,
                 "raw_store" => {
                     self.expr_child_requires_alloc(&payload, "pointer")?
@@ -8615,6 +8827,7 @@ impl CodeDb {
                 }
                 "box_new" => self.expr_child_requires_unsafe(&payload, "value")?,
                 "unbox" => self.expr_child_requires_unsafe(&payload, "value")?,
+                "int_cast" => self.expr_child_requires_unsafe(&payload, "value")?,
                 "vec_new" => self.expr_child_requires_unsafe(&payload, "capacity")?,
                 "vec_push" => {
                     self.expr_child_requires_unsafe(&payload, "target")?
@@ -9077,19 +9290,21 @@ impl CodeDb {
                 )?;
                 let bool_hash = type_hash_for("Bool");
                 match op {
-                    "+" | "-" | "*" | "/" | "%" => {
-                        let i64_hash = type_hash_for("I64");
-                        if left != i64_hash || right != i64_hash {
-                            bail!("integer op requires i64 operands");
+                    "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>" => {
+                        if scalar_int_type_by_hash(&left).is_none() {
+                            bail!("integer op requires a sized integer operand");
                         }
-                        i64_hash
+                        if left != right {
+                            bail!("integer op operands differ");
+                        }
+                        left
                     }
                     "==" | "!=" | "<" | "<=" | ">" | ">=" => {
                         if left != right {
                             bail!("comparison operands differ");
                         }
-                        if left != type_hash_for("I64") && left != type_hash_for("U8") {
-                            bail!("comparison op requires i64 or u8 operands");
+                        if scalar_int_type_by_hash(&left).is_none() {
+                            bail!("comparison op requires sized integer operands");
                         }
                         bool_hash
                     }
@@ -9119,11 +9334,11 @@ impl CodeDb {
                     locals,
                 )?;
                 match op {
-                    "-" => {
-                        if child_type != type_hash_for("I64") {
-                            bail!("integer unary op requires i64 operand");
+                    "-" | "~" => {
+                        if scalar_int_type_by_hash(&child_type).is_none() {
+                            bail!("integer unary op requires a sized integer operand");
                         }
-                        type_hash_for("I64")
+                        child_type
                     }
                     "!" => {
                         if child_type != type_hash_for("Bool") {
@@ -9386,6 +9601,36 @@ impl CodeDb {
                     bail!("unbox box_type mismatch");
                 }
                 element_type
+            }
+            "int_cast" => {
+                // Re-derive: the operand must be a sized integer, the recorded
+                // `source_type` must match it, and the declared target `type` must
+                // itself be a sized integer (R6).
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("int_cast missing value"))?;
+                let source = self.verify_expr_type_with_locals(
+                    value_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if scalar_int_type_by_hash(&source).is_none() {
+                    bail!("int_cast operand is not a sized integer");
+                }
+                if payload.get("source_type").and_then(JsonValue::as_str) != Some(source.as_str()) {
+                    bail!("int_cast source_type mismatch");
+                }
+                let target = payload
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("int_cast missing type"))?;
+                if scalar_int_type_by_hash(target).is_none() {
+                    bail!("int_cast target is not a sized integer");
+                }
+                target.to_string()
             }
             "vec_new" => {
                 let capacity_hash = payload

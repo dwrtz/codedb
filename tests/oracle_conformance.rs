@@ -54,66 +54,130 @@ fn can_build_default_native_target() -> bool {
 /// One operator fixture: a zero-arg entry whose body exercises exactly the named
 /// lowered `kind`, with the result the evaluator and native backend must agree on.
 struct Fixture {
-    kind: &'static str,
-    entry: &'static str,
-    ret: &'static str,
-    body: &'static str,
-    expect_flag: &'static str,
-    expect: &'static str,
+    kind: String,
+    entry: String,
+    ret: String,
+    body: String,
+    expect_flag: String,
+    expect: String,
 }
 
-const fn f(
-    kind: &'static str,
-    entry: &'static str,
-    ret: &'static str,
-    body: &'static str,
-    expect_flag: &'static str,
-    expect: &'static str,
-) -> Fixture {
-    Fixture {
-        kind,
-        entry,
-        ret,
-        body,
-        expect_flag,
-        expect,
+const BOOL: &str = "--expect-bool";
+
+/// The sized integer widths, mirroring `SCALAR_INT_TYPES`.
+const WIDTHS: &[(&str, u32, bool)] = &[
+    ("i8", 1, true),
+    ("i16", 2, true),
+    ("i32", 4, true),
+    ("i64", 8, true),
+    ("u8", 1, false),
+    ("u16", 2, false),
+    ("u32", 4, false),
+    ("u64", 8, false),
+];
+
+/// Reduce `value` (a full-precision result) into width `width_bytes`, formatted as
+/// the decimal text the `--expect-int` flag wants — the wrapping the evaluator and
+/// backend both apply.
+fn wrap_to_width(value: i128, width_bytes: u32, signed: bool) -> String {
+    let bits = u32::from(width_bytes) * 8;
+    let modulus = 1i128 << bits;
+    let masked = value.rem_euclid(modulus);
+    if signed && masked >= (1i128 << (bits - 1)) {
+        (masked - modulus).to_string()
+    } else {
+        masked.to_string()
     }
 }
 
-const I64: &str = "--expect-i64";
-const BOOL: &str = "--expect-bool";
-
-/// One fixture per registered operator. u8 operands are produced by byte-string
-/// indexing (`b"a"[0]`), the only way to spell a `u8` value in source today.
+/// One fixture per registered operator. The boolean operators are fixed; the
+/// integer operators are generated for every width, so the coverage gate stays
+/// satisfied as widths are added. Operands `a = 12`, `b = 3` keep arithmetic/
+/// bitwise/shift results in range for every width (only negate/complement of an
+/// unsigned width wrap, handled by `wrap_to_width`).
 fn fixtures() -> Vec<Fixture> {
-    vec![
-        // i64 arithmetic
-        f("add_i64", "op_add_i64", "i64", "2 + 3", I64, "5"),
-        f("sub_i64", "op_sub_i64", "i64", "7 - 4", I64, "3"),
-        f("mul_i64", "op_mul_i64", "i64", "6 * 7", I64, "42"),
-        f("div_i64", "op_div_i64", "i64", "20 / 4", I64, "5"),
-        f("mod_i64", "op_mod_i64", "i64", "17 % 5", I64, "2"),
-        // i64 comparisons
-        f("eq_i64", "op_eq_i64", "bool", "2 == 2", BOOL, "true"),
-        f("ne_i64", "op_ne_i64", "bool", "2 != 3", BOOL, "true"),
-        f("lt_i64", "op_lt_i64", "bool", "1 < 2", BOOL, "true"),
-        f("le_i64", "op_le_i64", "bool", "2 <= 2", BOOL, "true"),
-        f("gt_i64", "op_gt_i64", "bool", "3 > 2", BOOL, "true"),
-        f("ge_i64", "op_ge_i64", "bool", "3 >= 3", BOOL, "true"),
-        // u8 comparisons (operands via byte-string indexing)
-        f("eq_u8", "op_eq_u8", "bool", "b\"a\"[0] == b\"a\"[0]", BOOL, "true"),
-        f("ne_u8", "op_ne_u8", "bool", "b\"a\"[0] != b\"b\"[0]", BOOL, "true"),
-        f("lt_u8", "op_lt_u8", "bool", "b\"a\"[0] < b\"b\"[0]", BOOL, "true"),
-        f("le_u8", "op_le_u8", "bool", "b\"a\"[0] <= b\"a\"[0]", BOOL, "true"),
-        f("gt_u8", "op_gt_u8", "bool", "b\"b\"[0] > b\"a\"[0]", BOOL, "true"),
-        f("ge_u8", "op_ge_u8", "bool", "b\"b\"[0] >= b\"b\"[0]", BOOL, "true"),
-        // bool binary
-        f("and_bool", "op_and_bool", "bool", "true && false", BOOL, "false"),
-        f("or_bool", "op_or_bool", "bool", "true || false", BOOL, "true"),
-        // unary
-        f("neg_i64", "op_neg_i64", "i64", "-5", I64, "-5"),
-        f("not_bool", "op_not_bool", "bool", "!false", BOOL, "true"),
-    ]
+    let mut out = Vec::new();
+    let push = |out: &mut Vec<Fixture>, kind: String, ret: &str, body: String, expect_flag: &str, expect: String| {
+        out.push(Fixture {
+            entry: format!("op_{kind}"),
+            kind,
+            ret: ret.to_string(),
+            body,
+            expect_flag: expect_flag.to_string(),
+            expect,
+        });
+    };
+
+    // Boolean operators.
+    push(&mut out, "and_bool".into(), "bool", "true && false".into(), BOOL, "false".into());
+    push(&mut out, "or_bool".into(), "bool", "true || false".into(), BOOL, "true".into());
+    push(&mut out, "not_bool".into(), "bool", "!false".into(), BOOL, "true".into());
+
+    let (a, b): (i128, i128) = (12, 3);
+    for &(t, width, signed) in WIDTHS {
+        let int_flag = "--expect-int";
+        let bind = |expr: &str| format!("let x: {t} = 12 in let y: {t} = 3 in {expr}");
+        // Arithmetic / bitwise / shift -> same width.
+        let binops: &[(&str, &str, i128)] = &[
+            ("add", "+", a + b),
+            ("sub", "-", a - b),
+            ("mul", "*", a * b),
+            ("div", "/", a / b),
+            ("mod", "%", a % b),
+            ("and", "&", a & b),
+            ("or", "|", a | b),
+            ("xor", "^", a ^ b),
+            ("shl", "<<", a << b),
+            ("shr", ">>", a >> b),
+        ];
+        for &(verb, op, result) in binops {
+            push(
+                &mut out,
+                format!("{verb}_{t}"),
+                t,
+                bind(&format!("x {op} y")),
+                int_flag,
+                format!("{t}:{}", wrap_to_width(result, width, signed)),
+            );
+        }
+        // Comparisons -> bool.
+        let cmps: &[(&str, &str, bool)] = &[
+            ("eq", "==", a == b),
+            ("ne", "!=", a != b),
+            ("lt", "<", a < b),
+            ("le", "<=", a <= b),
+            ("gt", ">", a > b),
+            ("ge", ">=", a >= b),
+        ];
+        for &(verb, op, result) in cmps {
+            push(
+                &mut out,
+                format!("{verb}_{t}"),
+                "bool",
+                bind(&format!("x {op} y")),
+                BOOL,
+                result.to_string(),
+            );
+        }
+        // Unary negate / bitwise complement -> same width.
+        push(
+            &mut out,
+            format!("neg_{t}"),
+            t,
+            format!("let x: {t} = 12 in -x"),
+            int_flag,
+            format!("{t}:{}", wrap_to_width(-a, width, signed)),
+        );
+        push(
+            &mut out,
+            format!("bitnot_{t}"),
+            t,
+            format!("let x: {t} = 12 in ~x"),
+            int_flag,
+            format!("{t}:{}", wrap_to_width(!a, width, signed)),
+        );
+    }
+    out
 }
 
 /// The trap helpers (separate from the fixtures): `div_zero` divides by a
@@ -148,12 +212,14 @@ fn ir_contains_kind(ir: &JsonValue, kind: &str) -> bool {
 fn conformance_fixtures_cover_every_registered_operator() {
     // The honesty gate: every operator the registry knows must have a fixture.
     // Adding an `OPS` row without a fixture here makes these sets diverge.
-    let mut covered: Vec<&str> = fixtures().iter().map(|fixture| fixture.kind).collect();
-    covered.sort_unstable();
+    let mut covered: Vec<String> = fixtures().iter().map(|fixture| fixture.kind.clone()).collect();
+    covered.sort();
     covered.dedup();
+    let mut registered: Vec<String> =
+        codedb::operator_kinds().iter().map(|k| k.to_string()).collect();
+    registered.sort();
     assert_eq!(
-        covered,
-        codedb::operator_kinds(),
+        covered, registered,
         "every registered operator needs a conformance fixture (add one to fixtures())"
     );
 }
@@ -172,10 +238,10 @@ fn every_operator_lowers_to_its_kind_and_agrees_across_eval_and_native() {
     // agreement check below is exercising the operator it claims to.
     for fixture in &fixtures {
         let ir_path = temp.path().join(format!("{}.ir.json", fixture.entry));
-        run(&["emit-ir", path(&db), fixture.entry, "--out", path(&ir_path)]);
+        run(&["emit-ir", path(&db), fixture.entry.as_str(), "--out", path(&ir_path)]);
         let ir = read_json(&ir_path);
         assert!(
-            ir_contains_kind(&ir, fixture.kind),
+            ir_contains_kind(&ir, &fixture.kind),
             "fixture {} did not lower to a {} op",
             fixture.entry,
             fixture.kind
@@ -189,7 +255,7 @@ fn every_operator_lowers_to_its_kind_and_agrees_across_eval_and_native() {
             path(&db),
             &format!("conf_{}", fixture.kind),
             "--entry",
-            fixture.entry,
+            fixture.entry.as_str(),
             &format!("{}={}", fixture.expect_flag, fixture.expect),
             "--native-required",
             "--json",

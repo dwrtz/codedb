@@ -408,8 +408,9 @@ impl CodeDb {
             bail!("native scalar harness entry must not take parameters");
         }
         match self.type_spec_in_root(&root, &return_type_hash)? {
-            TypeSpec::Builtin(kind) if kind == "I64" || kind == "U8" || kind == "Bool" => {}
-            _ => bail!("native scalar harness entry must return i64, u8, or bool"),
+            TypeSpec::Builtin(kind)
+                if crate::types::scalar_int_type(&kind).is_some() || kind == "Bool" => {}
+            _ => bail!("native scalar harness entry must return a sized integer or bool"),
         }
         let entry_abi_symbol = prepared
             .plan
@@ -967,11 +968,10 @@ impl CodeDb {
         if !params.is_empty() {
             bail!("native executable entry must not take parameters");
         }
-        if return_type != type_hash_for("I64")
-            && return_type != type_hash_for("U8")
+        if crate::types::scalar_int_type_by_hash(&return_type).is_none()
             && return_type != type_hash_for("Bool")
         {
-            bail!("native executable entry must return i64, u8, or bool");
+            bail!("native executable entry must return a sized integer or bool");
         }
         Ok(())
     }

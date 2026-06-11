@@ -464,6 +464,54 @@ pub type ValueCell = Rc<RefCell<Value>>;
 /// the given sized-integer type. The single place the evaluator widens a literal
 /// token to a typed value; its radix handling mirrors `int_literal_in_range`, so a
 /// literal that type-checks parses here.
+/// The canonical 64-bit constant for an integer literal: the value (parsed at its
+/// width, hex or decimal) reinterpreted as `i64`. Lowering stores this so the
+/// backend and constant-index map read one decimal form regardless of width or
+/// radix (a u64 with the high bit set becomes a negative i64 bit pattern).
+pub(crate) fn int_literal_const_i64(value: &str, int: &crate::types::ScalarIntType) -> Result<i64> {
+    Ok(match int_literal_value(value, int)? {
+        Value::I8(x) => i64::from(x),
+        Value::I16(x) => i64::from(x),
+        Value::I32(x) => i64::from(x),
+        Value::I64(x) => x,
+        Value::U8(x) => i64::from(x),
+        Value::U16(x) => i64::from(x),
+        Value::U32(x) => i64::from(x),
+        Value::U64(x) => x as i64,
+        other => bail!("integer literal produced a non-integer value: {other}"),
+    })
+}
+
+/// Cast an integer [`Value`] to a target width/signedness with the `as` semantics
+/// the native backend reproduces (truncate on narrowing, sign-/zero-extend on
+/// widening, bit-reinterpret on a same-width sign change). The source's
+/// mathematical value goes through `i128`, then a final `as` to the target type
+/// applies the wrap/reinterpret.
+pub(crate) fn cast_int_value(value: &Value, target: &crate::types::ScalarIntType) -> Result<Value> {
+    let x: i128 = match value {
+        Value::I8(n) => i128::from(*n),
+        Value::I16(n) => i128::from(*n),
+        Value::I32(n) => i128::from(*n),
+        Value::I64(n) => i128::from(*n),
+        Value::U8(n) => i128::from(*n),
+        Value::U16(n) => i128::from(*n),
+        Value::U32(n) => i128::from(*n),
+        Value::U64(n) => i128::from(*n),
+        other => bail!("cannot cast non-integer value {other}"),
+    };
+    Ok(match (target.signed, target.width) {
+        (true, 1) => Value::I8(x as i8),
+        (true, 2) => Value::I16(x as i16),
+        (true, 4) => Value::I32(x as i32),
+        (true, 8) => Value::I64(x as i64),
+        (false, 1) => Value::U8(x as u8),
+        (false, 2) => Value::U16(x as u16),
+        (false, 4) => Value::U32(x as u32),
+        (false, 8) => Value::U64(x as u64),
+        _ => bail!("unsupported cast target width {}", target.width),
+    })
+}
+
 pub(crate) fn int_literal_value(value: &str, int: &crate::types::ScalarIntType) -> Result<Value> {
     let (radix, digits) = match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
         Some(hex) => (16, hex),
@@ -536,8 +584,14 @@ impl Drop for EvalCallDepthGuard {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Value::I8(left), Value::I8(right)) => left == right,
+            (Value::I16(left), Value::I16(right)) => left == right,
+            (Value::I32(left), Value::I32(right)) => left == right,
             (Value::I64(left), Value::I64(right)) => left == right,
             (Value::U8(left), Value::U8(right)) => left == right,
+            (Value::U16(left), Value::U16(right)) => left == right,
+            (Value::U32(left), Value::U32(right)) => left == right,
+            (Value::U64(left), Value::U64(right)) => left == right,
             (Value::Bool(left), Value::Bool(right)) => left == right,
             (Value::Unit, Value::Unit) => true,
             (Value::SharedRef(left), Value::SharedRef(right))
@@ -788,8 +842,14 @@ impl CodeDb {
         type_hash: &str,
     ) -> Result<bool> {
         match (value, self.type_spec_in_root(root, type_hash)?) {
+            (Value::I8(_), TypeSpec::Builtin(kind)) => Ok(kind == "I8"),
+            (Value::I16(_), TypeSpec::Builtin(kind)) => Ok(kind == "I16"),
+            (Value::I32(_), TypeSpec::Builtin(kind)) => Ok(kind == "I32"),
             (Value::I64(_), TypeSpec::Builtin(kind)) => Ok(kind == "I64"),
             (Value::U8(_), TypeSpec::Builtin(kind)) => Ok(kind == "U8"),
+            (Value::U16(_), TypeSpec::Builtin(kind)) => Ok(kind == "U16"),
+            (Value::U32(_), TypeSpec::Builtin(kind)) => Ok(kind == "U32"),
+            (Value::U64(_), TypeSpec::Builtin(kind)) => Ok(kind == "U64"),
             (Value::Bool(_), TypeSpec::Builtin(kind)) => Ok(kind == "Bool"),
             (Value::Unit, TypeSpec::Builtin(kind)) => Ok(kind == "Unit"),
             (
@@ -1077,6 +1137,20 @@ impl CodeDb {
                     Value::Boxed(cell) => Ok(cell.borrow().clone()),
                     _ => bail!("unbox expects a boxed value"),
                 }
+            }
+            "int_cast" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("int_cast missing value"))?;
+                let target_hash = payload
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("int_cast missing type"))?;
+                let target = crate::types::scalar_int_type_by_hash(target_hash)
+                    .ok_or_else(|| anyhow!("int_cast target is not a sized integer"))?;
+                let value = self.eval_expr_with_locals(root_hash, value_hash, args, locals)?;
+                cast_int_value(&value, target)
             }
             "vec_new" => {
                 let capacity_hash = payload
@@ -2446,6 +2520,30 @@ impl CodeDb {
                     )?
                 )
             }
+            "int_cast" => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("int_cast missing value"))?;
+                let target = payload
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("int_cast missing type"))?;
+                let target_name = crate::types::scalar_int_source_name_for_hash(target)
+                    .ok_or_else(|| anyhow!("int_cast target is not a sized integer"))?;
+                format!(
+                    "to_{target_name}({})",
+                    self.expr_to_source_with_locals(
+                        value,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
             "vec_new" => {
                 let capacity = payload
                     .get("capacity")
@@ -3033,15 +3131,17 @@ impl CodeDb {
                 let arm_count = arms.len();
                 let rendered_arms = arms
                     .iter()
-                    .enumerate()
-                    .map(|(arm_index, arm)| {
-                        // A nested low-precedence body — notably another `case`,
-                        // whose `| arm` list the OUTER case would otherwise capture
-                        // — must be parenthesized, except in the last arm where
-                        // nothing follows it to capture. Without this, a nested
-                        // non-last `case` projects to text that won't re-parse
-                        // (SPEC_V3 §11 checked-view round-trip).
-                        let body_prec = if arm_index + 1 == arm_count { 0 } else { 1 };
+                    .map(|arm| {
+                        // A nested low-precedence body must be parenthesized so the
+                        // OUTER case's `| arm` list (or a bitwise `|` in the body)
+                        // re-parses correctly (SPEC_V3 §11 checked-view round-trip).
+                        // Rendering at the case-arm-body floor parenthesizes both a
+                        // nested `case`/`if`/`let`/`fold` and a top-level bitwise `|`
+                        // (whose precedence sits just below the floor): the arm-body
+                        // parser ends at a top-level `|`, so it must be parenthesized
+                        // in every arm, including the last.
+                        let _ = arm_count;
+                        let body_prec = crate::op_registry::CASE_ARM_BODY_MIN_PRECEDENCE;
                         let binding = arm.get("binding_name").and_then(JsonValue::as_str);
                         // An `if <guard>` (R14) renders between the pattern and `=>`.
                         // Scalar arms bind nothing, so the guard renders in the current
@@ -3572,6 +3672,27 @@ impl CodeDb {
                     )?,
                 ],
             }),
+            "int_cast" => {
+                let target = payload
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("int_cast missing type"))?;
+                let target_name = crate::types::scalar_int_source_name_for_hash(target)
+                    .ok_or_else(|| anyhow!("int_cast target is not a sized integer"))?;
+                Ok(RawExpr::Call {
+                    name: format!("to_{target_name}"),
+                    args: vec![self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("int_cast missing value"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?],
+                })
+            }
             "vec_new" => Ok(RawExpr::Call {
                 name: "vec_new".to_string(),
                 args: vec![
@@ -4216,7 +4337,11 @@ fn assignment_precedence() -> u8 {
 }
 
 fn field_access_precedence() -> u8 {
-    8
+    // Postfix field access / indexing binds tightest — above unary
+    // (`op_registry::UNARY_PRECEDENCE`), so `-x.f` projects without parenthesizing
+    // `x.f`. Kept above the rescaled operator precedences (Phase 9 widened the
+    // binary precedence scale; this must stay the maximum).
+    80
 }
 
 fn signature_region_name_map(params: &[RegionParamDef]) -> BTreeMap<String, String> {
@@ -4404,6 +4529,13 @@ impl CodeDb {
                     .get("expr")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("unary missing expr"))?;
+                self.collect_expr_deps(root, child, deps)?;
+            }
+            "int_cast" => {
+                let child = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("int_cast missing value"))?;
                 self.collect_expr_deps(root, child, deps)?;
             }
             "borrow_shared" | "borrow_mut" => {
@@ -4705,6 +4837,12 @@ pub(crate) fn parse_signature_source_with_effects(
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// When set, a top-level `|` ends the current expression instead of parsing
+    /// as bitwise-OR. Set only while parsing a `case`-arm body, so the arm
+    /// separator `|` is not swallowed by the (lowest-precedence) bitwise-OR
+    /// operator; cleared inside `parse_primary`, so a parenthesized `(a | b)` is
+    /// the escape hatch for a bitwise-OR within an arm body.
+    bitor_terminates: bool,
 }
 
 impl Parser {
@@ -4712,6 +4850,7 @@ impl Parser {
         Ok(Self {
             tokens: lex(source)?,
             pos: 0,
+            bitor_terminates: false,
         })
     }
 
@@ -5037,7 +5176,7 @@ impl Parser {
                     // the catch-all default and must be last.
                     let guard = self.parse_optional_case_guard()?;
                     self.expect_symbol("=>")?;
-                    let body = self.parse_expr()?;
+                    let body = self.with_bitor_terminates(true, |p| p.parse_expr())?;
                     let guarded = guard.is_some();
                     arms.push(RawCaseArm {
                         variant: None,
@@ -5072,7 +5211,7 @@ impl Parser {
                         };
                         let guard = self.parse_optional_case_guard()?;
                         self.expect_symbol("=>")?;
-                        let body = self.parse_expr()?;
+                        let body = self.with_bitor_terminates(true, |p| p.parse_expr())?;
                         arms.push(RawCaseArm {
                             variant: None,
                             literal: None,
@@ -5090,7 +5229,7 @@ impl Parser {
                     } else {
                         let guard = self.parse_optional_case_guard()?;
                         self.expect_symbol("=>")?;
-                        let body = self.parse_expr()?;
+                        let body = self.with_bitor_terminates(true, |p| p.parse_expr())?;
                         arms.push(RawCaseArm {
                             variant: None,
                             literal: Some(Box::new(literal)),
@@ -5125,7 +5264,7 @@ impl Parser {
                     };
                     let guard = self.parse_optional_case_guard()?;
                     self.expect_symbol("=>")?;
-                    let body = self.parse_expr()?;
+                    let body = self.with_bitor_terminates(true, |p| p.parse_expr())?;
                     arms.push(RawCaseArm {
                         variant: Some(variant),
                         literal: None,
@@ -5225,7 +5364,29 @@ impl Parser {
     fn parse_binary_prec(&mut self, min_prec: u8) -> Result<RawExpr> {
         let mut left = self.parse_unary()?;
         loop {
-            let op = match self.peek() {
+            // The shift operators are two adjacent `<`/`>` tokens (the lexer keeps
+            // them separate so nested generic types like `box<Editor<'a>>` still
+            // close with single `>`s — type parsing never reaches here). Detect the
+            // pair before the single-token comparison operator.
+            let first = self.peek().clone();
+            let op = match &first {
+                Token::Symbol(s) if s == "<" => {
+                    if matches!(self.peek_second(), Token::Symbol(t) if t == "<") {
+                        "<<".to_string()
+                    } else {
+                        "<".to_string()
+                    }
+                }
+                Token::Symbol(s) if s == ">" => {
+                    if matches!(self.peek_second(), Token::Symbol(t) if t == ">") {
+                        ">>".to_string()
+                    } else {
+                        ">".to_string()
+                    }
+                }
+                // In a `case`-arm body a top-level `|` is the arm separator, not
+                // bitwise-OR (which is parenthesized there); end the expression.
+                Token::Symbol(s) if s == "|" && self.bitor_terminates => break,
                 Token::Symbol(op) if is_binary_op(op) => op.clone(),
                 _ => break,
             };
@@ -5233,7 +5394,12 @@ impl Parser {
             if prec < min_prec {
                 break;
             }
-            self.next();
+            if op == "<<" || op == ">>" {
+                self.next();
+                self.next();
+            } else {
+                self.next();
+            }
             let right = self.parse_binary_prec(prec + 1)?;
             left = RawExpr::Binary {
                 op,
@@ -5244,9 +5410,34 @@ impl Parser {
         Ok(left)
     }
 
+    /// The next non-comment token after the current one, for two-token operator
+    /// lookahead (`<<` / `>>`). Does not advance the cursor.
+    fn peek_second(&mut self) -> Token {
+        self.skip_comments();
+        let mut j = self.pos + 1;
+        while matches!(self.tokens.get(j), Some(Token::Comment(_))) {
+            j += 1;
+        }
+        self.tokens.get(j).cloned().unwrap_or(Token::Eof)
+    }
+
+    /// Run `f` with `bitor_terminates` temporarily set to `value`, restoring the
+    /// previous value afterward (so nesting composes).
+    fn with_bitor_terminates<T>(
+        &mut self,
+        value: bool,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let saved = self.bitor_terminates;
+        self.bitor_terminates = value;
+        let result = f(self);
+        self.bitor_terminates = saved;
+        result
+    }
+
     fn parse_unary(&mut self) -> Result<RawExpr> {
         match self.peek() {
-            Token::Symbol(op) if op == "-" || op == "!" => {
+            Token::Symbol(op) if op == "-" || op == "!" || op == "~" => {
                 let op = op.clone();
                 self.next();
                 Ok(RawExpr::Unary {
@@ -5303,6 +5494,14 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<RawExpr> {
+        // A primary is a leaf or a fully-delimited form (parens, call args, array,
+        // record, enum payload); none of its sub-expressions is the tail of a
+        // `case` arm, so bitwise-OR parses normally inside it. This is what makes
+        // `(a | b)` the escape hatch for `|` inside an arm body.
+        self.with_bitor_terminates(false, |p| p.parse_primary_inner())
+    }
+
+    fn parse_primary_inner(&mut self) -> Result<RawExpr> {
         match self.next() {
             Token::Number(value) => Ok(RawExpr::LiteralI64 { value }),
             Token::String(value) => Ok(RawExpr::LiteralString { value }),
@@ -5683,9 +5882,18 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             tokens.push(Token::Ident(chars[start..i].iter().collect()));
         } else if ch.is_ascii_digit() {
             let start = i;
-            i += 1;
-            while i < chars.len() && chars[i].is_ascii_digit() {
+            if ch == '0' && i + 1 < chars.len() && (chars[i + 1] == 'x' || chars[i + 1] == 'X') {
+                // Hex literal `0x...` — the number text carries the `0x` prefix and
+                // the literal range-check / evaluator parse it (R6, Phase 9).
+                i += 2;
+                while i < chars.len() && chars[i].is_ascii_hexdigit() {
+                    i += 1;
+                }
+            } else {
                 i += 1;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
             }
             tokens.push(Token::Number(chars[start..i].iter().collect()));
         } else if ch == '"' {

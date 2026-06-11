@@ -93,6 +93,9 @@ enum Command {
         expect_bool: Option<bool>,
         #[arg(long)]
         expect_unit: bool,
+        /// Sized-integer expectation as `TYPE:VALUE`, e.g. `u32:705032704`.
+        #[arg(long)]
+        expect_int: Option<String>,
         #[arg(long)]
         category: Option<String>,
         #[arg(long)]
@@ -739,6 +742,7 @@ fn main() -> Result<()> {
             expect_i64,
             expect_bool,
             expect_unit,
+            expect_int,
             category,
             native_agreement,
             native_required,
@@ -755,6 +759,7 @@ fn main() -> Result<()> {
                     expect_i64.as_deref(),
                     expect_bool,
                     expect_unit,
+                    expect_int.as_deref(),
                     category.as_deref(),
                     native_agreement,
                     native_required,

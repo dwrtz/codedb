@@ -16,10 +16,11 @@ use crate::lowering::{
     lowered_value_debug_ops,
 };
 use crate::model::ProgramRootPayload;
+use crate::op_registry::{ArithOp, BitOp, Cmp, IntKind, SemOp, ShiftOp, sem_for_kind};
 use crate::store::{
     CodeDb, cache_key_for_input, canonical_json, function_interface_metadata, hash_bytes,
 };
-use crate::types::{hex_to_bytes, type_hash_for};
+use crate::types::{hex_to_bytes, scalar_int_type_by_hash, type_hash_for};
 use crate::{APPLE_ARM64_TARGET, BYTES_DOMAIN, LINUX_X86_64_TARGET, MAIN_BRANCH};
 
 pub(crate) const ELF_BACKEND_ID: &str = "native-elf-x86_64-v0";
@@ -61,29 +62,24 @@ pub(crate) enum NativeArch {
 #[allow(dead_code)]
 pub(crate) fn backend_encodes_kind(arch: NativeArch, kind: &str) -> bool {
     let _ = arch;
+    // Both targets encode every operator semantic the registry defines (the
+    // per-semantic encoders are width-parametric). Matching the `SemOp` shapes
+    // explicitly keeps this gate honest: a future `SemOp` variant that the
+    // backend does not handle would not be listed here and would fail the
+    // `every_op_has_backend_encoders` coverage test.
     matches!(
-        kind,
-        "add_i64"
-            | "sub_i64"
-            | "mul_i64"
-            | "div_i64"
-            | "mod_i64"
-            | "eq_i64"
-            | "ne_i64"
-            | "lt_i64"
-            | "le_i64"
-            | "gt_i64"
-            | "ge_i64"
-            | "eq_u8"
-            | "ne_u8"
-            | "lt_u8"
-            | "le_u8"
-            | "gt_u8"
-            | "ge_u8"
-            | "and_bool"
-            | "or_bool"
-            | "neg_i64"
-            | "not_bool"
+        sem_for_kind(kind),
+        Some(
+            SemOp::Arith(..)
+                | SemOp::Cmp(..)
+                | SemOp::Bit(..)
+                | SemOp::Shift(..)
+                | SemOp::Neg(..)
+                | SemOp::BitNot(..)
+                | SemOp::AndBool
+                | SemOp::OrBool
+                | SemOp::NotBool
+        )
     )
 }
 
@@ -684,6 +680,7 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::ConstBool { .. }
             | LoweredOp::ConstUnit { .. }
             | LoweredOp::Unary { .. }
+            | LoweredOp::IntCast { .. }
             | LoweredOp::Binary { .. }
             | LoweredOp::BorrowShared { .. }
             | LoweredOp::BorrowMut { .. }
@@ -792,6 +789,7 @@ fn validate_native_ops(
             | LoweredOp::ConstBool { type_hash, .. }
             | LoweredOp::ConstUnit { type_hash, .. }
             | LoweredOp::Unary { type_hash, .. }
+            | LoweredOp::IntCast { type_hash, .. }
             | LoweredOp::Binary { type_hash, .. }
             | LoweredOp::Call { type_hash, .. }
             | LoweredOp::If { type_hash, .. }
@@ -976,19 +974,12 @@ fn native_supported_type(
     if type_hash == i64_type || type_hash == bool_type || type_hash == unit_type {
         return Ok(());
     }
-    // Signed narrow integers (i8/i16/i32) need a SIGN-extending load that the v0
-    // backend does not yet emit — it only zero-extends (correct for the unsigned
-    // widths u8/u16/u32/u64, wrong for a negative signed value). Fail closed here
-    // until sign-extension lands, rather than silently miscompile; the reference
-    // evaluator handles every width, so eval stays a faithful oracle (R5, Phase 9).
-    if ["I8", "I16", "I32"]
-        .iter()
-        .any(|name| type_hash == crate::types::type_hash_for(name))
-    {
-        bail!(
-            "native object backend does not yet support signed narrow integers (i8/i16/i32): \
-             sign-extending loads are unimplemented — use i64 or an unsigned width (u8/u16/u32/u64)"
-        );
+    // Every sized integer width is now supported natively: signed narrow loads
+    // sign-extend (movsx / ldrs*) and narrow operation results are re-normalized to
+    // the canonical slot form, so eval and native agree across i8/i16/i32/u16/u32/
+    // u64 (R5, Phase 9). Other scalar widths fall through to the layout check.
+    if scalar_int_type_by_hash(type_hash).is_some() {
+        return Ok(());
     }
     let layout = native_type_layout(type_layouts, type_hash)?;
     match layout.kind.as_str() {
@@ -1030,6 +1021,11 @@ fn validate_native_op_flow(
             value,
             type_hash,
             ..
+        }
+        | LoweredOp::IntCast {
+            id,
+            value,
+            type_hash,
         } => {
             native_value_type(values, value)?;
             native_insert_value(values, id, type_hash)?;
@@ -2394,6 +2390,7 @@ fn collect_value_ids_inner(
             | LoweredOp::ConstBool { id, .. }
             | LoweredOp::ConstUnit { id, .. }
             | LoweredOp::Unary { id, .. }
+            | LoweredOp::IntCast { id, .. }
             | LoweredOp::Binary { id, .. }
             | LoweredOp::Call { id, .. }
             | LoweredOp::BorrowShared { id, .. }
@@ -2641,6 +2638,13 @@ impl FunctionEmitter {
                 id, kind, value, ..
             } => {
                 self.emit_unary(kind, value)?;
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::IntCast { id, value, type_hash } => {
+                let int = scalar_int_type_by_hash(type_hash)
+                    .ok_or_else(|| anyhow!("int_cast target is not a sized integer"))?;
+                self.mov_rax_stack(self.value_offset(value)?);
+                self.renormalize_x86(IntKind { width: int.width, signed: int.signed });
                 self.mov_stack_rax(self.value_offset(id)?);
             }
             LoweredOp::Binary {
@@ -3114,9 +3118,19 @@ impl FunctionEmitter {
 
     fn emit_load_addressed_value(&mut self, type_hash: &str, address: &str) -> Result<()> {
         self.mov_rax_stack(self.value_offset(address)?);
+        // A signed narrow integer (i8/i16/i32) is held sign-extended in its slot
+        // (the canonical register form); everything else zero-extends. Sizes 2/4
+        // only reach this register-load path for scalar integers (an aggregate of
+        // size 2..=7 takes the byte-copy path in `_to_stack`).
+        let signed = scalar_int_type_by_hash(type_hash).is_some_and(|t| t.signed);
         match self.type_size(type_hash)? {
             0 => self.mov_rax_imm32(0),
+            1 if signed => self.text.extend_from_slice(&[0x48, 0x0f, 0xbe, 0x00]), // movsx rax, byte [rax]
             1 => self.movzx_rax_memb_rax(),
+            2 if signed => self.text.extend_from_slice(&[0x48, 0x0f, 0xbf, 0x00]), // movsx rax, word [rax]
+            2 => self.text.extend_from_slice(&[0x48, 0x0f, 0xb7, 0x00]),          // movzx rax, word [rax]
+            4 if signed => self.text.extend_from_slice(&[0x48, 0x63, 0x00]),      // movsxd rax, dword [rax]
+            4 => self.text.extend_from_slice(&[0x8b, 0x00]),                      // mov eax, [rax] (zero-extends)
             8 => self.mov_rax_mem_rax(),
             size => bail!("native x86_64 backend cannot load scalar size {size}"),
         }
@@ -3130,12 +3144,20 @@ impl FunctionEmitter {
         address: &str,
     ) -> Result<()> {
         let value_offset = self.value_offset(id)?;
-        match self.type_size(type_hash)? {
+        let size = self.type_size(type_hash)?;
+        let is_scalar_int = scalar_int_type_by_hash(type_hash).is_some();
+        match size {
             0 | 1 | 8 => {
                 self.emit_load_addressed_value(type_hash, address)?;
                 self.mov_stack_rax(value_offset);
             }
-            size @ 2..=7 => {
+            2 | 4 if is_scalar_int => {
+                // A sized integer (i16/u16/i32/u32) loads through the register path
+                // so it is sign-/zero-extended to the canonical slot form.
+                self.emit_load_addressed_value(type_hash, address)?;
+                self.mov_stack_rax(value_offset);
+            }
+            2..=7 => {
                 self.mov_rax_imm32(0);
                 self.mov_stack_rax(value_offset);
                 self.copy_memory_from_stack_pointer_to_stack(
@@ -3251,71 +3273,133 @@ impl FunctionEmitter {
     }
 
     fn emit_unary(&mut self, kind: &str, value: &str) -> Result<()> {
+        let sem = sem_for_kind(kind)
+            .ok_or_else(|| anyhow!("unsupported lowered unary op for native object backend: {kind}"))?;
         self.mov_rax_stack(self.value_offset(value)?);
-        match kind {
-            "neg_i64" => self.text.extend_from_slice(&[0x48, 0xf7, 0xd8]),
-            "not_bool" => {
+        match sem {
+            SemOp::Neg(k) => {
+                self.text.extend_from_slice(&[0x48, 0xf7, 0xd8]); // neg rax
+                self.renormalize_x86(k);
+            }
+            SemOp::BitNot(k) => {
+                self.text.extend_from_slice(&[0x48, 0xf7, 0xd0]); // not rax
+                self.renormalize_x86(k);
+            }
+            SemOp::NotBool => {
                 self.text.extend_from_slice(&[0x48, 0x85, 0xc0]);
                 self.text.extend_from_slice(&[0x0f, 0x94, 0xc0]);
                 self.text.extend_from_slice(&[0x0f, 0xb6, 0xc0]);
             }
-            other => bail!("unsupported lowered unary op for native object backend: {other}"),
+            _ => bail!("unsupported lowered unary op for native object backend: {kind}"),
         }
         Ok(())
     }
 
     fn emit_binary(&mut self, kind: &str, left: &str, right: &str) -> Result<()> {
+        let sem = sem_for_kind(kind)
+            .ok_or_else(|| anyhow!("unsupported lowered binary op for native object backend: {kind}"))?;
         self.mov_rax_stack(self.value_offset(left)?);
         self.mov_rcx_stack(self.value_offset(right)?);
-        match kind {
-            "add_i64" => self.text.extend_from_slice(&[0x48, 0x01, 0xc8]),
-            "sub_i64" => self.text.extend_from_slice(&[0x48, 0x29, 0xc8]),
-            "mul_i64" => self.text.extend_from_slice(&[0x48, 0x0f, 0xaf, 0xc1]),
-            "div_i64" => {
-                self.text.extend_from_slice(&[0x48, 0x85, 0xc9]);
-                self.text.extend_from_slice(&[0x75, 0x02]);
-                self.text.extend_from_slice(&[0x0f, 0x0b]);
-                self.text.extend_from_slice(&[0x48, 0x99]);
-                self.text.extend_from_slice(&[0x48, 0xf7, 0xf9]);
+        match sem {
+            SemOp::Arith(op, k) => self.emit_int_arith_x86(op, k),
+            SemOp::Bit(op, k) => {
+                self.emit_int_bit_x86(op);
+                self.renormalize_x86(k);
             }
-            "mod_i64" => {
-                // Signed remainder: trap on a zero divisor (test/jne/ud2), then
-                // `cqo; idiv rcx` and take the remainder from RDX into RAX. Same
-                // divide sequence as div_i64; only the result register differs.
-                self.text.extend_from_slice(&[0x48, 0x85, 0xc9]); // test rcx, rcx
-                self.text.extend_from_slice(&[0x75, 0x02]); // jne +2
-                self.text.extend_from_slice(&[0x0f, 0x0b]); // ud2
-                self.text.extend_from_slice(&[0x48, 0x99]); // cqo
-                self.text.extend_from_slice(&[0x48, 0xf7, 0xf9]); // idiv rcx
-                self.mov_rax_rdx(); // remainder (rdx) -> rax
+            SemOp::Shift(op, k) => {
+                self.emit_int_shift_x86(op, k);
+                self.renormalize_x86(k);
             }
-            // u8 relational ops reuse the i64 path: a signed 64-bit `cmp` plus a
-            // signed setcc (setl/setle/setg/setge below). This is correct because
-            // every u8 value is held zero-extended to [0,255] in its 64-bit slot
-            // (byte loads use movzx; u8 has no arithmetic), and for two operands in
-            // [0,255] a signed comparison agrees with an unsigned one. If a future
-            // change ever lets a u8 slot carry non-zero-extended high bits, the u8
-            // arms must move to the unsigned setcc opcodes (setb/setbe/seta/setae).
-            "eq_i64" | "ne_i64" | "lt_i64" | "le_i64" | "gt_i64" | "ge_i64" | "eq_u8" | "ne_u8"
-            | "lt_u8" | "le_u8" | "gt_u8" | "ge_u8" => {
-                self.text.extend_from_slice(&[0x48, 0x39, 0xc8]);
-                let cc = match kind {
-                    "eq_i64" | "eq_u8" => 0x94,
-                    "ne_i64" | "ne_u8" => 0x95,
-                    "lt_i64" | "lt_u8" => 0x9c,
-                    "le_i64" | "le_u8" => 0x9e,
-                    "gt_i64" | "gt_u8" => 0x9f,
-                    "ge_i64" | "ge_u8" => 0x9d,
-                    _ => unreachable!(),
-                };
-                self.text.extend_from_slice(&[0x0f, cc, 0xc0]);
-                self.text.extend_from_slice(&[0x0f, 0xb6, 0xc0]);
-            }
-            "and_bool" => self.text.extend_from_slice(&[0x48, 0x21, 0xc8]),
-            "or_bool" => self.text.extend_from_slice(&[0x48, 0x09, 0xc8]),
-            other => bail!("unsupported lowered binary op for native object backend: {other}"),
+            SemOp::Cmp(cmp, k) => self.emit_int_cmp_x86(cmp, k),
+            SemOp::AndBool => self.text.extend_from_slice(&[0x48, 0x21, 0xc8]), // and rax, rcx
+            SemOp::OrBool => self.text.extend_from_slice(&[0x48, 0x09, 0xc8]),  // or rax, rcx
+            _ => bail!("unsupported lowered binary op for native object backend: {kind}"),
         }
         Ok(())
+    }
+
+    /// Sign- or zero-extend RAX to the canonical 64-bit slot form for `k`'s width
+    /// after a narrow-width arithmetic/bitwise/shift result. A no-op at width 8.
+    fn renormalize_x86(&mut self, k: IntKind) {
+        match (k.signed, k.width) {
+            (true, 1) => self.text.extend_from_slice(&[0x48, 0x0f, 0xbe, 0xc0]), // movsx rax, al
+            (true, 2) => self.text.extend_from_slice(&[0x48, 0x0f, 0xbf, 0xc0]), // movsx rax, ax
+            (true, 4) => self.text.extend_from_slice(&[0x48, 0x63, 0xc0]),       // movsxd rax, eax
+            (false, 1) => self.text.extend_from_slice(&[0x0f, 0xb6, 0xc0]),      // movzx eax, al
+            (false, 2) => self.text.extend_from_slice(&[0x0f, 0xb7, 0xc0]),      // movzx eax, ax
+            (false, 4) => self.text.extend_from_slice(&[0x89, 0xc0]),            // mov eax, eax
+            _ => {} // width 8: already canonical
+        }
+    }
+
+    fn emit_int_arith_x86(&mut self, op: ArithOp, k: IntKind) {
+        match op {
+            ArithOp::Add => self.text.extend_from_slice(&[0x48, 0x01, 0xc8]), // add rax, rcx
+            ArithOp::Sub => self.text.extend_from_slice(&[0x48, 0x29, 0xc8]), // sub rax, rcx
+            ArithOp::Mul => self.text.extend_from_slice(&[0x48, 0x0f, 0xaf, 0xc1]), // imul rax, rcx
+            ArithOp::Div => self.emit_int_divrem_x86(k, false),
+            ArithOp::Rem => self.emit_int_divrem_x86(k, true),
+        }
+        self.renormalize_x86(k);
+    }
+
+    fn emit_int_divrem_x86(&mut self, k: IntKind, is_rem: bool) {
+        // Trap on a zero divisor (test rcx,rcx; jne +2; ud2), then divide.
+        self.text.extend_from_slice(&[0x48, 0x85, 0xc9]); // test rcx, rcx
+        self.text.extend_from_slice(&[0x75, 0x02]); // jne +2
+        self.text.extend_from_slice(&[0x0f, 0x0b]); // ud2
+        if k.signed || k.width < 8 {
+            // Signed divide. Narrow unsigned operands are zero-extended and thus
+            // non-negative in 64 bits, so a signed `idiv` yields the same quotient
+            // and the result is re-normalized to the width afterward.
+            self.text.extend_from_slice(&[0x48, 0x99]); // cqo
+            self.text.extend_from_slice(&[0x48, 0xf7, 0xf9]); // idiv rcx
+        } else {
+            // u64: unsigned divide.
+            self.text.extend_from_slice(&[0x48, 0x31, 0xd2]); // xor rdx, rdx
+            self.text.extend_from_slice(&[0x48, 0xf7, 0xf1]); // div rcx
+        }
+        if is_rem {
+            self.mov_rax_rdx(); // remainder (rdx) -> rax
+        }
+    }
+
+    fn emit_int_bit_x86(&mut self, op: BitOp) {
+        match op {
+            BitOp::And => self.text.extend_from_slice(&[0x48, 0x21, 0xc8]), // and rax, rcx
+            BitOp::Or => self.text.extend_from_slice(&[0x48, 0x09, 0xc8]),  // or rax, rcx
+            BitOp::Xor => self.text.extend_from_slice(&[0x48, 0x31, 0xc8]), // xor rax, rcx
+        }
+    }
+
+    fn emit_int_shift_x86(&mut self, op: ShiftOp, k: IntKind) {
+        // Mask the shift amount (rcx) to width*8 - 1, matching wrapping_sh{l,r}'s
+        // `amount % bits`, before shifting RAX by CL.
+        let mask = (k.width * 8 - 1) as u8; // 7/15/31/63 — fits imm8
+        self.text.extend_from_slice(&[0x48, 0x83, 0xe1, mask]); // and rcx, mask
+        match op {
+            ShiftOp::Shl => self.text.extend_from_slice(&[0x48, 0xd3, 0xe0]), // shl rax, cl
+            ShiftOp::Shr if k.signed => self.text.extend_from_slice(&[0x48, 0xd3, 0xf8]), // sar rax, cl
+            ShiftOp::Shr => self.text.extend_from_slice(&[0x48, 0xd3, 0xe8]), // shr rax, cl
+        }
+    }
+
+    fn emit_int_cmp_x86(&mut self, cmp: Cmp, k: IntKind) {
+        self.text.extend_from_slice(&[0x48, 0x39, 0xc8]); // cmp rax, rcx
+        // Operands are canonical: signed widths sign-extended, unsigned widths
+        // zero-extended. A signed 64-bit comparison is therefore correct for every
+        // width except u64 (high bit significant), which needs unsigned setcc.
+        let unsigned = !k.signed && k.width == 8;
+        let cc: u8 = match cmp {
+            Cmp::Eq => 0x94,                                   // sete
+            Cmp::Ne => 0x95,                                   // setne
+            Cmp::Lt => if unsigned { 0x92 } else { 0x9c },     // setb / setl
+            Cmp::Le => if unsigned { 0x96 } else { 0x9e },     // setbe / setle
+            Cmp::Gt => if unsigned { 0x97 } else { 0x9f },     // seta / setg
+            Cmp::Ge => if unsigned { 0x93 } else { 0x9d },     // setae / setge
+        };
+        self.text.extend_from_slice(&[0x0f, cc, 0xc0]); // setcc al
+        self.text.extend_from_slice(&[0x0f, 0xb6, 0xc0]); // movzx eax, al
     }
 
     fn emit_if(
@@ -4455,6 +4539,13 @@ impl Arm64Emitter {
                 self.emit_unary(kind, value)?;
                 self.str_stack(0, self.value_offset(id)?)?;
             }
+            LoweredOp::IntCast { id, value, type_hash } => {
+                let int = scalar_int_type_by_hash(type_hash)
+                    .ok_or_else(|| anyhow!("int_cast target is not a sized integer"))?;
+                self.ldr_stack(0, self.value_offset(value)?)?;
+                self.renormalize_arm64(IntKind { width: int.width, signed: int.signed });
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
             LoweredOp::Binary {
                 id,
                 kind,
@@ -4913,9 +5004,18 @@ impl Arm64Emitter {
 
     fn emit_load_addressed_value(&mut self, type_hash: &str, address: &str) -> Result<()> {
         self.ldr_stack(0, self.value_offset(address)?)?;
+        // Signed narrow integers (i8/i16/i32) load sign-extended into the
+        // canonical 64-bit slot form; everything else zero-extends. Sizes 2/4
+        // reach the register-load path only for scalar integers.
+        let signed = scalar_int_type_by_hash(type_hash).is_some_and(|t| t.signed);
         match self.type_size(type_hash)? {
             0 => self.mov_u64(0, 0),
+            1 if signed => self.reg_load_op(0x39800000, 0, 0)?, // ldrsb x0, [x0]
             1 => self.ldrb_reg_addr(0, 0)?,
+            2 if signed => self.reg_load_op(0x79800000, 0, 0)?, // ldrsh x0, [x0]
+            2 => self.reg_load_op(0x79400000, 0, 0)?,           // ldrh w0, [x0]
+            4 if signed => self.reg_load_op(0xb9800000, 0, 0)?, // ldrsw x0, [x0]
+            4 => self.reg_load_op(0xb9400000, 0, 0)?,           // ldr w0, [x0]
             8 => self.ldr_reg_addr(0, 0)?,
             size => bail!("native arm64 backend cannot load scalar size {size}"),
         }
@@ -4929,12 +5029,18 @@ impl Arm64Emitter {
         address: &str,
     ) -> Result<()> {
         let value_offset = self.value_offset(id)?;
-        match self.type_size(type_hash)? {
+        let size = self.type_size(type_hash)?;
+        let is_scalar_int = scalar_int_type_by_hash(type_hash).is_some();
+        match size {
             0 | 1 | 8 => {
                 self.emit_load_addressed_value(type_hash, address)?;
                 self.str_stack(0, value_offset)?;
             }
-            size @ 2..=7 => {
+            2 | 4 if is_scalar_int => {
+                self.emit_load_addressed_value(type_hash, address)?;
+                self.str_stack(0, value_offset)?;
+            }
+            2..=7 => {
                 self.mov_u64(0, 0);
                 self.str_stack(0, value_offset)?;
                 self.copy_memory_from_stack_pointer_to_stack(
@@ -5050,66 +5156,136 @@ impl Arm64Emitter {
     }
 
     fn emit_unary(&mut self, kind: &str, value: &str) -> Result<()> {
+        let sem = sem_for_kind(kind)
+            .ok_or_else(|| anyhow!("unsupported lowered unary op for native arm64 backend: {kind}"))?;
         self.ldr_stack(0, self.value_offset(value)?)?;
-        match kind {
-            "neg_i64" => self.sub_reg(0, 31, 0),
-            "not_bool" => {
+        match sem {
+            SemOp::Neg(k) => {
+                self.sub_reg(0, 31, 0); // neg x0 = sub x0, xzr, x0
+                self.renormalize_arm64(k);
+            }
+            SemOp::BitNot(k) => {
+                self.mvn_reg(0, 0);
+                self.renormalize_arm64(k);
+            }
+            SemOp::NotBool => {
                 self.cmp_imm_zero(0);
                 self.cset(0, 0);
             }
-            other => bail!("unsupported lowered unary op for native arm64 backend: {other}"),
+            _ => bail!("unsupported lowered unary op for native arm64 backend: {kind}"),
         }
         Ok(())
     }
 
     fn emit_binary(&mut self, kind: &str, left: &str, right: &str) -> Result<()> {
+        let sem = sem_for_kind(kind)
+            .ok_or_else(|| anyhow!("unsupported lowered binary op for native arm64 backend: {kind}"))?;
         self.ldr_stack(0, self.value_offset(left)?)?;
         self.ldr_stack(1, self.value_offset(right)?)?;
-        match kind {
-            "add_i64" => self.add_reg(0, 0, 1),
-            "sub_i64" => self.sub_reg(0, 0, 1),
-            "mul_i64" => self.mul_reg(0, 0, 1),
-            "div_i64" => {
-                let skip_trap = self.emit_cbnz_placeholder(1);
-                self.emit_u32(0xd4200000);
-                self.patch_imm19(skip_trap)?;
-                self.sdiv_reg(0, 0, 1);
+        match sem {
+            SemOp::Arith(op, k) => self.emit_int_arith_arm64(op, k)?,
+            SemOp::Bit(op, k) => {
+                self.emit_int_bit_arm64(op);
+                self.renormalize_arm64(k);
             }
-            "mod_i64" => {
-                // Signed remainder: trap on a zero divisor, then compute
-                // x0 - (x0 / x1) * x1 via a scratch register (arm64 has no rem
-                // instruction; this is the msub sequence open-coded).
-                let skip_trap = self.emit_cbnz_placeholder(1);
-                self.emit_u32(0xd4200000); // brk #0
-                self.patch_imm19(skip_trap)?;
-                self.sdiv_reg(2, 0, 1); // x2 = x0 / x1
-                self.mul_reg(2, 2, 1); // x2 = x2 * x1
-                self.sub_reg(0, 0, 2); // x0 = x0 - x2  (remainder)
+            SemOp::Shift(op, k) => {
+                self.emit_int_shift_arm64(op, k);
+                self.renormalize_arm64(k);
             }
-            // u8 relational ops reuse the i64 signed condition codes (LT/LE/GT/GE
-            // below). Correct because u8 operands are always zero-extended to
-            // [0,255] (byte loads use ldrb; u8 has no arithmetic), where signed and
-            // unsigned comparison agree. If that invariant ever breaks, the u8 arms
-            // must use the unsigned conditions (HS=2/LO=3/HI=8/LS=9).
-            "eq_i64" | "ne_i64" | "lt_i64" | "le_i64" | "gt_i64" | "ge_i64" | "eq_u8" | "ne_u8"
-            | "lt_u8" | "le_u8" | "gt_u8" | "ge_u8" => {
-                self.cmp_reg(0, 1);
-                let cond = match kind {
-                    "eq_i64" | "eq_u8" => 0,
-                    "ne_i64" | "ne_u8" => 1,
-                    "lt_i64" | "lt_u8" => 11,
-                    "le_i64" | "le_u8" => 13,
-                    "gt_i64" | "gt_u8" => 12,
-                    "ge_i64" | "ge_u8" => 10,
-                    _ => unreachable!(),
-                };
-                self.cset(0, cond);
-            }
-            "and_bool" => self.and_reg(0, 0, 1),
-            "or_bool" => self.orr_reg(0, 0, 1),
-            other => bail!("unsupported lowered binary op for native arm64 backend: {other}"),
+            SemOp::Cmp(cmp, k) => self.emit_int_cmp_arm64(cmp, k),
+            SemOp::AndBool => self.and_reg(0, 0, 1),
+            SemOp::OrBool => self.orr_reg(0, 0, 1),
+            _ => bail!("unsupported lowered binary op for native arm64 backend: {kind}"),
         }
         Ok(())
+    }
+
+    /// Sign- or zero-extend x0 to the canonical 64-bit slot form for `k`'s width
+    /// after a narrow-width arithmetic/bitwise/shift result. A no-op at width 8.
+    fn renormalize_arm64(&mut self, k: IntKind) {
+        match (k.signed, k.width) {
+            (true, 1) => self.sbfm_extend(0, 0, 7),  // sxtb x0, w0
+            (true, 2) => self.sbfm_extend(0, 0, 15), // sxth x0, w0
+            (true, 4) => self.sbfm_extend(0, 0, 31), // sxtw x0, w0
+            (false, 1) => self.ubfm_extend(0, 0, 7), // uxtb w0, w0
+            (false, 2) => self.ubfm_extend(0, 0, 15), // uxth w0, w0
+            (false, 4) => self.mov_w(0, 0),          // mov w0, w0 (zero high 32)
+            _ => {} // width 8: already canonical
+        }
+    }
+
+    fn emit_int_arith_arm64(&mut self, op: ArithOp, k: IntKind) -> Result<()> {
+        match op {
+            ArithOp::Add => self.add_reg(0, 0, 1),
+            ArithOp::Sub => self.sub_reg(0, 0, 1),
+            ArithOp::Mul => self.mul_reg(0, 0, 1),
+            ArithOp::Div => self.emit_int_divrem_arm64(k, false)?,
+            ArithOp::Rem => self.emit_int_divrem_arm64(k, true)?,
+        }
+        self.renormalize_arm64(k);
+        Ok(())
+    }
+
+    fn emit_int_divrem_arm64(&mut self, k: IntKind, is_rem: bool) -> Result<()> {
+        // Trap on a zero divisor, then divide. Narrow unsigned operands are
+        // zero-extended (non-negative in 64 bits), so a signed divide is correct
+        // and the result is re-normalized to the width; only u64 needs `udiv`.
+        let skip_trap = self.emit_cbnz_placeholder(1);
+        self.emit_u32(0xd4200000); // brk #0
+        self.patch_imm19(skip_trap)?;
+        let signed = k.signed || k.width < 8;
+        if is_rem {
+            // x0 - (x0 / x1) * x1 via scratch x2 (arm64 has no remainder).
+            if signed {
+                self.sdiv_reg(2, 0, 1);
+            } else {
+                self.udiv_reg(2, 0, 1);
+            }
+            self.mul_reg(2, 2, 1);
+            self.sub_reg(0, 0, 2);
+        } else if signed {
+            self.sdiv_reg(0, 0, 1);
+        } else {
+            self.udiv_reg(0, 0, 1);
+        }
+        Ok(())
+    }
+
+    fn emit_int_bit_arm64(&mut self, op: BitOp) {
+        match op {
+            BitOp::And => self.and_reg(0, 0, 1),
+            BitOp::Or => self.orr_reg(0, 0, 1),
+            BitOp::Xor => self.eor_reg(0, 0, 1),
+        }
+    }
+
+    fn emit_int_shift_arm64(&mut self, op: ShiftOp, k: IntKind) {
+        // 64-bit shift-by-register masks the amount to 63 (matching `wrapping_sh`
+        // at width 8); for narrower widths mask the amount (x1) to width*8 - 1.
+        if k.width < 8 {
+            self.and_imm_mask(1, 1, k.width * 8 - 1);
+        }
+        match op {
+            ShiftOp::Shl => self.lslv_reg(0, 0, 1),
+            ShiftOp::Shr if k.signed => self.asrv_reg(0, 0, 1),
+            ShiftOp::Shr => self.lsrv_reg(0, 0, 1),
+        }
+    }
+
+    fn emit_int_cmp_arm64(&mut self, cmp: Cmp, k: IntKind) {
+        self.cmp_reg(0, 1);
+        // Signed condition codes are correct for every width except u64 (the high
+        // bit is significant), which uses the unsigned conditions.
+        let unsigned = !k.signed && k.width == 8;
+        let cond = match cmp {
+            Cmp::Eq => 0,
+            Cmp::Ne => 1,
+            Cmp::Lt => if unsigned { 3 } else { 11 },  // LO / LT
+            Cmp::Le => if unsigned { 9 } else { 13 },  // LS / LE
+            Cmp::Gt => if unsigned { 8 } else { 12 },  // HI / GT
+            Cmp::Ge => if unsigned { 2 } else { 10 },  // HS / GE
+        };
+        self.cset(0, cond);
     }
 
     fn emit_if(
@@ -5814,6 +5990,66 @@ impl Arm64Emitter {
 
     fn orr_reg(&mut self, rd: u8, rn: u8, rm: u8) {
         self.emit_u32(0xaa000000 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rd));
+    }
+
+    fn eor_reg(&mut self, rd: u8, rn: u8, rm: u8) {
+        self.emit_u32(0xca000000 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rd));
+    }
+
+    fn mvn_reg(&mut self, rd: u8, rm: u8) {
+        // ORN xd, xzr, xm  (bitwise NOT)
+        self.emit_u32(0xaa2003e0 | (u32::from(rm) << 16) | u32::from(rd));
+    }
+
+    fn udiv_reg(&mut self, rd: u8, rn: u8, rm: u8) {
+        self.emit_u32(0x9ac00800 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rd));
+    }
+
+    fn lslv_reg(&mut self, rd: u8, rn: u8, rm: u8) {
+        self.emit_u32(0x9ac02000 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rd));
+    }
+
+    fn lsrv_reg(&mut self, rd: u8, rn: u8, rm: u8) {
+        self.emit_u32(0x9ac02400 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rd));
+    }
+
+    fn asrv_reg(&mut self, rd: u8, rn: u8, rm: u8) {
+        self.emit_u32(0x9ac02800 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rd));
+    }
+
+    /// `AND xd, xn, #mask` where `mask` is `2^k - 1` (k low ones, k in 3..=5 here):
+    /// the 64-bit logical immediate is N=1, immr=0, imms=k-1.
+    fn and_imm_mask(&mut self, rd: u8, rn: u8, mask: u64) {
+        let k = (mask + 1).trailing_zeros();
+        let imms = k - 1;
+        self.emit_u32(0x92400000 | (imms << 10) | (u32::from(rn) << 5) | u32::from(rd));
+    }
+
+    /// `SBFM xd, xn, #0, #imms` — sign-extend the low `imms+1` bits (sxtb/sxth/sxtw).
+    fn sbfm_extend(&mut self, rd: u8, rn: u8, imms: u32) {
+        self.emit_u32(0x93400000 | (imms << 10) | (u32::from(rn) << 5) | u32::from(rd));
+    }
+
+    /// `UBFM wd, wn, #0, #imms` (32-bit) — zero-extend the low `imms+1` bits
+    /// (uxtb/uxth), clearing the high 32 bits of xd.
+    fn ubfm_extend(&mut self, rd: u8, rn: u8, imms: u32) {
+        self.emit_u32(0x53000000 | (imms << 10) | (u32::from(rn) << 5) | u32::from(rd));
+    }
+
+    /// `MOV wd, wn` (ORR wd, wzr, wn) — copies the low 32 bits, zeroing the high
+    /// 32 bits of xd (the u32 zero-extend renormalization).
+    fn mov_w(&mut self, rd: u8, rm: u8) {
+        self.emit_u32(0x2a0003e0 | (u32::from(rm) << 16) | u32::from(rd));
+    }
+
+    /// A load from `[base_reg]` at offset 0 with the given opcode base (used by the
+    /// sign-/zero-extending narrow loads: ldrsb/ldrsh/ldrsw/ldrh/ldr-w).
+    fn reg_load_op(&mut self, base: u32, reg: u8, base_reg: u8) -> Result<()> {
+        if reg > 30 || base_reg > 30 {
+            bail!("invalid arm64 general register");
+        }
+        self.emit_u32(base | (u32::from(base_reg) << 5) | u32::from(reg));
+        Ok(())
     }
 
     fn emit_cbz_placeholder(&mut self, reg: u8) -> usize {

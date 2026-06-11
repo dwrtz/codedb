@@ -33,6 +33,7 @@ impl CodeDb {
         expected_i64: Option<&str>,
         expected_bool: Option<bool>,
         expected_unit: bool,
+        expected_int: Option<&str>,
         category: Option<&str>,
         native_agreement: bool,
         native_required: bool,
@@ -42,7 +43,7 @@ impl CodeDb {
         self.ensure_initialized()?;
         let branch = self.branch(MAIN_BRANCH)?;
         let operation_root = expected_root.unwrap_or(&branch.root_hash).to_string();
-        let expected = cli_expected_value(expected_i64, expected_bool, expected_unit)?;
+        let expected = cli_expected_value(expected_i64, expected_bool, expected_unit, expected_int)?;
         let (entry_module, entry_local_name) =
             self.preferred_entry_name_for_root(&operation_root, entry_name)?;
         let op = self.create_test_operation_from_text_args(
@@ -1134,7 +1135,15 @@ impl CodeDb {
             );
         }
         match expected {
-            Value::I64(_) | Value::Bool(_) => {
+            Value::I8(_)
+            | Value::I16(_)
+            | Value::I32(_)
+            | Value::I64(_)
+            | Value::U8(_)
+            | Value::U16(_)
+            | Value::U32(_)
+            | Value::U64(_)
+            | Value::Bool(_) => {
                 self.native_scalar_agreement_result(branch_name, case, expected)
             }
             Value::Array(_) | Value::Record(_) | Value::Enum { .. } => {
@@ -1245,7 +1254,24 @@ impl CodeDb {
                 vec![native_diagnostic("native_execution_failed", &detail)],
             );
         };
+        // The harness prints `(long long)result`. A scalar of width < 64 is held
+        // in the canonical register form (signed sign-extended, unsigned
+        // zero-extended), so its printed value equals `value as i64`; a u64 prints
+        // its bit pattern reinterpreted as i64. The comparison reconstructs the
+        // width from `actual_i64` and checks it against the evaluator's value.
         let (passed, actual_value) = match expected {
+            Value::I8(value) => (
+                i64::from(*value) == actual_i64,
+                TestValue::I8 { value: (actual_i64 as i8).to_string() },
+            ),
+            Value::I16(value) => (
+                i64::from(*value) == actual_i64,
+                TestValue::I16 { value: (actual_i64 as i16).to_string() },
+            ),
+            Value::I32(value) => (
+                i64::from(*value) == actual_i64,
+                TestValue::I32 { value: (actual_i64 as i32).to_string() },
+            ),
             Value::I64(value) => (
                 *value == actual_i64,
                 TestValue::I64 {
@@ -1261,6 +1287,18 @@ impl CodeDb {
                     },
                 )
             }
+            Value::U16(value) => (
+                i64::from(*value) == actual_i64,
+                TestValue::U16 { value: (actual_i64 as u16).to_string() },
+            ),
+            Value::U32(value) => (
+                i64::from(*value) == actual_i64,
+                TestValue::U32 { value: (actual_i64 as u32).to_string() },
+            ),
+            Value::U64(value) => (
+                *value == actual_i64 as u64,
+                TestValue::U64 { value: (actual_i64 as u64).to_string() },
+            ),
             Value::Bool(value) => {
                 let actual_bool = actual_i64 != 0;
                 (
@@ -1268,7 +1306,7 @@ impl CodeDb {
                     TestValue::Bool { value: actual_bool },
                 )
             }
-            _ => unreachable!("native_scalar_agreement_result only handles i64/u8/bool"),
+            _ => unreachable!("native_scalar_agreement_result only handles scalar returns"),
         };
         json!({
             "schema": NATIVE_TEST_RESULT_SCHEMA,
@@ -2019,8 +2057,14 @@ fn test_value_has_type(
     type_hash: &str,
 ) -> Result<bool> {
     match (value, db.type_spec_in_root(root, type_hash)?) {
+        (Value::I8(_), TypeSpec::Builtin(kind)) => Ok(kind == "I8"),
+        (Value::I16(_), TypeSpec::Builtin(kind)) => Ok(kind == "I16"),
+        (Value::I32(_), TypeSpec::Builtin(kind)) => Ok(kind == "I32"),
         (Value::I64(_), TypeSpec::Builtin(kind)) => Ok(kind == "I64"),
         (Value::U8(_), TypeSpec::Builtin(kind)) => Ok(kind == "U8"),
+        (Value::U16(_), TypeSpec::Builtin(kind)) => Ok(kind == "U16"),
+        (Value::U32(_), TypeSpec::Builtin(kind)) => Ok(kind == "U32"),
+        (Value::U64(_), TypeSpec::Builtin(kind)) => Ok(kind == "U64"),
         (Value::Bool(_), TypeSpec::Builtin(kind)) => Ok(kind == "Bool"),
         (Value::Unit, TypeSpec::Builtin(kind)) => Ok(kind == "Unit"),
         (Value::Array(values), TypeSpec::FixedArray { element, len }) => {
@@ -2070,13 +2114,17 @@ fn cli_expected_value(
     expected_i64: Option<&str>,
     expected_bool: Option<bool>,
     expected_unit: bool,
+    expected_int: Option<&str>,
 ) -> Result<TestValue> {
     let mut count = 0;
     count += usize::from(expected_i64.is_some());
     count += usize::from(expected_bool.is_some());
     count += usize::from(expected_unit);
+    count += usize::from(expected_int.is_some());
     if count != 1 {
-        bail!("create-test requires exactly one of --expect-i64, --expect-bool, or --expect-unit");
+        bail!(
+            "create-test requires exactly one of --expect-i64, --expect-bool, --expect-unit, or --expect-int"
+        );
     }
     if let Some(value) = expected_i64 {
         value
@@ -2089,7 +2137,44 @@ fn cli_expected_value(
     if let Some(value) = expected_bool {
         return Ok(TestValue::Bool { value });
     }
+    if let Some(spec) = expected_int {
+        // A sized-integer expectation: `TYPE:VALUE` (e.g. `u32:705032704`), so a
+        // single flag covers every width without a per-width clap option.
+        let (type_name, value) = spec
+            .split_once(':')
+            .ok_or_else(|| anyhow!("--expect-int must be TYPE:VALUE, got {spec:?}"))?;
+        return cli_sized_int_expected_value(type_name, value);
+    }
     Ok(TestValue::Unit)
+}
+
+/// Build a [`TestValue`] for a sized-integer expectation, validating the decimal
+/// text against the named width (carried as a string, uniform with `TestValue`).
+fn cli_sized_int_expected_value(type_name: &str, value: &str) -> Result<TestValue> {
+    macro_rules! sized {
+        ($ty:ty, $variant:ident) => {{
+            value
+                .parse::<$ty>()
+                .with_context(|| format!("--expect-int {type_name} out of range: {value:?}"))?;
+            Ok(TestValue::$variant { value: value.to_string() })
+        }};
+    }
+    match type_name {
+        "i8" => sized!(i8, I8),
+        "i16" => sized!(i16, I16),
+        "i32" => sized!(i32, I32),
+        "i64" => sized!(i64, I64),
+        "u16" => sized!(u16, U16),
+        "u32" => sized!(u32, U32),
+        "u64" => sized!(u64, U64),
+        "u8" => {
+            let parsed = value
+                .parse::<u8>()
+                .with_context(|| format!("--expect-int u8 out of range: {value:?}"))?;
+            Ok(TestValue::U8 { value: parsed })
+        }
+        other => bail!("--expect-int unknown integer type {other:?}"),
+    }
 }
 
 fn parse_test_category(category: Option<&str>) -> Result<TestCategory> {

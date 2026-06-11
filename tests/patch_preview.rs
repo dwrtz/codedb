@@ -416,7 +416,7 @@ fn semantic_patch_preview_reports_type_errors_before_apply() {
         preview["typecheck"]["message"]
             .as_str()
             .unwrap()
-            .contains("right operand expected i64, got bool")
+            .contains("expected a sized integer right operand, got bool")
     );
     assert_eq!(preview["diagnostics"][0]["kind"], "type_error");
     assert_eq!(preview["apply_preview"]["status"], "error");

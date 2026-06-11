@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::expr::{
-    Value, ValueCell, array_cell, eval_binary, eval_unary, field_cell, slice_cells_from_array_cell,
-    slice_len_from_value, subslice_value, value_cell,
+    Value, ValueCell, array_cell, cast_int_value, eval_binary, eval_unary, field_cell,
+    slice_cells_from_array_cell, slice_len_from_value, subslice_value, value_cell,
 };
 use crate::model::ProgramRootPayload;
 use crate::store::{CodeDb, canonical_json};
@@ -937,6 +937,36 @@ impl CodeDb {
                     locals,
                 )?;
                 let value = eval_unary(op, child);
+                self.finish_current_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    expr_hash,
+                    value,
+                )
+            }
+            "int_cast" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("int_cast missing value"))?;
+                let target_hash = payload
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("int_cast missing type"))?;
+                let child = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    value_hash,
+                    args,
+                    locals,
+                )?;
+                let value = crate::types::scalar_int_type_by_hash(target_hash)
+                    .ok_or_else(|| anyhow!("int_cast target is not a sized integer"))
+                    .and_then(|target| cast_int_value(&child, target));
                 self.finish_current_expr(
                     state,
                     frame,
