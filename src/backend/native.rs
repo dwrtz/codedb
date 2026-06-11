@@ -675,6 +675,10 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             LoweredOp::Fold { body, .. } => {
                 collect_called_symbols(&body.operations, out);
             }
+            LoweredOp::Loop { cond, body, .. } => {
+                collect_called_symbols(&cond.operations, out);
+                collect_called_symbols(&body.operations, out);
+            }
             LoweredOp::Param { .. }
             | LoweredOp::ConstI64 { .. }
             | LoweredOp::ConstBool { .. }
@@ -796,6 +800,7 @@ fn validate_native_ops(
             | LoweredOp::If { type_hash, .. }
             | LoweredOp::Case { type_hash, .. }
             | LoweredOp::Fold { type_hash, .. }
+            | LoweredOp::Loop { type_hash, .. }
             | LoweredOp::HeapAlloc { type_hash, .. }
             | LoweredOp::PtrCast { type_hash, .. }
             | LoweredOp::Return { type_hash, .. }
@@ -960,6 +965,45 @@ fn validate_native_ops(
             )?;
             if native_value_type(&body_values, &body.result)? != acc_type_hash {
                 bail!("native object backend saw fold body result type mismatch");
+            }
+        } else if let LoweredOp::Loop {
+            cond,
+            body,
+            acc_type_hash,
+            ..
+        } = op
+        {
+            let mut cond_values = values.clone();
+            let mut cond_addresses = addresses.clone();
+            validate_native_ops(
+                &cond.operations,
+                params,
+                locals,
+                i64_type,
+                bool_type,
+                unit_type,
+                type_layouts,
+                &mut cond_values,
+                &mut cond_addresses,
+            )?;
+            if native_value_type(&cond_values, &cond.result)? != bool_type {
+                bail!("native object backend saw loop condition type mismatch");
+            }
+            let mut body_values = values.clone();
+            let mut body_addresses = addresses.clone();
+            validate_native_ops(
+                &body.operations,
+                params,
+                locals,
+                i64_type,
+                bool_type,
+                unit_type,
+                type_layouts,
+                &mut body_values,
+                &mut body_addresses,
+            )?;
+            if native_value_type(&body_values, &body.result)? != acc_type_hash {
+                bail!("native object backend saw loop body result type mismatch");
             }
         }
     }
@@ -1158,6 +1202,31 @@ fn validate_native_op_flow(
             }
             native_type_layout(type_layouts, element_type_hash)?;
             let _ = body;
+            native_insert_value(values, id, type_hash)?;
+            if native_passes_indirect(type_layouts, type_hash)? {
+                native_insert_address(addresses, id, type_hash)?;
+            }
+        }
+        LoweredOp::Loop {
+            id,
+            acc_slot,
+            init,
+            acc_type_hash,
+            type_hash,
+            ..
+        } => {
+            if type_hash != acc_type_hash {
+                bail!("native object backend saw loop result/accumulator type mismatch");
+            }
+            if native_value_type(values, init)? != acc_type_hash {
+                bail!("native object backend saw loop init type mismatch");
+            }
+            if locals
+                .get(*acc_slot)
+                .is_none_or(|local| local.type_hash != *acc_type_hash)
+            {
+                bail!("native object backend saw loop accumulator slot type mismatch");
+            }
             native_insert_value(values, id, type_hash)?;
             if native_passes_indirect(type_layouts, type_hash)? {
                 native_insert_address(addresses, id, type_hash)?;
@@ -2446,6 +2515,13 @@ fn collect_value_ids_inner(
                 push_value_id(ids, seen, id)?;
                 collect_value_ids_inner(&body.operations, ids, seen)?;
             }
+            LoweredOp::Loop {
+                id, cond, body, ..
+            } => {
+                push_value_id(ids, seen, id)?;
+                collect_value_ids_inner(&cond.operations, ids, seen)?;
+                collect_value_ids_inner(&body.operations, ids, seen)?;
+            }
             LoweredOp::Store { .. }
             | LoweredOp::StoreEnumTag { .. }
             | LoweredOp::Drop { .. }
@@ -2742,6 +2818,17 @@ impl FunctionEmitter {
                     acc_type_hash,
                 };
                 self.emit_fold(spec)?;
+            }
+            LoweredOp::Loop {
+                id,
+                acc_slot,
+                init,
+                cond,
+                body,
+                acc_type_hash,
+                ..
+            } => {
+                self.emit_loop(id, *acc_slot, init, cond, body, acc_type_hash)?;
             }
             LoweredOp::BorrowShared { id, address, .. }
             | LoweredOp::BorrowMut { id, address, .. } => {
@@ -3502,6 +3589,40 @@ impl FunctionEmitter {
             self.mov_rax_stack(self.local_offset(spec.acc_slot)?);
         }
         self.mov_stack_rax(self.value_offset(spec.id)?);
+        Ok(())
+    }
+
+    /// `loop acc = init while cond do body` (R8): seed the accumulator slot with
+    /// `init`, then re-run the `cond` block each iteration — exit when its result is
+    /// false (0) — and the `body` block, storing its result back into the
+    /// accumulator slot. The loop's result is the final accumulator. Both blocks
+    /// read the accumulator slot via the `acc` local. Mirrors `emit_fold` minus the
+    /// index/item bookkeeping.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_loop(
+        &mut self,
+        id: &str,
+        acc_slot: usize,
+        init: &str,
+        cond: &LoweredBlock,
+        body: &LoweredBlock,
+        acc_type_hash: &str,
+    ) -> Result<()> {
+        self.store_value_to_local_x86(init, acc_type_hash, acc_slot)?;
+        let loop_start = self.text.len();
+        self.emit_ops(&cond.operations)?;
+        self.cmp_stack_imm8(self.value_offset(&cond.result)?, 0);
+        let exit_patch = self.emit_jz_placeholder();
+        self.emit_ops(&body.operations)?;
+        self.store_value_to_local_x86(&body.result, acc_type_hash, acc_slot)?;
+        self.emit_jmp_to(loop_start)?;
+        self.patch_rel32(exit_patch)?;
+        if self.type_passes_indirect(acc_type_hash)? {
+            self.lea_rax_stack(self.local_offset(acc_slot)?);
+        } else {
+            self.mov_rax_stack(self.local_offset(acc_slot)?);
+        }
+        self.mov_stack_rax(self.value_offset(id)?);
         Ok(())
     }
 
@@ -4657,6 +4778,17 @@ impl Arm64Emitter {
                 };
                 self.emit_fold(spec)?;
             }
+            LoweredOp::Loop {
+                id,
+                acc_slot,
+                init,
+                cond,
+                body,
+                acc_type_hash,
+                ..
+            } => {
+                self.emit_loop(id, *acc_slot, init, cond, body, acc_type_hash)?;
+            }
             LoweredOp::BorrowShared { id, address, .. }
             | LoweredOp::BorrowMut { id, address, .. } => {
                 self.ldr_stack(0, self.value_offset(address)?)?;
@@ -5398,6 +5530,35 @@ impl Arm64Emitter {
             self.ldr_stack(0, self.local_offset(spec.acc_slot)?)?;
         }
         self.str_stack(0, self.value_offset(spec.id)?)?;
+        Ok(())
+    }
+
+    /// `loop acc = init while cond do body` (R8), arm64 (mirrors x86 `emit_loop`).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_loop(
+        &mut self,
+        id: &str,
+        acc_slot: usize,
+        init: &str,
+        cond: &LoweredBlock,
+        body: &LoweredBlock,
+        acc_type_hash: &str,
+    ) -> Result<()> {
+        self.store_value_to_local_arm64(init, acc_type_hash, acc_slot)?;
+        let loop_start = self.text.len();
+        self.emit_ops(&cond.operations)?;
+        self.ldr_stack(0, self.value_offset(&cond.result)?)?;
+        let exit_patch = self.emit_cbz_placeholder(0);
+        self.emit_ops(&body.operations)?;
+        self.store_value_to_local_arm64(&body.result, acc_type_hash, acc_slot)?;
+        self.emit_b_to(loop_start)?;
+        self.patch_imm19(exit_patch)?;
+        if self.type_passes_indirect(acc_type_hash)? {
+            self.add_reg_sp_imm(0, self.local_offset(acc_slot)?)?;
+        } else {
+            self.ldr_stack(0, self.local_offset(acc_slot)?)?;
+        }
+        self.str_stack(0, self.value_offset(id)?)?;
         Ok(())
     }
 

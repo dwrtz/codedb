@@ -3357,6 +3357,17 @@ fn expression_child_hashes(expr_kind: &str, payload: &JsonValue) -> Result<Vec<S
                 );
             }
         }
+        "loop" => {
+            for key in ["init", "cond", "body"] {
+                children.push(
+                    payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("loop missing {key}"))?
+                        .to_string(),
+                );
+            }
+        }
         other => bail!("unknown expression kind {other}"),
     }
     Ok(children)

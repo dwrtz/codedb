@@ -99,6 +99,19 @@ pub enum RawExpr {
         init: Box<RawExpr>,
         body: Box<RawExpr>,
     },
+    /// `loop <acc> = <init> while <cond> do <body>` — a condition-driven loop (R8).
+    /// Carries one loop accumulator `acc` (initialized to `init`); each iteration,
+    /// if `cond` (a `bool` over `acc`) holds, `acc` becomes `body` (the next
+    /// accumulator, same type), else the loop exits yielding the final `acc`. Both
+    /// `cond` and `body` see `acc` in scope. The condition-driven counterpart of
+    /// `Fold`: like `fold`, the accumulator must be copyable and the body may not
+    /// move owned values (loop-carried drop glue is a follow-on; SPEC_V3 §7).
+    Loop {
+        acc: String,
+        init: Box<RawExpr>,
+        cond: Box<RawExpr>,
+        body: Box<RawExpr>,
+    },
     Array {
         elements: Vec<RawExpr>,
     },
@@ -204,6 +217,16 @@ pub(crate) fn validate_return_positions(expr: &RawExpr, allowed: bool) -> Result
         } => {
             validate_return_positions(target, false)?;
             validate_return_positions(init, false)?;
+            validate_return_positions(body, false)
+        }
+        // A `loop` body produces the next accumulator, not the function's result; a
+        // `return` there would be a break (deferred), so init/cond/body are all
+        // strict value positions.
+        RawExpr::Loop {
+            init, cond, body, ..
+        } => {
+            validate_return_positions(init, false)?;
+            validate_return_positions(cond, false)?;
             validate_return_positions(body, false)
         }
         RawExpr::Call { args, .. } => {
@@ -728,6 +751,16 @@ pub(crate) fn int_literal_value(value: &str, int: &crate::types::ScalarIntType) 
 /// expression nesting is bounded by source size.
 const MAX_EVAL_CALL_DEPTH: usize = if cfg!(debug_assertions) { 120 } else { 1000 };
 
+/// Per-`loop` iteration ceiling for the reference evaluator (R8). Like
+/// [`MAX_EVAL_CALL_DEPTH`], this is an ORACLE robustness bound, not a language
+/// limit: a condition-driven loop may not terminate, which would hang the
+/// evaluator (an iterative loop does not grow the host stack, so it cannot abort
+/// — it would spin forever). The native backend runs the same loop with no
+/// ceiling. Sized far above any realistic fixpoint/worklist iteration count, so it
+/// only ever fires on a genuinely non-terminating loop, converting a hang into a
+/// clean error.
+pub(crate) const MAX_EVAL_LOOP_ITERATIONS: u64 = 100_000_000;
+
 thread_local! {
     static EVAL_CALL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -1128,6 +1161,68 @@ impl CodeDb {
             }
             _ => Ok(false),
         }
+    }
+
+    /// Evaluate `loop acc = init while cond do body` (R8). Kept out of
+    /// `eval_expr_with_locals` (and never inlined) so its locals do not enlarge that
+    /// hot recursive frame. acc starts at init; while cond(acc) holds, acc becomes
+    /// body(acc); the loop yields the final acc. `cond` and `body` read `acc` from
+    /// one shared cell per iteration; a generous iteration ceiling converts a
+    /// non-terminating loop into a clean error (an oracle bound, not a native limit).
+    #[inline(never)]
+    fn eval_loop(
+        &self,
+        root_hash: &str,
+        payload: &JsonValue,
+        args: &mut Vec<ValueCell>,
+        locals: &mut Vec<ValueCell>,
+    ) -> Result<Value> {
+        let init_hash = payload
+            .get("init")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("loop missing init"))?;
+        let cond_hash = payload
+            .get("cond")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("loop missing cond"))?;
+        let body_hash = payload
+            .get("body")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("loop missing body"))?;
+        let mut accumulator = self.eval_expr_with_locals(root_hash, init_hash, args, locals)?;
+        let mut iterations: u64 = 0;
+        loop {
+            locals.push(value_cell(semantic_clone_value(&accumulator)));
+            let cond = self.eval_expr_with_locals(root_hash, cond_hash, args, locals);
+            let cond = match cond {
+                Ok(cond) => cond,
+                Err(err) => {
+                    locals.pop();
+                    return Err(err);
+                }
+            };
+            match cond {
+                Value::Bool(false) => {
+                    locals.pop();
+                    break;
+                }
+                Value::Bool(true) => {}
+                other => {
+                    locals.pop();
+                    bail!("loop condition evaluated to non-bool {other}");
+                }
+            }
+            let next = self.eval_expr_with_locals(root_hash, body_hash, args, locals);
+            locals.pop();
+            accumulator = next?;
+            iterations += 1;
+            if iterations > MAX_EVAL_LOOP_ITERATIONS {
+                bail!(
+                    "loop exceeded the reference evaluator's {MAX_EVAL_LOOP_ITERATIONS}-iteration ceiling (likely non-terminating); it is an oracle bound, not a native limit"
+                );
+            }
+        }
+        Ok(accumulator)
     }
 
     fn eval_expr_with_locals(
@@ -1590,6 +1685,11 @@ impl CodeDb {
                 }
                 Ok(accumulator)
             }
+            // Extracted (and never inlined) so this big arm's locals do NOT enlarge
+            // the hot, deeply-recursive `eval_expr_with_locals` stack frame — which
+            // would push the host-stack recursion ceiling past the real overflow
+            // depth (the `loop` body is never on the deep-recursion path).
+            "loop" => self.eval_loop(root_hash, &payload, args, locals),
             "array_literal" => {
                 let mut values = Vec::new();
                 for element in payload
@@ -3179,6 +3279,63 @@ impl CodeDb {
                     expr
                 }
             }
+            "loop" => {
+                let acc_name = payload
+                    .get("acc_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("loop missing acc_name"))?;
+                let init_hash = payload
+                    .get("init")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("loop missing init"))?;
+                let cond_hash = payload
+                    .get("cond")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("loop missing cond"))?;
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("loop missing body"))?;
+                // `init` renders without `acc` in scope; `cond` and `body` with it.
+                let init = self.expr_to_source_with_locals(
+                    init_hash,
+                    root,
+                    current_module,
+                    local_params,
+                    region_names,
+                    local_names,
+                    0,
+                )?;
+                local_names.push(acc_name.to_string());
+                let cond = self.expr_to_source_with_locals(
+                    cond_hash,
+                    root,
+                    current_module,
+                    local_params,
+                    region_names,
+                    local_names,
+                    0,
+                );
+                let body = self.expr_to_source_with_locals(
+                    body_hash,
+                    root,
+                    current_module,
+                    local_params,
+                    region_names,
+                    local_names,
+                    0,
+                );
+                local_names.pop();
+                let expr = format!(
+                    "loop {acc_name} = {init} while {} do {}",
+                    cond?, body?
+                );
+                if parent_prec > 0 {
+                    format!("({expr})")
+                } else {
+                    expr
+                }
+            }
             "record_literal" => {
                 let fields = payload
                     .get("fields")
@@ -4274,6 +4431,51 @@ impl CodeDb {
                     body: Box::new(body?),
                 })
             }
+            "loop" => {
+                let acc = payload
+                    .get("acc_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("loop missing acc_name"))?
+                    .to_string();
+                let init = self.typed_expr_to_raw_with_locals(
+                    payload
+                        .get("init")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("loop missing init"))?,
+                    root,
+                    current_module,
+                    region_names,
+                    local_names,
+                )?;
+                local_names.push(acc.clone());
+                let cond = self.typed_expr_to_raw_with_locals(
+                    payload
+                        .get("cond")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("loop missing cond"))?,
+                    root,
+                    current_module,
+                    region_names,
+                    local_names,
+                );
+                let body = self.typed_expr_to_raw_with_locals(
+                    payload
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("loop missing body"))?,
+                    root,
+                    current_module,
+                    region_names,
+                    local_names,
+                );
+                local_names.pop();
+                Ok(RawExpr::Loop {
+                    acc,
+                    init: Box::new(init),
+                    cond: Box::new(cond?),
+                    body: Box::new(body?),
+                })
+            }
             "record_literal" => Ok(RawExpr::Record {
                 fields: payload
                     .get("fields")
@@ -4930,6 +5132,15 @@ impl CodeDb {
                     self.collect_expr_deps(root, child, deps)?;
                 }
             }
+            "loop" => {
+                for key in ["init", "cond", "body"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("loop missing {key}"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
+            }
             "record_literal" => {
                 for field in payload
                     .get("fields")
@@ -5419,6 +5630,29 @@ impl Parser {
                 target: Box::new(target),
                 acc,
                 init: Box::new(init),
+                body: Box::new(body),
+            })
+        } else {
+            self.parse_loop()
+        }
+    }
+
+    /// `loop <acc> = <init> while <cond> do <body>` (R8): a condition-driven loop
+    /// carrying one accumulator. `init`/`cond`/`body` are full expressions; `cond`
+    /// stops at `while`/`do` (keywords no operator consumes), so no parens needed.
+    fn parse_loop(&mut self) -> Result<RawExpr> {
+        if self.consume_ident_value("loop") {
+            let acc = self.expect_ident()?;
+            self.expect_symbol("=")?;
+            let init = self.parse_expr()?;
+            self.expect_ident_value("while")?;
+            let cond = self.parse_expr()?;
+            self.expect_ident_value("do")?;
+            let body = self.parse_expr()?;
+            Ok(RawExpr::Loop {
+                acc,
+                init: Box::new(init),
+                cond: Box::new(cond),
                 body: Box::new(body),
             })
         } else {

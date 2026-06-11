@@ -970,6 +970,15 @@ fn expr_reachable_from(
             }
             expr_reachable_child_field(db, &payload, "body", target_hash, seen)
         }
+        "loop" => {
+            if expr_reachable_child_field(db, &payload, "init", target_hash, seen)? {
+                return Ok(true);
+            }
+            if expr_reachable_child_field(db, &payload, "cond", target_hash, seen)? {
+                return Ok(true);
+            }
+            expr_reachable_child_field(db, &payload, "body", target_hash, seen)
+        }
         other => bail!("unknown expression kind {other}"),
     }
 }

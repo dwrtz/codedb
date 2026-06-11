@@ -3324,6 +3324,17 @@ fn substitute_param_refs(expr: &RawExpr, args: &[RawExpr]) -> Result<RawExpr> {
             init: Box::new(substitute_param_refs(init, args)?),
             body: Box::new(substitute_param_refs(body, args)?),
         },
+        RawExpr::Loop {
+            acc,
+            init,
+            cond,
+            body,
+        } => RawExpr::Loop {
+            acc: acc.clone(),
+            init: Box::new(substitute_param_refs(init, args)?),
+            cond: Box::new(substitute_param_refs(cond, args)?),
+            body: Box::new(substitute_param_refs(body, args)?),
+        },
         RawExpr::Array { elements } => RawExpr::Array {
             elements: elements
                 .iter()
@@ -3450,6 +3461,18 @@ fn collect_free_param_names(
             bound_locals.push(acc.clone());
             collect_free_param_names(body, bound_locals, names);
             bound_locals.pop();
+            bound_locals.pop();
+        }
+        RawExpr::Loop {
+            acc,
+            init,
+            cond,
+            body,
+        } => {
+            collect_free_param_names(init, bound_locals, names);
+            bound_locals.push(acc.clone());
+            collect_free_param_names(cond, bound_locals, names);
+            collect_free_param_names(body, bound_locals, names);
             bound_locals.pop();
         }
         RawExpr::Array { elements } => {
@@ -3653,6 +3676,27 @@ fn alpha_rename_let_bindings_with_scope(
                 target: Box::new(target),
                 acc: renamed_acc,
                 init: Box::new(init),
+                body: Box::new(body),
+            }
+        }
+        RawExpr::Loop {
+            acc,
+            init,
+            cond,
+            body,
+        } => {
+            // `acc` is in scope for `cond` and `body` (renamed), not `init`.
+            let init = alpha_rename_let_bindings_with_scope(init, used_names, renamed_locals);
+            let renamed_acc = unique_inline_local_name(acc, used_names);
+            used_names.insert(renamed_acc.clone());
+            renamed_locals.push((acc.clone(), renamed_acc.clone()));
+            let cond = alpha_rename_let_bindings_with_scope(cond, used_names, renamed_locals);
+            let body = alpha_rename_let_bindings_with_scope(body, used_names, renamed_locals);
+            renamed_locals.pop();
+            RawExpr::Loop {
+                acc: renamed_acc,
+                init: Box::new(init),
+                cond: Box::new(cond),
                 body: Box::new(body),
             }
         }

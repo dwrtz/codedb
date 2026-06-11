@@ -4597,6 +4597,10 @@ fn collect_lowered_call_targets(
             LoweredOp::Fold { body, .. } => {
                 collect_lowered_call_targets(&body.operations, targets)?;
             }
+            LoweredOp::Loop { cond, body, .. } => {
+                collect_lowered_call_targets(&cond.operations, targets)?;
+                collect_lowered_call_targets(&body.operations, targets)?;
+            }
             LoweredOp::Param { .. }
             | LoweredOp::ConstI64 { .. }
             | LoweredOp::ConstBool { .. }

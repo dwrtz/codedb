@@ -255,6 +255,22 @@ pub(crate) enum LoweredOp {
         acc_type_hash: String,
         type_hash: String,
     },
+    /// `loop acc = init while cond do body` (R8): the condition-driven counterpart
+    /// of `Fold`. `acc_slot` holds the accumulator (initialized to `init`); each
+    /// iteration the `cond` block (reading `acc_slot`) yields a `bool` — if false,
+    /// the loop exits with the accumulator as its result (`id`); else the `body`
+    /// block (reading `acc_slot`) yields the next accumulator, stored back into
+    /// `acc_slot`. Like `Fold`, the accumulator is copyable and the body moves no
+    /// owned values (loop-carried drop glue is a follow-on; SPEC_V3 §7).
+    Loop {
+        id: String,
+        acc_slot: usize,
+        init: String,
+        cond: LoweredBlock,
+        body: LoweredBlock,
+        acc_type_hash: String,
+        type_hash: String,
+    },
     BorrowShared {
         id: String,
         address: String,
@@ -1690,6 +1706,7 @@ impl CodeDb {
             ),
             "case" => self.lower_case(root, expr_hash, &type_hash, param_types, ctx, locals),
             "fold" => self.lower_fold(root, expr_hash, &type_hash, param_types, ctx, locals),
+            "loop" => self.lower_loop(root, expr_hash, &type_hash, param_types, ctx, locals),
             other => bail!("unknown expression kind {other}"),
         }
     }
@@ -3952,6 +3969,102 @@ impl CodeDb {
                 result: body.value,
             },
             element_type_hash,
+            acc_type_hash: acc_type_hash.clone(),
+            type_hash: type_hash.to_string(),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash.to_string(),
+        })
+    }
+
+    /// Lower `loop acc = init while cond do body` (R8): the condition-driven
+    /// counterpart of `lower_fold`. `init` lowers and seeds the accumulator slot;
+    /// `cond` and `body` lower as blocks that read the accumulator slot (via the
+    /// `acc` local binding). Like fold, the accumulator must be copyable and the
+    /// body may move no owned values (loop-carried drop glue is a follow-on;
+    /// SPEC_V3 §7) — a body move is rejected here.
+    fn lower_loop(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let init_hash = payload
+            .get("init")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("loop missing init"))?;
+        let cond_hash = payload
+            .get("cond")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("loop missing cond"))?;
+        let body_hash = payload
+            .get("body")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("loop missing body"))?;
+        let acc_type_hash = payload
+            .get("acc_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("loop missing acc_type"))?
+            .to_string();
+        if acc_type_hash != type_hash {
+            bail!("loop accumulator/result type mismatch while lowering");
+        }
+        if self.type_is_move_only(root, ctx.target_triple(), &acc_type_hash)? {
+            bail!("loop lowering requires a copyable accumulator type");
+        }
+        let init = self.lower_expr_as(root, init_hash, &acc_type_hash, param_types, ctx, locals)?;
+        if !self.type_assignable_in_root(root, &init.type_hash, &acc_type_hash)? {
+            bail!("loop init type mismatch while lowering");
+        }
+        let mut operations = init.operations;
+        let acc_slot_size = stack_slot_size_bytes(self.layout_size_bytes(
+            root,
+            ctx.target_triple(),
+            &acc_type_hash,
+        )?);
+        let acc_slot = ctx.local_slot(acc_type_hash.clone(), acc_slot_size);
+        locals.push(LocalLoweredBinding {
+            slot: acc_slot,
+            type_hash: acc_type_hash.clone(),
+        });
+        let moved_before = ctx.moved.clone();
+        // `cond` and `body` both read the accumulator slot via the `acc` local.
+        let cond = self.lower_expr(root, cond_hash, param_types, ctx, locals);
+        let body = self.lower_expr_as(root, body_hash, &acc_type_hash, param_types, ctx, locals);
+        locals.pop();
+        let cond = cond?;
+        let body = body?;
+        if ctx.moved != moved_before {
+            bail!(
+                "unsupported_move: loop body cannot move owned values; loop-carried drop glue is not yet implemented"
+            );
+        }
+        if cond.type_hash != type_hash_for("Bool") {
+            bail!("loop condition must lower to bool");
+        }
+        if !self.type_assignable_in_root(root, &body.type_hash, &acc_type_hash)? {
+            bail!("loop body type mismatch while lowering");
+        }
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "loop", &id);
+        operations.push(LoweredOp::Loop {
+            id: id.clone(),
+            acc_slot,
+            init: init.value,
+            cond: LoweredBlock {
+                operations: cond.operations,
+                result: cond.value,
+            },
+            body: LoweredBlock {
+                operations: body.operations,
+                result: body.value,
+            },
             acc_type_hash: acc_type_hash.clone(),
             type_hash: type_hash.to_string(),
         });
@@ -7018,6 +7131,65 @@ impl CodeDb {
                         insert_address(addresses, id, type_hash)?;
                     }
                 }
+                LoweredOp::Loop {
+                    id,
+                    acc_slot,
+                    init,
+                    cond,
+                    body,
+                    acc_type_hash,
+                    type_hash,
+                } => {
+                    if type_hash != acc_type_hash {
+                        bail!("lowered loop result/accumulator type mismatch");
+                    }
+                    if value_type(values, init)? != acc_type_hash {
+                        bail!("lowered loop init type mismatch");
+                    }
+                    let acc_slot_type = local_slots
+                        .get(*acc_slot)
+                        .ok_or_else(|| anyhow!("lowered loop accumulator slot out of bounds"))?
+                        .type_hash
+                        .clone();
+                    if acc_slot_type != *acc_type_hash {
+                        bail!("lowered loop accumulator slot type mismatch");
+                    }
+                    // `cond` and `body` read the accumulator slot and run 0..N times;
+                    // since the body moves no owned values (enforced at lowering),
+                    // the shared drop-state is unchanged across the back-edge.
+                    let cond_type = self.verify_lowered_block(
+                        root,
+                        cond,
+                        target_triple,
+                        param_types,
+                        return_type,
+                        local_slots,
+                        values,
+                        addresses,
+                        drop_state,
+                    )?;
+                    if cond_type != type_hash_for("Bool") {
+                        bail!("lowered loop condition must be bool");
+                    }
+                    let body_type = self.verify_lowered_block(
+                        root,
+                        body,
+                        target_triple,
+                        param_types,
+                        return_type,
+                        local_slots,
+                        values,
+                        addresses,
+                        drop_state,
+                    )?;
+                    if body_type != *acc_type_hash {
+                        bail!("lowered loop body result type mismatch");
+                    }
+                    insert_value(values, id, type_hash)?;
+                    if self.type_passes_indirect(root, target_triple, type_hash)? {
+                        insert_address(addresses, id, type_hash)?;
+                    }
+                }
                 LoweredOp::BorrowShared {
                     id,
                     address,
@@ -8081,6 +8253,7 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::If { id, .. }
         | LoweredOp::Case { id, .. }
         | LoweredOp::Fold { id, .. }
+        | LoweredOp::Loop { id, .. }
         | LoweredOp::BorrowShared { id, .. }
         | LoweredOp::BorrowMut { id, .. }
         | LoweredOp::DerefShared { id, .. }
@@ -8135,6 +8308,7 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::If { .. } => "if",
         LoweredOp::Case { .. } => "case",
         LoweredOp::Fold { .. } => "fold",
+        LoweredOp::Loop { .. } => "loop",
         LoweredOp::EarlyReturn { .. } => "early_return",
         LoweredOp::BorrowShared { .. } => "borrow_shared",
         LoweredOp::BorrowMut { .. } => "borrow_mut",
@@ -8244,6 +8418,10 @@ fn collect_lowered_value_debug_infos(
                     }
                 }
                 LoweredOp::Fold { body, .. } => {
+                    collect_lowered_value_debug_infos(&body.operations, out)?;
+                }
+                LoweredOp::Loop { cond, body, .. } => {
+                    collect_lowered_value_debug_infos(&cond.operations, out)?;
                     collect_lowered_value_debug_infos(&body.operations, out)?;
                 }
                 _ => {}
@@ -8401,6 +8579,18 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
                 out.insert(target_type_hash.clone());
                 out.insert(element_type_hash.clone());
                 out.insert(acc_type_hash.clone());
+                collect_op_type_hashes(&body.operations, out);
+            }
+            LoweredOp::Loop {
+                acc_type_hash,
+                type_hash,
+                cond,
+                body,
+                ..
+            } => {
+                out.insert(acc_type_hash.clone());
+                out.insert(type_hash.clone());
+                collect_op_type_hashes(&cond.operations, out);
                 collect_op_type_hashes(&body.operations, out);
             }
             LoweredOp::DerefShared {

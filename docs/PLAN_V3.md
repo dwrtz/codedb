@@ -600,13 +600,42 @@ confirms the no-leak half at runtime scale.
 
 Goal: a condition-driven loop for worklist/fixpoint passes (and, later, servers).
 
-Status: planned. Resolves R8. Depends on Phases 4 (loop-carried drops) and 10 (break).
+Status: implemented. Resolves R8. In this expression language a loop must carry
+state (there is no mutation), so the surface is `loop acc = init while cond do body`
+— the condition-driven counterpart of `fold`: the accumulator `acc` starts at
+`init`; while `cond(acc)` (a `bool`) holds, `acc` becomes `body(acc)` (the next
+accumulator, same type); the loop yields the final `acc`. Both `cond` and `body` see
+`acc`. A record accumulator carries several loop-varying values (e.g. `{ state, i }`
+for a worklist over an array read by the loop index), context-typed/anchored to the
+named accumulator type exactly like a `let acc: T = <init>` (so a `{ acc: 0x0, .. }`
+sized-int field takes its declared width).
 
-Deliverables:
+Following the SPEC_V3 §7 sequencing, the MVP mirrors `fold`'s soundness envelope:
+the accumulator must be copyable and the body may move no owned values — loop-carried
+drop glue for an owned/move-only accumulator stays fail-closed (the still-open #4
+item), as does `break`/`continue` (the condition is the loop's only exit; `return` is
+rejected in `init`/`cond`/`body`). A new `LoweredOp::Loop` lowers to a real backend
+loop on x86_64 and arm64 (seed the accumulator slot, re-run the `cond` block each
+iteration and exit when it is false, else run the `body` block and store its result
+back) — `lower_loop`/`emit_loop` mirror `lower_fold`/`emit_fold` minus the
+index/item bookkeeping. The borrow checker scopes `acc` as a loop-local and the
+lowering rejects a body move (no loop-carried drop glue); the lowered-IR verifier
+checks the cond is `bool`, the body matches the accumulator, and (since the body
+moves nothing) the shared drop-state is unchanged across the back-edge — so verify
+tolerates non-terminating control. The reference evaluator and tracer iterate the
+loop, guarded by a generous per-loop iteration ceiling (`MAX_EVAL_LOOP_ITERATIONS`)
+that converts a non-terminating loop into a clean error — an oracle-robustness bound,
+not a native limit (the backend runs the loop unbounded), mirroring the recursion
+ceiling. Effects propagate through `init`/`cond`/`body`; round-trips, `verify`,
+`trace`, and replay/export/import all support it.
+
+Deliverables (delivered; the `and/or` alternatives deferred):
 
 ```text
-`while cond do body` and/or `loop { ... break }`, lowering to real backend loops
-loop-carried borrow/drop/effect checking; verify handles non-terminating control
+`loop acc = init while cond do body` lowering to real backend loops (x86_64 + arm64)
+loop-carried borrow/effect checking; verify tolerates non-terminating control
+(deferred: loop-carried drop glue for an owned accumulator — fail-closed, like fold;
+ break/continue — the condition is the exit, and the early-exit machinery is Phase 10)
 ```
 
 Files likely touched:
@@ -616,11 +645,21 @@ src/expr.rs, src/types.rs, src/lowering.rs, src/verify.rs, src/backend/native.rs
 tests/while_native.rs
 ```
 
-Acceptance fixture and oracle:
+Acceptance fixture and oracle (met):
 
 ```text
 a native fixpoint/worklist pass iterates until a condition and matches the oracle
 ```
+
+`tests/while_native.rs` pins the fixpoint/worklist acceptance natively (eval ==
+native): scalar fixpoints (count-up, double-until), a record accumulator (Collatz
+step count), a worklist iterating a fixed array by the loop index, a u32 accumulator
+with wrapping arithmetic + a u32 array read (the codec-shaped round loop), the
+zero-iteration edge, the fail-closed move-only-accumulator and body-move rejections,
+projection round-trip, and trace parity. (`examples/v3/sha256.cdb` can roll its 64
+compression rounds into a loop, but its message schedule writes array elements, which
+needs array update / a mutable buffer — a separate feature — so full sha256-native
+remains gated on that, not on loops.)
 
 ## Phase 12 — Strings and Integer Formatting (R15, R3)
 

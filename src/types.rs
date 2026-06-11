@@ -3040,6 +3040,124 @@ impl CodeDb {
         })
     }
 
+    /// Type-check `loop acc = init while cond do body` (R8): the condition-driven
+    /// counterpart of `type_fold_expr`. `acc` is bound (to `init`'s type, anchored
+    /// to the enclosing destination type like a fold so a record-literal init builds
+    /// in declaration-order layout) and is in scope for `cond` (which must be `bool`)
+    /// and `body` (which must produce the next accumulator, same type). Like fold,
+    /// the accumulator must be copyable and carry no references — loop-carried drop
+    /// glue for an owned accumulator is a follow-on (SPEC_V3 §7). The loop's result
+    /// type is the accumulator type (the final accumulator when `cond` is false).
+    #[allow(clippy::too_many_arguments)]
+    fn type_loop_expr(
+        &mut self,
+        current_module: &str,
+        acc: &str,
+        init: &RawExpr,
+        cond: &RawExpr,
+        body: &RawExpr,
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
+        locals: &mut Vec<LocalTypeBinding>,
+        expected_acc_type: Option<&str>,
+    ) -> Result<TypeCheckResult> {
+        validate_projection_identifier("loop accumulator binding", acc)?;
+        // `init` is checked with `acc` NOT yet in scope (acc is bound after init),
+        // but with the enclosing destination type as its expected type — so a
+        // record-literal init anchors to the named accumulator type (building in
+        // declaration-order layout AND context-typing a sized-int field like
+        // `{ acc: 0x0 }` to its declared width), mirroring `let acc: T = <init>`.
+        let init = self.type_expr_with_locals_expecting(
+            current_module,
+            init,
+            root,
+            param_names,
+            param_types,
+            region_scope,
+            locals,
+            expected_acc_type,
+        )?;
+        let acc_type = match expected_acc_type {
+            Some(expected)
+                if expected != init.type_hash.as_str()
+                    && self.type_assignable_in_root(root, &init.type_hash, expected)? =>
+            {
+                expected.to_string()
+            }
+            _ => init.type_hash.clone(),
+        };
+        let acc_class = self.value_class_in_root(root, &acc_type)?;
+        if acc_class.copy_kind == ValueCopyKind::MoveOnly {
+            bail!(
+                "loop accumulator type must be copyable (loop-carried drop glue is not yet implemented)"
+            );
+        }
+        if acc_class.contains_reference {
+            bail!("loop accumulator type must not carry references");
+        }
+        locals.push(LocalTypeBinding {
+            name: acc.to_string(),
+            type_hash: acc_type.clone(),
+        });
+        // `cond` and `body` both see `acc`. Check both with it in scope, then pop
+        // before propagating any error so the local stack stays consistent.
+        let cond = self.type_expr_with_locals(
+            current_module,
+            cond,
+            root,
+            param_names,
+            param_types,
+            region_scope,
+            locals,
+        );
+        let body = self.type_expr_with_locals_expecting(
+            current_module,
+            body,
+            root,
+            param_names,
+            param_types,
+            region_scope,
+            locals,
+            Some(acc_type.as_str()),
+        );
+        locals.pop();
+        let cond = cond?;
+        let body = body?;
+        require_type(&cond.type_hash, &type_hash_for("Bool"), "loop condition", self)?;
+        if !self.type_assignable_in_root(root, &body.type_hash, &acc_type)? {
+            bail!(
+                "loop body returns {}, expected accumulator type {}",
+                self.type_name(&body.type_hash)?,
+                self.type_name(&acc_type)?
+            );
+        }
+        let expr_hash = self.put_object(
+            "Expression",
+            &json!({
+                "expr_kind": "loop",
+                "acc_name": acc,
+                "init": init.expr_hash,
+                "acc_type": acc_type,
+                "cond": cond.expr_hash,
+                "body": body.expr_hash,
+                "type": acc_type,
+            }),
+        )?;
+        self.write_cache_json(
+            &expr_hash,
+            "typechecker",
+            "typed-dag",
+            ArtifactKind::TypedExpression,
+            &json!({ "type": acc_type }),
+        )?;
+        Ok(TypeCheckResult {
+            expr_hash,
+            type_hash: acc_type,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// Resolve the type of an integer literal `value` given the position's
     /// `expected_type`. A sized-integer expectation gives the literal that width
@@ -4001,6 +4119,24 @@ impl CodeDb {
                 target,
                 acc,
                 init,
+                body,
+                root,
+                param_names,
+                param_types,
+                region_scope,
+                locals,
+                expected_type,
+            ),
+            RawExpr::Loop {
+                acc,
+                init,
+                cond,
+                body,
+            } => self.type_loop_expr(
+                current_module,
+                acc,
+                init,
+                cond,
                 body,
                 root,
                 param_names,
@@ -6306,6 +6442,9 @@ impl CodeDb {
                 self.expr_escapes_local_borrow(root, value, locals_with_local_borrows)
             }
             "fold" => Ok(false),
+            // A `loop` accumulator is copyable and reference-free (R8 restriction),
+            // so the loop result cannot carry a borrow of a local.
+            "loop" => Ok(false),
             "case" => {
                 let expr = payload
                     .get("expr")
@@ -7339,6 +7478,52 @@ impl CodeDb {
                 state.locals.pop();
                 state.locals.pop();
                 body_result
+            }
+            "loop" => {
+                let init = payload
+                    .get("init")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("loop missing init"))?;
+                let cond = payload
+                    .get("cond")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("loop missing cond"))?;
+                let body = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("loop missing body"))?;
+                let acc_type = payload
+                    .get("acc_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("loop missing acc_type"))?;
+                if self.value_class_in_root(root, acc_type)?.contains_reference {
+                    bail!("loop accumulator type must not carry references");
+                }
+                self.verify_expr_borrows(root, init, param_types, state, ExprUse::Value)?;
+                // `acc` is a loop-local; `cond` and `body` see it. One representative
+                // iteration is checked (cond then body, sharing state); the
+                // accumulator's loans/moves are loop-local and retired afterward.
+                // Whether the body moves any *outer* owned value is rejected at
+                // lowering (no loop-carried drop glue yet), mirroring `fold`.
+                let acc_local = state.next_local;
+                state.next_local += 1;
+                state.locals.push(acc_local);
+                let cond_result =
+                    self.verify_expr_borrows(root, cond, param_types, state, ExprUse::Value);
+                let body_result =
+                    self.verify_expr_borrows(root, body, param_types, state, ExprUse::Value);
+                let acc_owner = LoanPlace {
+                    root: LoanRoot::Local(acc_local),
+                    fields: Vec::new(),
+                };
+                state
+                    .active
+                    .retain(|loan| !loan_owner_overlaps(loan, &acc_owner));
+                state
+                    .moved
+                    .retain(|place| !matches!(place.root, LoanRoot::Local(id) if id == acc_local));
+                state.locals.pop();
+                cond_result.and(body_result)
             }
             "record_literal" => {
                 for field in payload
@@ -8766,6 +8951,11 @@ impl CodeDb {
                         || self.expr_child_requires_state(&payload, "init")?
                         || self.expr_child_requires_state(&payload, "body")?
                 }
+                "loop" => {
+                    self.expr_child_requires_state(&payload, "init")?
+                        || self.expr_child_requires_state(&payload, "cond")?
+                        || self.expr_child_requires_state(&payload, "body")?
+                }
                 "record_literal" => {
                     let mut required = false;
                     for field in payload
@@ -8911,6 +9101,11 @@ impl CodeDb {
                         || self.expr_child_requires_alloc(&payload, "init")?
                         || self.expr_child_requires_alloc(&payload, "body")?
                 }
+                "loop" => {
+                    self.expr_child_requires_alloc(&payload, "init")?
+                        || self.expr_child_requires_alloc(&payload, "cond")?
+                        || self.expr_child_requires_alloc(&payload, "body")?
+                }
                 "record_literal" => {
                     let mut required = false;
                     for field in payload
@@ -9048,6 +9243,11 @@ impl CodeDb {
                 "fold" => {
                     self.expr_child_requires_unsafe(&payload, "target")?
                         || self.expr_child_requires_unsafe(&payload, "init")?
+                        || self.expr_child_requires_unsafe(&payload, "body")?
+                }
+                "loop" => {
+                    self.expr_child_requires_unsafe(&payload, "init")?
+                        || self.expr_child_requires_unsafe(&payload, "cond")?
                         || self.expr_child_requires_unsafe(&payload, "body")?
                 }
                 "record_literal" => {
@@ -10476,6 +10676,72 @@ impl CodeDb {
                 let body_type = body_type?;
                 if !self.type_assignable_in_root(root, &body_type, &acc_type)? {
                     bail!("fold body type mismatch");
+                }
+                acc_type
+            }
+            "loop" => {
+                let acc_name = payload
+                    .get("acc_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("loop missing acc_name"))?;
+                validate_projection_identifier("loop accumulator binding", acc_name)?;
+                let init_hash = payload
+                    .get("init")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("loop missing init"))?;
+                let cond_hash = payload
+                    .get("cond")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("loop missing cond"))?;
+                let body_hash = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("loop missing body"))?;
+                let init_type = self.verify_expr_type_with_locals(
+                    init_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                let acc_type = payload
+                    .get("acc_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("loop missing acc_type"))?
+                    .to_string();
+                if !self.type_assignable_in_root(root, &init_type, &acc_type)? {
+                    bail!("loop acc_type mismatch");
+                }
+                let acc_class = self.value_class_in_root(root, &acc_type)?;
+                if acc_class.copy_kind == ValueCopyKind::MoveOnly {
+                    bail!("loop accumulator type must be copyable");
+                }
+                if acc_class.contains_reference {
+                    bail!("loop accumulator type must not carry references");
+                }
+                locals.push(acc_type.clone());
+                let cond_type = self.verify_expr_type_with_locals(
+                    cond_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                );
+                let body_type = self.verify_expr_type_with_locals(
+                    body_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                );
+                locals.pop();
+                let cond_type = cond_type?;
+                let body_type = body_type?;
+                if cond_type != type_hash_for("Bool") {
+                    bail!("loop condition must be bool");
+                }
+                if !self.type_assignable_in_root(root, &body_type, &acc_type)? {
+                    bail!("loop body type mismatch");
                 }
                 acc_type
             }

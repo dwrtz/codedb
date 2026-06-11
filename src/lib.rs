@@ -1314,6 +1314,13 @@ fn collect_call_names(expr: &RawExpr, out: &mut Vec<String>) {
             collect_call_names(init, out);
             collect_call_names(body, out);
         }
+        RawExpr::Loop {
+            init, cond, body, ..
+        } => {
+            collect_call_names(init, out);
+            collect_call_names(cond, out);
+            collect_call_names(body, out);
+        }
         RawExpr::Array { elements } => {
             for element in elements {
                 collect_call_names(element, out);

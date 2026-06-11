@@ -1068,6 +1068,17 @@ fn append_default_arg_to_calls(expr: &RawExpr, target_name: &str, default: &RawE
             init: Box::new(append_default_arg_to_calls(init, target_name, default)),
             body: Box::new(append_default_arg_to_calls(body, target_name, default)),
         },
+        RawExpr::Loop {
+            acc,
+            init,
+            cond,
+            body,
+        } => RawExpr::Loop {
+            acc: acc.clone(),
+            init: Box::new(append_default_arg_to_calls(init, target_name, default)),
+            cond: Box::new(append_default_arg_to_calls(cond, target_name, default)),
+            body: Box::new(append_default_arg_to_calls(body, target_name, default)),
+        },
         RawExpr::Array { elements } => RawExpr::Array {
             elements: elements
                 .iter()
@@ -7602,6 +7613,35 @@ fn borrow_call_arg_to_calls(
                 mutable,
             )?),
         },
+        RawExpr::Loop {
+            acc,
+            init,
+            cond,
+            body,
+        } => RawExpr::Loop {
+            acc: acc.clone(),
+            init: Box::new(borrow_call_arg_to_calls(
+                init,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+            cond: Box::new(borrow_call_arg_to_calls(
+                cond,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+            body: Box::new(borrow_call_arg_to_calls(
+                body,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+        },
         RawExpr::Array { elements } => RawExpr::Array {
             elements: elements
                 .iter()
@@ -7860,6 +7900,25 @@ fn normalize_param_refs_scoped(
                 target: Box::new(target),
                 acc: acc.clone(),
                 init: Box::new(init),
+                body: Box::new(body),
+            }
+        }
+        RawExpr::Loop {
+            acc,
+            init,
+            cond,
+            body,
+        } => {
+            // `acc` is in scope for `cond` and `body`, not `init`.
+            let init = normalize_param_refs_scoped(init, local_params, local_bindings);
+            local_bindings.push(acc.clone());
+            let cond = normalize_param_refs_scoped(cond, local_params, local_bindings);
+            let body = normalize_param_refs_scoped(body, local_params, local_bindings);
+            local_bindings.pop();
+            RawExpr::Loop {
+                acc: acc.clone(),
+                init: Box::new(init),
+                cond: Box::new(cond),
                 body: Box::new(body),
             }
         }

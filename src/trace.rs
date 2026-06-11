@@ -666,6 +666,147 @@ impl CodeDb {
         Ok(value)
     }
 
+    /// Trace `loop acc = init while cond do body` (R8). Kept out of `trace_expr`
+    /// (and never inlined) so its locals do not enlarge that hot recursive frame
+    /// (see `CodeDb::eval_loop`). Mirrors the evaluator: acc starts at init; while
+    /// cond(acc), acc becomes body(acc); each iteration binds `acc`, traces cond then
+    /// body, and records a `LoopIteration` (no per-iteration item).
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn trace_loop(
+        &self,
+        state: &mut TraceState,
+        frame: usize,
+        symbol_hash: &str,
+        function_def_hash: &str,
+        expr_hash: &str,
+        payload: &JsonValue,
+        args: &mut Vec<ValueCell>,
+        locals: &mut Vec<ValueCell>,
+    ) -> Result<Value> {
+        let init_hash = payload
+            .get("init")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("loop missing init"))?;
+        let cond_hash = payload
+            .get("cond")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("loop missing cond"))?;
+        let body_hash = payload
+            .get("body")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("loop missing body"))?;
+        let acc_name = payload
+            .get("acc_name")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("loop missing acc_name"))?
+            .to_string();
+        let acc_type = payload
+            .get("acc_type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("loop missing acc_type"))?
+            .to_string();
+        let mut accumulator = self.trace_expr(
+            state,
+            frame,
+            symbol_hash,
+            function_def_hash,
+            init_hash,
+            args,
+            locals,
+        )?;
+        let mut iteration: usize = 0;
+        loop {
+            locals.push(value_cell(accumulator.clone()));
+            state.events.push(TraceEvent::LocalBind {
+                root_hash: state.root_hash.clone(),
+                frame,
+                symbol_hash: symbol_hash.to_string(),
+                function_def_hash: function_def_hash.to_string(),
+                expr_hash: expr_hash.to_string(),
+                name: acc_name.clone(),
+                type_hash: acc_type.clone(),
+                value: TraceValue::from_value(&accumulator),
+            });
+            let cond = self.trace_expr(
+                state,
+                frame,
+                symbol_hash,
+                function_def_hash,
+                cond_hash,
+                args,
+                locals,
+            );
+            let continue_loop = match &cond {
+                Ok(Value::Bool(b)) => *b,
+                Ok(_) | Err(_) => false,
+            };
+            if !continue_loop {
+                let popped = locals.pop();
+                if let Some(value) = popped {
+                    state.events.push(TraceEvent::LocalUnbind {
+                        root_hash: state.root_hash.clone(),
+                        frame,
+                        symbol_hash: symbol_hash.to_string(),
+                        function_def_hash: function_def_hash.to_string(),
+                        expr_hash: expr_hash.to_string(),
+                        name: acc_name.clone(),
+                        type_hash: acc_type.clone(),
+                        value: TraceValue::from_value(&value.borrow()),
+                    });
+                }
+                match cond? {
+                    Value::Bool(false) => break,
+                    other => bail!("loop condition evaluated to non-bool {other}"),
+                }
+            }
+            let before = accumulator.clone();
+            let body = self.trace_expr(
+                state,
+                frame,
+                symbol_hash,
+                function_def_hash,
+                body_hash,
+                args,
+                locals,
+            );
+            let popped = locals.pop();
+            if let Some(value) = popped {
+                state.events.push(TraceEvent::LocalUnbind {
+                    root_hash: state.root_hash.clone(),
+                    frame,
+                    symbol_hash: symbol_hash.to_string(),
+                    function_def_hash: function_def_hash.to_string(),
+                    expr_hash: expr_hash.to_string(),
+                    name: acc_name.clone(),
+                    type_hash: acc_type.clone(),
+                    value: TraceValue::from_value(&value.borrow()),
+                });
+            }
+            let after = body?;
+            state.events.push(TraceEvent::LoopIteration {
+                root_hash: state.root_hash.clone(),
+                frame,
+                symbol_hash: symbol_hash.to_string(),
+                function_def_hash: function_def_hash.to_string(),
+                expr_hash: expr_hash.to_string(),
+                iteration,
+                item: TraceValue::from_value(&Value::Unit),
+                accumulator_before: TraceValue::from_value(&before),
+                accumulator_after: TraceValue::from_value(&after),
+            });
+            accumulator = after;
+            iteration += 1;
+            if iteration as u64 > crate::expr::MAX_EVAL_LOOP_ITERATIONS {
+                bail!(
+                    "loop exceeded the reference evaluator's iteration ceiling (likely non-terminating)"
+                );
+            }
+        }
+        state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &accumulator);
+        Ok(accumulator)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn trace_expr(
         &self,
@@ -1516,6 +1657,18 @@ impl CodeDb {
                 );
                 Ok(accumulator)
             }
+            // Extracted (and never inlined) so this big arm does not enlarge the
+            // hot, deeply-recursive `trace_expr` frame (see `eval_loop`).
+            "loop" => self.trace_loop(
+                state,
+                frame,
+                symbol_hash,
+                function_def_hash,
+                expr_hash,
+                &payload,
+                args,
+                locals,
+            ),
             "record_literal" => {
                 let mut values = std::collections::BTreeMap::new();
                 for field in payload
