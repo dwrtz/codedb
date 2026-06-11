@@ -67,6 +67,7 @@ pub(crate) fn backend_encodes_kind(arch: NativeArch, kind: &str) -> bool {
             | "sub_i64"
             | "mul_i64"
             | "div_i64"
+            | "mod_i64"
             | "eq_i64"
             | "ne_i64"
             | "lt_i64"
@@ -3277,6 +3278,17 @@ impl FunctionEmitter {
                 self.text.extend_from_slice(&[0x48, 0x99]);
                 self.text.extend_from_slice(&[0x48, 0xf7, 0xf9]);
             }
+            "mod_i64" => {
+                // Signed remainder: trap on a zero divisor (test/jne/ud2), then
+                // `cqo; idiv rcx` and take the remainder from RDX into RAX. Same
+                // divide sequence as div_i64; only the result register differs.
+                self.text.extend_from_slice(&[0x48, 0x85, 0xc9]); // test rcx, rcx
+                self.text.extend_from_slice(&[0x75, 0x02]); // jne +2
+                self.text.extend_from_slice(&[0x0f, 0x0b]); // ud2
+                self.text.extend_from_slice(&[0x48, 0x99]); // cqo
+                self.text.extend_from_slice(&[0x48, 0xf7, 0xf9]); // idiv rcx
+                self.mov_rax_rdx(); // remainder (rdx) -> rax
+            }
             // u8 relational ops reuse the i64 path: a signed 64-bit `cmp` plus a
             // signed setcc (setl/setle/setg/setge below). This is correct because
             // every u8 value is held zero-extended to [0,255] in its 64-bit slot
@@ -5062,6 +5074,17 @@ impl Arm64Emitter {
                 self.emit_u32(0xd4200000);
                 self.patch_imm19(skip_trap)?;
                 self.sdiv_reg(0, 0, 1);
+            }
+            "mod_i64" => {
+                // Signed remainder: trap on a zero divisor, then compute
+                // x0 - (x0 / x1) * x1 via a scratch register (arm64 has no rem
+                // instruction; this is the msub sequence open-coded).
+                let skip_trap = self.emit_cbnz_placeholder(1);
+                self.emit_u32(0xd4200000); // brk #0
+                self.patch_imm19(skip_trap)?;
+                self.sdiv_reg(2, 0, 1); // x2 = x0 / x1
+                self.mul_reg(2, 2, 1); // x2 = x2 * x1
+                self.sub_reg(0, 0, 2); // x0 = x0 - x2  (remainder)
             }
             // u8 relational ops reuse the i64 signed condition codes (LT/LE/GT/GE
             // below). Correct because u8 operands are always zero-extended to

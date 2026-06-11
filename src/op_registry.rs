@@ -53,6 +53,7 @@ pub(crate) enum SemOp {
     SubI64,
     MulI64,
     DivI64,
+    ModI64,
     CmpI64(Cmp),
     CmpU8(Cmp),
     AndBool,
@@ -109,6 +110,11 @@ const DIV_TRAP: TrapSpec = TrapSpec {
     code: "division_by_zero",
 };
 
+const MOD_TRAP: TrapSpec = TrapSpec {
+    condition: "right_operand_zero",
+    code: "modulo_by_zero",
+};
+
 /// THE operator table. Adding a trivial operator is one row here (plus a backend
 /// encoder arm on each target — see module docs).
 pub(crate) static OPS: &[OpEntry] = &[
@@ -117,6 +123,7 @@ pub(crate) static OPS: &[OpEntry] = &[
     bin("sub_i64", "-", "I64", "I64", "I64", None, 5, SemOp::SubI64),
     bin("mul_i64", "*", "I64", "I64", "I64", None, 6, SemOp::MulI64),
     bin("div_i64", "/", "I64", "I64", "I64", Some(DIV_TRAP), 6, SemOp::DivI64),
+    bin("mod_i64", "%", "I64", "I64", "I64", Some(MOD_TRAP), 6, SemOp::ModI64),
     // i64 comparisons -> Bool
     bin("eq_i64", "==", "I64", "I64", "Bool", None, 3, SemOp::CmpI64(Cmp::Eq)),
     bin("ne_i64", "!=", "I64", "I64", "Bool", None, 3, SemOp::CmpI64(Cmp::Ne)),
@@ -209,6 +216,14 @@ fn lookup_binary_kind(kind: &str) -> Option<&'static OpEntry> {
 fn lookup_unary_kind(kind: &str) -> Option<&'static OpEntry> {
     OPS.iter()
         .find(|entry| entry.category == OpCategory::Unary && entry.kind == kind)
+}
+
+/// Whether `op` is a source-level binary operator (i.e. the registry carries a
+/// binary entry for it). The parser routes its `is_binary_op` gate here so adding
+/// an operator is one [`OPS`] row, not a second hand-maintained list.
+pub(crate) fn is_source_binary_op(op: &str) -> bool {
+    OPS.iter()
+        .any(|entry| entry.category == OpCategory::Binary && entry.source_op == op)
 }
 
 /// Parser precedence for a binary operator (`DEFAULT_PRECEDENCE` for anything not
@@ -343,6 +358,8 @@ pub(crate) fn eval_binary(op: &str, left: Value, right: Value) -> Result<Value> 
         (Some(SemOp::MulI64), Value::I64(a), Value::I64(b)) => Ok(Value::I64(a * b)),
         (Some(SemOp::DivI64), Value::I64(_), Value::I64(0)) => bail!("division by zero"),
         (Some(SemOp::DivI64), Value::I64(a), Value::I64(b)) => Ok(Value::I64(a / b)),
+        (Some(SemOp::ModI64), Value::I64(_), Value::I64(0)) => bail!("modulo by zero"),
+        (Some(SemOp::ModI64), Value::I64(a), Value::I64(b)) => Ok(Value::I64(a % b)),
         (Some(SemOp::CmpI64(cmp)), Value::I64(a), Value::I64(b)) => {
             Ok(Value::Bool(apply_cmp(cmp, &a, &b)))
         }

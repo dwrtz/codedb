@@ -3413,7 +3413,7 @@ impl CodeDb {
                 )?;
                 let bool_hash = type_hash_for("Bool");
                 let result_type = match op.as_str() {
-                    "+" | "-" | "*" | "/" => {
+                    "+" | "-" | "*" | "/" | "%" => {
                         let i64_hash = type_hash_for("I64");
                         require_type(&left.type_hash, &i64_hash, "left operand", self)?;
                         require_type(&right.type_hash, &i64_hash, "right operand", self)?;
@@ -9077,7 +9077,7 @@ impl CodeDb {
                 )?;
                 let bool_hash = type_hash_for("Bool");
                 match op {
-                    "+" | "-" | "*" | "/" => {
+                    "+" | "-" | "*" | "/" | "%" => {
                         let i64_hash = type_hash_for("I64");
                         if left != i64_hash || right != i64_hash {
                             bail!("integer op requires i64 operands");

@@ -92,6 +92,7 @@ fn fixtures() -> Vec<Fixture> {
         f("sub_i64", "op_sub_i64", "i64", "7 - 4", I64, "3"),
         f("mul_i64", "op_mul_i64", "i64", "6 * 7", I64, "42"),
         f("div_i64", "op_div_i64", "i64", "20 / 4", I64, "5"),
+        f("mod_i64", "op_mod_i64", "i64", "17 % 5", I64, "2"),
         // i64 comparisons
         f("eq_i64", "op_eq_i64", "bool", "2 == 2", BOOL, "true"),
         f("ne_i64", "op_ne_i64", "bool", "2 != 3", BOOL, "true"),
@@ -117,7 +118,7 @@ fn fixtures() -> Vec<Fixture> {
 
 /// The trap helpers (separate from the fixtures): `div_zero` divides by a
 /// non-constant zero so the division necessarily happens at run time.
-const TRAP_HELPERS: &str = "fn op_zero() -> i64 = 0\nfn op_div_zero() -> i64 = 1 / op_zero()\n";
+const TRAP_HELPERS: &str = "fn op_zero() -> i64 = 0\nfn op_div_zero() -> i64 = 1 / op_zero()\nfn op_mod_zero() -> i64 = 1 % op_zero()\n";
 
 fn program_source(fixtures: &[Fixture]) -> String {
     let mut source = String::new();
@@ -254,6 +255,29 @@ fn division_by_zero_traps_natively() {
     assert!(
         !status.success(),
         "div_i64 by zero must trap at runtime (non-zero/abnormal exit), got {status:?}"
+    );
+}
+
+#[test]
+fn modulo_by_zero_traps_natively() {
+    if !can_build_default_native_target() {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("oracle-mod-trap.sqlite");
+    let source = temp.path().join("oracle-mod-trap.cdb");
+    let exe = temp.path().join("mod-zero-trap");
+    std::fs::write(&source, program_source(&fixtures())).unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&source)]);
+
+    run(&["build", path(&db), "op_mod_zero", "--out", path(&exe)]);
+    let status = StdCommand::new(&exe)
+        .status()
+        .expect("run mod-by-zero trap binary");
+    assert!(
+        !status.success(),
+        "mod_i64 by zero must trap at runtime (non-zero/abnormal exit), got {status:?}"
     );
 }
 

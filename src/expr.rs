@@ -5791,10 +5791,9 @@ fn projection_hex_value(ch: char) -> Result<u8> {
 }
 
 fn is_binary_op(op: &str) -> bool {
-    matches!(
-        op,
-        "+" | "-" | "*" | "/" | "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||"
-    )
+    // The operator registry is the single source of truth for which symbols are
+    // binary operators (and their precedence); see `op_registry`.
+    crate::op_registry::is_source_binary_op(op)
 }
 
 fn local_at_depth<T>(locals: &[T], depth: usize) -> Option<&T> {
