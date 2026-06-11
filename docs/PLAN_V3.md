@@ -799,31 +799,133 @@ follow-on).
 Goal: type parameters on fn/record/enum with monomorphization at lowering — the
 one large rock the compiler genuinely needs (`Vec<T>`, `Option<T>`, `Result`).
 
-Status: planned. Resolves R11. Designed as its own pass.
+Status: implemented for records, enums, AND functions. Resolves R11 for
+parametric types and parametric functions. Type parameters on `record`/`enum`
+(`record Pair<T>`, `enum Option<T>`)
+are constraint-free and monomorphized by **on-demand substitution** rather than a
+stored-instance pass: a generic instance `Option<i64>` is the content hash of a
+`Named` Type object carrying its type arguments (`{type_symbol: <generic>,
+type_args: [i64]}`) — that hash *is* the instance's stable derived identity — and
+its concrete structure is materialized by substituting the arguments into the
+generic's template wherever structure is needed (`type_spec_in_root`, layout,
+lowering). So instances are never separate stored objects, "monomorphize at
+lowering" holds for layout/codegen, and import→export→import is a trivial fixpoint
+(only the generic templates and their uses are projected — `enum Option<T>` and
+`Option<i64>` — never the instances).
 
-Deliverables:
+Representation: `TypeSpec`/`ParsedTypeSpec` gain a `TypeParam { index }` variant
+(a positional, name-independent type-parameter reference — the opaque type during
+generic-body checking, which is exactly constraint-free parametricity: arithmetic
+or field access on a `T` fails) and a `type_args` field on `Named` (skipped when
+empty, so every pre-generics Type-object hash is byte-identical). `TypeDefinition`
+and the `RecordDef`/`EnumDef`/`CreateType` payloads gain `type_params` (also
+skip-if-empty). A localized `bind_type_params` rewrite turns each `T` in a generic
+definition's members into a `TypeParam` before resolution, so the rest of the
+resolver needs no threaded scope; `substitute_type_hash`/`put_substituted_type`
+(the type-arg twins of the existing region-substitution machinery) do the
+substitution, with `materialize_named_type_expansion` transitively storing every
+nested instance (`List<i64>`'s `box<List<i64>>`) so layout/lowering can load them
+(a `seen` set + the `box` size-break keep recursive generics terminating).
+
+Construction infers type arguments: `Option::some(5)` matches the variant's payload
+template (`some: T`) against the payload's type to solve `T = i64`; `Option::none`
+takes its argument from the expected type. The construction projects as the bare
+`Option::some(..)` (no `<...>` at `::`) and re-infers identically on re-import, so
+the grammar stays simple and the round trip is byte-stable. Layout (substitute
+then lay out), the reference evaluator, native x86_64+arm64, `verify`
+(`type_check_root` re-runs the arity + `TypeParam`-scope checks over every
+instance; the object canonical-hash check validates the new `TypeParam`/`type_args`
+payload forms), provenance (a generic's birth `create_type` records its
+`type_params`, so blame on the generic identifies the parameters its instances
+derive from), `trace`, and replay/export/import all support it. Wrong type-arg
+arity, a bare generic in a type position, and applying a type parameter
+(`T<i64>`, higher-kinded) all fail closed.
+
+Deliverables (records, enums, and functions all delivered):
 
 ```text
-type parameters on functions, records, and enums (constraint-free to start)
-monomorphization at lowering; stable derived identity for each instance
-the interface_hash/implementation_hash split applied to instances
-verify recomputes and validates instances; provenance traces instance -> generic
+type parameters on records, enums, and functions (constraint-free) — DONE
+monomorphization (types: on-demand substitution; functions: instances materialized
+  at the lowering seam, "at lowering" for layout/codegen) — DONE
+stable derived identity for each instance (a type instance is the Named-with-
+  type_args Type hash; a function instance is the hash of a descriptor naming its
+  generic + type arguments) — DONE
+verify recomputes and validates instances; provenance traces instance -> generic — DONE
 ```
 
-Files likely touched:
+Files touched:
 
 ```text
-src/types.rs, src/model.rs, src/lowering.rs, src/verify.rs
-src/provenance.rs, src/migrations.rs, src/backend/native.rs
-tests/generics_native.rs
+src/types.rs (TypeParam + Named.type_args, parser, bind_type_params, substitution,
+  resolution, layout-feeding expansion, projection, enum-construct inference, the
+  ~exhaustive-match fail-closed arms; AND for functions: signature type_params +
+  reader, generic-call inference `type_generic_call` with the deferred-argument
+  retry, the monomorphization pass `monomorphize_into_root` + typed-expression
+  substitution walker `substitute_typed_expr`, `value_class_in_root` parametric
+  class, the two call verifiers' type-arg substitution, instance verify),
+  src/migrations.rs (CreateType/CreateFunction.type_params, apply + source-round-trip
+  postconditions, monomorphize at apply + recursion-group member bodies),
+  src/layout.rs, src/lowering.rs (generic-call → instance target), src/verify.rs
+  (generic-instance consistency + reference check), src/provenance.rs, src/diff.rs
+  (skip unnamed derived symbols), src/expr.rs (TypeDefinitionSource/FunctionSource
+  .type_params, def + fn header `<T>` parse + projection, named-dependency
+  projection ordering, eval `TypeParam` value-typing), src/api.rs, src/lib.rs
+  (importer + recursive-generic-function fail-closed)
+tests/generics_native.rs (new)
 ```
 
-Acceptance fixture and oracle:
+Acceptance fixture and oracle (met):
 
 ```text
-one generic Option<T> (or Vec<T>) compiles natively at two or more instantiations;
-  blame/why traces an instance back to its generic definition
+one generic Option<T> compiles natively at two instantiations (Option<i64>,
+  Option<bool>), eval == native; blame on the generic Pair records its type
+  parameters; one generic function id<T> compiles natively at two instantiations
+  (id<i64>, id<bool>), eval == native, each a distinct native symbol; blame on the
+  generic id records its type parameters, tracing every instance back to it
 ```
+
+`tests/generics_native.rs` pins the type fixtures (generic `Option<T>` at
+`Option<i64>`+`Option<bool>` native; a generic `record Pair<T>`; distinct-layout
+`Boxed<i64>` vs `Boxed<bool>`; nested `Option<Pair<i64>>`; the instance→generic
+provenance trace; the import→export→import fixpoint) AND the generic-function
+fixtures: `id<T>` at i64+bool native (eval == native), a generic function over a
+generic enum (`unwrap_or<T>(Option<T>, T)` — with `Option::none` resolved by the
+deferred-argument retry), a generic function over a generic record (`make<T> ->
+Pair<T>` feeding `first_of<T>(Pair<T>)`), distinct monomorphizations with distinct
+layouts (`tag_of<i64>` vs `tag_of<bool>`), blame recording the function's type
+params, the generic-function import→export→import fixpoint with a byte-stable
+projection (instances never projected), `verify` rejecting an instance inconsistent
+with its generic, and fail-closed rejections (arity, higher-kinded `T<i64>`,
+un-inferrable type arguments).
+
+Generic functions: representation and monomorphization. A function's signature
+carries `type_params` (skip-if-empty, so a non-generic signature hashes
+identically); its parameter/return types use `TypeParam { index }` and it is
+type-checked once with the parameters opaque (`value_class_in_root` gives any
+`TypeParam`-bearing type the conservative move-only/needs-drop parametric class, so
+the template borrow/move/drop check is sound for every instantiation). A generic
+call records the inferred `type_args` on the call expression (so the reference
+evaluator runs the type-erased generic body unchanged, while the native backend
+sees the instantiation). Inference matches the argument types against the parameter
+templates with `infer_type_args_from_match` (shared with enum construction), falls
+back to the expected result type, and retries an argument that could not type on
+its own once `T` is solved from its siblings. **Monomorphization happens at the
+lowering seam**: after a body type-checks, `monomorphize_into_root` walks it,
+materializes each concrete `(generic, type_args)` instantiation as a derived,
+*unnamed* root symbol (a substituted concrete signature + a type-substituted
+concrete body), and recurses (a generic calling a generic). An instance's stable
+symbol is the content hash of a `MonomorphicFunctionInstance` descriptor naming the
+generic and its type arguments — so its native ABI symbol is distinct per
+instantiation, two call sites at the same type share one instance, and re-import
+reproduces it. Reachability and lowering map a generic call to its instance symbol;
+projection ordering maps the instance back to the named generic (so a callee is
+emitted before its caller). Because instances are unnamed and derived
+deterministically, the projection emits only the generic templates and bare calls —
+never the instances — and import→export→import is a fixpoint. Generic *functions*
+must be non-recursive (a recursive or mutually-recursive generic function needs a
+generic recursion group — monomorphizing a clique that binds its own type
+parameters — which fails closed with a clear message; a non-generic recursive
+function calling a generic helper is supported).
 
 ## Phase 15 — Self-Hosted Front-End to Lowered IR (Ladder Rung A)
 
@@ -1058,7 +1160,11 @@ Success: CodeDB-eval == Rust-eval on the corpus — a three-way oracle.
 ### Milestone V3.3 — Expressiveness for a Front-End
 
 Includes: Phases 9–14 (ints/bitwise/casts/modulo, early exit, loops, strings/fmt,
-array fill, generics).
+array fill, generics). Generics (Phase 14) is delivered for records, enums, AND
+functions — parametric `record`/`enum`/`fn` monomorphized natively at two-plus
+instantiations (a generic function's instances materialized as derived symbols at
+the lowering seam); recursive generic functions are the remaining follow-on (they
+need a generic recursion group), failing closed with a clear message.
 
 ```text
 Success: sha256.cdb and tokenizer.cdb compile native; the language can express a

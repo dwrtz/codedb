@@ -209,6 +209,15 @@ impl CodeDb {
         let mut changes = Vec::new();
 
         for symbol in all_symbols {
+            // Derived symbols — a generic function's monomorphic instances (R11)
+            // — have no name binding and are not part of the semantic surface;
+            // they are reproduced deterministically on re-import, so a change to
+            // a generic shows up as a change to the generic, not its instances.
+            if self.preferred_binding(&a, &symbol).is_none()
+                && self.preferred_binding(&b, &symbol).is_none()
+            {
+                continue;
+            }
             match (a_symbols.get(&symbol), b_symbols.get(&symbol)) {
                 (None, Some(_)) => changes.push(json!({
                     "kind": "symbol_added",

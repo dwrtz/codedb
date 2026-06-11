@@ -1177,6 +1177,7 @@ impl CodeDb {
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("semantic-patch:extract-function:{name}")),
             region_params: Vec::new(),
+            type_params: Vec::new(),
             params: params.to_vec(),
             return_type,
             effects: Vec::new(),

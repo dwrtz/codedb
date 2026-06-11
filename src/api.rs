@@ -39,6 +39,8 @@ enum ApiOperation {
         birth_seed: Option<String>,
         #[serde(default)]
         region_params: Vec<String>,
+        #[serde(default)]
+        type_params: Vec<String>,
         params: Vec<ParamSpec>,
         return_type: String,
         #[serde(default)]
@@ -74,6 +76,8 @@ enum ApiOperation {
         birth_seed: Option<String>,
         #[serde(default)]
         region_params: Vec<String>,
+        #[serde(default)]
+        type_params: Vec<String>,
         definition: TypeDefinitionKind,
         #[serde(default, alias = "expect_root")]
         expect_root_hash: Option<String>,
@@ -695,6 +699,7 @@ impl CodeDb {
                 name,
                 birth_seed,
                 region_params,
+                type_params,
                 params,
                 return_type,
                 effects,
@@ -707,6 +712,7 @@ impl CodeDb {
                     .clone()
                     .unwrap_or_else(|| format!("json:{module}:{name}")),
                 region_params: region_params.clone(),
+                type_params: type_params.clone(),
                 params: params.clone(),
                 return_type: return_type.clone(),
                 effects: effects.clone(),
@@ -743,6 +749,7 @@ impl CodeDb {
                 name,
                 birth_seed,
                 region_params,
+                type_params,
                 definition,
                 ..
             } => Ok(Operation::CreateType {
@@ -752,6 +759,7 @@ impl CodeDb {
                     .clone()
                     .unwrap_or_else(|| format!("json:type:{module}:{name}")),
                 region_params: region_params.clone(),
+                type_params: type_params.clone(),
                 definition: definition.clone(),
                 identity: None,
             }),

@@ -19,7 +19,8 @@ use crate::store::{CodeDb, canonical_json, hash_bytes};
 use crate::tests::{test_points_to_entry_symbol, validate_test_value_for_type};
 use crate::types::{
     Effect, ParamSpec, RegionParamDef, SymbolBirthSpec, TypeDefinition, TypeDefinitionIdentity,
-    TypeDefinitionKind, TypeMemberDef, TypeMemberSpec, TypeSpec, type_hash_for,
+    TypeDefinitionKind, TypeMemberDef, TypeMemberSpec, TypeParamDef, TypeSpec, type_hash_for,
+    validate_type_param_names, validate_type_params,
 };
 use crate::{HISTORY_DOMAIN, MAIN_BRANCH, MIGRATION_DOMAIN};
 
@@ -64,6 +65,12 @@ pub(crate) enum Operation {
         birth_seed: String,
         #[serde(default)]
         region_params: Vec<String>,
+        /// Type parameters (R11): a non-empty list makes this a generic function
+        /// template `fn name<T, ..>`. Skipped when empty so a non-generic
+        /// function's operation — and its migration hash — is byte-identical to
+        /// the pre-generics form.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        type_params: Vec<String>,
         params: Vec<ParamSpec>,
         return_type: String,
         #[serde(default)]
@@ -116,6 +123,11 @@ pub(crate) enum Operation {
         birth_seed: String,
         #[serde(default)]
         region_params: Vec<String>,
+        /// Type parameters making this a generic record/enum (R11). Defaulted and
+        /// skipped when empty so a non-generic `CreateType` op — and every existing
+        /// migration history — is byte-identical to the pre-generics form.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        type_params: Vec<String>,
         definition: TypeDefinitionKind,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         identity: Option<TypeDefinitionIdentity>,
@@ -808,6 +820,8 @@ pub(crate) enum Postcondition {
         module: String,
         name: String,
         region_params: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        type_params: Vec<String>,
         params: Vec<ParamSpec>,
         return_type: String,
         effects: Vec<Effect>,
@@ -828,6 +842,8 @@ pub(crate) enum Postcondition {
         module: String,
         name: String,
         region_params: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        type_params: Vec<String>,
         definition: TypeDefinitionKind,
     },
     NamePointsToSymbol {
@@ -2210,6 +2226,7 @@ impl CodeDb {
                 module,
                 name,
                 region_params,
+                type_params,
                 params,
                 return_type,
                 effects,
@@ -2223,6 +2240,7 @@ impl CodeDb {
                     module: module.clone(),
                     name: name.clone(),
                     region_params: region_params.clone(),
+                    type_params: type_params.clone(),
                     params: params.clone(),
                     return_type: return_type.clone(),
                     effects: effects.clone(),
@@ -2241,6 +2259,7 @@ impl CodeDb {
                         module: module.clone(),
                         name: member.name.clone(),
                         region_params: member.region_params.clone(),
+                        type_params: Vec::new(),
                         params: member.params.clone(),
                         return_type: member.return_type.clone(),
                         effects: member.effects.clone(),
@@ -2261,6 +2280,7 @@ impl CodeDb {
                         module: module.clone(),
                         name: member.name.clone(),
                         region_params: member.region_params.clone(),
+                        type_params: Vec::new(),
                         definition: member.definition.clone(),
                     });
                 }
@@ -2297,6 +2317,7 @@ impl CodeDb {
                 module,
                 name,
                 region_params,
+                type_params,
                 definition,
                 ..
             } => vec![
@@ -2307,6 +2328,7 @@ impl CodeDb {
                     module: module.clone(),
                     name: name.clone(),
                     region_params: region_params.clone(),
+                    type_params: type_params.clone(),
                     definition: definition.clone(),
                 },
             ],
@@ -2945,6 +2967,7 @@ impl CodeDb {
                 module,
                 name,
                 region_params,
+                type_params,
                 params,
                 return_type,
                 effects,
@@ -2962,6 +2985,7 @@ impl CodeDb {
                     module,
                     &symbol,
                     region_params,
+                    type_params,
                     params,
                     return_type,
                     effects,
@@ -3004,8 +3028,16 @@ impl CodeDb {
                 module,
                 name,
                 region_params,
+                type_params,
                 definition,
-            } => self.type_source_matches(root, module, name, region_params, definition),
+            } => self.type_source_matches(
+                root,
+                module,
+                name,
+                region_params,
+                type_params,
+                definition,
+            ),
             Postcondition::NamePointsToSymbol {
                 module,
                 name,
@@ -3078,6 +3110,7 @@ impl CodeDb {
                     module,
                     symbol,
                     region_params,
+                    &[],
                     params,
                     return_type,
                     effects,
@@ -3112,12 +3145,14 @@ impl CodeDb {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn function_signature_source_matches(
         &self,
         root: &ProgramRootPayload,
         module: &str,
         symbol: &str,
         region_param_names: &[String],
+        type_param_names: &[String],
         params: &[ParamSpec],
         return_type: &str,
         effects: &[Effect],
@@ -3135,23 +3170,30 @@ impl CodeDb {
         {
             return Ok(false);
         }
+        // Generic functions (R11): the type-parameter names must round-trip and
+        // scope the `T` references in the parameter/return source.
+        if self.signature_type_params(&entry.signature)? != type_param_names {
+            return Ok(false);
+        }
         let region_scope = region_scope_from_params(&actual_region_params);
         let expected_params = params
             .iter()
             .map(|param| {
-                self.type_hash_for_source_in_root_with_regions(
+                self.type_hash_for_source_in_root_with_scope(
                     module,
                     root,
                     &param.ty,
                     &region_scope,
+                    type_param_names,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let expected_return_type = self.type_hash_for_source_in_root_with_regions(
+        let expected_return_type = self.type_hash_for_source_in_root_with_scope(
             module,
             root,
             return_type,
             &region_scope,
+            type_param_names,
         )?;
         let expected_effects = crate::types::normalize_effects(effects)?;
         let actual_effects = self.signature_effects(&entry.signature)?;
@@ -3187,6 +3229,7 @@ impl CodeDb {
             module,
             symbol,
             region_params,
+            &[],
             params,
             return_type,
             effects,
@@ -3237,6 +3280,7 @@ impl CodeDb {
                 name,
                 birth_seed,
                 region_params,
+                type_params,
                 params,
                 return_type,
                 effects,
@@ -3248,6 +3292,7 @@ impl CodeDb {
                 name,
                 birth_seed,
                 region_params,
+                type_params,
                 params,
                 return_type,
                 effects,
@@ -3289,6 +3334,7 @@ impl CodeDb {
                 name,
                 birth_seed,
                 region_params,
+                type_params,
                 definition,
                 identity,
             } => self.apply_create_type(
@@ -3298,6 +3344,7 @@ impl CodeDb {
                 name,
                 birth_seed,
                 region_params,
+                type_params,
                 definition,
                 identity.as_ref(),
             ),
@@ -3533,6 +3580,7 @@ impl CodeDb {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_create_function(
         &mut self,
         input_root: &str,
@@ -3541,6 +3589,7 @@ impl CodeDb {
         name: &str,
         birth_seed: &str,
         region_param_names: &[String],
+        type_param_names: &[String],
         params: &[ParamSpec],
         return_type: &str,
         effects: &[Effect],
@@ -3549,6 +3598,7 @@ impl CodeDb {
         validate_module_path("module", module)?;
         validate_projection_identifier("function name", name)?;
         validate_param_names(params)?;
+        validate_type_param_names(type_param_names)?;
         let mut root = self.load_root(input_root)?;
         if root
             .names
@@ -3570,16 +3620,28 @@ impl CodeDb {
         let param_types = params
             .iter()
             .map(|param| {
-                self.resolve_type_in_root_with_regions(module, &root, &param.ty, &region_scope)
+                self.resolve_type_in_root_with_scope(
+                    module,
+                    &root,
+                    &param.ty,
+                    &region_scope,
+                    type_param_names,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
-        let return_type_hash =
-            self.resolve_type_in_root_with_regions(module, &root, return_type, &region_scope)?;
-        let signature = self.put_signature_with_effects_and_regions(
+        let return_type_hash = self.resolve_type_in_root_with_scope(
+            module,
+            &root,
+            return_type,
+            &region_scope,
+            type_param_names,
+        )?;
+        let signature = self.put_signature_with_effects_regions_and_type_params(
             &param_types,
             &return_type_hash,
             effects,
             &region_params,
+            type_param_names,
         )?;
         let param_name_list = params
             .iter()
@@ -3618,6 +3680,12 @@ impl CodeDb {
             symbol,
             names: param_name_list,
         });
+        // Generic functions (R11): materialize every concrete generic-function
+        // instantiation this body reaches as a derived (unnamed) root symbol, so
+        // reachability/lowering/linking treat each monomorphization as an
+        // ordinary function. A non-generic body adds none, leaving the root
+        // unchanged.
+        self.monomorphize_into_root(&mut root, &typed_body.expr_hash)?;
         if module != MAIN_BRANCH
             || root
                 .metadata
@@ -3743,6 +3811,7 @@ impl CodeDb {
 
         // Pass 2: type each body against the root (all in-group names bound now),
         // then fix up the member's FunctionDef definition.
+        let mut member_bodies = Vec::with_capacity(members.len());
         for (ordinal, member) in members.iter().enumerate() {
             let pending_member = &pending[ordinal];
             let typed_body = self.type_expr_in_module_with_regions_expecting(
@@ -3772,11 +3841,20 @@ impl CodeDb {
                 &typed_body.expr_hash,
             )?;
             root.symbols[symbols_base + ordinal].definition = definition;
+            member_bodies.push(typed_body.expr_hash);
         }
 
         let member_entries = root.symbols[symbols_base..symbols_base + members.len()].to_vec();
         let group_hash = self.put_recursion_group(module, &member_entries)?;
         root.recursion_groups.push(group_hash);
+
+        // Generic functions (R11): materialize the generic-function instances a
+        // recursion-group member calls (e.g. a recursive function calling a
+        // generic helper). Runs after the group is recorded so the clique's
+        // member ordinals are unaffected by the appended instances.
+        for body in &member_bodies {
+            self.monomorphize_into_root(&mut root, body)?;
+        }
 
         if module != MAIN_BRANCH
             || root
@@ -3861,15 +3939,19 @@ impl CodeDb {
                 name: "placeholder".to_string(),
                 type_hash: type_hash_for("I64"),
             };
+            // Generic parameters on a mutually-recursive type-clique member are not
+            // supported in this cut; members of a type group are non-generic.
             let placeholder = match member.definition {
                 TypeDefinitionKind::Record { .. } => TypeDefinition::Record {
                     type_symbol: type_symbol.clone(),
                     region_params: region_params.clone(),
+                    type_params: Vec::new(),
                     fields: vec![placeholder_member],
                 },
                 TypeDefinitionKind::Enum { .. } => TypeDefinition::Enum {
                     type_symbol: type_symbol.clone(),
                     region_params: region_params.clone(),
+                    type_params: Vec::new(),
                     variants: vec![placeholder_member],
                 },
             };
@@ -3903,6 +3985,7 @@ impl CodeDb {
                 &pending_type.birth_seed,
                 &pending_type.type_symbol,
                 pending_type.region_params.clone(),
+                Vec::new(),
                 &pending_type.region_scope,
                 &member.definition,
                 member.identity.as_ref(),
@@ -4014,6 +4097,7 @@ impl CodeDb {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_create_type(
         &mut self,
         input_root: &str,
@@ -4022,12 +4106,18 @@ impl CodeDb {
         name: &str,
         birth_seed: &str,
         region_param_names: &[String],
+        type_param_names: &[String],
         definition: &TypeDefinitionKind,
         identity: Option<&TypeDefinitionIdentity>,
     ) -> Result<String> {
         validate_module_path("module", module)?;
         validate_projection_identifier("type name", name)?;
         validate_region_param_names(region_param_names)?;
+        let type_params = type_param_names
+            .iter()
+            .map(|name| TypeParamDef { name: name.clone() })
+            .collect::<Vec<_>>();
+        validate_type_params(&type_params)?;
         validate_type_member_specs(definition)?;
         let mut root = self.load_root(input_root)?;
         if root
@@ -4073,11 +4163,13 @@ impl CodeDb {
             TypeDefinitionKind::Record { .. } => TypeDefinition::Record {
                 type_symbol: type_symbol.clone(),
                 region_params: region_params.clone(),
+                type_params: type_params.clone(),
                 fields: vec![placeholder_member],
             },
             TypeDefinitionKind::Enum { .. } => TypeDefinition::Enum {
                 type_symbol: type_symbol.clone(),
                 region_params: region_params.clone(),
+                type_params: type_params.clone(),
                 variants: vec![placeholder_member],
             },
         };
@@ -4099,6 +4191,7 @@ impl CodeDb {
             birth_seed,
             &type_symbol,
             region_params,
+            type_params,
             &region_scope,
             definition,
             identity,
@@ -4228,6 +4321,7 @@ impl CodeDb {
         let definition = self.type_definition_for_symbol(&root, type_symbol)?;
         let TypeDefinition::Record {
             region_params,
+            type_params,
             mut fields,
             ..
         } = definition
@@ -4256,6 +4350,7 @@ impl CodeDb {
             TypeDefinition::Record {
                 type_symbol: type_symbol.to_string(),
                 region_params,
+                type_params,
                 fields,
             },
         )?;
@@ -4283,6 +4378,7 @@ impl CodeDb {
         let definition = self.type_definition_for_symbol(&root, type_symbol)?;
         let TypeDefinition::Record {
             region_params,
+            type_params,
             mut fields,
             ..
         } = definition
@@ -4308,6 +4404,7 @@ impl CodeDb {
             TypeDefinition::Record {
                 type_symbol: type_symbol.to_string(),
                 region_params,
+                type_params,
                 fields,
             },
         )?;
@@ -4341,6 +4438,7 @@ impl CodeDb {
         let definition = self.type_definition_for_symbol(&root, type_symbol)?;
         let TypeDefinition::Record {
             region_params,
+            type_params,
             mut fields,
             ..
         } = definition
@@ -4358,6 +4456,7 @@ impl CodeDb {
             TypeDefinition::Record {
                 type_symbol: type_symbol.to_string(),
                 region_params,
+                type_params,
                 fields,
             },
         )?;
@@ -4384,6 +4483,7 @@ impl CodeDb {
         let definition = self.type_definition_for_symbol(&root, type_symbol)?;
         let TypeDefinition::Enum {
             region_params,
+            type_params,
             mut variants,
             ..
         } = definition
@@ -4415,6 +4515,7 @@ impl CodeDb {
             TypeDefinition::Enum {
                 type_symbol: type_symbol.to_string(),
                 region_params,
+                type_params,
                 variants,
             },
         )?;
@@ -4442,6 +4543,7 @@ impl CodeDb {
         let definition = self.type_definition_for_symbol(&root, type_symbol)?;
         let TypeDefinition::Enum {
             region_params,
+            type_params,
             mut variants,
             ..
         } = definition
@@ -4467,6 +4569,7 @@ impl CodeDb {
             TypeDefinition::Enum {
                 type_symbol: type_symbol.to_string(),
                 region_params,
+                type_params,
                 variants,
             },
         )?;
@@ -4500,6 +4603,7 @@ impl CodeDb {
         let definition = self.type_definition_for_symbol(&root, type_symbol)?;
         let TypeDefinition::Enum {
             region_params,
+            type_params,
             mut variants,
             ..
         } = definition
@@ -4518,6 +4622,7 @@ impl CodeDb {
             TypeDefinition::Enum {
                 type_symbol: type_symbol.to_string(),
                 region_params,
+                type_params,
                 variants,
             },
         )?;
@@ -5523,10 +5628,18 @@ impl CodeDb {
         birth_seed: &str,
         type_symbol: &str,
         region_params: Vec<RegionParamDef>,
+        type_params: Vec<TypeParamDef>,
         region_scope: &BTreeMap<String, String>,
         definition: &TypeDefinitionKind,
         identity: Option<&TypeDefinitionIdentity>,
     ) -> Result<TypeDefinition> {
+        // A generic definition's members resolve their own type parameters by name
+        // (R11): `bind_type_params` (inside `resolve_type_in_root_with_scope`)
+        // turns each occurrence into a positional `TypeParam`.
+        let type_param_names = type_params
+            .iter()
+            .map(|param| param.name.clone())
+            .collect::<Vec<_>>();
         match definition {
             TypeDefinitionKind::Record { fields } => {
                 if let Some(identity) = identity
@@ -5559,11 +5672,12 @@ impl CodeDb {
                         Ok(TypeMemberDef {
                             member_symbol,
                             name: field.name.clone(),
-                            type_hash: self.resolve_type_in_root_with_regions(
+                            type_hash: self.resolve_type_in_root_with_scope(
                                 module,
                                 root,
                                 &field.ty,
                                 region_scope,
+                                &type_param_names,
                             )?,
                         })
                     })
@@ -5571,6 +5685,7 @@ impl CodeDb {
                 Ok(TypeDefinition::Record {
                     type_symbol: type_symbol.to_string(),
                     region_params,
+                    type_params,
                     fields,
                 })
             }
@@ -5605,11 +5720,12 @@ impl CodeDb {
                         Ok(TypeMemberDef {
                             member_symbol,
                             name: variant.name.clone(),
-                            type_hash: self.resolve_type_in_root_with_regions(
+                            type_hash: self.resolve_type_in_root_with_scope(
                                 module,
                                 root,
                                 &variant.ty,
                                 region_scope,
+                                &type_param_names,
                             )?,
                         })
                     })
@@ -5617,6 +5733,7 @@ impl CodeDb {
                 Ok(TypeDefinition::Enum {
                     type_symbol: type_symbol.to_string(),
                     region_params,
+                    type_params,
                     variants,
                 })
             }
@@ -6427,6 +6544,7 @@ impl CodeDb {
         module: &str,
         name: &str,
         region_param_names: &[String],
+        type_param_names: &[String],
         expected: &TypeDefinitionKind,
     ) -> Result<bool> {
         let Some(type_symbol) = type_symbol_for_name(root, module, name) else {
@@ -6441,16 +6559,38 @@ impl CodeDb {
         if actual_region_names != region_param_names {
             return Ok(false);
         }
+        let actual_type_param_names = definition
+            .type_params()
+            .iter()
+            .map(|param| param.name.clone())
+            .collect::<Vec<_>>();
+        if actual_type_param_names != type_param_names {
+            return Ok(false);
+        }
         let region_scope = region_scope_from_params(definition.region_params());
         match (definition, expected) {
             (
                 TypeDefinition::Record { fields, .. },
                 TypeDefinitionKind::Record { fields: expected },
-            ) => self.member_specs_match(root, module, &region_scope, &fields, expected),
+            ) => self.member_specs_match(
+                root,
+                module,
+                &region_scope,
+                type_param_names,
+                &fields,
+                expected,
+            ),
             (
                 TypeDefinition::Enum { variants, .. },
                 TypeDefinitionKind::Enum { variants: expected },
-            ) => self.member_specs_match(root, module, &region_scope, &variants, expected),
+            ) => self.member_specs_match(
+                root,
+                module,
+                &region_scope,
+                type_param_names,
+                &variants,
+                expected,
+            ),
             _ => Ok(false),
         }
     }
@@ -6460,6 +6600,7 @@ impl CodeDb {
         root: &ProgramRootPayload,
         module: &str,
         region_scope: &BTreeMap<String, String>,
+        type_param_names: &[String],
         actual: &[TypeMemberDef],
         expected: &[TypeMemberSpec],
     ) -> Result<bool> {
@@ -6470,11 +6611,12 @@ impl CodeDb {
             if actual.name != expected.name {
                 return Ok(false);
             }
-            let expected_hash = self.type_hash_for_source_in_root_with_regions(
+            let expected_hash = self.type_hash_for_source_in_root_with_scope(
                 module,
                 root,
                 &expected.ty,
                 region_scope,
+                type_param_names,
             )?;
             if actual.type_hash != expected_hash {
                 return Ok(false);

@@ -1206,11 +1206,20 @@ impl CodeDb {
                 self.lower_place_value(root, expr_hash, &type_hash, param_types, ctx, locals)
             }
             "call" => {
-                let target_symbol_hash = payload
+                let callee_symbol = payload
                     .get("symbol")
                     .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("call missing symbol"))?
-                    .to_string();
+                    .ok_or_else(|| anyhow!("call missing symbol"))?;
+                // Generic call (R11): lower it as a call to the monomorphic
+                // instance derived from the callee and the concrete type
+                // arguments — a distinct native symbol per instantiation. A
+                // non-generic call targets its callee directly.
+                let type_args = crate::types::call_type_args(&payload)?;
+                let target_symbol_hash = if type_args.is_empty() {
+                    callee_symbol.to_string()
+                } else {
+                    crate::types::monomorphic_instance_symbol(callee_symbol, &type_args)
+                };
                 let target = self
                     .root_symbol(root, &target_symbol_hash)
                     .ok_or_else(|| anyhow!("call target missing from root {target_symbol_hash}"))?;
@@ -6636,7 +6645,10 @@ impl CodeDb {
                     self.collect_lowered_layout_type_hashes(root, &variant.type_hash, out, seen)?;
                 }
             }
-            TypeSpec::Builtin(_) | TypeSpec::Named { .. } | TypeSpec::String => {}
+            TypeSpec::Builtin(_)
+            | TypeSpec::Named { .. }
+            | TypeSpec::String
+            | TypeSpec::TypeParam { .. } => {}
         }
         Ok(())
     }

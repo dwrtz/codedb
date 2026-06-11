@@ -272,6 +272,7 @@ impl CodeDb {
                             name: definition.name.clone(),
                             birth_seed,
                             region_params: definition.region_params.clone(),
+                            type_params: definition.type_params.clone(),
                             definition: definition.definition.clone(),
                             identity,
                         }
@@ -298,6 +299,22 @@ impl CodeDb {
                                     member.module
                                 );
                             }
+                            if !member.type_params.is_empty() {
+                                // A recursive (or mutually-recursive) generic
+                                // function needs a generic recursion group —
+                                // monomorphizing a clique that binds its own
+                                // type parameters (R11). That is a follow-on;
+                                // non-recursive generic functions, and a
+                                // recursive function calling a generic helper,
+                                // are supported. Fail closed cleanly rather than
+                                // dropping the `<T>`.
+                                bail!(
+                                    "recursive generic functions are not yet supported \
+                                     (`fn {}<...>` is part of a recursion group); generic \
+                                     functions must be non-recursive (R11, PLAN_V3 Phase 14)",
+                                    member.name
+                                );
+                            }
                             member_specs.push(RecursionGroupMemberSpec {
                                 name: member.name.clone(),
                                 region_params: member.region_params.clone(),
@@ -319,6 +336,7 @@ impl CodeDb {
                             name: function.name.clone(),
                             birth_seed,
                             region_params: function.region_params.clone(),
+                            type_params: function.type_params.clone(),
                             params: function.params.clone(),
                             return_type: function.return_type.clone(),
                             effects: function.effects.clone(),

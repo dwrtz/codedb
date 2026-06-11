@@ -232,6 +232,10 @@ impl CodeDb {
                 .iter()
                 .map(|param| param.region.clone())
                 .collect(),
+            // A generic definition is never laid out directly — only its
+            // instances are (each carrying concrete `type_args`), so the bare
+            // form computed here has no type arguments.
+            type_args: Vec::new(),
         })?;
         self.put_object("Type", &payload)
     }
@@ -298,9 +302,16 @@ impl LayoutComputer<'_> {
     fn layout_type_inner(&mut self, type_hash: &str) -> Result<ComputedLayout> {
         match self.db.type_spec(type_hash)? {
             TypeSpec::Builtin(kind) => self.layout_builtin(type_hash, &kind),
+            // A type parameter has no concrete layout; only its substituted
+            // instances do (R11). Reaching it means a generic template leaked
+            // into layout — fail closed.
+            TypeSpec::TypeParam { index } => {
+                bail!("cannot lay out type parameter {index}")
+            }
             TypeSpec::Named {
                 type_symbol,
                 region_args,
+                type_args,
             } => {
                 let entry = self
                     .db
@@ -312,6 +323,15 @@ impl LayoutComputer<'_> {
                         "named type {type_symbol} expects {} region args, got {}",
                         definition.region_params().len(),
                         region_args.len()
+                    );
+                }
+                // A generic instance carries concrete `type_args`; `type_spec_in_root`
+                // below substitutes them into the members it expands (R11).
+                if definition.type_params().len() != type_args.len() {
+                    bail!(
+                        "named type {type_symbol} expects {} type args, got {}",
+                        definition.type_params().len(),
+                        type_args.len()
                     );
                 }
                 self.dependency_type_def_hashes
@@ -758,6 +778,11 @@ impl LayoutComputer<'_> {
         match self.db.type_spec_in_root(self.root, type_hash)? {
             TypeSpec::Builtin(_) => Ok(LayoutClass::copy()),
             TypeSpec::Named { .. } => Ok(LayoutClass::copy()),
+            // A type parameter is never laid out concretely — its instances
+            // substitute it away first (R11), so reaching it here is a bug.
+            TypeSpec::TypeParam { index } => {
+                bail!("cannot compute layout of type parameter {index}")
+            }
             TypeSpec::Reference { mutable, .. } => {
                 if mutable {
                     Ok(LayoutClass::mutable_reference())

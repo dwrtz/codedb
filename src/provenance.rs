@@ -1501,6 +1501,9 @@ impl CodeDb {
         let payload = type_payload_for_spec(&TypeSpec::Named {
             type_symbol: type_symbol.to_string(),
             region_args,
+            // The bare (uninstantiated) form of a type — generic instances are
+            // addressed through their own `Named` Type objects (R11).
+            type_args: Vec::new(),
         })?;
         self.put_object("Type", &payload)
     }

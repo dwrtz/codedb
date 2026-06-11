@@ -642,6 +642,25 @@ impl CodeDb {
             "TypeRecursionGroup" => {
                 self.verify_type_recursion_group_references(parent_hash, payload, errors)?;
             }
+            "MonomorphicFunctionInstance" => {
+                // A generic function's instance descriptor (R11): its `generic`
+                // and every `type_args` entry must be live object references.
+                self.check_hash_ref(parent_hash, "generic", payload.get("generic"), errors)?;
+                for (idx, entry) in payload
+                    .get("type_args")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    self.check_hash_ref(
+                        parent_hash,
+                        &format!("type_args[{idx}]"),
+                        Some(entry),
+                        errors,
+                    )?;
+                }
+            }
             "TestCase" => {
                 self.check_hash_ref(
                     parent_hash,
@@ -932,13 +951,22 @@ impl CodeDb {
             return Ok(());
         };
         match type_spec_from_payload(&payload) {
-            Ok(crate::types::TypeSpec::Named { region_args, .. }) => {
+            Ok(crate::types::TypeSpec::Named {
+                region_args,
+                type_args,
+                ..
+            }) => {
                 for region in region_args {
                     if !allowed_regions.contains(&region) && !is_static_region(&region) {
                         errors.push(format!(
                             "bad_type_def: {parent_hash}: invalid region reference {region}"
                         ));
                     }
+                }
+                // Generic instance arguments are themselves types; validate the
+                // regions nested inside each one (R11).
+                for arg in type_args {
+                    self.verify_type_region_args(parent_hash, &arg, allowed_regions, errors)?;
                 }
             }
             Ok(crate::types::TypeSpec::Reference {
@@ -984,7 +1012,9 @@ impl CodeDb {
                     )?;
                 }
             }
-            Ok(crate::types::TypeSpec::Builtin(_)) | Ok(crate::types::TypeSpec::String) => {}
+            Ok(crate::types::TypeSpec::Builtin(_))
+            | Ok(crate::types::TypeSpec::String)
+            | Ok(crate::types::TypeSpec::TypeParam { .. }) => {}
             Err(err) => errors.push(format!("bad_type_def: {parent_hash}: {err:#}")),
         }
         Ok(())
@@ -1589,6 +1619,15 @@ impl CodeDb {
             };
             if let Err(err) = self.verify_root_indexes(&root_hash, &root, errors) {
                 errors.push(format!("bad_index: root {root_hash}: {err:#}"));
+            }
+            // Generic functions (R11): recompute each monomorphic instance from
+            // its generic and reject one whose signature does not derive from
+            // the generic at its recorded type arguments.
+            match self.verify_generic_instances_in_root(&root) {
+                Ok(instance_errors) => errors.extend(instance_errors),
+                Err(err) => {
+                    errors.push(format!("bad_generic_instance: root {root_hash}: {err:#}"))
+                }
             }
             self.verify_lowerable_functions(&root_hash, &root, &mut lowered_definitions, errors);
             if has_cliques {

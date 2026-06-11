@@ -187,6 +187,17 @@ pub(crate) struct RegionParamDef {
     pub(crate) name: String,
 }
 
+/// A type parameter on a generic record/enum/function definition (R11). Its
+/// identity is positional (the index of the slot it occupies), so only the
+/// display `name` is carried — no birth symbol — and a rename of the parameter
+/// is a pure projection change that does not re-identify the generic. A use of
+/// the parameter inside the body resolves to `TypeSpec::TypeParam { index }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TypeParamDef {
+    pub(crate) name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TypeMemberDef {
     pub(crate) member_symbol: String,
@@ -199,11 +210,13 @@ pub(crate) enum TypeDefinition {
     Record {
         type_symbol: String,
         region_params: Vec<RegionParamDef>,
+        type_params: Vec<TypeParamDef>,
         fields: Vec<TypeMemberDef>,
     },
     Enum {
         type_symbol: String,
         region_params: Vec<RegionParamDef>,
+        type_params: Vec<TypeParamDef>,
         variants: Vec<TypeMemberDef>,
     },
 }
@@ -227,6 +240,13 @@ impl TypeDefinition {
         match self {
             TypeDefinition::Record { region_params, .. }
             | TypeDefinition::Enum { region_params, .. } => region_params,
+        }
+    }
+
+    pub(crate) fn type_params(&self) -> &[TypeParamDef] {
+        match self {
+            TypeDefinition::Record { type_params, .. }
+            | TypeDefinition::Enum { type_params, .. } => type_params,
         }
     }
 }
@@ -414,6 +434,28 @@ pub(crate) enum TypeSpec {
     Named {
         type_symbol: String,
         region_args: Vec<String>,
+        /// Type arguments instantiating a generic record/enum (R11). Empty for a
+        /// non-generic named type, so its Type-object payload — and therefore its
+        /// content hash — is byte-identical to the pre-generics form. A non-empty
+        /// list makes this Named a *generic instance* whose content hash (derived
+        /// from the generic's `type_symbol` plus the argument hashes) is the
+        /// instance's stable identity; the concrete structure is materialized on
+        /// demand by substituting the arguments into the generic's template
+        /// (`type_spec_in_root`), i.e. monomorphized at use/layout/lowering, never
+        /// stored as a separate object.
+        type_args: Vec<String>,
+    },
+    /// A reference to the enclosing generic definition's type parameter, by
+    /// positional index (R11). Like a `param_ref` for types: the parameter
+    /// *names* live on the generic `TypeDefinition`/signature, so the hash is
+    /// name-independent (two generics with differently-named but structurally
+    /// identical parameters instantiate to identical hashes). Only ever appears
+    /// inside a generic template (a field/variant/param/return type); it is the
+    /// opaque type during generic-body type checking (it has no fields and no
+    /// arithmetic, which is exactly constraint-free parametricity) and is
+    /// substituted away before any concrete layout/lowering.
+    TypeParam {
+        index: u32,
     },
     Reference {
         region: String,
@@ -689,22 +731,43 @@ impl CodeDb {
         let TypeDefinition::Record {
             type_symbol,
             region_params,
+            type_params,
             fields,
         } = definition
         else {
             bail!("put_record_def requires record definition");
         };
         validate_region_params(region_params)?;
+        validate_type_params(type_params)?;
         validate_member_defs("record field", fields)?;
-        self.put_object(
-            "RecordDef",
-            &json!({
-                "type_symbol": type_symbol,
-                "region_params": region_params
+        // `type_params` is emitted only when non-empty so a non-generic record's
+        // RecordDef payload (and hash) is unchanged from the pre-generics form.
+        let mut payload = serde_json::Map::new();
+        payload.insert("type_symbol".to_string(), json!(type_symbol));
+        payload.insert(
+            "region_params".to_string(),
+            json!(
+                region_params
                     .iter()
                     .map(|param| json!({ "region": param.region, "name": param.name }))
-                    .collect::<Vec<_>>(),
-                "fields": fields
+                    .collect::<Vec<_>>()
+            ),
+        );
+        if !type_params.is_empty() {
+            payload.insert(
+                "type_params".to_string(),
+                json!(
+                    type_params
+                        .iter()
+                        .map(|param| json!({ "name": param.name }))
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+        payload.insert(
+            "fields".to_string(),
+            json!(
+                fields
                     .iter()
                     .map(|field| {
                         json!({
@@ -713,31 +776,51 @@ impl CodeDb {
                             "type": field.type_hash,
                         })
                     })
-                    .collect::<Vec<_>>(),
-            }),
-        )
+                    .collect::<Vec<_>>()
+            ),
+        );
+        self.put_object("RecordDef", &JsonValue::Object(payload))
     }
 
     pub(crate) fn put_enum_def(&mut self, definition: &TypeDefinition) -> Result<String> {
         let TypeDefinition::Enum {
             type_symbol,
             region_params,
+            type_params,
             variants,
         } = definition
         else {
             bail!("put_enum_def requires enum definition");
         };
         validate_region_params(region_params)?;
+        validate_type_params(type_params)?;
         validate_member_defs("enum variant", variants)?;
-        self.put_object(
-            "EnumDef",
-            &json!({
-                "type_symbol": type_symbol,
-                "region_params": region_params
+        let mut payload = serde_json::Map::new();
+        payload.insert("type_symbol".to_string(), json!(type_symbol));
+        payload.insert(
+            "region_params".to_string(),
+            json!(
+                region_params
                     .iter()
                     .map(|param| json!({ "region": param.region, "name": param.name }))
-                    .collect::<Vec<_>>(),
-                "variants": variants
+                    .collect::<Vec<_>>()
+            ),
+        );
+        if !type_params.is_empty() {
+            payload.insert(
+                "type_params".to_string(),
+                json!(
+                    type_params
+                        .iter()
+                        .map(|param| json!({ "name": param.name }))
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+        payload.insert(
+            "variants".to_string(),
+            json!(
+                variants
                     .iter()
                     .map(|variant| {
                         json!({
@@ -746,9 +829,10 @@ impl CodeDb {
                             "type": variant.type_hash,
                         })
                     })
-                    .collect::<Vec<_>>(),
-            }),
-        )
+                    .collect::<Vec<_>>()
+            ),
+        );
+        self.put_object("EnumDef", &JsonValue::Object(payload))
     }
 
     pub(crate) fn type_definition(&self, type_def_hash: &str) -> Result<TypeDefinition> {
@@ -794,6 +878,7 @@ impl CodeDb {
             bail!("RecordDef type_symbol does not match TypeDef");
         }
         let region_params = region_params_from_payload(payload.get("region_params"))?;
+        let type_params = type_params_from_payload(payload.get("type_params"))?;
         let fields =
             member_defs_from_payload("record field", "field_symbol", payload.get("fields"))?;
         validate_region_params(&region_params)?;
@@ -801,6 +886,7 @@ impl CodeDb {
         Ok(TypeDefinition::Record {
             type_symbol,
             region_params,
+            type_params,
             fields,
         })
     }
@@ -823,6 +909,7 @@ impl CodeDb {
             bail!("EnumDef type_symbol does not match TypeDef");
         }
         let region_params = region_params_from_payload(payload.get("region_params"))?;
+        let type_params = type_params_from_payload(payload.get("type_params"))?;
         let variants =
             member_defs_from_payload("enum variant", "variant_symbol", payload.get("variants"))?;
         validate_region_params(&region_params)?;
@@ -830,6 +917,7 @@ impl CodeDb {
         Ok(TypeDefinition::Enum {
             type_symbol,
             region_params,
+            type_params,
             variants,
         })
     }
@@ -856,7 +944,23 @@ impl CodeDb {
         ty: &str,
         region_scope: &BTreeMap<String, String>,
     ) -> Result<String> {
-        let parsed = parse_type_source(ty)?;
+        self.resolve_type_in_root_with_scope(current_module, root, ty, region_scope, &[])
+    }
+
+    /// Resolve a source type with both a region scope and a type-parameter scope
+    /// (R11): a bare name matching `type_param_names[index]` binds to
+    /// `TypeSpec::TypeParam { index }` before resolution, so a generic
+    /// definition's members may reference its parameters. Empty `type_param_names`
+    /// reproduces the non-generic `resolve_type_in_root_with_regions` behavior.
+    pub(crate) fn resolve_type_in_root_with_scope(
+        &mut self,
+        current_module: &str,
+        root: &ProgramRootPayload,
+        ty: &str,
+        region_scope: &BTreeMap<String, String>,
+        type_param_names: &[String],
+    ) -> Result<String> {
+        let parsed = bind_type_params(parse_type_source(ty)?, type_param_names)?;
         self.put_type_spec_in_root(current_module, root, &parsed, region_scope)
     }
 
@@ -883,7 +987,27 @@ impl CodeDb {
         ty: &str,
         region_scope: &BTreeMap<String, String>,
     ) -> Result<String> {
-        let parsed = parse_type_source(ty)?;
+        self.type_hash_for_source_in_root_with_scope(
+            current_module,
+            root,
+            ty,
+            region_scope,
+            &[],
+        )
+    }
+
+    /// Hash a source type under a region scope and a type-parameter scope (R11) —
+    /// the read-only twin of `resolve_type_in_root_with_scope`, used by the
+    /// type-definition source-round-trip postcondition for generic types.
+    pub(crate) fn type_hash_for_source_in_root_with_scope(
+        &self,
+        current_module: &str,
+        root: &ProgramRootPayload,
+        ty: &str,
+        region_scope: &BTreeMap<String, String>,
+        type_param_names: &[String],
+    ) -> Result<String> {
+        let parsed = bind_type_params(parse_type_source(ty)?, type_param_names)?;
         self.type_hash_for_parsed_in_root(current_module, root, &parsed, region_scope)
     }
 
@@ -1009,26 +1133,25 @@ impl CodeDb {
         self.type_name_in_root_with_regions(root, current_module, hash, &BTreeMap::new())
     }
 
-    pub(crate) fn type_name_in_root_with_regions(
+    /// Render the *constructor head* of an enum type at a `Enum::variant(..)` site:
+    /// the base name plus any region arguments, but WITHOUT type arguments (R11).
+    /// A generic enum instance projects as the bare `Option` (not `Option<i64>`),
+    /// and the type arguments are re-inferred when the projection is re-parsed in
+    /// the same context — keeping the construction grammar free of `<...>` at `::`
+    /// while staying a byte-stable round trip. Non-generic and region-only enums
+    /// render exactly as before.
+    pub(crate) fn enum_constructor_type_source(
         &self,
         root: &ProgramRootPayload,
         current_module: &str,
-        hash: &str,
+        enum_type_hash: &str,
         region_names: &BTreeMap<String, String>,
     ) -> Result<String> {
-        if let Some(name) = scalar_int_source_name_for_hash(hash) {
-            return Ok(name);
-        }
-        if hash == type_hash_for("Bool") {
-            return Ok("bool".to_string());
-        }
-        if hash == type_hash_for("Unit") {
-            return Ok("unit".to_string());
-        }
-        match self.type_spec(hash)? {
+        match self.type_spec(enum_type_hash)? {
             TypeSpec::Named {
                 type_symbol,
                 region_args,
+                ..
             } => {
                 let mut source =
                     self.type_symbol_display_for_module(root, current_module, &type_symbol)?;
@@ -1046,6 +1169,89 @@ impl CodeDb {
                 }
                 Ok(source)
             }
+            _ => self.type_name_in_root_with_regions(
+                root,
+                current_module,
+                enum_type_hash,
+                region_names,
+            ),
+        }
+    }
+
+    pub(crate) fn type_name_in_root_with_regions(
+        &self,
+        root: &ProgramRootPayload,
+        current_module: &str,
+        hash: &str,
+        region_names: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        self.type_name_in_root_with_scope(root, current_module, hash, region_names, &[])
+    }
+
+    /// Root-aware source rendering with both a region-name scope and a
+    /// type-parameter-name scope (R11). `type_param_names[index]` is the display
+    /// name of the enclosing generic definition's `index`-th parameter, so a
+    /// `TypeSpec::TypeParam { index }` renders as that name and a generic instance
+    /// `Named { type_args }` renders its arguments. Non-generic callers reach this
+    /// through `type_name_in_root_with_regions` (empty type-parameter scope).
+    pub(crate) fn type_name_in_root_with_scope(
+        &self,
+        root: &ProgramRootPayload,
+        current_module: &str,
+        hash: &str,
+        region_names: &BTreeMap<String, String>,
+        type_param_names: &[String],
+    ) -> Result<String> {
+        if let Some(name) = scalar_int_source_name_for_hash(hash) {
+            return Ok(name);
+        }
+        if hash == type_hash_for("Bool") {
+            return Ok("bool".to_string());
+        }
+        if hash == type_hash_for("Unit") {
+            return Ok("unit".to_string());
+        }
+        let recurse = |this: &Self, inner: &str| {
+            this.type_name_in_root_with_scope(
+                root,
+                current_module,
+                inner,
+                region_names,
+                type_param_names,
+            )
+        };
+        match self.type_spec(hash)? {
+            TypeSpec::Named {
+                type_symbol,
+                region_args,
+                type_args,
+            } => {
+                let mut source =
+                    self.type_symbol_display_for_module(root, current_module, &type_symbol)?;
+                if !region_args.is_empty() || !type_args.is_empty() {
+                    // Region arguments (`'r`) render first, then type arguments —
+                    // the order `parse_optional_type_args` accepts, so the
+                    // projection re-parses to the same type.
+                    let mut args = region_args
+                        .iter()
+                        .map(|region| {
+                            region_names
+                                .get(region)
+                                .map(|name| format!("'{name}"))
+                                .unwrap_or_else(|| region.clone())
+                        })
+                        .collect::<Vec<_>>();
+                    for arg in &type_args {
+                        args.push(recurse(self, arg)?);
+                    }
+                    source.push_str(&format!("<{}>", args.join(", ")));
+                }
+                Ok(source)
+            }
+            TypeSpec::TypeParam { index } => type_param_names
+                .get(index as usize)
+                .cloned()
+                .ok_or_else(|| anyhow!("type parameter {index} out of scope while rendering")),
             TypeSpec::Reference {
                 region,
                 mutable,
@@ -1056,12 +1262,7 @@ impl CodeDb {
                     .map(String::as_str)
                     .or_else(|| is_static_region(&region).then_some("static"))
                     .unwrap_or(region.as_str());
-                let referent = self.type_name_in_root_with_regions(
-                    root,
-                    current_module,
-                    &referent,
-                    region_names,
-                )?;
+                let referent = recurse(self, &referent)?;
                 if mutable {
                     Ok(format!("&'{region_name} mut {referent}"))
                 } else {
@@ -1069,36 +1270,15 @@ impl CodeDb {
                 }
             }
             TypeSpec::RawPointer { mutable, pointee } => {
-                let pointee = self.type_name_in_root_with_regions(
-                    root,
-                    current_module,
-                    &pointee,
-                    region_names,
-                )?;
+                let pointee = recurse(self, &pointee)?;
                 if mutable {
                     Ok(format!("raw_mut_ptr<{pointee}>"))
                 } else {
                     Ok(format!("raw_ptr<{pointee}>"))
                 }
             }
-            TypeSpec::Box { element } => {
-                let element = self.type_name_in_root_with_regions(
-                    root,
-                    current_module,
-                    &element,
-                    region_names,
-                )?;
-                Ok(format!("box<{element}>"))
-            }
-            TypeSpec::Vec { element } => {
-                let element = self.type_name_in_root_with_regions(
-                    root,
-                    current_module,
-                    &element,
-                    region_names,
-                )?;
-                Ok(format!("vec<{element}>"))
-            }
+            TypeSpec::Box { element } => Ok(format!("box<{}>", recurse(self, &element)?)),
+            TypeSpec::Vec { element } => Ok(format!("vec<{}>", recurse(self, &element)?)),
             TypeSpec::String => Ok("string".to_string()),
             TypeSpec::Slice {
                 region,
@@ -1110,12 +1290,7 @@ impl CodeDb {
                     .map(String::as_str)
                     .or_else(|| is_static_region(&region).then_some("static"))
                     .unwrap_or(region.as_str());
-                let element = self.type_name_in_root_with_regions(
-                    root,
-                    current_module,
-                    &element,
-                    region_names,
-                )?;
+                let element = recurse(self, &element)?;
                 if mutable {
                     Ok(format!("mut_slice<'{region_name}, {element}>"))
                 } else {
@@ -1123,29 +1298,12 @@ impl CodeDb {
                 }
             }
             TypeSpec::FixedArray { element, len } => {
-                let element = self.type_name_in_root_with_regions(
-                    root,
-                    current_module,
-                    &element,
-                    region_names,
-                )?;
-                Ok(format!("array<{element}, {len}>"))
+                Ok(format!("array<{}, {len}>", recurse(self, &element)?))
             }
             TypeSpec::Record(fields) => {
                 let rendered = fields
                     .iter()
-                    .map(|field| {
-                        Ok(format!(
-                            "{}: {}",
-                            field.name,
-                            self.type_name_in_root_with_regions(
-                                root,
-                                current_module,
-                                &field.type_hash,
-                                region_names,
-                            )?
-                        ))
-                    })
+                    .map(|field| Ok(format!("{}: {}", field.name, recurse(self, &field.type_hash)?)))
                     .collect::<Result<Vec<_>>>()?;
                 Ok(format!("record {{{}}}", rendered.join(", ")))
             }
@@ -1156,12 +1314,7 @@ impl CodeDb {
                         Ok(format!(
                             "{}: {}",
                             variant.name,
-                            self.type_name_in_root_with_regions(
-                                root,
-                                current_module,
-                                &variant.type_hash,
-                                region_names,
-                            )?
+                            recurse(self, &variant.type_hash)?
                         ))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1196,9 +1349,15 @@ impl CodeDb {
             TypeSpec::Named {
                 type_symbol,
                 region_args,
+                type_args,
             } => {
-                let (definition, region_substitutions) =
-                    self.named_type_definition_with_regions(root, &type_symbol, &region_args)?;
+                let (definition, region_substitutions, param_args) = self
+                    .named_type_definition_with_args(
+                        root,
+                        &type_symbol,
+                        &region_args,
+                        &type_args,
+                    )?;
                 match definition {
                     TypeDefinition::Record { fields, .. } => Ok(TypeSpec::Record(
                         fields
@@ -1206,9 +1365,10 @@ impl CodeDb {
                             .map(|field| {
                                 Ok(TypeFieldSpec {
                                     name: field.name,
-                                    type_hash: self.substitute_type_regions_hash(
+                                    type_hash: self.substitute_type_hash(
                                         &field.type_hash,
                                         &region_substitutions,
+                                        &param_args,
                                     )?,
                                 })
                             })
@@ -1220,9 +1380,10 @@ impl CodeDb {
                             .map(|variant| {
                                 Ok(TypeFieldSpec {
                                     name: variant.name,
-                                    type_hash: self.substitute_type_regions_hash(
+                                    type_hash: self.substitute_type_hash(
                                         &variant.type_hash,
                                         &region_substitutions,
+                                        &param_args,
                                     )?,
                                 })
                             })
@@ -1234,12 +1395,17 @@ impl CodeDb {
         }
     }
 
-    fn named_type_definition_with_regions(
+    /// Resolve a named type's definition plus the substitutions for instantiating
+    /// it: a region map (from region parameters) and a positional type-argument
+    /// vector (from type parameters, R11). Both arities are checked, so a generic
+    /// `Option<i64>` used with the wrong number of type arguments fails closed.
+    fn named_type_definition_with_args(
         &self,
         root: &ProgramRootPayload,
         type_symbol: &str,
         region_args: &[String],
-    ) -> Result<(TypeDefinition, BTreeMap<String, String>)> {
+        type_args: &[String],
+    ) -> Result<(TypeDefinition, BTreeMap<String, String>, Vec<String>)> {
         let entry = self
             .root_type(root, type_symbol)
             .ok_or_else(|| anyhow!("named type missing from root {type_symbol}"))?;
@@ -1251,13 +1417,20 @@ impl CodeDb {
                 region_args.len()
             );
         }
+        if definition.type_params().len() != type_args.len() {
+            bail!(
+                "named type {type_symbol} expects {} type args, got {}",
+                definition.type_params().len(),
+                type_args.len()
+            );
+        }
         let region_substitutions = definition
             .region_params()
             .iter()
             .zip(region_args.iter())
             .map(|(param, arg)| (param.region.clone(), arg.clone()))
             .collect();
-        Ok((definition, region_substitutions))
+        Ok((definition, region_substitutions, type_args.to_vec()))
     }
 
     fn substitute_region_hash(
@@ -1273,28 +1446,56 @@ impl CodeDb {
         type_hash: &str,
         region_substitutions: &BTreeMap<String, String>,
     ) -> Result<String> {
-        if region_substitutions.is_empty() {
+        self.substitute_type_hash(type_hash, region_substitutions, &[])
+    }
+
+    /// Hash-only substitution of a (possibly generic) template type: regions via
+    /// `region_substitutions`, and a `TypeSpec::TypeParam { index }` via
+    /// `param_args[index]` (R11). A nested generic instance's own `type_args` are
+    /// substituted in turn, so `box<Pair<T>>` with `T := i64` becomes
+    /// `box<Pair<i64>>`. Returns the substituted type's content hash without
+    /// storing intermediate Type objects (used by type resolution / checking);
+    /// `put_substituted_type` is the storing twin used when the result must be
+    /// referenceable by layout and lowering.
+    fn substitute_type_hash(
+        &self,
+        type_hash: &str,
+        region_substitutions: &BTreeMap<String, String>,
+        param_args: &[String],
+    ) -> Result<String> {
+        if region_substitutions.is_empty() && param_args.is_empty() {
             return Ok(type_hash.to_string());
         }
+        let recurse = |this: &Self, inner: &str| {
+            this.substitute_type_hash(inner, region_substitutions, param_args)
+        };
         match self.type_spec(type_hash)? {
             TypeSpec::Builtin(_) => Ok(type_hash.to_string()),
+            TypeSpec::TypeParam { index } => param_args
+                .get(index as usize)
+                .cloned()
+                .ok_or_else(|| anyhow!("type parameter {index} has no substitution argument")),
             TypeSpec::Named {
                 type_symbol,
                 region_args,
+                type_args,
             } => hash_for_type_spec(&TypeSpec::Named {
                 type_symbol,
                 region_args: region_args
                     .into_iter()
                     .map(|region| self.substitute_region_hash(region, region_substitutions))
                     .collect(),
+                type_args: type_args
+                    .iter()
+                    .map(|arg| recurse(self, arg))
+                    .collect::<Result<Vec<_>>>()?,
             }),
             TypeSpec::Reference {
                 region,
                 mutable,
                 referent,
             } => {
-                let referent =
-                    self.substitute_type_regions_hash(&referent, region_substitutions)?;
+                let referent = recurse(self, &referent)?;
                 hash_for_type_spec(&TypeSpec::Reference {
                     region: self.substitute_region_hash(region, region_substitutions),
                     mutable,
@@ -1302,15 +1503,15 @@ impl CodeDb {
                 })
             }
             TypeSpec::RawPointer { mutable, pointee } => {
-                let pointee = self.substitute_type_regions_hash(&pointee, region_substitutions)?;
+                let pointee = recurse(self, &pointee)?;
                 hash_for_type_spec(&TypeSpec::RawPointer { mutable, pointee })
             }
             TypeSpec::Box { element } => {
-                let element = self.substitute_type_regions_hash(&element, region_substitutions)?;
+                let element = recurse(self, &element)?;
                 hash_for_type_spec(&TypeSpec::Box { element })
             }
             TypeSpec::Vec { element } => {
-                let element = self.substitute_type_regions_hash(&element, region_substitutions)?;
+                let element = recurse(self, &element)?;
                 hash_for_type_spec(&TypeSpec::Vec { element })
             }
             TypeSpec::String => hash_for_type_spec(&TypeSpec::String),
@@ -1319,7 +1520,7 @@ impl CodeDb {
                 mutable,
                 element,
             } => {
-                let element = self.substitute_type_regions_hash(&element, region_substitutions)?;
+                let element = recurse(self, &element)?;
                 hash_for_type_spec(&TypeSpec::Slice {
                     region: self.substitute_region_hash(region, region_substitutions),
                     mutable,
@@ -1327,7 +1528,7 @@ impl CodeDb {
                 })
             }
             TypeSpec::FixedArray { element, len } => {
-                let element = self.substitute_type_regions_hash(&element, region_substitutions)?;
+                let element = recurse(self, &element)?;
                 hash_for_type_spec(&TypeSpec::FixedArray { element, len })
             }
             TypeSpec::Record(fields) => {
@@ -1336,10 +1537,7 @@ impl CodeDb {
                     .map(|field| {
                         Ok(TypeFieldSpec {
                             name: field.name,
-                            type_hash: self.substitute_type_regions_hash(
-                                &field.type_hash,
-                                region_substitutions,
-                            )?,
+                            type_hash: recurse(self, &field.type_hash)?,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1351,10 +1549,7 @@ impl CodeDb {
                     .map(|variant| {
                         Ok(TypeFieldSpec {
                             name: variant.name,
-                            type_hash: self.substitute_type_regions_hash(
-                                &variant.type_hash,
-                                region_substitutions,
-                            )?,
+                            type_hash: recurse(self, &variant.type_hash)?,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1368,28 +1563,53 @@ impl CodeDb {
         type_hash: &str,
         region_substitutions: &BTreeMap<String, String>,
     ) -> Result<String> {
-        if region_substitutions.is_empty() {
+        self.put_substituted_type(type_hash, region_substitutions, &[])
+    }
+
+    /// Storing twin of `substitute_type_hash`: substitutes regions and type
+    /// parameters (R11) and persists every intermediate structural Type object,
+    /// so the result — and its children — can be loaded by layout and lowering.
+    fn put_substituted_type(
+        &mut self,
+        type_hash: &str,
+        region_substitutions: &BTreeMap<String, String>,
+        param_args: &[String],
+    ) -> Result<String> {
+        if region_substitutions.is_empty() && param_args.is_empty() {
             return Ok(type_hash.to_string());
         }
         match self.type_spec(type_hash)? {
             TypeSpec::Builtin(_) => Ok(type_hash.to_string()),
+            TypeSpec::TypeParam { index } => param_args
+                .get(index as usize)
+                .cloned()
+                .ok_or_else(|| anyhow!("type parameter {index} has no substitution argument")),
             TypeSpec::Named {
                 type_symbol,
                 region_args,
-            } => self.put_structural_type(TypeSpec::Named {
-                type_symbol,
-                region_args: region_args
+                type_args,
+            } => {
+                let region_args = region_args
                     .into_iter()
                     .map(|region| self.substitute_region_hash(region, region_substitutions))
-                    .collect(),
-            }),
+                    .collect();
+                let type_args = type_args
+                    .iter()
+                    .map(|arg| self.put_substituted_type(arg, region_substitutions, param_args))
+                    .collect::<Result<Vec<_>>>()?;
+                self.put_structural_type(TypeSpec::Named {
+                    type_symbol,
+                    region_args,
+                    type_args,
+                })
+            }
             TypeSpec::Reference {
                 region,
                 mutable,
                 referent,
             } => {
                 let referent =
-                    self.put_substituted_type_regions(&referent, region_substitutions)?;
+                    self.put_substituted_type(&referent, region_substitutions, param_args)?;
                 self.put_structural_type(TypeSpec::Reference {
                     region: self.substitute_region_hash(region, region_substitutions),
                     mutable,
@@ -1397,15 +1617,18 @@ impl CodeDb {
                 })
             }
             TypeSpec::RawPointer { mutable, pointee } => {
-                let pointee = self.put_substituted_type_regions(&pointee, region_substitutions)?;
+                let pointee =
+                    self.put_substituted_type(&pointee, region_substitutions, param_args)?;
                 self.put_structural_type(TypeSpec::RawPointer { mutable, pointee })
             }
             TypeSpec::Box { element } => {
-                let element = self.put_substituted_type_regions(&element, region_substitutions)?;
+                let element =
+                    self.put_substituted_type(&element, region_substitutions, param_args)?;
                 self.put_structural_type(TypeSpec::Box { element })
             }
             TypeSpec::Vec { element } => {
-                let element = self.put_substituted_type_regions(&element, region_substitutions)?;
+                let element =
+                    self.put_substituted_type(&element, region_substitutions, param_args)?;
                 self.put_structural_type(TypeSpec::Vec { element })
             }
             TypeSpec::String => self.put_structural_type(TypeSpec::String),
@@ -1414,7 +1637,8 @@ impl CodeDb {
                 mutable,
                 element,
             } => {
-                let element = self.put_substituted_type_regions(&element, region_substitutions)?;
+                let element =
+                    self.put_substituted_type(&element, region_substitutions, param_args)?;
                 self.put_structural_type(TypeSpec::Slice {
                     region: self.substitute_region_hash(region, region_substitutions),
                     mutable,
@@ -1422,7 +1646,8 @@ impl CodeDb {
                 })
             }
             TypeSpec::FixedArray { element, len } => {
-                let element = self.put_substituted_type_regions(&element, region_substitutions)?;
+                let element =
+                    self.put_substituted_type(&element, region_substitutions, param_args)?;
                 self.put_structural_type(TypeSpec::FixedArray { element, len })
             }
             TypeSpec::Record(fields) => {
@@ -1431,9 +1656,10 @@ impl CodeDb {
                     .map(|field| {
                         Ok(TypeFieldSpec {
                             name: field.name,
-                            type_hash: self.put_substituted_type_regions(
+                            type_hash: self.put_substituted_type(
                                 &field.type_hash,
                                 region_substitutions,
+                                param_args,
                             )?,
                         })
                     })
@@ -1446,9 +1672,10 @@ impl CodeDb {
                     .map(|variant| {
                         Ok(TypeFieldSpec {
                             name: variant.name,
-                            type_hash: self.put_substituted_type_regions(
+                            type_hash: self.put_substituted_type(
                                 &variant.type_hash,
                                 region_substitutions,
+                                param_args,
                             )?,
                         })
                     })
@@ -1463,22 +1690,96 @@ impl CodeDb {
         root: &ProgramRootPayload,
         type_symbol: &str,
         region_args: &[String],
+        type_args: &[String],
     ) -> Result<()> {
-        let (definition, region_substitutions) =
-            self.named_type_definition_with_regions(root, type_symbol, region_args)?;
-        match definition {
-            TypeDefinition::Record { fields, .. } => {
-                for field in fields {
-                    self.put_substituted_type_regions(&field.type_hash, &region_substitutions)?;
-                }
-            }
-            TypeDefinition::Enum { variants, .. } => {
-                for variant in variants {
-                    self.put_substituted_type_regions(&variant.type_hash, &region_substitutions)?;
-                }
-            }
+        // A plain named type (no region or type arguments) has nothing to
+        // substitute — its members are already stored as written, so skip the
+        // walk entirely (preserving the pre-generics no-op fast path).
+        if region_args.is_empty() && type_args.is_empty() {
+            return Ok(());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        self.materialize_instance(root, type_symbol, region_args, type_args, &mut seen)
+    }
+
+    /// Eagerly store the substituted member types of one named-type instantiation,
+    /// and recurse into any *nested* generic instances it produces (R11). A
+    /// generic substitution changes type structure (`Pair<T>` → `Pair<i64>`), so a
+    /// nested instance reached only through substitution — never written in source
+    /// — would otherwise have no stored expansion for layout/lowering to load. The
+    /// `seen` set keeps a recursive generic (`List<T>` whose `cons` holds a
+    /// `box<List<T>>`) terminating: the box also breaks the layout size cycle.
+    fn materialize_instance(
+        &mut self,
+        root: &ProgramRootPayload,
+        type_symbol: &str,
+        region_args: &[String],
+        type_args: &[String],
+        seen: &mut std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        let instance_hash = self.put_structural_type(TypeSpec::Named {
+            type_symbol: type_symbol.to_string(),
+            region_args: region_args.to_vec(),
+            type_args: type_args.to_vec(),
+        })?;
+        if !seen.insert(instance_hash) {
+            return Ok(());
+        }
+        let (definition, region_substitutions, param_args) =
+            self.named_type_definition_with_args(root, type_symbol, region_args, type_args)?;
+        let members = match &definition {
+            TypeDefinition::Record { fields, .. } => fields.clone(),
+            TypeDefinition::Enum { variants, .. } => variants.clone(),
+        };
+        for member in members {
+            let substituted =
+                self.put_substituted_type(&member.type_hash, &region_substitutions, &param_args)?;
+            self.materialize_nested_instances(root, &substituted, seen)?;
         }
         Ok(())
+    }
+
+    fn materialize_nested_instances(
+        &mut self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+        seen: &mut std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        match self.type_spec(type_hash)? {
+            TypeSpec::Named {
+                type_symbol,
+                region_args,
+                type_args,
+            } => {
+                if !type_args.is_empty() {
+                    self.materialize_instance(
+                        root,
+                        &type_symbol,
+                        &region_args,
+                        &type_args,
+                        seen,
+                    )?;
+                }
+                Ok(())
+            }
+            TypeSpec::Box { element }
+            | TypeSpec::Vec { element }
+            | TypeSpec::FixedArray { element, .. }
+            | TypeSpec::Slice { element, .. }
+            | TypeSpec::Reference {
+                referent: element, ..
+            }
+            | TypeSpec::RawPointer { pointee: element, .. } => {
+                self.materialize_nested_instances(root, &element, seen)
+            }
+            TypeSpec::Record(members) | TypeSpec::Enum(members) => {
+                for member in members {
+                    self.materialize_nested_instances(root, &member.type_hash, seen)?;
+                }
+                Ok(())
+            }
+            TypeSpec::Builtin(_) | TypeSpec::String | TypeSpec::TypeParam { .. } => Ok(()),
+        }
     }
 
     pub(crate) fn record_field_type_in_root(
@@ -1498,6 +1799,990 @@ impl CodeDb {
                 other.to_source(self)?
             ),
         }
+    }
+
+    /// Resolve the concrete enum *instance* type at a construction site
+    /// `Enum::variant(value)` (R11). For a non-generic enum, or one written with
+    /// explicit type arguments (`Option<i64>::some(..)`), this is ordinary
+    /// resolution. For a bare generic enum (`Option::some(5)`), the type arguments
+    /// are inferred: from the `expected_type` when it is an instance of the same
+    /// generic, otherwise by matching the variant's payload template against the
+    /// payload value's concrete type.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_enum_construct_type(
+        &mut self,
+        current_module: &str,
+        root: &ProgramRootPayload,
+        enum_type: &str,
+        variant: &str,
+        value: &RawExpr,
+        param_names: &[String],
+        param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
+        locals: &mut Vec<LocalTypeBinding>,
+        expected_type: Option<&str>,
+    ) -> Result<String> {
+        // Inspect the written type: its base name and whether explicit arguments
+        // were given. A non-named (inline `enum { .. }`) construction type is never
+        // generic, so it resolves directly.
+        let parsed = parse_type_source(enum_type)?;
+        let (base_name, has_explicit_args) = match &parsed {
+            ParsedTypeSpec::Named {
+                name,
+                region_args,
+                type_args,
+            } => (name.clone(), !region_args.is_empty() || !type_args.is_empty()),
+            _ => {
+                return self.resolve_type_in_root_with_regions(
+                    current_module,
+                    root,
+                    enum_type,
+                    region_scope,
+                );
+            }
+        };
+        let Some(base_symbol) = resolve_named_type_in_root(root, current_module, &base_name) else {
+            // Not a known named type (could be a module-qualified inline form the
+            // direct resolver still understands) — defer to ordinary resolution.
+            return self.resolve_type_in_root_with_regions(
+                current_module,
+                root,
+                enum_type,
+                region_scope,
+            );
+        };
+        let entry = self
+            .root_type(root, &base_symbol)
+            .ok_or_else(|| anyhow!("type {base_name} missing root definition"))?;
+        let definition = self.type_definition(&entry.type_def)?;
+        let type_param_count = definition.type_params().len();
+
+        // Non-generic, or the writer supplied explicit arguments: resolve directly.
+        if type_param_count == 0 || has_explicit_args {
+            return self.resolve_type_in_root_with_regions(
+                current_module,
+                root,
+                enum_type,
+                region_scope,
+            );
+        }
+        if !definition.region_params().is_empty() {
+            bail!(
+                "generic enum {base_name} with region parameters requires explicit type arguments at construction"
+            );
+        }
+
+        // Infer the type arguments. Prefer an `expected_type` that is an instance
+        // of this same generic.
+        let mut inferred: Option<Vec<String>> = None;
+        if let Some(expected) = expected_type
+            && let TypeSpec::Named {
+                type_symbol,
+                type_args,
+                ..
+            } = self.type_spec(expected)?
+            && type_symbol == base_symbol
+            && type_args.len() == type_param_count
+        {
+            inferred = Some(type_args);
+        }
+
+        let instance_args = match inferred {
+            Some(args) => args,
+            None => {
+                // Match the variant's payload template against the payload's type.
+                let template = self.generic_variant_payload_template(root, &base_symbol, variant)?;
+                let probe = self.type_expr_with_locals(
+                    current_module,
+                    value,
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                let mut solutions = vec![None; type_param_count];
+                self.infer_type_args_from_match(&template, &probe.type_hash, &mut solutions)?;
+                solutions
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, slot)| {
+                        slot.ok_or_else(|| {
+                            anyhow!(
+                                "cannot infer type argument {idx} for generic enum {base_name}; \
+                                 write it explicitly, e.g. {base_name}<...>::{variant}(...)"
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+
+        let instance = self.put_structural_type(TypeSpec::Named {
+            type_symbol: base_symbol.clone(),
+            region_args: Vec::new(),
+            type_args: instance_args.clone(),
+        })?;
+        self.materialize_named_type_expansion(root, &base_symbol, &[], &instance_args)?;
+        Ok(instance)
+    }
+
+    /// The (un-substituted) payload type of `variant` in the *generic template* of
+    /// the enum named by `type_symbol` (R11) — i.e. the type that still contains
+    /// `TypeSpec::TypeParam`s. Used to infer a generic enum instance's type
+    /// arguments at a construction site.
+    fn generic_variant_payload_template(
+        &self,
+        root: &ProgramRootPayload,
+        type_symbol: &str,
+        variant: &str,
+    ) -> Result<String> {
+        let entry = self
+            .root_type(root, type_symbol)
+            .ok_or_else(|| anyhow!("named type missing from root {type_symbol}"))?;
+        let definition = self.type_definition(&entry.type_def)?;
+        let TypeDefinition::Enum { variants, .. } = definition else {
+            bail!("enum variant construction requires enum type");
+        };
+        variants
+            .into_iter()
+            .find(|candidate| candidate.name == variant)
+            .map(|candidate| candidate.type_hash)
+            .ok_or_else(|| anyhow!("enum has no variant {variant}"))
+    }
+
+    /// Unify a generic template type `template` (which may contain `TypeParam`s)
+    /// against a concrete type `concrete`, recording each parameter's solution in
+    /// `solutions[index]` (R11). A parameter bound twice to differing types is a
+    /// conflict. Shapes that do not line up simply leave parameters unsolved (the
+    /// caller reports "cannot infer"); this is matching, not full unification.
+    fn infer_type_args_from_match(
+        &self,
+        template: &str,
+        concrete: &str,
+        solutions: &mut [Option<String>],
+    ) -> Result<()> {
+        match self.type_spec(template)? {
+            TypeSpec::TypeParam { index } => {
+                let slot = solutions
+                    .get_mut(index as usize)
+                    .ok_or_else(|| anyhow!("type parameter {index} out of range"))?;
+                match slot {
+                    Some(existing) if existing != concrete => bail!(
+                        "conflicting type arguments inferred for parameter {index}"
+                    ),
+                    _ => *slot = Some(concrete.to_string()),
+                }
+                Ok(())
+            }
+            TypeSpec::Box { element } => {
+                if let TypeSpec::Box { element: c } = self.type_spec(concrete)? {
+                    self.infer_type_args_from_match(&element, &c, solutions)?;
+                }
+                Ok(())
+            }
+            TypeSpec::Vec { element } => {
+                if let TypeSpec::Vec { element: c } = self.type_spec(concrete)? {
+                    self.infer_type_args_from_match(&element, &c, solutions)?;
+                }
+                Ok(())
+            }
+            TypeSpec::FixedArray { element, .. } => {
+                if let TypeSpec::FixedArray { element: c, .. } = self.type_spec(concrete)? {
+                    self.infer_type_args_from_match(&element, &c, solutions)?;
+                }
+                Ok(())
+            }
+            TypeSpec::Slice { element, .. } => {
+                if let TypeSpec::Slice { element: c, .. } = self.type_spec(concrete)? {
+                    self.infer_type_args_from_match(&element, &c, solutions)?;
+                }
+                Ok(())
+            }
+            TypeSpec::Reference { referent, .. } => {
+                if let TypeSpec::Reference { referent: c, .. } = self.type_spec(concrete)? {
+                    self.infer_type_args_from_match(&referent, &c, solutions)?;
+                }
+                Ok(())
+            }
+            TypeSpec::RawPointer { pointee, .. } => {
+                if let TypeSpec::RawPointer { pointee: c, .. } = self.type_spec(concrete)? {
+                    self.infer_type_args_from_match(&pointee, &c, solutions)?;
+                }
+                Ok(())
+            }
+            TypeSpec::Named { type_args, .. } => {
+                if let TypeSpec::Named {
+                    type_args: c_args, ..
+                } = self.type_spec(concrete)?
+                    && c_args.len() == type_args.len()
+                {
+                    for (t, c) in type_args.iter().zip(c_args.iter()) {
+                        self.infer_type_args_from_match(t, c, solutions)?;
+                    }
+                }
+                Ok(())
+            }
+            TypeSpec::Record(fields) => {
+                if let TypeSpec::Record(c_fields) = self.type_spec(concrete)?
+                    && c_fields.len() == fields.len()
+                {
+                    for (t, c) in fields.iter().zip(c_fields.iter()) {
+                        self.infer_type_args_from_match(&t.type_hash, &c.type_hash, solutions)?;
+                    }
+                }
+                Ok(())
+            }
+            TypeSpec::Enum(variants) => {
+                if let TypeSpec::Enum(c_variants) = self.type_spec(concrete)?
+                    && c_variants.len() == variants.len()
+                {
+                    for (t, c) in variants.iter().zip(c_variants.iter()) {
+                        self.infer_type_args_from_match(&t.type_hash, &c.type_hash, solutions)?;
+                    }
+                }
+                Ok(())
+            }
+            TypeSpec::Builtin(_) | TypeSpec::String => Ok(()),
+        }
+    }
+
+    /// Resolve a call's expected parameter and return types, substituting any
+    /// type arguments recorded on a generic call (R11) so verification checks
+    /// against the concrete instantiation rather than the opaque template. A
+    /// non-generic call (no `type_args`) returns the signature parts unchanged.
+    fn call_signature_with_type_args(
+        &self,
+        signature_hash: &str,
+        payload: &JsonValue,
+    ) -> Result<(Vec<String>, String)> {
+        let (params, return_type) = self.signature_parts(signature_hash)?;
+        let type_args = call_type_args(payload)?;
+        if type_args.is_empty() {
+            return Ok((params, return_type));
+        }
+        let no_regions = BTreeMap::new();
+        let params = params
+            .iter()
+            .map(|param| self.substitute_type_hash(param, &no_regions, &type_args))
+            .collect::<Result<Vec<_>>>()?;
+        let return_type = self.substitute_type_hash(&return_type, &no_regions, &type_args)?;
+        Ok((params, return_type))
+    }
+
+    /// Build a partial type-argument substitution from a solution vector (R11):
+    /// a solved parameter maps to its inferred type, an unsolved one maps to its
+    /// own `TypeParam` (so substituting leaves it in place). Substituting a
+    /// parameter type with this yields a concrete type exactly when every
+    /// parameter it mentions is already solved — the test the deferred-argument
+    /// retry uses to know an anchor is usable.
+    fn partial_type_args(&self, solutions: &[Option<String>]) -> Result<Vec<String>> {
+        solutions
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| match slot {
+                Some(hash) => Ok(hash.clone()),
+                None => hash_for_type_spec(&TypeSpec::TypeParam {
+                    index: index as u32,
+                }),
+            })
+            .collect()
+    }
+
+    /// Materialize the structural expansion of every generic instance nested in
+    /// `type_hash` (R11), so a type produced only by substitution at a call
+    /// site (e.g. `Option<i64>` returned by a generic function) has its members
+    /// stored for the caller's layout and lowering to load.
+    fn materialize_type_instances(
+        &mut self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+    ) -> Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.materialize_nested_instances(root, type_hash, &mut seen)
+    }
+
+    /// Type-check a call to a generic function (R11): infer the callee's type
+    /// arguments from the argument types (and the expected result type), verify
+    /// the now-concrete parameter types, and record the inferred `type_args` on
+    /// the call so lowering can monomorphize it. The typed call still names the
+    /// generic symbol — its monomorphic instance is materialized as a derived
+    /// root symbol by `monomorphize_into_root` — so the reference evaluator runs
+    /// the (type-erased) generic body unchanged while the native backend lowers
+    /// one concrete instance per `type_args`.
+    #[allow(clippy::too_many_arguments)]
+    fn type_generic_call(
+        &mut self,
+        current_module: &str,
+        name: &str,
+        symbol: &str,
+        expected_params: &[String],
+        return_type: &str,
+        type_param_count: usize,
+        callee_regions: &BTreeSet<String>,
+        args: &[RawExpr],
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
+        locals: &mut Vec<LocalTypeBinding>,
+        expected_type: Option<&str>,
+    ) -> Result<TypeCheckResult> {
+        // 1. Type-check the arguments. A generic parameter type is opaque, so
+        //    in the first pass each argument is typed on its own (no
+        //    expectation). An argument that needs its parameter type to type —
+        //    e.g. a bare `Option::none` at parameter `Option<T>` — fails here
+        //    and is retried in pass 3 once `T` is solved from the other
+        //    arguments.
+        let mut pass1 = Vec::with_capacity(args.len());
+        for arg in args {
+            pass1.push(self.type_expr_with_locals(
+                current_module,
+                arg,
+                root,
+                param_names,
+                param_types,
+                region_scope,
+                locals,
+            ));
+        }
+        // 2. Solve each type parameter by matching the parameter template
+        //    against every argument that typed, then fall back to the expected
+        //    result type (so a call whose only `T`-bearing argument needs
+        //    context still resolves).
+        let mut solutions = vec![None; type_param_count];
+        for (idx, typed) in pass1.iter().enumerate() {
+            if let Ok(typed) = typed {
+                self.infer_type_args_from_match(
+                    &expected_params[idx],
+                    &typed.type_hash,
+                    &mut solutions,
+                )?;
+            }
+        }
+        if solutions.iter().any(Option::is_none)
+            && let Some(expected_outer) = expected_type
+        {
+            self.infer_type_args_from_match(return_type, expected_outer, &mut solutions)?;
+        }
+        // 3. Retry any argument that did not type on its own, now anchoring it
+        //    to its parameter type with the solved arguments substituted in. If
+        //    that anchor is still not concrete the type arguments are genuinely
+        //    under-determined.
+        let partial_args = self.partial_type_args(&solutions)?;
+        let no_regions = BTreeMap::new();
+        let mut typed_args = Vec::with_capacity(args.len());
+        let mut arg_types = Vec::with_capacity(args.len());
+        for (idx, typed) in pass1.into_iter().enumerate() {
+            let typed = match typed {
+                Ok(typed) => typed,
+                Err(original) => {
+                    let anchor =
+                        self.substitute_type_hash(&expected_params[idx], &no_regions, &partial_args)?;
+                    if !self.type_is_concrete(&anchor)? {
+                        return Err(original.context(format!(
+                            "cannot infer the type arguments of generic function {name} for \
+                             argument {idx}; annotate the call's context"
+                        )));
+                    }
+                    self.type_expr_with_locals_expecting(
+                        current_module,
+                        &args[idx],
+                        root,
+                        param_names,
+                        param_types,
+                        region_scope,
+                        locals,
+                        Some(&anchor),
+                    )?
+                }
+            };
+            arg_types.push(typed.type_hash);
+            typed_args.push(typed.expr_hash);
+        }
+        let type_args = solutions
+            .into_iter()
+            .enumerate()
+            .map(|(idx, slot)| {
+                slot.ok_or_else(|| {
+                    anyhow!(
+                        "cannot infer type argument {idx} for generic function {name}; \
+                         the argument types do not determine it (annotate the call's context)"
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // 4. Substitute the solved type arguments into the parameter and return
+        //    types, infer any region arguments against the now-concrete
+        //    parameter types, and check each argument is assignable.
+        let mut region_substitutions = BTreeMap::new();
+        for (idx, expected) in expected_params.iter().enumerate() {
+            let concrete = self.substitute_type_hash(expected, &no_regions, &type_args)?;
+            if !self.type_assignable_for_call_in_root(
+                root,
+                &arg_types[idx],
+                &concrete,
+                callee_regions,
+            )? {
+                bail!(
+                    "call arg {idx} for {name} expected {}, got {}",
+                    self.type_name(&concrete)?,
+                    self.type_name(&arg_types[idx])?
+                );
+            }
+            self.infer_call_region_substitutions(
+                root,
+                &arg_types[idx],
+                &concrete,
+                callee_regions,
+                &mut region_substitutions,
+            )?;
+        }
+        // 5. The call's concrete result type (type args + any inferred
+        //    regions), with every nested generic instance it introduces
+        //    materialized so the caller's layout/lowering can load them.
+        let return_type =
+            self.put_substituted_type(return_type, &region_substitutions, &type_args)?;
+        self.materialize_type_instances(root, &return_type)?;
+        // 6. The typed call records the generic symbol plus the inferred type
+        //    arguments. (`type_args` is absent on a non-generic call, so
+        //    existing call payloads — and their hashes — are unchanged.)
+        let expr_hash = self.put_object(
+            "Expression",
+            &json!({
+                "expr_kind": "call",
+                "symbol": symbol,
+                "args": typed_args,
+                "type": return_type,
+                "type_args": type_args,
+            }),
+        )?;
+        self.write_cache_json(
+            &expr_hash,
+            "typechecker",
+            "typed-dag",
+            ArtifactKind::TypedExpression,
+            &json!({ "type": return_type }),
+        )?;
+        Ok(TypeCheckResult {
+            expr_hash,
+            type_hash: return_type,
+        })
+    }
+
+    /// Materialize every concrete generic-function instantiation reachable in a
+    /// typed body as a derived root symbol (R11) — the monomorphization pass at
+    /// the lowering seam. Each `(generic, type_args)` instance becomes an
+    /// ordinary concrete function (substituted signature + substituted body) so
+    /// reachability, lowering, linking, and bundling treat it like any other
+    /// function; the instances are derived deterministically from the body, so
+    /// import→export→import reproduces them and they are never projected (they
+    /// have no name binding). A non-generic program adds none, so its root is
+    /// unchanged. Called after a body is type-checked, before the root is
+    /// stored.
+    pub(crate) fn monomorphize_into_root(
+        &mut self,
+        root: &mut ProgramRootPayload,
+        body: &str,
+    ) -> Result<()> {
+        let mut worklist = Vec::new();
+        self.collect_concrete_generic_calls(body, &mut worklist)?;
+        let mut done = std::collections::BTreeSet::new();
+        let mut next = 0;
+        while next < worklist.len() {
+            let (generic, type_args) = worklist[next].clone();
+            next += 1;
+            let instance = monomorphic_instance_symbol(&generic, &type_args);
+            if !done.insert(instance.clone()) {
+                continue;
+            }
+            if root.symbols.iter().any(|entry| entry.symbol == instance) {
+                continue;
+            }
+            let (signature, definition, names) =
+                self.build_function_instance(root, &generic, &type_args)?;
+            root.symbols.push(crate::model::RootSymbolPayload {
+                symbol: instance.clone(),
+                definition: definition.clone(),
+                signature,
+            });
+            root.param_names.push(crate::model::ParamNames {
+                symbol: instance,
+                names,
+            });
+            // The instance body's own generic calls (a generic function calling
+            // another generic function) are now concrete — instantiate them too.
+            let instance_body = self.function_body_hash(&definition)?;
+            self.collect_concrete_generic_calls(&instance_body, &mut worklist)?;
+        }
+        Ok(())
+    }
+
+    /// Verify every monomorphic generic-function instance in a root (R11),
+    /// returning one error string per inconsistency. An instance's symbol is its
+    /// descriptor's content hash (so `verify_objects` already proves the symbol
+    /// matches its `generic` + `type_args`); this recomputes the *signature* —
+    /// the generic's parameters and return type with the recorded arguments
+    /// substituted in — and rejects an instance whose stored signature does not
+    /// derive from its generic, the generic missing or non-generic, or the
+    /// argument count not matching the generic's arity. The instance's body is
+    /// validated as an ordinary concrete function by `type_check_root`.
+    pub(crate) fn verify_generic_instances_in_root(
+        &self,
+        root: &ProgramRootPayload,
+    ) -> Result<Vec<String>> {
+        let mut errors = Vec::new();
+        for entry in &root.symbols {
+            if self.get_kind(&entry.symbol).ok().as_deref() != Some(MONOMORPHIC_INSTANCE_KIND) {
+                continue;
+            }
+            let descriptor = self.get_payload(&entry.symbol)?;
+            let Some(generic) = descriptor.get("generic").and_then(JsonValue::as_str) else {
+                errors.push(format!(
+                    "bad_generic_instance: instance {} descriptor missing generic",
+                    entry.symbol
+                ));
+                continue;
+            };
+            let type_args = call_type_args(&descriptor)?;
+            let Some(template) = self.root_symbol(root, generic) else {
+                errors.push(format!(
+                    "bad_generic_instance: instance {} names generic {generic} missing from root",
+                    entry.symbol
+                ));
+                continue;
+            };
+            let type_params = self.signature_type_params(&template.signature)?;
+            if type_params.is_empty() {
+                errors.push(format!(
+                    "bad_generic_instance: instance {} names non-generic function {generic}",
+                    entry.symbol
+                ));
+                continue;
+            }
+            if type_params.len() != type_args.len() {
+                errors.push(format!(
+                    "bad_generic_instance: instance {} provides {} type args for generic {generic} expecting {}",
+                    entry.symbol,
+                    type_args.len(),
+                    type_params.len()
+                ));
+                continue;
+            }
+            let (generic_params, generic_return) = self.signature_parts(&template.signature)?;
+            let no_regions = BTreeMap::new();
+            let expected_params = generic_params
+                .iter()
+                .map(|param| self.substitute_type_hash(param, &no_regions, &type_args))
+                .collect::<Result<Vec<_>>>()?;
+            let expected_return =
+                self.substitute_type_hash(&generic_return, &no_regions, &type_args)?;
+            let (instance_params, instance_return) = self.signature_parts(&entry.signature)?;
+            if instance_params != expected_params || instance_return != expected_return {
+                errors.push(format!(
+                    "bad_generic_instance: instance {} signature does not derive from generic {generic} at its type arguments",
+                    entry.symbol
+                ));
+            }
+        }
+        Ok(errors)
+    }
+
+    /// Build one monomorphic instance of a generic function (R11): substitute
+    /// the concrete `type_args` into the template's signature and typed body,
+    /// store both, and return the instance's signature, definition, and
+    /// parameter names. The instance carries no type parameters — it is a
+    /// concrete function keyed by the derived instance symbol.
+    fn build_function_instance(
+        &mut self,
+        root: &ProgramRootPayload,
+        generic_symbol: &str,
+        type_args: &[String],
+    ) -> Result<(String, String, Vec<String>)> {
+        let template = self
+            .root_symbol(root, generic_symbol)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!("generic function {generic_symbol} missing for instantiation")
+            })?;
+        let type_params = self.signature_type_params(&template.signature)?;
+        if type_params.len() != type_args.len() {
+            bail!(
+                "generic function {generic_symbol} expects {} type args, got {}",
+                type_params.len(),
+                type_args.len()
+            );
+        }
+        let (param_types, return_type) = self.signature_parts(&template.signature)?;
+        let concrete_params = param_types
+            .iter()
+            .map(|param| self.substitute_body_type(root, param, type_args))
+            .collect::<Result<Vec<_>>>()?;
+        let concrete_return = self.substitute_body_type(root, &return_type, type_args)?;
+        let effects = self.signature_effects(&template.signature)?;
+        let region_params = self.signature_region_params(&template.signature)?;
+        // The instance signature has no type parameters: it is concrete.
+        let signature = self.put_signature_with_effects_and_regions(
+            &concrete_params,
+            &concrete_return,
+            &effects,
+            &region_params,
+        )?;
+        let template_body = self.function_body_hash(&template.definition)?;
+        let instance_body = self.substitute_typed_expr(root, &template_body, type_args)?;
+        // Store the instance descriptor so its content hash — the instance's
+        // symbol — is a real object (a root symbol references `objects`). The
+        // hash matches the pure `monomorphic_instance_symbol`.
+        let instance_symbol = self.put_object(
+            MONOMORPHIC_INSTANCE_KIND,
+            &monomorphic_instance_descriptor(generic_symbol, type_args),
+        )?;
+        let definition = self.put_function_def(&instance_symbol, &signature, &instance_body)?;
+        let names = crate::model::param_names(root, generic_symbol);
+        Ok((signature, definition, names))
+    }
+
+    /// Substitute a generic function's type arguments into a type from its body
+    /// (R11) and materialize any nested generic instance the substitution
+    /// produces, so the monomorphized body's types are concrete and stored for
+    /// layout/lowering.
+    fn substitute_body_type(
+        &mut self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+        type_args: &[String],
+    ) -> Result<String> {
+        let no_regions = BTreeMap::new();
+        let concrete = self.put_substituted_type(type_hash, &no_regions, type_args)?;
+        self.materialize_type_instances(root, &concrete)?;
+        Ok(concrete)
+    }
+
+    /// Collect every concrete generic-function call reachable in a typed body —
+    /// `(generic_symbol, type_args)` pairs whose type arguments are fully
+    /// concrete (R11). A call inside a generic template body has `TypeParam`
+    /// arguments and is skipped (the template is not lowered; its instances are
+    /// materialized when the template is itself instantiated). The traversal is
+    /// structural and deterministic, so the materialization order — and the
+    /// resulting root — reproduce on re-import.
+    fn collect_concrete_generic_calls(
+        &self,
+        expr_hash: &str,
+        out: &mut Vec<(String, Vec<String>)>,
+    ) -> Result<()> {
+        let payload = self.get_payload(expr_hash)?;
+        if payload.get("expr_kind").and_then(JsonValue::as_str) == Some("call") {
+            let type_args = call_type_args(&payload)?;
+            if !type_args.is_empty()
+                && type_args
+                    .iter()
+                    .all(|arg| self.type_is_concrete(arg).unwrap_or(false))
+            {
+                let symbol = payload
+                    .get("symbol")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("call missing symbol"))?;
+                out.push((symbol.to_string(), type_args));
+            }
+        }
+        for child in self.child_expr_hashes(&payload)? {
+            self.collect_concrete_generic_calls(&child, out)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `type_hash` contains no `TypeParam` (R11) — i.e. it is a concrete
+    /// type at which a generic function may be monomorphized.
+    pub(crate) fn type_is_concrete(&self, type_hash: &str) -> Result<bool> {
+        Ok(match self.type_spec(type_hash)? {
+            TypeSpec::TypeParam { .. } => false,
+            TypeSpec::Builtin(_) | TypeSpec::String => true,
+            TypeSpec::Named { type_args, .. } => {
+                let mut concrete = true;
+                for arg in type_args {
+                    concrete &= self.type_is_concrete(&arg)?;
+                }
+                concrete
+            }
+            TypeSpec::Reference { referent: inner, .. }
+            | TypeSpec::RawPointer { pointee: inner, .. }
+            | TypeSpec::Box { element: inner }
+            | TypeSpec::Vec { element: inner }
+            | TypeSpec::Slice { element: inner, .. }
+            | TypeSpec::FixedArray { element: inner, .. } => self.type_is_concrete(&inner)?,
+            TypeSpec::Record(members) | TypeSpec::Enum(members) => {
+                let mut concrete = true;
+                for member in members {
+                    concrete &= self.type_is_concrete(&member.type_hash)?;
+                }
+                concrete
+            }
+        })
+    }
+
+    /// The child *expression* hashes of a typed expression, in source order
+    /// (R11). Centralizes the per-kind child structure shared by the
+    /// monomorphization traversals (mirrors `collect_expr_deps`); the
+    /// substitution walker overrides each child in place.
+    fn child_expr_hashes(&self, payload: &JsonValue) -> Result<Vec<String>> {
+        let kind = payload
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing expr_kind"))?;
+        let field = |key: &str| -> Result<String> {
+            payload
+                .get(key)
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("{kind} missing {key}"))
+        };
+        let mut children = Vec::new();
+        match kind {
+            "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref"
+            | "local_ref" => {}
+            "call" => {
+                for arg in payload
+                    .get("args")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("call missing args"))?
+                {
+                    children.push(
+                        arg.as_str()
+                            .ok_or_else(|| anyhow!("call arg must be hash"))?
+                            .to_string(),
+                    );
+                }
+            }
+            "record_literal" => {
+                for member in payload
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("record_literal missing fields"))?
+                {
+                    children.push(
+                        member
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("record field missing value"))?
+                            .to_string(),
+                    );
+                }
+            }
+            "array_literal" => {
+                for element in payload
+                    .get("elements")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("array_literal missing elements"))?
+                {
+                    children.push(
+                        element
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("array element missing value"))?
+                            .to_string(),
+                    );
+                }
+            }
+            "case" => {
+                children.push(field("expr")?);
+                for arm in payload
+                    .get("arms")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("case missing arms"))?
+                {
+                    if let Some(guard) = arm.get("guard").and_then(JsonValue::as_str) {
+                        children.push(guard.to_string());
+                    }
+                    children.push(
+                        arm.get("body")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("case arm missing body"))?
+                            .to_string(),
+                    );
+                }
+            }
+            other => {
+                for key in plain_child_expr_keys(other)? {
+                    children.push(field(key)?);
+                }
+            }
+        }
+        Ok(children)
+    }
+
+    /// Rewrite a typed expression with a generic function's type arguments
+    /// substituted into every type it carries (R11), recursing into all child
+    /// expressions, and return the new expression's hash. Used to produce a
+    /// monomorphic instance's concrete body from the generic template's body:
+    /// every `type`/`*_type` field and `type_args` list is substituted (and any
+    /// nested generic instance materialized), so the result is an ordinary
+    /// concrete typed expression the existing layout/lowering/verify accept.
+    fn substitute_typed_expr(
+        &mut self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_args: &[String],
+    ) -> Result<String> {
+        let payload = self.get_payload(expr_hash)?;
+        let object = payload
+            .as_object()
+            .ok_or_else(|| anyhow!("expression payload must be an object"))?;
+        let kind = object
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing expr_kind"))?
+            .to_string();
+        // Substitute every type-bearing top-level field. Type hashes live under
+        // `type`, every `*_type` key, and the `type_args` list; all other
+        // scalar fields (names, operators, variants, counts) are copied
+        // verbatim, and child expressions are overwritten below.
+        let mut out = serde_json::Map::new();
+        for (key, value) in object {
+            if key == "type_args" {
+                let mut args = Vec::new();
+                for arg in value
+                    .as_array()
+                    .ok_or_else(|| anyhow!("type_args must be an array"))?
+                {
+                    let arg = arg
+                        .as_str()
+                        .ok_or_else(|| anyhow!("type arg must be a hash"))?;
+                    args.push(self.substitute_body_type(root, arg, type_args)?);
+                }
+                out.insert(key.clone(), json!(args));
+            } else if key == "type" || key.ends_with("_type") {
+                let hash = value
+                    .as_str()
+                    .ok_or_else(|| anyhow!("type field {key} must be a hash"))?;
+                out.insert(
+                    key.clone(),
+                    json!(self.substitute_body_type(root, hash, type_args)?),
+                );
+            } else {
+                out.insert(key.clone(), value.clone());
+            }
+        }
+        // Recurse into child expressions, rebuilding the kinds with structured
+        // children (call args, record/array members, case arms) and overwriting
+        // the plain single-/multi-child keys for the rest.
+        match kind.as_str() {
+            "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref"
+            | "local_ref" => {}
+            "call" => {
+                let mut args = Vec::new();
+                for arg in object
+                    .get("args")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("call missing args"))?
+                {
+                    let arg = arg
+                        .as_str()
+                        .ok_or_else(|| anyhow!("call arg must be hash"))?;
+                    args.push(self.substitute_typed_expr(root, arg, type_args)?);
+                }
+                out.insert("args".to_string(), json!(args));
+            }
+            "record_literal" => {
+                let mut fields = Vec::new();
+                for member in object
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("record_literal missing fields"))?
+                {
+                    let name = member.get("name").cloned().unwrap_or(JsonValue::Null);
+                    let value = member
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("record field missing value"))?;
+                    let field_type = member
+                        .get("type")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("record field missing type"))?;
+                    fields.push(json!({
+                        "name": name,
+                        "value": self.substitute_typed_expr(root, value, type_args)?,
+                        "type": self.substitute_body_type(root, field_type, type_args)?,
+                    }));
+                }
+                out.insert("fields".to_string(), json!(fields));
+            }
+            "array_literal" => {
+                let mut elements = Vec::new();
+                for element in object
+                    .get("elements")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("array_literal missing elements"))?
+                {
+                    let value = element
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array element missing value"))?;
+                    let element_type = element
+                        .get("type")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array element missing type"))?;
+                    elements.push(json!({
+                        "value": self.substitute_typed_expr(root, value, type_args)?,
+                        "type": self.substitute_body_type(root, element_type, type_args)?,
+                    }));
+                }
+                out.insert("elements".to_string(), json!(elements));
+            }
+            "case" => {
+                let scrutinee = object
+                    .get("expr")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("case missing expr"))?;
+                out.insert(
+                    "expr".to_string(),
+                    json!(self.substitute_typed_expr(root, scrutinee, type_args)?),
+                );
+                let mut arms = Vec::new();
+                for arm in object
+                    .get("arms")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("case missing arms"))?
+                {
+                    // Arm patterns (`variant`/`binding_name`/`payload_pattern`/
+                    // `default`) carry no type hashes — the binding types are
+                    // re-derived from the (substituted) scrutinee type at
+                    // lowering — so copy them and rewrite only the guard and body.
+                    let mut new_arm = arm
+                        .as_object()
+                        .ok_or_else(|| anyhow!("case arm must be an object"))?
+                        .clone();
+                    if let Some(guard) = arm.get("guard").and_then(JsonValue::as_str) {
+                        new_arm.insert(
+                            "guard".to_string(),
+                            json!(self.substitute_typed_expr(root, guard, type_args)?),
+                        );
+                    }
+                    let body = arm
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("case arm missing body"))?;
+                    new_arm.insert(
+                        "body".to_string(),
+                        json!(self.substitute_typed_expr(root, body, type_args)?),
+                    );
+                    arms.push(JsonValue::Object(new_arm));
+                }
+                out.insert("arms".to_string(), json!(arms));
+            }
+            other => {
+                for key in plain_child_expr_keys(other)? {
+                    let child = object
+                        .get(*key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("{other} missing {key}"))?;
+                    out.insert(
+                        key.to_string(),
+                        json!(self.substitute_typed_expr(root, child, type_args)?),
+                    );
+                }
+            }
+        }
+        self.put_object("Expression", &JsonValue::Object(out))
     }
 
     pub(crate) fn enum_variant_type_in_root(
@@ -1843,19 +3128,37 @@ impl CodeDb {
                 TypeSpec::Named {
                     type_symbol: actual_symbol,
                     region_args: actual_args,
+                    type_args: actual_type_args,
                 },
                 TypeSpec::Named {
                     type_symbol: expected_symbol,
                     region_args: expected_args,
+                    type_args: expected_type_args,
                 },
             ) => {
-                if actual_symbol != expected_symbol || actual_args.len() != expected_args.len() {
+                if actual_symbol != expected_symbol
+                    || actual_args.len() != expected_args.len()
+                    || actual_type_args.len() != expected_type_args.len()
+                {
                     return Ok(());
                 }
                 for (actual_region, expected_region) in actual_args.into_iter().zip(expected_args) {
                     record_call_region_substitution(
                         expected_region,
                         actual_region,
+                        callee_regions,
+                        substitutions,
+                    )?;
+                }
+                // Recurse into the generic instance's type arguments so a region
+                // nested inside one (e.g. `Holder<&'r i64>`) is inferred too (R11).
+                for (actual_arg, expected_arg) in
+                    actual_type_args.into_iter().zip(expected_type_args)
+                {
+                    self.infer_call_region_substitutions(
+                        root,
+                        &actual_arg,
+                        &expected_arg,
                         callee_regions,
                         substitutions,
                     )?;
@@ -1975,10 +3278,12 @@ impl CodeDb {
             TypeSpec::Named {
                 type_symbol: actual_symbol,
                 region_args: actual_args,
+                ..
             },
             TypeSpec::Named {
                 type_symbol: expected_symbol,
                 region_args: expected_args,
+                ..
             },
         ) = (self.type_spec(actual)?, self.type_spec(expected)?)
         else {
@@ -2022,6 +3327,22 @@ impl CodeDb {
         root: &ProgramRootPayload,
         type_hash: &str,
     ) -> Result<ValueClass> {
+        // Generic functions (R11): a type mentioning a `TypeParam` (a bare `T`,
+        // or `Option<T>`, `Pair<T>`, ...) has no concrete layout, so it gets the
+        // most conservative parametric classification — move-only and needs-drop
+        // (the generic body may not assume `T` is copyable, which is exactly
+        // constraint-free parametricity). The concrete copy/drop behaviour is
+        // recovered per instantiation, when the parameters are substituted away
+        // and the monomorphic body is checked with real types.
+        if !self.type_is_concrete(type_hash)? {
+            return Ok(ValueClass {
+                copy_kind: ValueCopyKind::MoveOnly,
+                drop_kind: ValueDropKind::NeedsDrop,
+                contains_reference: false,
+                contains_mut_reference: false,
+                contains_box: false,
+            });
+        }
         let layout = self.compute_type_layout(root, type_hash, DEFAULT_NATIVE_TARGET)?;
         let copy_kind = match layout.metadata.get("copy_kind").and_then(JsonValue::as_str) {
             Some("copy") => ValueCopyKind::Copy,
@@ -2064,6 +3385,9 @@ impl CodeDb {
             ParsedTypeSpec::Builtin(kind) => Ok(type_hash_for(kind)),
             ParsedTypeSpec::Named { name, .. } => {
                 bail!("named type {name} requires root-aware resolution")
+            }
+            ParsedTypeSpec::TypeParam { index } => {
+                self.put_structural_type(TypeSpec::TypeParam { index: *index })
             }
             ParsedTypeSpec::Reference {
                 region,
@@ -2139,7 +3463,11 @@ impl CodeDb {
     ) -> Result<String> {
         match spec {
             ParsedTypeSpec::Builtin(kind) => Ok(type_hash_for(kind)),
-            ParsedTypeSpec::Named { name, region_args } => {
+            ParsedTypeSpec::Named {
+                name,
+                region_args,
+                type_args,
+            } => {
                 let type_symbol = resolve_named_type_in_root(root, current_module, name)
                     .ok_or_else(|| anyhow!("unknown type {name}"))?;
                 let entry = self
@@ -2153,13 +3481,35 @@ impl CodeDb {
                         region_args.len()
                     );
                 }
+                if definition.type_params().len() != type_args.len() {
+                    bail!(
+                        "type {name} expects {} type args, got {}",
+                        definition.type_params().len(),
+                        type_args.len()
+                    );
+                }
                 let region_args = resolve_region_args(region_args, region_scope)?;
+                let type_args = type_args
+                    .iter()
+                    .map(|arg| {
+                        self.put_type_spec_in_root(current_module, root, arg, region_scope)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let type_hash = self.put_structural_type(TypeSpec::Named {
                     type_symbol: type_symbol.clone(),
                     region_args: region_args.clone(),
+                    type_args: type_args.clone(),
                 })?;
-                self.materialize_named_type_expansion(root, &type_symbol, &region_args)?;
+                self.materialize_named_type_expansion(
+                    root,
+                    &type_symbol,
+                    &region_args,
+                    &type_args,
+                )?;
                 Ok(type_hash)
+            }
+            ParsedTypeSpec::TypeParam { index } => {
+                self.put_structural_type(TypeSpec::TypeParam { index: *index })
             }
             ParsedTypeSpec::Reference {
                 region,
@@ -2259,7 +3609,11 @@ impl CodeDb {
     ) -> Result<String> {
         match spec {
             ParsedTypeSpec::Builtin(kind) => Ok(type_hash_for(kind)),
-            ParsedTypeSpec::Named { name, region_args } => {
+            ParsedTypeSpec::Named {
+                name,
+                region_args,
+                type_args,
+            } => {
                 let type_symbol = resolve_named_type_in_root(root, current_module, name)
                     .ok_or_else(|| anyhow!("unknown type {name}"))?;
                 let entry = self
@@ -2273,10 +3627,26 @@ impl CodeDb {
                         region_args.len()
                     );
                 }
+                if definition.type_params().len() != type_args.len() {
+                    bail!(
+                        "type {name} expects {} type args, got {}",
+                        definition.type_params().len(),
+                        type_args.len()
+                    );
+                }
                 hash_for_type_spec(&TypeSpec::Named {
                     type_symbol,
                     region_args: resolve_region_args(region_args, region_scope)?,
+                    type_args: type_args
+                        .iter()
+                        .map(|arg| {
+                            self.type_hash_for_parsed_in_root(current_module, root, arg, region_scope)
+                        })
+                        .collect::<Result<Vec<_>>>()?,
                 })
+            }
+            ParsedTypeSpec::TypeParam { index } => {
+                hash_for_type_spec(&TypeSpec::TypeParam { index: *index })
             }
             ParsedTypeSpec::Reference {
                 region,
@@ -2399,6 +3769,30 @@ impl CodeDb {
         effects: &[Effect],
         region_params: &[RegionParamDef],
     ) -> Result<String> {
+        self.put_signature_with_effects_regions_and_type_params(
+            param_types,
+            return_type,
+            effects,
+            region_params,
+            &[],
+        )
+    }
+
+    /// Build a function signature carrying type parameters (R11). A non-empty
+    /// `type_params` names the generic function's positional parameters and
+    /// makes the signature a *generic template* whose `params`/`return` use
+    /// `TypeSpec::TypeParam { index }`. `type_params` is skipped when empty so a
+    /// non-generic signature's payload — and therefore its content hash — is
+    /// byte-identical to the pre-generics form (the whole existing corpus keeps
+    /// its hashes).
+    pub(crate) fn put_signature_with_effects_regions_and_type_params(
+        &mut self,
+        param_types: &[String],
+        return_type: &str,
+        effects: &[Effect],
+        region_params: &[RegionParamDef],
+        type_params: &[String],
+    ) -> Result<String> {
         let effects = normalize_effects(effects)?;
         validate_region_params(region_params)?;
         let mut payload = serde_json::Map::new();
@@ -2413,11 +3807,34 @@ impl CodeDb {
                 ),
             );
         }
+        if !type_params.is_empty() {
+            payload.insert("type_params".to_string(), json!(type_params));
+        }
         payload.insert("params".to_string(), json!(param_types));
         payload.insert("return".to_string(), json!(return_type));
         payload.insert("abi".to_string(), json!(ABI_TAG));
         payload.insert("effects".to_string(), json!(effect_names(&effects)));
         self.put_object("FunctionSignature", &JsonValue::Object(payload))
+    }
+
+    /// The type-parameter names of a function signature (R11), empty for a
+    /// non-generic function. The length is the generic arity; the names drive
+    /// the `TypeParam` scope when checking/projecting the generic template.
+    pub(crate) fn signature_type_params(&self, signature_hash: &str) -> Result<Vec<String>> {
+        let payload = self.get_payload(signature_hash)?;
+        match payload.get("type_params") {
+            None => Ok(Vec::new()),
+            Some(JsonValue::Array(values)) => values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| anyhow!("signature type param must be a string"))
+                })
+                .collect::<Result<Vec<_>>>(),
+            Some(_) => bail!("signature type_params must be an array {signature_hash}"),
+        }
     }
 
     pub(crate) fn signature_parts(&self, signature_hash: &str) -> Result<(Vec<String>, String)> {
@@ -2720,7 +4137,7 @@ impl CodeDb {
             // here is safe because the authoritative root-aware tier in
             // `type_check_root` re-runs this check with the name resolved — see
             // `validate_external_signature_effects`.
-            TypeSpec::Builtin(_) | TypeSpec::Named { .. } => Ok(false),
+            TypeSpec::Builtin(_) | TypeSpec::Named { .. } | TypeSpec::TypeParam { .. } => Ok(false),
         };
         active_types.remove(type_hash);
         contains
@@ -3487,12 +4904,31 @@ impl CodeDb {
                         args.len()
                     );
                 }
-                let mut typed_args = Vec::with_capacity(args.len());
+                let type_param_count = self.signature_type_params(&callee.signature)?.len();
                 let callee_regions = self
                     .signature_region_params(&callee.signature)?
                     .into_iter()
                     .map(|param| param.region)
                     .collect::<BTreeSet<_>>();
+                if type_param_count > 0 {
+                    return self.type_generic_call(
+                        current_module,
+                        name,
+                        &symbol,
+                        &expected_params,
+                        &return_type,
+                        type_param_count,
+                        &callee_regions,
+                        args,
+                        root,
+                        param_names,
+                        param_types,
+                        region_scope,
+                        locals,
+                        expected_type,
+                    );
+                }
+                let mut typed_args = Vec::with_capacity(args.len());
                 let mut region_substitutions = BTreeMap::new();
                 for (idx, arg) in args.iter().enumerate() {
                     // Anchor a `fold` argument (including one in `let ... in` tail
@@ -4423,11 +5859,17 @@ impl CodeDb {
                 value,
             } => {
                 validate_projection_identifier("enum variant", variant)?;
-                let enum_type_hash = self.resolve_type_in_root_with_regions(
+                let enum_type_hash = self.resolve_enum_construct_type(
                     current_module,
                     root,
                     enum_type,
+                    variant,
+                    value,
+                    param_names,
+                    param_types,
                     region_scope,
+                    locals,
+                    expected_type,
                 )?;
                 let variant_type =
                     self.enum_variant_type_in_root(root, &enum_type_hash, variant)?;
@@ -6468,11 +7910,26 @@ impl CodeDb {
                 .iter()
                 .map(|param| param.region.clone())
                 .collect::<BTreeSet<_>>();
+            // Generic functions (R11): a `TypeParam { index }` in the signature is
+            // valid only for `index < type_param_count`. The template is checked
+            // once with its parameters opaque; its concrete instances are ordinary
+            // functions (no type parameters) checked normally.
+            let type_param_count = self.signature_type_params(&entry.signature)?.len();
             self.signature_effects(&entry.signature)?;
             for param_type in &param_types {
-                self.validate_type_hash_in_root(&root, param_type, &allowed_regions)?;
+                self.validate_type_hash_in_root_with_params(
+                    &root,
+                    param_type,
+                    &allowed_regions,
+                    type_param_count,
+                )?;
             }
-            self.validate_type_hash_in_root(&root, &return_type, &allowed_regions)?;
+            self.validate_type_hash_in_root_with_params(
+                &root,
+                &return_type,
+                &allowed_regions,
+                type_param_count,
+            )?;
             let definition_signature = self.function_signature_hash(&entry.definition)?;
             if definition_signature != entry.signature {
                 bail!(
@@ -6871,7 +8328,8 @@ impl CodeDb {
         let callee = self
             .root_symbol(root, symbol)
             .ok_or_else(|| anyhow!("call target missing from root {symbol}"))?;
-        let (expected_params, return_type) = self.signature_parts(&callee.signature)?;
+        let (expected_params, return_type) =
+            self.call_signature_with_type_args(&callee.signature, payload)?;
         let args = payload
             .get("args")
             .and_then(JsonValue::as_array)
@@ -6986,6 +8444,9 @@ impl CodeDb {
                 }
                 Ok(())
             }
+            // A type parameter is opaque and carries no regions (R11); the
+            // concrete instance's regions appear once it is substituted.
+            TypeSpec::TypeParam { .. } => Ok(()),
         }
     }
 
@@ -7000,21 +8461,20 @@ impl CodeDb {
                 .iter()
                 .map(|param| param.region.clone())
                 .collect::<BTreeSet<_>>();
-            match definition {
-                TypeDefinition::Record { fields, .. } => {
-                    for field in fields {
-                        self.validate_type_hash_in_root(root, &field.type_hash, &allowed_regions)?;
-                    }
-                }
-                TypeDefinition::Enum { variants, .. } => {
-                    for variant in variants {
-                        self.validate_type_hash_in_root(
-                            root,
-                            &variant.type_hash,
-                            &allowed_regions,
-                        )?;
-                    }
-                }
+            // A generic type's members may reference its own type parameters
+            // (R11), so they are validated with the parameter count in scope.
+            let type_param_count = definition.type_params().len();
+            let members = match &definition {
+                TypeDefinition::Record { fields, .. } => fields,
+                TypeDefinition::Enum { variants, .. } => variants,
+            };
+            for member in members {
+                self.validate_type_hash_in_root_with_params(
+                    root,
+                    &member.type_hash,
+                    &allowed_regions,
+                    type_param_count,
+                )?;
             }
         }
         Ok(())
@@ -7026,11 +8486,42 @@ impl CodeDb {
         type_hash: &str,
         allowed_regions: &BTreeSet<String>,
     ) -> Result<()> {
+        self.validate_type_hash_in_root_with_params(root, type_hash, allowed_regions, 0)
+    }
+
+    /// Validate that a type hash references only types/regions that exist in scope.
+    /// `type_param_count` is the number of type parameters in scope (R11): a
+    /// `TypeSpec::TypeParam { index }` is valid only when `index < type_param_count`
+    /// (i.e. inside a generic template); it is `0` for ordinary concrete contexts,
+    /// where any `TypeParam` is rejected as an escaped parameter.
+    fn validate_type_hash_in_root_with_params(
+        &self,
+        root: &ProgramRootPayload,
+        type_hash: &str,
+        allowed_regions: &BTreeSet<String>,
+        type_param_count: usize,
+    ) -> Result<()> {
+        let recurse = |this: &Self, inner: &str| {
+            this.validate_type_hash_in_root_with_params(
+                root,
+                inner,
+                allowed_regions,
+                type_param_count,
+            )
+        };
         match self.type_spec(type_hash)? {
             TypeSpec::Builtin(_) => Ok(()),
+            TypeSpec::TypeParam { index } => {
+                if (index as usize) < type_param_count {
+                    Ok(())
+                } else {
+                    bail!("type parameter index {index} out of scope")
+                }
+            }
             TypeSpec::Named {
                 type_symbol,
                 region_args,
+                type_args,
             } => {
                 let entry = self
                     .root_type(root, &type_symbol)
@@ -7044,10 +8535,21 @@ impl CodeDb {
                         region_args.len()
                     );
                 }
+                if definition.type_params().len() != type_args.len() {
+                    bail!(
+                        "named type {} expects {} type args, got {}",
+                        type_symbol,
+                        definition.type_params().len(),
+                        type_args.len()
+                    );
+                }
                 for region in region_args {
                     if !allowed_regions.contains(&region) && !is_static_region(&region) {
                         bail!("invalid region reference {region}");
                     }
+                }
+                for arg in type_args {
+                    recurse(self, &arg)?;
                 }
                 Ok(())
             }
@@ -7057,17 +8559,11 @@ impl CodeDb {
                 if !allowed_regions.contains(&region) && !is_static_region(&region) {
                     bail!("invalid region reference {region}");
                 }
-                self.validate_type_hash_in_root(root, &referent, allowed_regions)
+                recurse(self, &referent)
             }
-            TypeSpec::RawPointer { pointee, .. } => {
-                self.validate_type_hash_in_root(root, &pointee, allowed_regions)
-            }
-            TypeSpec::Box { element } => {
-                self.validate_type_hash_in_root(root, &element, allowed_regions)
-            }
-            TypeSpec::Vec { element } => {
-                self.validate_type_hash_in_root(root, &element, allowed_regions)
-            }
+            TypeSpec::RawPointer { pointee, .. } => recurse(self, &pointee),
+            TypeSpec::Box { element } => recurse(self, &element),
+            TypeSpec::Vec { element } => recurse(self, &element),
             TypeSpec::String => Ok(()),
             TypeSpec::Slice {
                 region, element, ..
@@ -7075,14 +8571,12 @@ impl CodeDb {
                 if !allowed_regions.contains(&region) && !is_static_region(&region) {
                     bail!("invalid region reference {region}");
                 }
-                self.validate_type_hash_in_root(root, &element, allowed_regions)
+                recurse(self, &element)
             }
-            TypeSpec::FixedArray { element, .. } => {
-                self.validate_type_hash_in_root(root, &element, allowed_regions)
-            }
+            TypeSpec::FixedArray { element, .. } => recurse(self, &element),
             TypeSpec::Record(fields) | TypeSpec::Enum(fields) => {
                 for field in fields {
-                    self.validate_type_hash_in_root(root, &field.type_hash, allowed_regions)?;
+                    recurse(self, &field.type_hash)?;
                 }
                 Ok(())
             }
@@ -8716,6 +10210,7 @@ impl CodeDb {
             TypeSpec::Builtin(_)
             | TypeSpec::RawPointer { .. }
             | TypeSpec::String
+            | TypeSpec::TypeParam { .. }
             | TypeSpec::Named { .. } => {}
         }
         Ok(())
@@ -9994,7 +11489,8 @@ impl CodeDb {
                 let callee = self
                     .root_symbol(root, symbol)
                     .ok_or_else(|| anyhow!("call target missing from root {symbol}"))?;
-                let (expected_params, return_type) = self.signature_parts(&callee.signature)?;
+                let (expected_params, return_type) =
+                    self.call_signature_with_type_args(&callee.signature, &payload)?;
                 let args = payload
                     .get("args")
                     .and_then(JsonValue::as_array)
@@ -11820,6 +13316,7 @@ fn named_actual_type_assignable(actual: &TypeSpec, expected: &TypeSpec) -> Optio
     let TypeSpec::Named {
         type_symbol: actual_symbol,
         region_args: actual_args,
+        type_args: actual_type_args,
     } = actual
     else {
         return None;
@@ -11827,11 +13324,16 @@ fn named_actual_type_assignable(actual: &TypeSpec, expected: &TypeSpec) -> Optio
     let TypeSpec::Named {
         type_symbol: expected_symbol,
         region_args: expected_args,
+        type_args: expected_type_args,
     } = expected
     else {
         return Some(false);
     };
-    Some(actual_symbol == expected_symbol && actual_args == expected_args)
+    Some(
+        actual_symbol == expected_symbol
+            && actual_args == expected_args
+            && actual_type_args == expected_type_args,
+    )
 }
 
 fn named_actual_type_assignable_for_call(
@@ -11842,6 +13344,7 @@ fn named_actual_type_assignable_for_call(
     let TypeSpec::Named {
         type_symbol: actual_symbol,
         region_args: actual_args,
+        type_args: actual_type_args,
     } = actual
     else {
         return None;
@@ -11849,11 +13352,15 @@ fn named_actual_type_assignable_for_call(
     let TypeSpec::Named {
         type_symbol: expected_symbol,
         region_args: expected_args,
+        type_args: expected_type_args,
     } = expected
     else {
         return Some(false);
     };
-    if actual_symbol != expected_symbol || actual_args.len() != expected_args.len() {
+    if actual_symbol != expected_symbol
+        || actual_args.len() != expected_args.len()
+        || actual_type_args != expected_type_args
+    {
         return Some(false);
     }
     Some(
@@ -11981,14 +13488,21 @@ impl TypeSpec {
                 other => scalar_int_source_name(other)
                     .ok_or_else(|| anyhow!("unknown builtin type kind {other}")),
             },
+            TypeSpec::TypeParam { index } => Ok(format!("typeparam<{index}>")),
             TypeSpec::Named {
                 type_symbol,
                 region_args,
+                type_args,
             } => {
-                if region_args.is_empty() {
+                let args = region_args
+                    .iter()
+                    .cloned()
+                    .chain(type_args.iter().map(|arg| format!("type<{arg}>")))
+                    .collect::<Vec<_>>();
+                if args.is_empty() {
                     Ok(format!("type<{type_symbol}>"))
                 } else {
-                    Ok(format!("type<{type_symbol}<{}>>", region_args.join(", ")))
+                    Ok(format!("type<{type_symbol}<{}>>", args.join(", ")))
                 }
             }
             TypeSpec::Reference {
@@ -12071,6 +13585,14 @@ enum ParsedTypeSpec {
     Named {
         name: String,
         region_args: Vec<String>,
+        /// Type arguments on a named type use, e.g. `Option<i64>` (R11). Region
+        /// arguments (`'r`) come first in the source list, then type arguments.
+        type_args: Vec<ParsedTypeSpec>,
+    },
+    /// A bare name that `bind_type_params` has resolved to the enclosing generic
+    /// definition's type parameter at this positional `index` (R11).
+    TypeParam {
+        index: u32,
     },
     Reference {
         region: String,
@@ -12108,6 +13630,7 @@ impl ParsedTypeSpec {
             ParsedTypeSpec::Named { name, .. } => {
                 bail!("named type {name} requires root-aware resolution")
             }
+            ParsedTypeSpec::TypeParam { index } => Ok(TypeSpec::TypeParam { index: *index }),
             ParsedTypeSpec::Reference { region, .. } => {
                 bail!("reference region '{region} requires root-aware resolution")
             }
@@ -12174,7 +13697,17 @@ pub(crate) fn collect_named_type_refs(definition: &TypeDefinitionKind) -> Result
 
 fn collect_parsed_named_refs(spec: &ParsedTypeSpec, out: &mut Vec<String>) {
     match spec {
-        ParsedTypeSpec::Named { name, .. } => out.push(name.clone()),
+        ParsedTypeSpec::Named {
+            name, type_args, ..
+        } => {
+            out.push(name.clone());
+            // A generic instance `Pair<List<i64>>` references both `Pair` and the
+            // names in its type arguments (R11), so the clique analysis sees them.
+            for arg in type_args {
+                collect_parsed_named_refs(arg, out);
+            }
+        }
+        ParsedTypeSpec::TypeParam { .. } => {}
         ParsedTypeSpec::Reference { referent, .. } => collect_parsed_named_refs(referent, out),
         ParsedTypeSpec::RawPointer { pointee, .. } => collect_parsed_named_refs(pointee, out),
         ParsedTypeSpec::Box { element }
@@ -12242,13 +13775,23 @@ fn recolor_parsed_type(
     match spec {
         ParsedTypeSpec::Builtin(kind) => json!({ "k": "builtin", "name": kind }),
         ParsedTypeSpec::String => json!({ "k": "string" }),
-        ParsedTypeSpec::Named { name, region_args } => {
+        ParsedTypeSpec::Named {
+            name,
+            region_args,
+            type_args,
+        } => {
             let head = match resolve_clique_type_name(name, module, name_to_local) {
                 Some(local) => format!("@type-peer:{}", colors[local]),
                 None => name.clone(),
             };
-            json!({ "k": "named", "name": head, "regions": region_args })
+            json!({
+                "k": "named",
+                "name": head,
+                "regions": region_args,
+                "type_args": type_args.iter().map(&recolor).collect::<Vec<_>>(),
+            })
         }
+        ParsedTypeSpec::TypeParam { index } => json!({ "k": "type_param", "index": index }),
         ParsedTypeSpec::Reference {
             region,
             mutable,
@@ -12301,6 +13844,100 @@ fn parse_type_source(source: &str) -> Result<ParsedTypeSpec> {
     Ok(spec)
 }
 
+/// Rewrite a parsed type so a bare name matching one of `type_param_names` binds
+/// to `ParsedTypeSpec::TypeParam { index }` at its positional index (R11). This
+/// is the localized "type-parameter scope" — applied once to each member/param/
+/// return type of a generic definition before root-aware resolution — so the
+/// rest of the resolver needs no threaded scope. A type parameter may not take
+/// arguments (`T<i64>` is rejected), since constraint-free generics are not
+/// higher-kinded.
+fn bind_type_params(spec: ParsedTypeSpec, type_param_names: &[String]) -> Result<ParsedTypeSpec> {
+    let bind = |inner: ParsedTypeSpec| bind_type_params(inner, type_param_names);
+    Ok(match spec {
+        ParsedTypeSpec::Named {
+            name,
+            region_args,
+            type_args,
+        } => {
+            if let Some(index) = type_param_names.iter().position(|candidate| *candidate == name) {
+                if !region_args.is_empty() || !type_args.is_empty() {
+                    bail!("type parameter {name} cannot take type or region arguments");
+                }
+                ParsedTypeSpec::TypeParam {
+                    index: index as u32,
+                }
+            } else {
+                ParsedTypeSpec::Named {
+                    name,
+                    region_args,
+                    type_args: type_args
+                        .into_iter()
+                        .map(bind)
+                        .collect::<Result<Vec<_>>>()?,
+                }
+            }
+        }
+        ParsedTypeSpec::TypeParam { index } => ParsedTypeSpec::TypeParam { index },
+        ParsedTypeSpec::Reference {
+            region,
+            mutable,
+            referent,
+        } => ParsedTypeSpec::Reference {
+            region,
+            mutable,
+            referent: Box::new(bind(*referent)?),
+        },
+        ParsedTypeSpec::RawPointer { mutable, pointee } => ParsedTypeSpec::RawPointer {
+            mutable,
+            pointee: Box::new(bind(*pointee)?),
+        },
+        ParsedTypeSpec::Box { element } => ParsedTypeSpec::Box {
+            element: Box::new(bind(*element)?),
+        },
+        ParsedTypeSpec::Vec { element } => ParsedTypeSpec::Vec {
+            element: Box::new(bind(*element)?),
+        },
+        ParsedTypeSpec::Slice {
+            region,
+            mutable,
+            element,
+        } => ParsedTypeSpec::Slice {
+            region,
+            mutable,
+            element: Box::new(bind(*element)?),
+        },
+        ParsedTypeSpec::FixedArray { element, len } => ParsedTypeSpec::FixedArray {
+            element: Box::new(bind(*element)?),
+            len,
+        },
+        ParsedTypeSpec::Record(fields) => ParsedTypeSpec::Record(bind_type_param_fields(
+            fields,
+            type_param_names,
+        )?),
+        ParsedTypeSpec::Enum(variants) => ParsedTypeSpec::Enum(bind_type_param_fields(
+            variants,
+            type_param_names,
+        )?),
+        ParsedTypeSpec::Builtin(kind) => ParsedTypeSpec::Builtin(kind),
+        ParsedTypeSpec::String => ParsedTypeSpec::String,
+    })
+}
+
+fn bind_type_param_fields(
+    fields: Vec<ParsedTypeField>,
+    type_param_names: &[String],
+) -> Result<Vec<ParsedTypeField>> {
+    fields
+        .into_iter()
+        .map(|field| {
+            Ok(ParsedTypeField {
+                name: field.name,
+                ty: bind_type_params(field.ty, type_param_names)?,
+            })
+        })
+        .collect()
+}
+
 fn type_hash_for_spec(spec: &ParsedTypeSpec) -> Result<String> {
     match spec {
         ParsedTypeSpec::Builtin(kind) => Ok(type_hash_for(kind)),
@@ -12310,7 +13947,8 @@ fn type_hash_for_spec(spec: &ParsedTypeSpec) -> Result<String> {
         ParsedTypeSpec::Reference { region, .. } | ParsedTypeSpec::Slice { region, .. } => {
             bail!("region '{region} requires root-aware resolution")
         }
-        ParsedTypeSpec::RawPointer { .. }
+        ParsedTypeSpec::TypeParam { .. }
+        | ParsedTypeSpec::RawPointer { .. }
         | ParsedTypeSpec::Box { .. }
         | ParsedTypeSpec::Vec { .. }
         | ParsedTypeSpec::String
@@ -12333,14 +13971,28 @@ pub(crate) fn type_payload_for_spec(spec: &TypeSpec) -> Result<JsonValue> {
         TypeSpec::Named {
             type_symbol,
             region_args,
+            type_args,
         } => {
             validate_region_args(region_args)?;
-            json!({
-                "type_kind": "Named",
-                "type_symbol": type_symbol,
-                "region_args": region_args,
-            })
+            for arg in type_args {
+                validate_type_hash("named type argument", arg)?;
+            }
+            let mut payload = serde_json::Map::new();
+            payload.insert("type_kind".to_string(), json!("Named"));
+            payload.insert("type_symbol".to_string(), json!(type_symbol));
+            payload.insert("region_args".to_string(), json!(region_args));
+            // Emit `type_args` only when non-empty so a non-generic Named type's
+            // payload — and therefore its content hash — is byte-identical to the
+            // pre-generics form (the entire existing corpus keeps its hashes).
+            if !type_args.is_empty() {
+                payload.insert("type_args".to_string(), json!(type_args));
+            }
+            JsonValue::Object(payload)
         }
+        TypeSpec::TypeParam { index } => json!({
+            "type_kind": "TypeParam",
+            "index": index,
+        }),
         TypeSpec::Reference {
             region,
             mutable,
@@ -12454,10 +14106,36 @@ pub(crate) fn type_spec_from_payload(payload: &JsonValue) -> Result<TypeSpec> {
                 None => Vec::new(),
             };
             validate_region_args(&region_args)?;
+            let type_args = match payload.get("type_args") {
+                Some(JsonValue::Array(values)) => values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| anyhow!("Named Type type arg must be string"))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                Some(_) => bail!("Named Type type_args must be an array"),
+                None => Vec::new(),
+            };
+            for arg in &type_args {
+                validate_type_hash("named type argument", arg)?;
+            }
             Ok(TypeSpec::Named {
                 type_symbol,
                 region_args,
+                type_args,
             })
+        }
+        "TypeParam" => {
+            let index = payload
+                .get("index")
+                .and_then(JsonValue::as_u64)
+                .ok_or_else(|| anyhow!("TypeParam Type object missing index"))?;
+            let index = u32::try_from(index)
+                .map_err(|_| anyhow!("TypeParam index {index} out of range"))?;
+            Ok(TypeSpec::TypeParam { index })
         }
         "Reference" => {
             let region = payload
@@ -12698,6 +14376,129 @@ pub(crate) fn region_params_from_payload(value: Option<&JsonValue>) -> Result<Ve
     Ok(params)
 }
 
+pub(crate) fn type_params_from_payload(value: Option<&JsonValue>) -> Result<Vec<TypeParamDef>> {
+    let params = match value {
+        Some(JsonValue::Array(values)) => values
+            .iter()
+            .map(|entry| {
+                let name = entry
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("type parameter missing name"))?
+                    .to_string();
+                Ok(TypeParamDef { name })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        Some(_) => bail!("type_params must be an array"),
+        None => Vec::new(),
+    };
+    validate_type_params(&params)?;
+    Ok(params)
+}
+
+pub(crate) fn validate_type_params(params: &[TypeParamDef]) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for param in params {
+        validate_projection_identifier("type parameter", &param.name)?;
+        if !seen.insert(param.name.as_str()) {
+            bail!("duplicate type parameter {}", param.name);
+        }
+    }
+    Ok(())
+}
+
+/// Object kind for a generic function's monomorphic-instance descriptor (R11).
+/// The instance's stable symbol is this object's content hash, so storing the
+/// descriptor (see `monomorphic_instance_descriptor`) makes the symbol a real
+/// content-addressed object — required because a root symbol references the
+/// `objects` table — while keeping it a pure function of `(generic, type_args)`.
+pub(crate) const MONOMORPHIC_INSTANCE_KIND: &str = "MonomorphicFunctionInstance";
+
+/// The plain child-expression payload keys for an expression kind (R11) — the
+/// single- and multi-child kinds. The leaves return no children; the kinds with
+/// structured children (`call`, `record_literal`, `array_literal`, `case`) are
+/// handled directly by the monomorphization traversals and never reach here. An
+/// unknown kind fails closed.
+fn plain_child_expr_keys(kind: &str) -> Result<&'static [&'static str]> {
+    Ok(match kind {
+        "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref"
+        | "local_ref" => &[],
+        "unary" => &["expr"],
+        "int_cast" | "box_new" | "unbox" | "raw_ptr_cast" | "array_fill" | "enum_construct"
+        | "return" => &["value"],
+        "borrow_shared" | "borrow_mut" | "slice_from_array" | "slice_len" | "vec_len"
+        | "string_len" | "field_access" => &["target"],
+        "vec_new" | "string_with_capacity" => &["capacity"],
+        "string_new" => &["source"],
+        "raw_load" => &["pointer"],
+        "binary" => &["left", "right"],
+        "vec_push" | "string_push" | "assign" => &["target", "value"],
+        "raw_store" => &["pointer", "value"],
+        "vec_get" | "string_get" | "array_index" => &["target", "index"],
+        "let" => &["value", "body"],
+        "subslice" => &["target", "start", "len"],
+        "if" => &["cond", "then", "else"],
+        "fold" => &["target", "init", "body"],
+        "loop" => &["init", "cond", "body"],
+        other => bail!("unknown expression kind {other}"),
+    })
+}
+
+/// The inferred type arguments recorded on a generic call expression (R11);
+/// empty for a non-generic call (the `type_args` field is then absent).
+pub(crate) fn call_type_args(payload: &JsonValue) -> Result<Vec<String>> {
+    match payload.get("type_args") {
+        None => Ok(Vec::new()),
+        Some(JsonValue::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("call type arg must be a hash"))
+            })
+            .collect::<Result<Vec<_>>>(),
+        Some(_) => bail!("call type_args must be an array"),
+    }
+}
+
+/// The descriptor payload whose content hash is a generic instance's symbol
+/// (R11): the generic symbol plus its concrete type arguments.
+fn monomorphic_instance_descriptor(generic_symbol: &str, type_args: &[String]) -> JsonValue {
+    json!({
+        "generic": generic_symbol,
+        "type_args": type_args,
+    })
+}
+
+/// The derived stable symbol of a generic function's monomorphic instance
+/// (R11): the content hash of its descriptor (`generic` + concrete
+/// `type_args`). This hash *is* the instance's identity — its native ABI symbol
+/// derives from it via `internal_abi_symbol`, so two call sites at the same type
+/// share one instance and import→export→import reproduces it. Pure (no store),
+/// so reachability, lowering, and monomorphization all derive the same symbol;
+/// the descriptor object itself is stored by `build_function_instance` so the
+/// symbol is a real object (a root symbol references the `objects` table).
+pub(crate) fn monomorphic_instance_symbol(generic_symbol: &str, type_args: &[String]) -> String {
+    let canonical = canonical_json(&monomorphic_instance_descriptor(generic_symbol, type_args));
+    hash_object_canonical(MONOMORPHIC_INSTANCE_KIND, SCHEMA_VERSION, &canonical)
+}
+
+/// Validate a generic function's type-parameter *names* (R11): each must be a
+/// valid identifier and they must be distinct. The string-list twin of
+/// [`validate_type_params`], used on the function path where parameters are
+/// carried by name on the signature rather than as `TypeParamDef`s.
+pub(crate) fn validate_type_param_names(names: &[String]) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for name in names {
+        validate_projection_identifier("type parameter", name)?;
+        if !seen.insert(name.as_str()) {
+            bail!("duplicate type parameter {name}");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn member_defs_from_payload(
     label: &str,
     symbol_field: &str,
@@ -12823,8 +14624,12 @@ impl TypeParser {
             TypeToken::Ident(value) if value == "array" => self.parse_fixed_array_type(),
             TypeToken::Ident(value) => {
                 let name = self.finish_name_path(value)?;
-                let region_args = self.parse_optional_region_args()?;
-                Ok(ParsedTypeSpec::Named { name, region_args })
+                let (region_args, type_args) = self.parse_optional_type_args()?;
+                Ok(ParsedTypeSpec::Named {
+                    name,
+                    region_args,
+                    type_args,
+                })
             }
             TypeToken::Symbol(value) if value == "(" => {
                 self.expect_symbol(")")?;
@@ -12901,25 +14706,39 @@ impl TypeParser {
         validate_parsed_type_fields(label, fields)
     }
 
-    fn parse_optional_region_args(&mut self) -> Result<Vec<String>> {
+    /// Parse a named type's optional argument list `<...>` (R11). Region
+    /// arguments (`'r`) come first, then type arguments (any type) —
+    /// `Foo<'r, T1, T2>` — so the two lists round-trip from a single source list.
+    /// A type argument may not follow... no, a region argument may not follow a
+    /// type argument (regions precede types). The plain `Foo` form yields two
+    /// empty lists.
+    fn parse_optional_type_args(&mut self) -> Result<(Vec<String>, Vec<ParsedTypeSpec>)> {
         if !self.consume_symbol("<") {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
-        let mut args = Vec::new();
+        let mut region_args = Vec::new();
+        let mut type_args = Vec::new();
         if self.consume_symbol(">") {
-            bail!("region argument list must not be empty");
+            bail!("type/region argument list must not be empty");
         }
         loop {
-            self.expect_symbol("'")?;
-            let name = self.expect_ident()?;
-            validate_region_name("region argument", &name)?;
-            args.push(name);
+            if self.peek_symbol("'") {
+                if !type_args.is_empty() {
+                    bail!("region arguments must come before type arguments");
+                }
+                self.expect_symbol("'")?;
+                let name = self.expect_ident()?;
+                validate_region_name("region argument", &name)?;
+                region_args.push(name);
+            } else {
+                type_args.push(self.parse_type()?);
+            }
             if self.consume_symbol(">") {
                 break;
             }
             self.expect_symbol(",")?;
         }
-        Ok(args)
+        Ok((region_args, type_args))
     }
 
     fn finish_name_path(&mut self, first: String) -> Result<String> {
@@ -12969,6 +14788,10 @@ impl TypeParser {
             }
             _ => false,
         }
+    }
+
+    fn peek_symbol(&self, expected: &str) -> bool {
+        matches!(self.peek(), TypeToken::Symbol(value) if value == expected)
     }
 
     fn consume_ident_value(&mut self, expected: &str) -> bool {

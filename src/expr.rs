@@ -556,6 +556,10 @@ pub struct FunctionSource {
     pub name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub region_params: Vec<String>,
+    /// Type parameters on a generic function, e.g. the `T` in
+    /// `fn id<T>(x: T) -> T` (R11). Empty for a non-generic function.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_params: Vec<String>,
     pub params: Vec<ParamSpec>,
     pub return_type: String,
     #[serde(default)]
@@ -588,6 +592,9 @@ pub struct TypeDefinitionSource {
     pub module: String,
     pub name: String,
     pub region_params: Vec<String>,
+    /// Type parameters on a generic record/enum, e.g. the `T` in
+    /// `record Pair<T>` / `enum Option<T>` (R11). Empty for a non-generic type.
+    pub type_params: Vec<String>,
     pub definition: TypeDefinitionKind,
     pub(crate) identity: Option<TypeDefinitionIdentity>,
 }
@@ -1073,6 +1080,10 @@ impl CodeDb {
         type_hash: &str,
     ) -> Result<bool> {
         match (value, self.type_spec_in_root(root, type_hash)?) {
+            // A generic parameter `T` (R11) is type-erased at evaluation: the
+            // reference evaluator runs the generic body on whatever concrete
+            // value the caller supplied, so any value inhabits a `TypeParam`.
+            (_, TypeSpec::TypeParam { .. }) => Ok(true),
             (Value::I8(_), TypeSpec::Builtin(kind)) => Ok(kind == "I8"),
             (Value::I16(_), TypeSpec::Builtin(kind)) => Ok(kind == "I16"),
             (Value::I32(_), TypeSpec::Builtin(kind)) => Ok(kind == "I32"),
@@ -2200,73 +2211,67 @@ impl CodeDb {
             .iter()
             .map(|param| (param.region.clone(), param.name.clone()))
             .collect::<BTreeMap<_, _>>();
-        let region_suffix = if definition.region_params().is_empty() {
-            String::new()
-        } else {
-            format!(
-                "<{}>",
-                definition
+        let type_param_names = definition
+            .type_params()
+            .iter()
+            .map(|param| param.name.clone())
+            .collect::<Vec<_>>();
+        // Header parameter list `<'r, T>`: region parameters first, then type
+        // parameters (R11) — the order `parse_optional_region_and_type_params`
+        // accepts, so the projection re-parses to the same definition.
+        let param_suffix =
+            if definition.region_params().is_empty() && definition.type_params().is_empty() {
+                String::new()
+            } else {
+                let parts = definition
                     .region_params()
                     .iter()
                     .map(|param| format!("'{}", param.name))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
+                    .chain(type_param_names.iter().cloned())
+                    .collect::<Vec<_>>();
+                format!("<{}>", parts.join(", "))
+            };
+        let render_member = |this: &Self, member: &crate::types::TypeMemberDef| -> Result<String> {
+            let member_identity = canonical_json(&serde_json::to_value(
+                this.symbol_birth_spec(&member.member_symbol)?,
+            )?);
+            Ok(format!(
+                "{}  {}: {}",
+                member_identity_prefix(&member_identity),
+                member.name,
+                this.type_name_in_root_with_scope(
+                    root,
+                    &binding.module,
+                    &member.type_hash,
+                    &region_names,
+                    &type_param_names,
+                )?
+            ))
         };
         match definition {
             TypeDefinition::Record { fields, .. } => {
                 let rendered_fields = fields
                     .iter()
-                    .map(|field| {
-                        let member_identity = canonical_json(&serde_json::to_value(
-                            self.symbol_birth_spec(&field.member_symbol)?,
-                        )?);
-                        Ok(format!(
-                            "{}  {}: {}",
-                            member_identity_prefix(&member_identity),
-                            field.name,
-                            self.type_name_in_root_with_regions(
-                                root,
-                                &binding.module,
-                                &field.type_hash,
-                                &region_names,
-                            )?
-                        ))
-                    })
+                    .map(|field| render_member(self, field))
                     .collect::<Result<Vec<_>>>()?;
                 Ok(format!(
                     "{}record {}{} {{\n{}\n}}",
                     type_identity_prefix,
                     binding.display_name,
-                    region_suffix,
+                    param_suffix,
                     rendered_fields.join("\n")
                 ))
             }
             TypeDefinition::Enum { variants, .. } => {
                 let rendered_variants = variants
                     .iter()
-                    .map(|variant| {
-                        let member_identity = canonical_json(&serde_json::to_value(
-                            self.symbol_birth_spec(&variant.member_symbol)?,
-                        )?);
-                        Ok(format!(
-                            "{}  {}: {}",
-                            member_identity_prefix(&member_identity),
-                            variant.name,
-                            self.type_name_in_root_with_regions(
-                                root,
-                                &binding.module,
-                                &variant.type_hash,
-                                &region_names,
-                            )?
-                        ))
-                    })
+                    .map(|variant| render_member(self, variant))
                     .collect::<Result<Vec<_>>>()?;
                 Ok(format!(
                     "{}enum {}{} {{\n{}\n}}",
                     type_identity_prefix,
                     binding.display_name,
-                    region_suffix,
+                    param_suffix,
                     rendered_variants.join("\n")
                 ))
             }
@@ -2383,7 +2388,10 @@ impl CodeDb {
         }
 
         if let Some(entry) = self.root_symbol(root, symbol) {
-            for dependency in self.dependencies_for_definition(root, &entry.definition)? {
+            // Order by *named* dependencies so a generic call orders this
+            // function after the generic it names (R11), not after the unnamed
+            // instance — which a projection cannot emit.
+            for dependency in self.named_dependencies_for_definition(root, &entry.definition)? {
                 if binding_by_symbol.contains_key(&dependency) {
                     self.visit_projection_symbol(
                         root,
@@ -2497,6 +2505,10 @@ impl CodeDb {
     ) -> Result<String> {
         let region_params = self.signature_region_params(signature_hash)?;
         let region_names = signature_region_name_map(&region_params);
+        // Generic functions (R11): the type-parameter names scope every
+        // `TypeParam` in the parameter/return types and render in the `<...>`
+        // header after the region parameters (the order the parser accepts).
+        let type_param_names = self.signature_type_params(signature_hash)?;
         let (params, return_type) = self.signature_parts(signature_hash)?;
         let effects = self.signature_effects(signature_hash)?;
         let rendered_params = params
@@ -2509,19 +2521,26 @@ impl CodeDb {
                     .unwrap_or_else(|| format!("p{idx}"));
                 Ok(format!(
                     "{name}: {}",
-                    self.type_name_in_root_with_regions(root, current_module, ty, &region_names)?
+                    self.type_name_in_root_with_scope(
+                        root,
+                        current_module,
+                        ty,
+                        &region_names,
+                        &type_param_names,
+                    )?
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
         let mut source = format!(
             "{}({}) -> {}",
-            signature_region_suffix(&region_params),
+            signature_region_and_type_suffix(&region_params, &type_param_names),
             rendered_params.join(", "),
-            self.type_name_in_root_with_regions(
+            self.type_name_in_root_with_scope(
                 root,
                 current_module,
                 &return_type,
                 &region_names,
+                &type_param_names,
             )?
         );
         if !effects.is_empty() {
@@ -3694,7 +3713,7 @@ impl CodeDb {
                 {
                     format!(
                         "{}::{variant}",
-                        self.type_name_in_root_with_regions(
+                        self.enum_constructor_type_source(
                             root,
                             current_module,
                             enum_type,
@@ -3704,7 +3723,7 @@ impl CodeDb {
                 } else {
                     format!(
                         "{}::{variant}({})",
-                        self.type_name_in_root_with_regions(
+                        self.enum_constructor_type_source(
                             root,
                             current_module,
                             enum_type,
@@ -4867,7 +4886,7 @@ impl CodeDb {
                     .to_string(),
             }),
             "enum_construct" => Ok(RawExpr::EnumConstruct {
-                enum_type: self.type_name_in_root_with_regions(
+                enum_type: self.enum_constructor_type_source(
                     root,
                     current_module,
                     payload
@@ -5110,6 +5129,25 @@ fn signature_region_suffix(params: &[RegionParamDef]) -> String {
     }
 }
 
+/// Render a function header's `<'r, T>` parameter list (R11): region parameters
+/// first (each `'name`), then type parameters (each a bare name) — the order
+/// `parse_optional_region_and_type_params` accepts, so the projection re-parses
+/// to the same signature. Empty when the function has neither.
+fn signature_region_and_type_suffix(
+    region_params: &[RegionParamDef],
+    type_param_names: &[String],
+) -> String {
+    if region_params.is_empty() && type_param_names.is_empty() {
+        return String::new();
+    }
+    let parts = region_params
+        .iter()
+        .map(|param| format!("'{}", param.name))
+        .chain(type_param_names.iter().cloned())
+        .collect::<Vec<_>>();
+    format!("<{}>", parts.join(", "))
+}
+
 fn field_access_from_path(path: &str) -> RawExpr {
     let mut parts = path.split('.');
     let first = parts.next().unwrap_or_default().to_string();
@@ -5167,6 +5205,41 @@ impl CodeDb {
         Ok(deps)
     }
 
+    /// The *named* function dependencies of a definition (R11): like
+    /// `dependencies_for_definition`, but a generic-function instance is mapped
+    /// back to the named generic it derives from. Build reachability follows the
+    /// (unnamed) instances; source-level concerns — projection ordering — follow
+    /// the named generic a call site mentions, so the projection emits a callee
+    /// before its caller and re-imports to the same program.
+    pub(crate) fn named_dependencies_for_definition(
+        &self,
+        root: &ProgramRootPayload,
+        definition_hash: &str,
+    ) -> Result<BTreeSet<String>> {
+        let mut named = BTreeSet::new();
+        for dep in self.dependencies_for_definition(root, definition_hash)? {
+            match self.generic_function_of_instance(&dep)? {
+                Some(generic) => named.insert(generic),
+                None => named.insert(dep),
+            };
+        }
+        Ok(named)
+    }
+
+    /// If `symbol` is a generic function's monomorphic instance (R11), the named
+    /// generic it was derived from; otherwise `None`. The instance's symbol is
+    /// the content hash of its descriptor, which records the generic.
+    pub(crate) fn generic_function_of_instance(&self, symbol: &str) -> Result<Option<String>> {
+        if self.get_kind(symbol).ok().as_deref() != Some(crate::types::MONOMORPHIC_INSTANCE_KIND) {
+            return Ok(None);
+        }
+        let payload = self.get_payload(symbol)?;
+        Ok(payload
+            .get("generic")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string))
+    }
+
     pub(crate) fn dependencies_for_type_definition(
         &self,
         _root: &ProgramRootPayload,
@@ -5192,8 +5265,18 @@ impl CodeDb {
     fn collect_type_deps(&self, type_hash: &str, deps: &mut BTreeSet<String>) -> Result<()> {
         match self.type_spec(type_hash)? {
             TypeSpec::Builtin(_) => {}
-            TypeSpec::Named { type_symbol, .. } => {
+            // A type parameter resolves to no concrete type symbol (R11).
+            TypeSpec::TypeParam { .. } => {}
+            TypeSpec::Named {
+                type_symbol,
+                type_args,
+                ..
+            } => {
                 deps.insert(type_symbol);
+                // A generic instance also depends on the types in its arguments.
+                for arg in type_args {
+                    self.collect_type_deps(&arg, deps)?;
+                }
             }
             TypeSpec::Reference { referent, .. } => {
                 self.collect_type_deps(&referent, deps)?;
@@ -5242,8 +5325,18 @@ impl CodeDb {
                     .get("symbol")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("call missing symbol"))?;
-                if self.root_symbol(root, symbol).is_some() {
-                    deps.insert(symbol.to_string());
+                // Generic call (R11): the real build/link dependency is the
+                // monomorphic instance derived from the callee and the concrete
+                // type arguments, not the generic template (which is never
+                // lowered). A non-generic call depends on its callee directly.
+                let type_args = crate::types::call_type_args(&payload)?;
+                let target = if type_args.is_empty() {
+                    symbol.to_string()
+                } else {
+                    crate::types::monomorphic_instance_symbol(symbol, &type_args)
+                };
+                if self.root_symbol(root, &target).is_some() {
+                    deps.insert(target);
                 }
                 for arg in payload
                     .get("args")
@@ -5707,7 +5800,7 @@ impl Parser {
             bail!("member identity comment cannot attach to type definition");
         }
         let name = self.expect_ident()?;
-        let region_params = self.parse_optional_region_params()?;
+        let (region_params, type_params) = self.parse_optional_region_and_type_params()?;
         self.expect_symbol("{")?;
         let mut members = Vec::new();
         let mut member_births = Vec::new();
@@ -5755,6 +5848,7 @@ impl Parser {
             module,
             name,
             region_params,
+            type_params,
             definition,
             identity,
         })
@@ -5763,7 +5857,11 @@ impl Parser {
     fn parse_function_in_module(&mut self, module: String) -> Result<FunctionSource> {
         self.expect_ident_value("fn")?;
         let name = self.expect_ident()?;
-        let region_params = self.parse_optional_region_params()?;
+        // Generic functions (R11): `<'r, T>` parses into region and type
+        // parameters. The type parameters scope the `T` references in the
+        // signature/body and drive per-instantiation monomorphization at
+        // lowering.
+        let (region_params, type_params) = self.parse_optional_region_and_type_params()?;
         let (params, return_type) = self.parse_function_signature_tail()?;
         let effects = if self.consume_ident_value("effects") {
             self.parse_effect_list()?
@@ -5776,6 +5874,7 @@ impl Parser {
             module,
             name,
             region_params,
+            type_params,
             params,
             return_type,
             effects,
@@ -5859,6 +5958,37 @@ impl Parser {
             self.expect_symbol(",")?;
         }
         Ok(params)
+    }
+
+    /// Parse an optional definition parameter list `<...>` carrying region
+    /// parameters (`'r`) and/or type parameters (bare identifiers), in that order
+    /// (R11) — e.g. `<'r, T>`, `<T>`, `<'r>`. Returns `(region_params,
+    /// type_params)`. Mirrors `parse_optional_type_args` on the use side so a
+    /// definition and its uses share one argument-list grammar.
+    fn parse_optional_region_and_type_params(&mut self) -> Result<(Vec<String>, Vec<String>)> {
+        if !self.consume_symbol("<") {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut region_params = Vec::new();
+        let mut type_params = Vec::new();
+        if self.consume_symbol(">") {
+            bail!("parameter list must not be empty");
+        }
+        loop {
+            if self.consume_symbol("'") {
+                if !type_params.is_empty() {
+                    bail!("region parameters must come before type parameters");
+                }
+                region_params.push(self.expect_ident()?);
+            } else {
+                type_params.push(self.expect_ident()?);
+            }
+            if self.consume_symbol(">") {
+                break;
+            }
+            self.expect_symbol(",")?;
+        }
+        Ok((region_params, type_params))
     }
 
     fn parse_effect_list(&mut self) -> Result<Vec<Effect>> {
@@ -6527,35 +6657,39 @@ impl Parser {
             }
             _ => {
                 let path = self.finish_name_path(name)?;
-                let region_args = self.parse_optional_type_region_args()?;
-                if region_args.is_empty() {
+                let args = self.parse_optional_type_source_args()?;
+                if args.is_empty() {
                     Ok(path)
                 } else {
-                    Ok(format!(
-                        "{}<{}>",
-                        path,
-                        region_args
-                            .into_iter()
-                            .map(|name| format!("'{name}"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ))
+                    Ok(format!("{}<{}>", path, args.join(", ")))
                 }
             }
         }
     }
 
-    fn parse_optional_type_region_args(&mut self) -> Result<Vec<String>> {
+    /// Parse a named type's optional argument list `<...>` and re-render each
+    /// argument as a source string (R11): a region argument as `'name`, a type
+    /// argument by recursively rendering its type. Regions precede types, matching
+    /// the type-side grammar, so the rebuilt string re-parses identically.
+    fn parse_optional_type_source_args(&mut self) -> Result<Vec<String>> {
         if !self.consume_symbol_raw("<") {
             return Ok(Vec::new());
         }
         let mut args = Vec::new();
+        let mut seen_type = false;
         if self.consume_symbol_raw(">") {
-            bail!("region argument list must not be empty");
+            bail!("type/region argument list must not be empty");
         }
         loop {
-            self.expect_symbol("'")?;
-            args.push(self.expect_ident()?);
+            if self.consume_symbol_raw("'") {
+                if seen_type {
+                    bail!("region arguments must come before type arguments");
+                }
+                args.push(format!("'{}", self.expect_ident()?));
+            } else {
+                seen_type = true;
+                args.push(self.parse_type_source()?);
+            }
             if self.consume_symbol_raw(">") {
                 break;
             }
