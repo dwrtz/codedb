@@ -453,9 +453,89 @@ pub(crate) struct ExternalFunctionMetadata {
     pub(crate) library: Option<String>,
 }
 
+/// One builtin scalar integer type: its registry name, byte width, and
+/// signedness. THE single source of truth for the sized-integer surface (Phase 9,
+/// R5) — builtin registration, layout sizing, parser recognition, source
+/// projection, the evaluator's `Value` model, native loads/stores, and the
+/// operator registry all derive from this list, so a new width is one row here
+/// plus the layers it forces. Ordered widening within each signedness (used by
+/// cast and the conformance ordering).
+pub(crate) struct ScalarIntType {
+    pub(crate) name: &'static str,
+    pub(crate) width: u64,
+    pub(crate) signed: bool,
+}
+
+pub(crate) const SCALAR_INT_TYPES: &[ScalarIntType] = &[
+    ScalarIntType { name: "I8", width: 1, signed: true },
+    ScalarIntType { name: "I16", width: 2, signed: true },
+    ScalarIntType { name: "I32", width: 4, signed: true },
+    ScalarIntType { name: "I64", width: 8, signed: true },
+    ScalarIntType { name: "U8", width: 1, signed: false },
+    ScalarIntType { name: "U16", width: 2, signed: false },
+    ScalarIntType { name: "U32", width: 4, signed: false },
+    ScalarIntType { name: "U64", width: 8, signed: false },
+];
+
+/// The `ScalarIntType` for a registry name (`"I32"`, `"U8"`, …), or `None` for a
+/// non-integer builtin (`Bool`, `Unit`) or a non-builtin type.
+pub(crate) fn scalar_int_type(name: &str) -> Option<&'static ScalarIntType> {
+    SCALAR_INT_TYPES.iter().find(|t| t.name == name)
+}
+
+/// The lowercase source spelling of a scalar-int registry name (`"I32"` ⇒
+/// `"i32"`), used by both the parser (accepting either case) and projection.
+pub(crate) fn scalar_int_source_name(name: &str) -> Option<String> {
+    scalar_int_type(name).map(|t| t.name.to_ascii_lowercase())
+}
+
+/// Resolve a source type identifier (`"u32"`, `"U32"`) to its registry name, for
+/// the parser and the type-annotation normalizer.
+pub(crate) fn scalar_int_name_for_source(ident: &str) -> Option<&'static str> {
+    SCALAR_INT_TYPES
+        .iter()
+        .find(|t| t.name.eq_ignore_ascii_case(ident))
+        .map(|t| t.name)
+}
+
+/// The lowercase source spelling of a builtin scalar integer type *by content
+/// hash* (`type_hash_for("U32")` ⇒ `"u32"`), or `None` if `hash` is not one. The
+/// hash→name resolvers (`type_name`, `type_kind_str`, …) route scalar ints here.
+pub(crate) fn scalar_int_source_name_for_hash(hash: &str) -> Option<String> {
+    SCALAR_INT_TYPES
+        .iter()
+        .find(|t| hash == type_hash_for(t.name))
+        .map(|t| t.name.to_ascii_lowercase())
+}
+
+/// Whether the decimal/`0x`-hex literal text `value` is in range for `int`'s width
+/// and signedness. The single check both the type-checker (context-typed literals)
+/// and the evaluator route through, so "fits the width" means exactly one thing.
+pub(crate) fn int_literal_in_range(value: &str, int: &ScalarIntType) -> bool {
+    let (radix, digits) = match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+        Some(hex) => (16, hex),
+        None => (10, value),
+    };
+    match (int.signed, int.width) {
+        (true, 1) => i8::from_str_radix(digits, radix).is_ok(),
+        (true, 2) => i16::from_str_radix(digits, radix).is_ok(),
+        (true, 4) => i32::from_str_radix(digits, radix).is_ok(),
+        (true, 8) => i64::from_str_radix(digits, radix).is_ok(),
+        (false, 1) => u8::from_str_radix(digits, radix).is_ok(),
+        (false, 2) => u16::from_str_radix(digits, radix).is_ok(),
+        (false, 4) => u32::from_str_radix(digits, radix).is_ok(),
+        (false, 8) => u64::from_str_radix(digits, radix).is_ok(),
+        _ => false,
+    }
+}
+
 impl CodeDb {
     pub(crate) fn insert_builtin_types(&mut self) -> Result<()> {
-        for type_name in ["I64", "Bool", "Unit", "U8"] {
+        for type_name in ["Bool", "Unit"]
+            .iter()
+            .copied()
+            .chain(SCALAR_INT_TYPES.iter().map(|t| t.name))
+        {
             self.put_object("Type", &json!({ "type_kind": type_name }))?;
         }
         self.put_object("SymbolBirth", &static_region_payload())?;
@@ -792,10 +872,8 @@ impl CodeDb {
     }
 
     pub(crate) fn type_name(&self, hash: &str) -> Result<String> {
-        if hash == type_hash_for("I64") {
-            Ok("i64".to_string())
-        } else if hash == type_hash_for("U8") {
-            Ok("u8".to_string())
+        if let Some(name) = scalar_int_source_name_for_hash(hash) {
+            Ok(name)
         } else if hash == type_hash_for("Bool") {
             Ok("bool".to_string())
         } else if hash == type_hash_for("Unit") {
@@ -810,11 +888,8 @@ impl CodeDb {
         hash: &str,
         region_names: &BTreeMap<String, String>,
     ) -> Result<String> {
-        if hash == type_hash_for("I64") {
-            return Ok("i64".to_string());
-        }
-        if hash == type_hash_for("U8") {
-            return Ok("u8".to_string());
+        if let Some(name) = scalar_int_source_name_for_hash(hash) {
+            return Ok(name);
         }
         if hash == type_hash_for("Bool") {
             return Ok("bool".to_string());
@@ -925,11 +1000,8 @@ impl CodeDb {
         hash: &str,
         region_names: &BTreeMap<String, String>,
     ) -> Result<String> {
-        if hash == type_hash_for("I64") {
-            return Ok("i64".to_string());
-        }
-        if hash == type_hash_for("U8") {
-            return Ok("u8".to_string());
+        if let Some(name) = scalar_int_source_name_for_hash(hash) {
+            return Ok(name);
         }
         if hash == type_hash_for("Bool") {
             return Ok("bool".to_string());
@@ -1084,11 +1156,8 @@ impl CodeDb {
     }
 
     pub(crate) fn type_spec(&self, hash: &str) -> Result<TypeSpec> {
-        if hash == type_hash_for("I64") {
-            return Ok(TypeSpec::Builtin("I64".to_string()));
-        }
-        if hash == type_hash_for("U8") {
-            return Ok(TypeSpec::Builtin("U8".to_string()));
+        if let Some(int) = SCALAR_INT_TYPES.iter().find(|t| hash == type_hash_for(t.name)) {
+            return Ok(TypeSpec::Builtin(int.name.to_string()));
         }
         if hash == type_hash_for("Bool") {
             return Ok(TypeSpec::Builtin("Bool".to_string()));
@@ -2951,6 +3020,31 @@ impl CodeDb {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Resolve the type of an integer literal `value` given the position's
+    /// `expected_type`. A sized-integer expectation gives the literal that width
+    /// (range-checked against it); anything else (no hint, an `i64` hint, or a
+    /// non-integer hint) makes it `i64` — a non-integer expectation then surfaces as
+    /// a normal type mismatch at the use site, not here (R5, context-typed literals).
+    fn literal_int_type(&self, value: &str, expected_type: Option<&str>) -> Result<String> {
+        if let Some(expected) = expected_type
+            && let TypeSpec::Builtin(name) = self.type_spec(expected)?
+            && let Some(int) = scalar_int_type(&name)
+            && int.name != "I64"
+        {
+            if !int_literal_in_range(value, int) {
+                bail!(
+                    "integer literal {value} is out of range for {}",
+                    int.name.to_ascii_lowercase()
+                );
+            }
+            return Ok(expected.to_string());
+        }
+        value
+            .parse::<i64>()
+            .with_context(|| format!("invalid i64 literal {value}"))?;
+        Ok(type_hash_for("I64"))
+    }
+
     fn type_expr_with_locals(
         &mut self,
         current_module: &str,
@@ -2992,10 +3086,14 @@ impl CodeDb {
     ) -> Result<TypeCheckResult> {
         match expr {
             RawExpr::LiteralI64 { value } => {
-                value
-                    .parse::<i64>()
-                    .with_context(|| format!("invalid i64 literal {value}"))?;
-                let type_hash = type_hash_for("I64");
+                // Context-typed integer literal (R5): when the result position
+                // expects a sized integer type, the literal takes that width (range-
+                // checked); otherwise it defaults to `i64`. The typed node keeps
+                // `expr_kind: "literal_i64"` — an integer literal whose WIDTH is given
+                // by its `type` field — so projection/diff/patch (which only read the
+                // numeric text) are unchanged and only typing+eval+lowering dispatch
+                // on width.
+                let type_hash = self.literal_int_type(value, expected_type)?;
                 let expr_hash = self.put_object(
                     "Expression",
                     &json!({
@@ -8809,7 +8907,31 @@ impl CodeDb {
             .and_then(JsonValue::as_str)
             .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
         {
-            "literal_i64" => type_hash_for("I64"),
+            "literal_i64" => {
+                // An integer literal's width is carried by its declared `type`
+                // (context-typed; R5). Re-derive it independently: the declared type
+                // must be a sized integer and the value must fit it.
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("literal_i64 missing value"))?;
+                let declared = payload
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("literal_i64 missing type"))?;
+                let TypeSpec::Builtin(name) = self.type_spec(declared)? else {
+                    bail!("integer literal declares a non-builtin type");
+                };
+                let int = scalar_int_type(&name)
+                    .ok_or_else(|| anyhow!("integer literal declares non-integer type {name}"))?;
+                if !int_literal_in_range(value, int) {
+                    bail!(
+                        "integer literal {value} is out of range for {}",
+                        int.name.to_ascii_lowercase()
+                    );
+                }
+                declared.to_string()
+            }
             "literal_bool" => type_hash_for("Bool"),
             "literal_unit" => type_hash_for("Unit"),
             "static_bytes" => {
@@ -10588,11 +10710,10 @@ impl TypeSpec {
     pub(crate) fn to_source(&self, db: &CodeDb) -> Result<String> {
         match self {
             TypeSpec::Builtin(kind) => match kind.as_str() {
-                "I64" => Ok("i64".to_string()),
-                "U8" => Ok("u8".to_string()),
                 "Bool" => Ok("bool".to_string()),
                 "Unit" => Ok("unit".to_string()),
-                other => bail!("unknown builtin type kind {other}"),
+                other => scalar_int_source_name(other)
+                    .ok_or_else(|| anyhow!("unknown builtin type kind {other}")),
             },
             TypeSpec::Named {
                 type_symbol,
@@ -11044,10 +11165,9 @@ pub(crate) fn type_spec_from_payload(payload: &JsonValue) -> Result<TypeSpec> {
         .and_then(JsonValue::as_str)
         .ok_or_else(|| anyhow!("Type object missing type_kind"))?
     {
-        "I64" => Ok(TypeSpec::Builtin("I64".to_string())),
-        "U8" => Ok(TypeSpec::Builtin("U8".to_string())),
         "Bool" => Ok(TypeSpec::Builtin("Bool".to_string())),
         "Unit" => Ok(TypeSpec::Builtin("Unit".to_string())),
+        kind if scalar_int_type(kind).is_some() => Ok(TypeSpec::Builtin(kind.to_string())),
         "Named" => {
             let type_symbol = payload
                 .get("type_symbol")
@@ -11400,12 +11520,9 @@ impl TypeParser {
     fn parse_type(&mut self) -> Result<ParsedTypeSpec> {
         match self.next() {
             TypeToken::Symbol(value) if value == "&" => self.parse_reference_type(),
-            TypeToken::Ident(value) if value == "i64" || value == "I64" => {
-                Ok(ParsedTypeSpec::Builtin("I64".to_string()))
-            }
-            TypeToken::Ident(value) if value == "u8" || value == "U8" => {
-                Ok(ParsedTypeSpec::Builtin("U8".to_string()))
-            }
+            TypeToken::Ident(value) if scalar_int_name_for_source(&value).is_some() => Ok(
+                ParsedTypeSpec::Builtin(scalar_int_name_for_source(&value).unwrap().to_string()),
+            ),
             TypeToken::Ident(value) if value == "bool" || value == "Bool" => {
                 Ok(ParsedTypeSpec::Builtin("Bool".to_string()))
             }

@@ -163,11 +163,29 @@ impl TestCategory {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum TestValue {
+    I8 {
+        value: String,
+    },
+    I16 {
+        value: String,
+    },
+    I32 {
+        value: String,
+    },
     I64 {
         value: String,
     },
     U8 {
         value: u8,
+    },
+    U16 {
+        value: String,
+    },
+    U32 {
+        value: String,
+    },
+    U64 {
+        value: String,
     },
     Bool {
         value: bool,

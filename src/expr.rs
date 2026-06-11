@@ -424,8 +424,14 @@ pub struct TypeDefinitionSource {
 
 #[derive(Debug, Clone)]
 pub enum Value {
+    I8(i8),
+    I16(i16),
+    I32(i32),
     I64(i64),
     U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
     Bool(bool),
     Unit,
     SharedRef(ValueCell),
@@ -453,6 +459,29 @@ pub enum Value {
 }
 
 pub type ValueCell = Rc<RefCell<Value>>;
+
+/// Parse an integer literal's text (decimal, or `0x`/`0X` hex) into the `Value` of
+/// the given sized-integer type. The single place the evaluator widens a literal
+/// token to a typed value; its radix handling mirrors `int_literal_in_range`, so a
+/// literal that type-checks parses here.
+pub(crate) fn int_literal_value(value: &str, int: &crate::types::ScalarIntType) -> Result<Value> {
+    let (radix, digits) = match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+        Some(hex) => (16, hex),
+        None => (10, value),
+    };
+    let parse_err = || anyhow!("integer literal {value} out of range for {}", int.name);
+    Ok(match (int.signed, int.width) {
+        (true, 1) => Value::I8(i8::from_str_radix(digits, radix).map_err(|_| parse_err())?),
+        (true, 2) => Value::I16(i16::from_str_radix(digits, radix).map_err(|_| parse_err())?),
+        (true, 4) => Value::I32(i32::from_str_radix(digits, radix).map_err(|_| parse_err())?),
+        (true, 8) => Value::I64(i64::from_str_radix(digits, radix).map_err(|_| parse_err())?),
+        (false, 1) => Value::U8(u8::from_str_radix(digits, radix).map_err(|_| parse_err())?),
+        (false, 2) => Value::U16(u16::from_str_radix(digits, radix).map_err(|_| parse_err())?),
+        (false, 4) => Value::U32(u32::from_str_radix(digits, radix).map_err(|_| parse_err())?),
+        (false, 8) => Value::U64(u64::from_str_radix(digits, radix).map_err(|_| parse_err())?),
+        _ => bail!("unsupported integer width {}", int.width),
+    })
+}
 
 /// Reference-evaluator call-recursion ceiling. The evaluator is a host-stack
 /// tree-walker (`eval_symbol` -> `eval_expr` -> ... -> `eval_symbol`), so a deeply
@@ -594,8 +623,14 @@ impl Eq for Value {}
 impl Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Value::I8(value) => write!(f, "{value}"),
+            Value::I16(value) => write!(f, "{value}"),
+            Value::I32(value) => write!(f, "{value}"),
             Value::I64(value) => write!(f, "{value}"),
             Value::U8(value) => write!(f, "{value}"),
+            Value::U16(value) => write!(f, "{value}"),
+            Value::U32(value) => write!(f, "{value}"),
+            Value::U64(value) => write!(f, "{value}"),
             Value::Bool(value) => write!(f, "{value}"),
             Value::Unit => write!(f, "()"),
             Value::SharedRef(value) => write!(f, "&{}", value.borrow()),
@@ -861,12 +896,22 @@ impl CodeDb {
             .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
         {
             "literal_i64" => {
+                // An integer literal of the width given by its `type` field
+                // (context-typed; defaults to i64). See `literal_int_type`.
                 let value = payload
                     .get("value")
                     .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("literal_i64 missing value"))?
-                    .parse::<i64>()?;
-                Ok(Value::I64(value))
+                    .ok_or_else(|| anyhow!("literal_i64 missing value"))?;
+                let type_hash = payload
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("literal_i64 missing type"))?;
+                let TypeSpec::Builtin(name) = self.type_spec(type_hash)? else {
+                    bail!("integer literal has non-builtin type");
+                };
+                let int = crate::types::scalar_int_type(&name)
+                    .ok_or_else(|| anyhow!("integer literal has non-integer type {name}"))?;
+                int_literal_value(value, int)
             }
             "literal_bool" => {
                 let value = payload
@@ -5383,9 +5428,10 @@ impl Parser {
     }
 
     fn parse_type_source_after_ident(&mut self, name: String) -> Result<String> {
+        if let Some(int) = crate::types::scalar_int_name_for_source(&name) {
+            return Ok(int.to_ascii_lowercase());
+        }
         match name.as_str() {
-            "i64" | "I64" => Ok("i64".to_string()),
-            "u8" | "U8" => Ok("u8".to_string()),
             "bool" | "Bool" => Ok("bool".to_string()),
             "unit" | "Unit" => Ok("unit".to_string()),
             "string" | "String" => Ok("string".to_string()),
@@ -5771,8 +5817,14 @@ pub(crate) fn value_cell(value: Value) -> ValueCell {
 
 fn semantic_clone_value(value: &Value) -> Value {
     match value {
+        Value::I8(value) => Value::I8(*value),
+        Value::I16(value) => Value::I16(*value),
+        Value::I32(value) => Value::I32(*value),
         Value::I64(value) => Value::I64(*value),
         Value::U8(value) => Value::U8(*value),
+        Value::U16(value) => Value::U16(*value),
+        Value::U32(value) => Value::U32(*value),
+        Value::U64(value) => Value::U64(*value),
         Value::Bool(value) => Value::Bool(*value),
         Value::Unit => Value::Unit,
         Value::SharedRef(value) => Value::SharedRef(value.clone()),

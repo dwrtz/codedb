@@ -6339,12 +6339,22 @@ impl CodeDb {
                     value,
                     type_hash,
                 } => {
-                    let parsed = value.parse::<i64>()?;
-                    if type_hash != &type_hash_for("I64") {
-                        bail!("lowered const_i64 type mismatch");
+                    // An integer constant of the width given by `type_hash` — i64 or
+                    // any sized integer (R5) — whose text must fit that width.
+                    let TypeSpec::Builtin(name) = self.type_spec(type_hash)? else {
+                        bail!("lowered const_i64 requires an integer type");
+                    };
+                    let int = crate::types::scalar_int_type(&name)
+                        .ok_or_else(|| anyhow!("lowered const_i64 non-integer type {name}"))?;
+                    if !crate::types::int_literal_in_range(value, int) {
+                        bail!("lowered const_i64 value {value} out of range for {}", int.name);
                     }
                     insert_value(values, id, type_hash)?;
-                    drop_state.const_i64.insert(id.clone(), parsed);
+                    // Only i64 constants index arrays, so only they seed the
+                    // constant-index map (used by element-granular drop glue).
+                    if int.name == "I64" {
+                        drop_state.const_i64.insert(id.clone(), value.parse::<i64>()?);
+                    }
                 }
                 LoweredOp::ConstBool {
                     id,

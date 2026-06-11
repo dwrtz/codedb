@@ -975,6 +975,20 @@ fn native_supported_type(
     if type_hash == i64_type || type_hash == bool_type || type_hash == unit_type {
         return Ok(());
     }
+    // Signed narrow integers (i8/i16/i32) need a SIGN-extending load that the v0
+    // backend does not yet emit — it only zero-extends (correct for the unsigned
+    // widths u8/u16/u32/u64, wrong for a negative signed value). Fail closed here
+    // until sign-extension lands, rather than silently miscompile; the reference
+    // evaluator handles every width, so eval stays a faithful oracle (R5, Phase 9).
+    if ["I8", "I16", "I32"]
+        .iter()
+        .any(|name| type_hash == crate::types::type_hash_for(name))
+    {
+        bail!(
+            "native object backend does not yet support signed narrow integers (i8/i16/i32): \
+             sign-extending loads are unimplemented — use i64 or an unsigned width (u8/u16/u32/u64)"
+        );
+    }
     let layout = native_type_layout(type_layouts, type_hash)?;
     match layout.kind.as_str() {
         "scalar" | "record" | "enum" | "fixed_array" | "slice" | "reference" | "raw_pointer"

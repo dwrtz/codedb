@@ -1868,11 +1868,35 @@ fn native_semantic_trap_diagnostic(diagnostic: &crate::trace::TraceDiagnostic) -
 
 pub(crate) fn value_from_test_value(value: &TestValue) -> Result<Value> {
     match value {
+        TestValue::I8 { value } => value
+            .parse::<i8>()
+            .map(Value::I8)
+            .with_context(|| format!("invalid i8 test value {value:?}")),
+        TestValue::I16 { value } => value
+            .parse::<i16>()
+            .map(Value::I16)
+            .with_context(|| format!("invalid i16 test value {value:?}")),
+        TestValue::I32 { value } => value
+            .parse::<i32>()
+            .map(Value::I32)
+            .with_context(|| format!("invalid i32 test value {value:?}")),
         TestValue::I64 { value } => value
             .parse::<i64>()
             .map(Value::I64)
             .with_context(|| format!("invalid i64 test value {value:?}")),
         TestValue::U8 { value } => Ok(Value::U8(*value)),
+        TestValue::U16 { value } => value
+            .parse::<u16>()
+            .map(Value::U16)
+            .with_context(|| format!("invalid u16 test value {value:?}")),
+        TestValue::U32 { value } => value
+            .parse::<u32>()
+            .map(Value::U32)
+            .with_context(|| format!("invalid u32 test value {value:?}")),
+        TestValue::U64 { value } => value
+            .parse::<u64>()
+            .map(Value::U64)
+            .with_context(|| format!("invalid u64 test value {value:?}")),
         TestValue::Bool { value } => Ok(Value::Bool(*value)),
         TestValue::Unit => Ok(Value::Unit),
         TestValue::Array { elements } => Ok(Value::Array(
@@ -1909,10 +1933,28 @@ pub(crate) fn value_from_test_value(value: &TestValue) -> Result<Value> {
 
 pub(crate) fn test_value_from_value(value: &Value) -> Result<TestValue> {
     Ok(match value {
+        Value::I8(value) => TestValue::I8 {
+            value: value.to_string(),
+        },
+        Value::I16(value) => TestValue::I16 {
+            value: value.to_string(),
+        },
+        Value::I32(value) => TestValue::I32 {
+            value: value.to_string(),
+        },
         Value::I64(value) => TestValue::I64 {
             value: value.to_string(),
         },
         Value::U8(value) => TestValue::U8 { value: *value },
+        Value::U16(value) => TestValue::U16 {
+            value: value.to_string(),
+        },
+        Value::U32(value) => TestValue::U32 {
+            value: value.to_string(),
+        },
+        Value::U64(value) => TestValue::U64 {
+            value: value.to_string(),
+        },
         Value::Bool(value) => TestValue::Bool { value: *value },
         Value::Unit => TestValue::Unit,
         Value::Array(elements) => TestValue::Array {
@@ -2062,7 +2104,38 @@ fn parse_test_category(category: Option<&str>) -> Result<TestCategory> {
     }
 }
 
+/// Parse a sized-integer test value (`i8/i16/i32/u16/u32/u64`); `None` for any
+/// other type name (`i64`/`u8`/`bool`/`unit` keep their existing handling). The
+/// decimal text is validated against the named width and carried as a string.
+fn parse_sized_int_test_value(
+    arg: &str,
+    type_name: &str,
+    idx: usize,
+) -> Result<Option<TestValue>> {
+    macro_rules! sized {
+        ($ty:ty, $variant:ident) => {{
+            arg.parse::<$ty>()
+                .with_context(|| format!("argument {idx} must be {type_name}, got {arg:?}"))?;
+            Some(TestValue::$variant { value: arg.to_string() })
+        }};
+    }
+    Ok(match type_name {
+        "i8" => sized!(i8, I8),
+        "i16" => sized!(i16, I16),
+        "i32" => sized!(i32, I32),
+        "u16" => sized!(u16, U16),
+        "u32" => sized!(u32, U32),
+        "u64" => sized!(u64, U64),
+        _ => None,
+    })
+}
+
 fn parse_test_value_arg(arg: &str, type_name: &str, idx: usize) -> Result<TestValue> {
+    // Sized integers: validate the decimal text parses into the named width, then
+    // carry it as a string (uniform, and u64 exceeds JSON's safe-integer range).
+    if let Some(tv) = parse_sized_int_test_value(arg, type_name, idx)? {
+        return Ok(tv);
+    }
     match type_name {
         "i64" => {
             arg.parse::<i64>()
@@ -2092,8 +2165,14 @@ fn parse_test_value_arg(arg: &str, type_name: &str, idx: usize) -> Result<TestVa
 
 fn display_test_value(value: &TestValue) -> String {
     match value {
+        TestValue::I8 { value } => format!("i8:{value}"),
+        TestValue::I16 { value } => format!("i16:{value}"),
+        TestValue::I32 { value } => format!("i32:{value}"),
         TestValue::I64 { value } => format!("i64:{value}"),
         TestValue::U8 { value } => format!("u8:{value}"),
+        TestValue::U16 { value } => format!("u16:{value}"),
+        TestValue::U32 { value } => format!("u32:{value}"),
+        TestValue::U64 { value } => format!("u64:{value}"),
         TestValue::Bool { value } => format!("bool:{value}"),
         TestValue::Unit => "unit:()".to_string(),
         TestValue::Array { elements } => {

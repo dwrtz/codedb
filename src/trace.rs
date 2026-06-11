@@ -82,12 +82,20 @@ pub struct TraceRecordField {
 impl TraceValue {
     fn from_value(value: &Value) -> Self {
         match value {
+            // Trace/debug render integers of every width as their decimal text;
+            // the width is not distinguished in the trace view.
+            Value::I8(value) => TraceValue::I64 { value: value.to_string() },
+            Value::I16(value) => TraceValue::I64 { value: value.to_string() },
+            Value::I32(value) => TraceValue::I64 { value: value.to_string() },
             Value::I64(value) => TraceValue::I64 {
                 value: value.to_string(),
             },
             Value::U8(value) => TraceValue::I64 {
                 value: value.to_string(),
             },
+            Value::U16(value) => TraceValue::I64 { value: value.to_string() },
+            Value::U32(value) => TraceValue::I64 { value: value.to_string() },
+            Value::U64(value) => TraceValue::I64 { value: value.to_string() },
             Value::Bool(value) => TraceValue::Bool { value: *value },
             Value::Unit => TraceValue::Unit,
             Value::SharedRef(value) => TraceValue::Record {

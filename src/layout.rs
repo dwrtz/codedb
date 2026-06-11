@@ -592,10 +592,14 @@ impl LayoutComputer<'_> {
     }
 
     fn layout_builtin(&self, type_hash: &str, kind: &str) -> Result<ComputedLayout> {
-        let (layout_kind, size_bytes, align_bytes) = if type_hash == type_hash_for("I64") {
-            ("scalar", 8, 8)
-        } else if type_hash == type_hash_for("U8") {
-            ("scalar", 1, 1)
+        // A sized integer's size and alignment are its byte width (natural
+        // alignment); the single source of truth is `SCALAR_INT_TYPES`.
+        let (layout_kind, size_bytes, align_bytes) = if let Some(int) =
+            crate::types::SCALAR_INT_TYPES
+                .iter()
+                .find(|t| type_hash == type_hash_for(t.name))
+        {
+            ("scalar", int.width, int.width)
         } else if type_hash == type_hash_for("Bool") {
             ("scalar", 1, 1)
         } else if type_hash == type_hash_for("Unit") {
