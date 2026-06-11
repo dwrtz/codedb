@@ -1330,6 +1330,10 @@ fn collect_call_names(expr: &RawExpr, out: &mut Vec<String>) {
         }
         RawExpr::FieldAccess { target, .. } => collect_call_names(target, out),
         RawExpr::EnumConstruct { value, .. } => collect_call_names(value, out),
+        // `return <value>` (R7): a call inside the returned value is a real
+        // call-graph edge (recursion-group analysis must see a recursive call in
+        // an early-exit path).
+        RawExpr::Return { value } => collect_call_names(value, out),
         RawExpr::Case { expr, arms } => {
             collect_call_names(expr, out);
             for arm in arms {

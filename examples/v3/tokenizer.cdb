@@ -1,0 +1,37 @@
+// tokenizer.cdb - a byte-stream tokenizer, the Phase 10 (R7) forcing program.
+//
+// Parses a fixed byte array as a decimal integer, EARLY-RETURNING an error
+// sentinel (-1) the moment it meets a malformed (non-digit) byte — the
+// malformed-input early-exit SPEC_V3 §12 names. The early `return` sits in a
+// `let` value's `if` branch (a non-tail position), so it abandons the rest of the
+// scan — exactly the "exit early" R7 gives that a plain `if` cannot: the
+// continuation (`scan` of the remaining bytes) is skipped, not hoisted.
+//
+// Iteration is by recursion over the index (unbounded loops are Phase 11), so
+// "exits its loop early" is realized as "stops recursing and returns". Every owned
+// value is scalar here, so the early-exit edge carries no drops; the
+// drop-across-the-edge half of R7 is pinned natively by tests/early_exit_native.rs
+// and tests/leak_interposer.rs. The reference evaluator is the oracle; the digit
+// scan also compiles native (tests/early_exit_native.rs::tokenizer_*).
+//
+//   tokenize "123" = 123 ;  tokenize "1x3" = -1 (malformed: early exit at 'x')
+
+fn is_digit(b: i64) -> bool = if b < 48 then false else if b > 57 then false else true
+
+// Scan bytes[i..len] as a decimal number accumulated into `acc`. On a non-digit
+// byte, `return 0 - 1` exits immediately, skipping the remaining recursion.
+fn scan(bytes: array<i64, 8>, len: i64, i: i64, acc: i64) -> i64 =
+  if i >= len then acc
+  else
+    let b: i64 = bytes[i] in
+    let digit: i64 = (if is_digit(b) then b - 48 else return 0 - 1) in
+    scan(bytes, len, i + 1, acc * 10 + digit)
+
+fn tokenize(bytes: array<i64, 8>, len: i64) -> i64 = scan(bytes, len, 0, 0)
+
+// "123" -> 123 (well-formed)
+fn tokenize_ok() -> i64 = tokenize([49, 50, 51, 0, 0, 0, 0, 0], 3)
+// "1x3" -> -1 (malformed 'x' at index 1: early exit, "3" never scanned)
+fn tokenize_bad() -> i64 = tokenize([49, 120, 51, 0, 0, 0, 0, 0], 3)
+// "" -> 0 (empty: i >= len immediately)
+fn tokenize_empty() -> i64 = tokenize([0, 0, 0, 0, 0, 0, 0, 0], 0)

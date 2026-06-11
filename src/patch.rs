@@ -3308,6 +3308,9 @@ fn substitute_param_refs(expr: &RawExpr, args: &[RawExpr]) -> Result<RawExpr> {
             then_expr: Box::new(substitute_param_refs(then_expr, args)?),
             else_expr: Box::new(substitute_param_refs(else_expr, args)?),
         },
+        RawExpr::Return { value } => RawExpr::Return {
+            value: Box::new(substitute_param_refs(value, args)?),
+        },
         RawExpr::Fold {
             item,
             target,
@@ -3433,6 +3436,7 @@ fn collect_free_param_names(
             collect_free_param_names(then_expr, bound_locals, names);
             collect_free_param_names(else_expr, bound_locals, names);
         }
+        RawExpr::Return { value } => collect_free_param_names(value, bound_locals, names),
         RawExpr::Fold {
             item,
             target,
@@ -3615,6 +3619,13 @@ fn alpha_rename_let_bindings_with_scope(
             )),
             else_expr: Box::new(alpha_rename_let_bindings_with_scope(
                 else_expr,
+                used_names,
+                renamed_locals,
+            )),
+        },
+        RawExpr::Return { value } => RawExpr::Return {
+            value: Box::new(alpha_rename_let_bindings_with_scope(
+                value,
                 used_names,
                 renamed_locals,
             )),

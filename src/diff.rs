@@ -644,6 +644,17 @@ impl CodeDb {
                     )?;
                 }
             }
+            "return" => {
+                out.push_str(&format!("{indent}value:\n"));
+                self.diff_exprs(
+                    root_a,
+                    root_b,
+                    a.get("value").and_then(JsonValue::as_str).unwrap_or(""),
+                    b.get("value").and_then(JsonValue::as_str).unwrap_or(""),
+                    out,
+                    &format!("{indent}  "),
+                )?;
+            }
             "param_ref" => {
                 if a.get("index") != b.get("index") {
                     out.push_str(&format!(
@@ -843,6 +854,16 @@ impl CodeDb {
                         changes,
                     )?;
                 }
+            }
+            "return" => {
+                self.diff_exprs_json(
+                    root_a,
+                    root_b,
+                    a.get("value").and_then(JsonValue::as_str).unwrap_or(""),
+                    b.get("value").and_then(JsonValue::as_str).unwrap_or(""),
+                    &child_path(path, "value"),
+                    changes,
+                )?;
             }
             "param_ref" => {
                 if a.get("index") != b.get("index") {

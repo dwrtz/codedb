@@ -2871,6 +2871,11 @@ impl CodeDb {
         region_scope: &BTreeMap<String, String>,
         expected_type: Option<&str>,
     ) -> Result<TypeCheckResult> {
+        // The root of a top-level type-check (a function body, or any expression
+        // typed against a destination) is a result position, so an early `return`
+        // (R7) is well-formed at its block boundaries; reject one placed in an
+        // operand/value position before typing (see `validate_return_positions`).
+        crate::expr::validate_return_positions(expr, true)?;
         self.type_expr_with_locals_expecting(
             current_module,
             expr,
@@ -3867,6 +3872,12 @@ impl CodeDb {
                 then_expr,
                 else_expr,
             } => {
+                // Early-exit divergence (R7): a branch that always `return`s yields
+                // no value to the `if`, so its type need not match the other
+                // branch — the non-divergent branch fixes the result type. Computed
+                // from the raw branch shape before it is shadowed by its typed result.
+                let then_diverges = crate::expr::raw_expr_diverges(then_expr);
+                let else_diverges = crate::expr::raw_expr_diverges(else_expr);
                 let cond = self.type_expr_with_locals(
                     current_module,
                     cond,
@@ -3896,13 +3907,23 @@ impl CodeDb {
                     region_scope,
                     locals,
                 )?;
-                if then_expr.type_hash != else_expr.type_hash {
-                    bail!(
-                        "if branches differ: {} vs {}",
-                        self.type_name(&then_expr.type_hash)?,
-                        self.type_name(&else_expr.type_hash)?
-                    );
-                }
+                // The result type is the non-divergent branch's; if both produce a
+                // value they must agree; if both diverge the `if` itself diverges
+                // and its (unobserved) type is taken from `then`.
+                let result_type = if then_diverges && !else_diverges {
+                    else_expr.type_hash.clone()
+                } else if else_diverges && !then_diverges {
+                    then_expr.type_hash.clone()
+                } else {
+                    if !then_diverges && then_expr.type_hash != else_expr.type_hash {
+                        bail!(
+                            "if branches differ: {} vs {}",
+                            self.type_name(&then_expr.type_hash)?,
+                            self.type_name(&else_expr.type_hash)?
+                        );
+                    }
+                    then_expr.type_hash.clone()
+                };
                 let expr_hash = self.put_object(
                     "Expression",
                     &json!({
@@ -3910,7 +3931,7 @@ impl CodeDb {
                         "cond": cond.expr_hash,
                         "then": then_expr.expr_hash,
                         "else": else_expr.expr_hash,
-                        "type": then_expr.type_hash,
+                        "type": result_type,
                     }),
                 )?;
                 self.write_cache_json(
@@ -3918,11 +3939,54 @@ impl CodeDb {
                     "typechecker",
                     "typed-dag",
                     ArtifactKind::TypedExpression,
-                    &json!({ "type": then_expr.type_hash }),
+                    &json!({ "type": result_type }),
                 )?;
                 Ok(TypeCheckResult {
                     expr_hash,
-                    type_hash: then_expr.type_hash,
+                    type_hash: result_type,
+                })
+            }
+            RawExpr::Return { value } => {
+                // `return <value>` (R7): early exit from the enclosing function.
+                // It is divergent — it yields no value to its own context — so the
+                // typed node carries the operand's type only so a sibling `if`/`case`
+                // branch can fix the join's result type (see the `If`/`Case` arms).
+                // Two facts are checked elsewhere, where the function's return type
+                // is in scope: (1) the operand is assignable to the declared return
+                // type (`check_return_operand_types`, at the body/return-type gate);
+                // (2) the `return` sits in a block-result position
+                // (`ensure_return_positions`). The operand is typed against the
+                // ambient `expected_type`, which is the return type in tail position
+                // so a context-typed literal (`return 0` for a sized-int return)
+                // takes the right width.
+                let value = self.type_expr_with_locals_expecting(
+                    current_module,
+                    value,
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                    expected_type,
+                )?;
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "return",
+                        "value": value.expr_hash,
+                        "type": value.type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": value.type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash: value.type_hash,
                 })
             }
             RawExpr::Fold {
@@ -4257,6 +4321,8 @@ impl CodeDb {
                 // recursive nested-exhaustiveness check (R14).
                 let mut arm_patterns: Vec<RawPattern> = Vec::new();
                 let mut result_type: Option<String> = None;
+                // The first arm's body type, used only when every arm diverges (R7).
+                let mut fallback_type: Option<String> = None;
                 let mut arms_json = Vec::with_capacity(arms.len());
                 let mut has_default = false;
                 for (index, arm) in arms.iter().enumerate() {
@@ -4379,16 +4445,26 @@ impl CodeDb {
                             })),
                         }
                     }
-                    if let Some(expected) = &result_type {
-                        if expected != &body.type_hash {
-                            bail!(
-                                "case arm returns {}, expected {}",
-                                self.type_name(&body.type_hash)?,
-                                self.type_name(expected)?
-                            );
+                    // Early-exit divergence (R7): an arm whose body always `return`s
+                    // yields no value to the `case`, so it neither fixes nor must
+                    // match the result type — the non-divergent arms do (mirrors the
+                    // `if` join). `fallback_type` keeps a type for the all-arms-diverge
+                    // case (the `case` then diverges; its type is unobserved).
+                    if fallback_type.is_none() {
+                        fallback_type = Some(body.type_hash.clone());
+                    }
+                    if !crate::expr::raw_expr_diverges(&arm.body) {
+                        if let Some(expected) = &result_type {
+                            if expected != &body.type_hash {
+                                bail!(
+                                    "case arm returns {}, expected {}",
+                                    self.type_name(&body.type_hash)?,
+                                    self.type_name(expected)?
+                                );
+                            }
+                        } else {
+                            result_type = Some(body.type_hash.clone());
                         }
-                    } else {
-                        result_type = Some(body.type_hash.clone());
                     }
                 }
                 let expected_variants = variants
@@ -4413,8 +4489,9 @@ impl CodeDb {
                         bail!("case expression must cover every enum variant");
                     }
                 }
-                let type_hash =
-                    result_type.ok_or_else(|| anyhow!("case expression has no arms"))?;
+                let type_hash = result_type
+                    .or(fallback_type)
+                    .ok_or_else(|| anyhow!("case expression has no arms"))?;
                 let expr_hash = self.put_object(
                     "Expression",
                     &json!({
@@ -4597,6 +4674,8 @@ impl CodeDb {
     ) -> Result<TypeCheckResult> {
         let mut arms_json = Vec::with_capacity(arms.len());
         let mut result_type: Option<String> = None;
+        // First arm's body type, used only when every arm diverges (R7).
+        let mut fallback_type: Option<String> = None;
         let mut has_default = false;
         let mut seen_i64: BTreeSet<String> = BTreeSet::new();
         let mut seen_bool: BTreeSet<bool> = BTreeSet::new();
@@ -4721,16 +4800,23 @@ impl CodeDb {
                 region_scope,
                 locals,
             )?;
-            if let Some(expected) = &result_type {
-                if expected != &body.type_hash {
-                    bail!(
-                        "case arm returns {}, expected {}",
-                        self.type_name(&body.type_hash)?,
-                        self.type_name(expected)?
-                    );
+            if fallback_type.is_none() {
+                fallback_type = Some(body.type_hash.clone());
+            }
+            // Early exit (R7): a divergent arm neither fixes nor must match the
+            // result type (mirrors the `if` and enum-`case` joins).
+            if !crate::expr::raw_expr_diverges(&arm.body) {
+                if let Some(expected) = &result_type {
+                    if expected != &body.type_hash {
+                        bail!(
+                            "case arm returns {}, expected {}",
+                            self.type_name(&body.type_hash)?,
+                            self.type_name(expected)?
+                        );
+                    }
+                } else {
+                    result_type = Some(body.type_hash.clone());
                 }
-            } else {
-                result_type = Some(body.type_hash.clone());
             }
             pattern.insert("body".to_string(), json!(body.expr_hash));
             arms_json.push(JsonValue::Object(pattern));
@@ -4751,7 +4837,9 @@ impl CodeDb {
                 }
             );
         }
-        let type_hash = result_type.ok_or_else(|| anyhow!("case expression has no arms"))?;
+        let type_hash = result_type
+            .or(fallback_type)
+            .ok_or_else(|| anyhow!("case expression has no arms"))?;
         let expr_hash = self.put_object(
             "Expression",
             &json!({
@@ -6207,6 +6295,16 @@ impl CodeDb {
                         )?,
                 )
             }
+            "return" => {
+                // `return <value>` (R7) makes `<value>` a function return value, so
+                // a local borrow it carries escapes exactly as a tail return value
+                // would. Propagate the operand's escape status.
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("return missing value"))?;
+                self.expr_escapes_local_borrow(root, value, locals_with_local_borrows)
+            }
             "fold" => Ok(false),
             "case" => {
                 let expr = payload
@@ -6657,6 +6755,61 @@ impl CodeDb {
             })
     }
 
+    /// Whether the typed expression `expr_hash` always exits the enclosing
+    /// function early (R7) — the typed-DAG counterpart of
+    /// [`crate::expr::raw_expr_diverges`]. A divergent expression yields no value
+    /// to its own context, so the borrow/move merge and lowering route a divergent
+    /// branch to the early-exit edge instead of the join. Used wherever a branch's
+    /// state must NOT flow into the continuation it never reaches.
+    pub(crate) fn typed_expr_diverges(&self, expr_hash: &str) -> Result<bool> {
+        let payload = self.get_payload(expr_hash)?;
+        let kind = payload
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?;
+        Ok(match kind {
+            "return" => true,
+            "if" => {
+                let then_hash = payload
+                    .get("then")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("if missing then"))?;
+                let else_hash = payload
+                    .get("else")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("if missing else"))?;
+                self.typed_expr_diverges(then_hash)? && self.typed_expr_diverges(else_hash)?
+            }
+            "case" => {
+                let arms = payload
+                    .get("arms")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| anyhow!("case missing arms"))?;
+                if arms.is_empty() {
+                    return Ok(false);
+                }
+                for arm in arms {
+                    let body = arm
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("case arm missing body"))?;
+                    if !self.typed_expr_diverges(body)? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            "let" => {
+                let body = payload
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("let missing body"))?;
+                self.typed_expr_diverges(body)?
+            }
+            _ => false,
+        })
+    }
+
     fn verify_expr_borrows(
         &self,
         root: &ProgramRootPayload,
@@ -7098,7 +7251,21 @@ impl CodeDb {
                 // use-after-move. `boundary` is retained for symmetry with the
                 // branch-local reasoning in lowering.
                 let _ = boundary;
-                merge_branch_state(state, then_state, else_state);
+                // Early exit (R7): a branch that always `return`s never reaches the
+                // code after the `if`, so its moves must NOT flow into the
+                // continuation — only the non-divergent branch's state does (else a
+                // place merely moved on the early-exit path would falsely read as
+                // moved afterward). Both branches are still checked above.
+                let then_div = self.typed_expr_diverges(then_hash)?;
+                let else_div = self.typed_expr_diverges(else_hash)?;
+                match (then_div, else_div) {
+                    (false, false) => merge_branch_state(state, then_state, else_state),
+                    (true, false) => *state = else_state,
+                    (false, true) => *state = then_state,
+                    // Both diverge: the code after the `if` is unreachable; pick one
+                    // consistent state for the (dead) continuation's checks.
+                    (true, true) => *state = then_state,
+                }
                 Ok(())
             }
             "fold" => {
@@ -7373,14 +7540,31 @@ impl CodeDb {
                             ExprUse::Value,
                         )?;
                     }
-                    merged = Some(match merged {
-                        Some(previous) => merged_branch_states(previous, arm_state),
-                        None => arm_state,
-                    });
+                    // Early exit (R7): a divergent arm never reaches the code after
+                    // the `case`, so its moves do not flow into the continuation —
+                    // only non-divergent arms merge (the arm is still checked above).
+                    if !self.typed_expr_diverges(body)? {
+                        merged = Some(match merged {
+                            Some(previous) => merged_branch_states(previous, arm_state),
+                            None => arm_state,
+                        });
+                    }
                 }
                 if let Some(merged) = merged {
                     *state = merged;
                 }
+                Ok(())
+            }
+            "return" => {
+                // Early exit (R7): the returned value is consumed (moved) out of the
+                // function. Borrow/move-check it as an owned value; the divergence of
+                // this branch is handled by the enclosing `if`/`case` merge, which
+                // does not flow this branch's state into the continuation.
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("return missing value"))?;
+                self.verify_expr_borrows(root, value, param_types, state, ExprUse::Value)?;
                 Ok(())
             }
             other => bail!("unknown expression kind {other}"),
@@ -7599,6 +7783,11 @@ impl CodeDb {
                 self.check_loans_point_to_live_storage(&body_loans, state)?;
                 out.extend(body_loans);
             }
+            // `return <value>` (R7) yields no value to its context — it exits the
+            // function — so it contributes no loans to a binding/merge here. The
+            // loans the operand carries escape as a return value and are governed by
+            // `expr_escapes_local_borrow`, not by this binding-loan flow.
+            "return" => {}
             "if" => {
                 let then_hash = payload
                     .get("then")
@@ -7879,6 +8068,10 @@ impl CodeDb {
                 }
                 Ok(out)
             }
+            // `return <value>` (R7) exits the function rather than storing into the
+            // binding, so it transfers no loans to the store target (it is not a
+            // place; the catch-all's place attribution does not apply).
+            "return" => Ok(Vec::new()),
             _ => {
                 let mut loans = self.collect_value_loans(root, expr_hash, param_types, state)?;
                 let source_owner =
@@ -8567,6 +8760,7 @@ impl CodeDb {
                         || self.expr_child_requires_state(&payload, "then")?
                         || self.expr_child_requires_state(&payload, "else")?
                 }
+                "return" => self.expr_child_requires_state(&payload, "value")?,
                 "fold" => {
                     self.expr_child_requires_state(&payload, "target")?
                         || self.expr_child_requires_state(&payload, "init")?
@@ -8711,6 +8905,7 @@ impl CodeDb {
                         || self.expr_child_requires_alloc(&payload, "then")?
                         || self.expr_child_requires_alloc(&payload, "else")?
                 }
+                "return" => self.expr_child_requires_alloc(&payload, "value")?,
                 "fold" => {
                     self.expr_child_requires_alloc(&payload, "target")?
                         || self.expr_child_requires_alloc(&payload, "init")?
@@ -8849,6 +9044,7 @@ impl CodeDb {
                         || self.expr_child_requires_unsafe(&payload, "then")?
                         || self.expr_child_requires_unsafe(&payload, "else")?
                 }
+                "return" => self.expr_child_requires_unsafe(&payload, "value")?,
                 "fold" => {
                     self.expr_child_requires_unsafe(&payload, "target")?
                         || self.expr_child_requires_unsafe(&payload, "init")?
@@ -8986,6 +9182,8 @@ impl CodeDb {
     ) -> Result<String> {
         let is_i64 = scrutinee_type == type_hash_for("I64");
         let mut result_type: Option<String> = None;
+        // First arm's body type, used only when every arm diverges (R7).
+        let mut fallback_type: Option<String> = None;
         let mut has_default = false;
         let mut seen_i64: BTreeSet<String> = BTreeSet::new();
         let mut seen_bool: BTreeSet<bool> = BTreeSet::new();
@@ -9080,10 +9278,16 @@ impl CodeDb {
                 allowed_regions,
                 locals,
             )?;
-            match &result_type {
-                Some(expected) if expected != &body_type => bail!("case arm type mismatch"),
-                Some(_) => {}
-                None => result_type = Some(body_type),
+            if fallback_type.is_none() {
+                fallback_type = Some(body_type.clone());
+            }
+            // Early exit (R7): a divergent arm neither fixes nor must match the type.
+            if !self.typed_expr_diverges(body_hash)? {
+                match &result_type {
+                    Some(expected) if expected != &body_type => bail!("case arm type mismatch"),
+                    Some(_) => {}
+                    None => result_type = Some(body_type),
+                }
             }
         }
         let exhaustive = has_default
@@ -9091,7 +9295,9 @@ impl CodeDb {
         if !exhaustive {
             bail!("case expression is not exhaustive: a scalar `case` needs a `_` wildcard");
         }
-        let actual_type = result_type.ok_or_else(|| anyhow!("case expression has no arms"))?;
+        let actual_type = result_type
+            .or(fallback_type)
+            .ok_or_else(|| anyhow!("case expression has no arms"))?;
         if declared_type != actual_type {
             bail!("bad_type: case declares {declared_type}, actual {actual_type}");
         }
@@ -10118,6 +10324,8 @@ impl CodeDb {
                 if cond_type != type_hash_for("Bool") {
                     bail!("if condition must be bool");
                 }
+                let then_div = self.typed_expr_diverges(then_hash)?;
+                let else_div = self.typed_expr_diverges(else_hash)?;
                 let then_type = self.verify_expr_type_with_locals(
                     then_hash,
                     root,
@@ -10132,10 +10340,33 @@ impl CodeDb {
                     allowed_regions,
                     locals,
                 )?;
-                if then_type != else_type {
-                    bail!("if branches must have the same type");
+                // Early exit (R7): a divergent branch fixes no type — the
+                // non-divergent branch does (mirrors the type-checker join).
+                if then_div && !else_div {
+                    else_type
+                } else if else_div && !then_div {
+                    then_type
+                } else {
+                    if !then_div && then_type != else_type {
+                        bail!("if branches must have the same type");
+                    }
+                    then_type
                 }
-                then_type
+            }
+            "return" => {
+                // `return <value>` (R7): re-derive the operand's type; the node's
+                // declared type is the operand's, so this matches by construction.
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("return missing value"))?;
+                self.verify_expr_type_with_locals(
+                    value,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?
             }
             "fold" => {
                 let item_name = payload
@@ -10496,6 +10727,8 @@ impl CodeDb {
                 let mut has_nested = false;
                 let mut arm_patterns: Vec<RawPattern> = Vec::new();
                 let mut result_type = None;
+                // First arm's body type, used only when every arm diverges (R7).
+                let mut fallback_type: Option<String> = None;
                 let mut has_default = false;
                 for (index, arm) in arms.iter().enumerate() {
                     if arm.get("guard").is_some() {
@@ -10593,12 +10826,19 @@ impl CodeDb {
                         locals.pop();
                     }
                     let body_type = body_type?;
-                    if let Some(expected) = &result_type {
-                        if expected != &body_type {
-                            bail!("case arm type mismatch");
+                    if fallback_type.is_none() {
+                        fallback_type = Some(body_type.clone());
+                    }
+                    // Early exit (R7): a divergent arm neither fixes nor must match
+                    // the result type (mirrors the type-checker join).
+                    if !self.typed_expr_diverges(body_hash)? {
+                        if let Some(expected) = &result_type {
+                            if expected != &body_type {
+                                bail!("case arm type mismatch");
+                            }
+                        } else {
+                            result_type = Some(body_type);
                         }
-                    } else {
-                        result_type = Some(body_type);
                     }
                 }
                 let expected_variants = variants
@@ -10619,7 +10859,9 @@ impl CodeDb {
                         bail!("case expression must cover every enum variant");
                     }
                 }
-                result_type.ok_or_else(|| anyhow!("case expression has no arms"))?
+                result_type
+                    .or(fallback_type)
+                    .ok_or_else(|| anyhow!("case expression has no arms"))?
             }
             other => bail!("unknown expression kind {other}"),
         };

@@ -1052,6 +1052,9 @@ fn append_default_arg_to_calls(expr: &RawExpr, target_name: &str, default: &RawE
             then_expr: Box::new(append_default_arg_to_calls(then_expr, target_name, default)),
             else_expr: Box::new(append_default_arg_to_calls(else_expr, target_name, default)),
         },
+        RawExpr::Return { value } => RawExpr::Return {
+            value: Box::new(append_default_arg_to_calls(value, target_name, default)),
+        },
         RawExpr::Fold {
             item,
             target,
@@ -7559,6 +7562,15 @@ fn borrow_call_arg_to_calls(
                 mutable,
             )?),
         },
+        RawExpr::Return { value } => RawExpr::Return {
+            value: Box::new(borrow_call_arg_to_calls(
+                value,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+        },
         RawExpr::Fold {
             item,
             target,
@@ -7825,6 +7837,9 @@ fn normalize_param_refs_scoped(
                 local_params,
                 local_bindings,
             )),
+        },
+        RawExpr::Return { value } => RawExpr::Return {
+            value: Box::new(normalize_param_refs_scoped(value, local_params, local_bindings)),
         },
         RawExpr::Fold {
             item,

@@ -340,6 +340,21 @@ fn go(n: i64) -> i64 effects[alloc] =
 fn main() -> i64 effects[alloc] = go({K})
 "#;
 
+// Phase 10 (R7): an owned `box` is live at an early `return` and must be dropped on
+// the early-exit edge. `early` allocates a box per call and always takes the
+// `return b.v` branch, which drops the box as control leaves the function — the
+// drop the lowering emits at the `EarlyReturn` rather than at the fall-through scope
+// exit. A skipped early-exit drop leaks one box per level, so net grows with K.
+const EARLY_RETURN_DROP: &str = r#"
+record Line { v: i64 }
+fn early(n: i64) -> i64 effects[alloc] =
+  let b: box<Line> = box_new({ v: n }) in
+  if n < 0 then b.v else return b.v
+fn go(n: i64) -> i64 effects[alloc] =
+  if n < 1 then 0 else early(n) + go(n - 1)
+fn main() -> i64 effects[alloc] = go({K})
+"#;
+
 fn build_exe(dir: &Path, name: &str, source: &str) -> PathBuf {
     let db = dir.join(format!("{name}.sqlite"));
     let src = dir.join(format!("{name}.cdb"));
@@ -495,4 +510,9 @@ fn box_deref_partial_move_frees_every_box_at_runtime() {
 #[test]
 fn nested_box_deref_partial_move_frees_every_box_at_runtime() {
     assert_balanced_across_scale("nested_box_deref_move", NESTED_BOX_DEREF_MOVE, 4, 64);
+}
+
+#[test]
+fn early_return_drops_live_box_on_the_exit_edge_at_runtime() {
+    assert_balanced_across_scale("early_return_drop", EARLY_RETURN_DROP, 4, 64);
 }

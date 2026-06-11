@@ -641,7 +641,9 @@ impl CodeDb {
         let body = self.function_body_hash(&root_symbol.definition)?;
         let mut args = args.into_iter().map(value_cell).collect::<Vec<_>>();
         let mut locals = Vec::new();
-        let value = self.trace_expr(
+        // Early-return (R7) boundary: an early `return` inside the body unwinds
+        // here as the sentinel error and becomes this call's traced result.
+        let value = match self.trace_expr(
             state,
             frame,
             symbol,
@@ -649,7 +651,10 @@ impl CodeDb {
             &body,
             &mut args,
             &mut locals,
-        )?;
+        ) {
+            Ok(value) => value,
+            Err(err) => crate::expr::take_return_unwind(err)?,
+        };
         state.events.push(TraceEvent::ExitFunction {
             root_hash: state.root_hash.clone(),
             frame,
@@ -1351,6 +1356,27 @@ impl CodeDb {
                 )?;
                 state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
                 Ok(value)
+            }
+            "return" => {
+                // Early exit (R7): trace the operand, record it at the `return`
+                // node, then unwind to `trace_symbol` (the function boundary), which
+                // converts the sentinel into this call's result — mirroring the
+                // evaluator's `eval_symbol`.
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("return missing value"))?;
+                let value = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    value_hash,
+                    args,
+                    locals,
+                )?;
+                state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
+                Err(crate::expr::raise_return_unwind(value))
             }
             "fold" => {
                 let target_hash = payload

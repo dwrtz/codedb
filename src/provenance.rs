@@ -2640,6 +2640,21 @@ impl CodeDb {
                     }
                 }
             }
+            "return" => {
+                if let (Some(from_child), Some(to_child)) = (
+                    from_payload.get("value").and_then(JsonValue::as_str),
+                    to_payload.get("value").and_then(JsonValue::as_str),
+                ) {
+                    self.collect_expression_changes(
+                        from_root,
+                        to_root,
+                        from_child,
+                        to_child,
+                        &format!("{path}.value"),
+                        changes,
+                    )?;
+                }
+            }
             "param_ref" | "local_ref" => {
                 let key = if from_kind == "param_ref" {
                     "index"
@@ -3321,6 +3336,15 @@ fn expression_child_hashes(expr_kind: &str, payload: &JsonValue) -> Result<Vec<S
                         .to_string(),
                 );
             }
+        }
+        "return" => {
+            children.push(
+                payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("return missing value"))?
+                    .to_string(),
+            );
         }
         "fold" => {
             for key in ["target", "init", "body"] {

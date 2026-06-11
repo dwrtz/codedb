@@ -82,6 +82,16 @@ pub enum RawExpr {
         #[serde(rename = "else")]
         else_expr: Box<RawExpr>,
     },
+    /// `return <expr>` — early exit (R7). Evaluating it abandons the rest of the
+    /// enclosing function and yields `<expr>` as the function's result. It is a
+    /// *divergent* expression: it produces no value to its own context, so it is
+    /// only well-formed in a "block-result" position (a function body, an `if`
+    /// then/else branch, a `case` arm body, or a `let` body) — see
+    /// `raw_expr_diverges` and the position check in type-checking. The early-exit
+    /// edge drops every owned value still live at the return point (SPEC_V3 §7).
+    Return {
+        value: Box<RawExpr>,
+    },
     Fold {
         item: String,
         target: Box<RawExpr>,
@@ -113,6 +123,133 @@ pub enum RawExpr {
         expr: Box<RawExpr>,
         arms: Vec<RawCaseArm>,
     },
+}
+
+/// Whether evaluating `expr` always exits the enclosing function early (R7) — it
+/// is a `return`, or a conditional whose every continuation path is itself
+/// divergent. A divergent expression yields no value to its own context, so the
+/// `if`/`case` type-join treats a divergent branch as having "no type" (the
+/// other, non-divergent branch fixes the result type) and lowering routes the
+/// branch to the early-exit edge rather than the merge. Structural and pure: it
+/// reads only the shape, never types.
+pub(crate) fn raw_expr_diverges(expr: &RawExpr) -> bool {
+    match expr {
+        RawExpr::Return { .. } => true,
+        RawExpr::If {
+            then_expr,
+            else_expr,
+            ..
+        } => raw_expr_diverges(then_expr) && raw_expr_diverges(else_expr),
+        RawExpr::Case { arms, .. } => {
+            !arms.is_empty() && arms.iter().all(|arm| raw_expr_diverges(&arm.body))
+        }
+        RawExpr::Let { body, .. } => raw_expr_diverges(body),
+        _ => false,
+    }
+}
+
+/// Reject an early `return` (R7) that is not in a "block-result" position. A
+/// `return` yields no value to its own context, so it is only well-formed where
+/// its value *is* the enclosing computation's result on that path: the function
+/// body, an `if` then/else branch, a `case` arm body, or a `let` body. Every
+/// other position (a condition, scrutinee, `let` value, operand, argument, index,
+/// field, or `fold` sub-expression) evaluates its child for a value, so a
+/// `return` there is rejected — keeping lowering's early-exit edge confined to
+/// block boundaries. Branches/bodies are return-allowed regardless of the
+/// enclosing context, so `let b = (if c then return e else next) in rest` is
+/// well-formed (the `return` is an `if` branch) while `let x = return e in body`
+/// and `f(return e)` are not. Exhaustive over `RawExpr`, so a new form must state
+/// its return-position policy.
+pub(crate) fn validate_return_positions(expr: &RawExpr, allowed: bool) -> Result<()> {
+    match expr {
+        RawExpr::Return { value } => {
+            if !allowed {
+                bail!(
+                    "`return` may only appear as a function body, an `if`/`case` branch, or a \
+                     `let` body — not in a condition, scrutinee, `let` value, operand, argument, \
+                     index, field, or `fold` body"
+                );
+            }
+            // A return's operand is a value position, not a block result.
+            validate_return_positions(value, false)
+        }
+        RawExpr::If {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            validate_return_positions(cond, false)?;
+            validate_return_positions(then_expr, true)?;
+            validate_return_positions(else_expr, true)
+        }
+        RawExpr::Let { value, body, .. } => {
+            validate_return_positions(value, false)?;
+            validate_return_positions(body, true)
+        }
+        RawExpr::Case { expr, arms } => {
+            validate_return_positions(expr, false)?;
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    validate_return_positions(guard, false)?;
+                }
+                validate_return_positions(&arm.body, true)?;
+            }
+            Ok(())
+        }
+        // A `fold` body's value is the accumulator, not the function's result — a
+        // `return` there would be a break out of a loop (R8, a later phase), so it
+        // is a strict value position here.
+        RawExpr::Fold {
+            target, init, body, ..
+        } => {
+            validate_return_positions(target, false)?;
+            validate_return_positions(init, false)?;
+            validate_return_positions(body, false)
+        }
+        RawExpr::Call { args, .. } => {
+            for arg in args {
+                validate_return_positions(arg, false)?;
+            }
+            Ok(())
+        }
+        RawExpr::Binary { left, right, .. } => {
+            validate_return_positions(left, false)?;
+            validate_return_positions(right, false)
+        }
+        RawExpr::Unary { expr, .. } => validate_return_positions(expr, false),
+        RawExpr::BorrowShared { target, .. } | RawExpr::BorrowMut { target, .. } => {
+            validate_return_positions(target, false)
+        }
+        RawExpr::Assign { target, value } => {
+            validate_return_positions(target, false)?;
+            validate_return_positions(value, false)
+        }
+        RawExpr::Array { elements } => {
+            for element in elements {
+                validate_return_positions(element, false)?;
+            }
+            Ok(())
+        }
+        RawExpr::Index { target, index } => {
+            validate_return_positions(target, false)?;
+            validate_return_positions(index, false)
+        }
+        RawExpr::Record { fields } => {
+            for field in fields {
+                validate_return_positions(&field.value, false)?;
+            }
+            Ok(())
+        }
+        RawExpr::FieldAccess { target, .. } => validate_return_positions(target, false),
+        RawExpr::EnumConstruct { value, .. } => validate_return_positions(value, false),
+        RawExpr::LiteralI64 { .. }
+        | RawExpr::LiteralBool { .. }
+        | RawExpr::LiteralString { .. }
+        | RawExpr::LiteralBytes { .. }
+        | RawExpr::Unit
+        | RawExpr::ParamRef { .. }
+        | RawExpr::ParamName { .. } => Ok(()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,6 +597,51 @@ pub enum Value {
 
 pub type ValueCell = Rc<RefCell<Value>>;
 
+thread_local! {
+    /// Out-of-band slot carrying an early-`return` value (R7) while the sentinel
+    /// error unwinds to the function-call boundary. A `Value` holds an `Rc`, which
+    /// is not `Send + Sync`, so it cannot be carried inside an `anyhow::Error`;
+    /// instead the value is stashed here and read back by `take_return_unwind` at
+    /// the nearest `eval_symbol`/`trace_symbol`. Unwinding is immediate and
+    /// single-threaded — the value is written, the sentinel propagates straight up
+    /// through `?`, and the boundary takes it before any other `return` can run —
+    /// so a single slot (per thread) suffices and need not be a stack.
+    static RETURN_UNWIND_VALUE: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
+/// The unwinding signal an early `return` raises; recognized by `eval_symbol` /
+/// `trace_symbol` via `anyhow::Error::downcast_ref`.
+#[derive(Debug)]
+pub(crate) struct ReturnUnwind;
+
+impl std::fmt::Display for ReturnUnwind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "early return propagated past the enclosing function boundary")
+    }
+}
+
+impl std::error::Error for ReturnUnwind {}
+
+/// Stash an early-`return` value and produce the sentinel error that unwinds to
+/// the function-call boundary (R7).
+pub(crate) fn raise_return_unwind(value: Value) -> anyhow::Error {
+    RETURN_UNWIND_VALUE.with(|slot| *slot.borrow_mut() = Some(value));
+    anyhow::Error::new(ReturnUnwind)
+}
+
+/// At a function-call boundary, recover the value a propagating early `return`
+/// stashed. `Some(value)` converts the unwind into the call's result; `None`
+/// means the slot was empty (a malformed unwind), surfaced as an error.
+pub(crate) fn take_return_unwind(err: anyhow::Error) -> Result<Value> {
+    if err.downcast_ref::<ReturnUnwind>().is_some() {
+        RETURN_UNWIND_VALUE
+            .with(|slot| slot.borrow_mut().take())
+            .ok_or_else(|| anyhow!("early-return unwind slot was empty"))
+    } else {
+        Err(err)
+    }
+}
+
 /// Parse an integer literal's text (decimal, or `0x`/`0X` hex) into the `Value` of
 /// the given sized-integer type. The single place the evaluator widens a literal
 /// token to a typed value; its radix handling mirrors `int_literal_in_range`, so a
@@ -795,7 +977,13 @@ impl CodeDb {
         }
         let body = self.function_body_hash(&root_symbol.definition)?;
         let mut args = args.into_iter().map(value_cell).collect::<Vec<_>>();
-        self.eval_expr(root_hash, &body, &mut args)
+        // This is the early-return (R7) boundary: an early `return` inside the body
+        // unwinds here as a sentinel error, which becomes this call's result. Any
+        // other error propagates unchanged.
+        match self.eval_expr(root_hash, &body, &mut args) {
+            Ok(value) => Ok(value),
+            Err(err) => take_return_unwind(err),
+        }
     }
 
     pub(crate) fn eval_expr(
@@ -1357,6 +1545,20 @@ impl CodeDb {
                     }
                     other => bail!("if condition evaluated to non-bool {other}"),
                 }
+            }
+            "return" => {
+                // Early exit (R7): evaluate the operand, then unwind to the
+                // enclosing function-call boundary (`eval_symbol`) by raising a
+                // sentinel error carrying the value out-of-band (a `Value` holds an
+                // `Rc` and cannot ride inside a `Send + Sync` error). `?`-propagation
+                // through `let`/`if`/`case` runs their scope cleanup (e.g. the `let`
+                // pops its local before returning the error) and then unwinds.
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("return missing value"))?;
+                let value = self.eval_expr_with_locals(root_hash, value_hash, args, locals)?;
+                Err(raise_return_unwind(value))
             }
             "fold" => {
                 let target_hash = payload
@@ -2888,6 +3090,33 @@ impl CodeDb {
                     expr
                 }
             }
+            "return" => {
+                // `return <value>` (R7). The operand renders at precedence 0 — a
+                // `return` greedily takes the whole following expression, so its
+                // operand never needs parens relative to `return` — and the whole
+                // form parenthesizes when nested in a higher-precedence position.
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("return missing value"))?;
+                let expr = format!(
+                    "return {}",
+                    self.expr_to_source_with_locals(
+                        value,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                );
+                if parent_prec > 0 {
+                    format!("({expr})")
+                } else {
+                    expr
+                }
+            }
             "fold" => {
                 let item_name = payload
                     .get("item_name")
@@ -3978,6 +4207,20 @@ impl CodeDb {
                     )?,
                 ),
             }),
+            "return" => Ok(RawExpr::Return {
+                value: Box::new(
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("return missing value"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ),
+            }),
             "fold" => {
                 let item = payload
                     .get("item_name")
@@ -4671,6 +4914,13 @@ impl CodeDb {
                     self.collect_expr_deps(root, child, deps)?;
                 }
             }
+            "return" => {
+                let child = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("return missing value"))?;
+                self.collect_expr_deps(root, child, deps)?;
+            }
             "fold" => {
                 for key in ["target", "init", "body"] {
                     let child = payload
@@ -5114,6 +5364,22 @@ impl Parser {
                 ty,
                 value: Box::new(value),
                 body: Box::new(body),
+            })
+        } else {
+            self.parse_return()
+        }
+    }
+
+    /// `return <expr>` (R7): early exit. A prefix keyword form binding looser than
+    /// any operator, so `return` greedily takes the whole following expression
+    /// (`return a + b`, `return if c then x else y`). Sits between `let` and `if`
+    /// so it is recognized before identifier/operator parsing; in `if c then
+    /// return a else b` the `then` branch parses as `return a` and stops at `else`.
+    fn parse_return(&mut self) -> Result<RawExpr> {
+        if self.consume_ident_value("return") {
+            let value = self.parse_expr()?;
+            Ok(RawExpr::Return {
+                value: Box::new(value),
             })
         } else {
             self.parse_if()

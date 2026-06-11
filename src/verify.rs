@@ -4639,7 +4639,8 @@ fn collect_lowered_call_targets(
             | LoweredOp::Drop { .. }
             | LoweredOp::FreeBoxShell { .. }
             | LoweredOp::BorrowDebug { .. }
-            | LoweredOp::Return { .. } => {}
+            | LoweredOp::Return { .. }
+            | LoweredOp::EarlyReturn { .. } => {}
         }
     }
     Ok(())

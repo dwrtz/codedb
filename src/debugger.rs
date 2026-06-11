@@ -960,6 +960,7 @@ fn expr_reachable_from(
             }
             expr_reachable_child_field(db, &payload, "else", target_hash, seen)
         }
+        "return" => expr_reachable_child_field(db, &payload, "value", target_hash, seen),
         "fold" => {
             if expr_reachable_child_field(db, &payload, "target", target_hash, seen)? {
                 return Ok(true);

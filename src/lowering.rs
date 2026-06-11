@@ -483,6 +483,45 @@ pub(crate) enum LoweredOp {
         value: String,
         type_hash: String,
     },
+    /// Early exit (R7): place `value` (of the function's return type) in the
+    /// return position and leave the function from here, skipping the rest of the
+    /// body. Unlike `Return` (the single, terminal fall-through return) this is a
+    /// mid-stream control-flow terminator: it is the last op of a *divergent*
+    /// block (an `if`/`case` branch that always `return`s), and the drops for every
+    /// owned value live at the exit point are emitted by lowering immediately
+    /// before it (SPEC_V3 §7), so each owned value is dropped exactly once on the
+    /// early-exit path. The backend reuses the terminal-return value placement and
+    /// epilogue, emitted inline (no jump — the epilogue is self-contained).
+    EarlyReturn {
+        value: String,
+        type_hash: String,
+    },
+}
+
+/// Whether `ops` (a block body) ends by exiting the function early (R7) — its last
+/// op is an `EarlyReturn`, or a control-flow op (`If`/`Case`) whose every sub-block
+/// diverges. A divergent block never falls through to its `result`/merge, so the
+/// `if`/`case` merge (lowering, verify) and the backend skip its result handling,
+/// and the function's terminal return/param-drop scaffolds are unreachable after a
+/// divergent body. Structural — no IR field — so existing IR hashes are unchanged.
+pub(crate) fn lowered_ops_diverge(ops: &[LoweredOp]) -> bool {
+    match ops.last() {
+        Some(LoweredOp::EarlyReturn { .. }) => true,
+        Some(LoweredOp::If {
+            then_block,
+            else_block,
+            ..
+        }) => lowered_block_diverges(then_block) && lowered_block_diverges(else_block),
+        Some(LoweredOp::Case { arms, .. }) => {
+            !arms.is_empty() && arms.iter().all(|arm| lowered_block_diverges(&arm.block))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a lowered block exits the function early on every path (R7).
+pub(crate) fn lowered_block_diverges(block: &LoweredBlock) -> bool {
+    lowered_ops_diverge(&block.operations)
 }
 
 pub(crate) struct LoweredFunctionArtifact {
@@ -723,6 +762,10 @@ struct DropTracker {
 
 struct LowerCtx {
     target_triple: String,
+    /// The enclosing function's declared return type — the type an early `return`
+    /// (R7) lowers its operand to, and the `EarlyReturn` op's type. Constant for
+    /// the whole body.
+    return_type: String,
     next_value: usize,
     next_local: usize,
     local_slots: Vec<LoweredLocalSlot>,
@@ -733,9 +776,10 @@ struct LowerCtx {
 }
 
 impl LowerCtx {
-    fn new(target_triple: &str) -> Self {
+    fn new(target_triple: &str, return_type: &str) -> Self {
         Self {
             target_triple: target_triple.to_string(),
+            return_type: return_type.to_string(),
             next_value: 0,
             next_local: 0,
             local_slots: Vec::new(),
@@ -979,7 +1023,7 @@ impl CodeDb {
             );
         }
 
-        let mut ctx = LowerCtx::new(target_triple);
+        let mut ctx = LowerCtx::new(target_triple, &return_type);
         let mut lowered = self.lower_expr_as(
             root,
             &body,
@@ -988,13 +1032,22 @@ impl CodeDb {
             &mut ctx,
             &mut Vec::new(),
         )?;
-        lowered.operations.extend(self.lower_param_drop_scaffolds(
-            root,
-            target_triple,
-            &param_types,
-            &body,
-            &mut ctx,
-        )?);
+        // Early exit (R7): when the body always `return`s (every path ends in an
+        // `EarlyReturn`, which already dropped its live params/locals), the
+        // function-end param-drop scaffolds and the terminal `Return` are
+        // unreachable. Emitting the param scaffolds would double-drop params on
+        // each early-exit path, so skip them; still append a (now unreachable)
+        // terminal `Return` to satisfy the "IR ends with a return" invariant.
+        let body_diverges = lowered_ops_diverge(&lowered.operations);
+        if !body_diverges {
+            lowered.operations.extend(self.lower_param_drop_scaffolds(
+                root,
+                target_triple,
+                &param_types,
+                &body,
+                &mut ctx,
+            )?);
+        }
         let local_slots = ctx.local_slots.clone();
         let debug_map = ctx.into_debug_map();
         lowered.operations.push(LoweredOp::Return {
@@ -1620,6 +1673,7 @@ impl CodeDb {
                 locals,
             ),
             "if" => self.lower_if(root, expr_hash, &type_hash, param_types, ctx, locals),
+            "return" => self.lower_return(root, expr_hash, param_types, ctx, locals),
             "field_access" => {
                 self.lower_place_value(root, expr_hash, &type_hash, param_types, ctx, locals)
             }
@@ -2230,6 +2284,70 @@ impl CodeDb {
                 ctx,
                 operations,
             )?;
+        }
+        Ok(())
+    }
+
+    /// Divergence-aware (R7) two-way move merge at an `if` / desugared-scalar-`case`
+    /// boundary. A divergent branch (one that always `return`s) leaves through its
+    /// own `EarlyReturn`, which already dropped every value live at that point, and
+    /// never reaches the merge — so it is excluded from the move union and receives
+    /// no compensating drops; only the non-divergent branch(es) set `ctx.moved` for
+    /// the continuation. With both branches divergent the code after is unreachable.
+    /// Reduces to the plain union+compensation merge when neither diverges.
+    #[allow(clippy::too_many_arguments)]
+    fn merge_two_branch_moves(
+        &self,
+        root: &ProgramRootPayload,
+        then_expr: &mut LoweredExpr,
+        else_expr: &mut LoweredExpr,
+        then_moved: BTreeSet<MovedPlace>,
+        else_moved: BTreeSet<MovedPlace>,
+        moved_before: &BTreeSet<MovedPlace>,
+        param_types: &[String],
+        debug_expr_hash: &str,
+        ctx: &mut LowerCtx,
+    ) -> Result<()> {
+        let then_div = lowered_ops_diverge(&then_expr.operations);
+        let else_div = lowered_ops_diverge(&else_expr.operations);
+        ctx.moved = moved_before.clone();
+        match (then_div, else_div) {
+            (false, false) => {
+                let union =
+                    normalize_moved_set(then_moved.union(&else_moved).cloned().collect());
+                self.emit_merge_compensation(
+                    root,
+                    &union,
+                    &then_moved,
+                    param_types,
+                    debug_expr_hash,
+                    ctx,
+                    &mut then_expr.operations,
+                )?;
+                self.emit_merge_compensation(
+                    root,
+                    &union,
+                    &else_moved,
+                    param_types,
+                    debug_expr_hash,
+                    ctx,
+                    &mut else_expr.operations,
+                )?;
+                for place in union {
+                    ctx.mark_moved_place(place);
+                }
+            }
+            (true, false) => {
+                for place in else_moved {
+                    ctx.mark_moved_place(place);
+                }
+            }
+            (false, true) => {
+                for place in then_moved {
+                    ctx.mark_moved_place(place);
+                }
+            }
+            (true, true) => {}
         }
         Ok(())
     }
@@ -4376,6 +4494,79 @@ impl CodeDb {
         }
     }
 
+    /// Lower an early `return <value>` (R7). The operand is lowered to the
+    /// function's return type, then — on this early-exit edge — every owned value
+    /// still live is dropped (in-scope locals innermost-first, then params), except
+    /// the places the operand just consumed (already in `ctx.moved`). This mirrors
+    /// exactly what the `let`-scope-exit and function-end param scaffolds drop on
+    /// the fall-through path, emitted here instead, so each owned value is dropped
+    /// once on the early-exit path (SPEC_V3 §7). The op list ends in `EarlyReturn`,
+    /// which makes the enclosing block divergent (`lowered_ops_diverge`); the
+    /// returned `value`/`type_hash` serve only as the block's (unread) result.
+    fn lower_return(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let value_hash = payload
+            .get("value")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("return missing value"))?;
+        let return_type = ctx.return_type.clone();
+        let target_triple = ctx.target_triple().to_string();
+        // Lower the operand to the function's return type. A mismatch here is the
+        // authoritative operand-type gate for `return` (the type-checker does not
+        // thread the return type into operand positions).
+        let value =
+            self.lower_expr_as(root, value_hash, &return_type, param_types, ctx, locals)?;
+        if !self.type_assignable_in_root(root, &value.type_hash, &return_type)? {
+            bail!(
+                "return value type {} does not match function return type {}",
+                value.type_hash,
+                return_type
+            );
+        }
+        let mut operations = value.operations;
+        // Drop the owned values live at the exit: in-scope locals innermost-first,
+        // then params, each respecting the places the operand consumed.
+        for binding in locals.iter().rev() {
+            if self.type_requires_drop_scaffold(root, &target_triple, &binding.type_hash)? {
+                let moved = ctx.moved.clone();
+                let place = MovedPlace::whole(RootSlot::Local(binding.slot));
+                self.emit_residual_drops(
+                    root,
+                    &place,
+                    &binding.type_hash,
+                    &binding.type_hash,
+                    &moved,
+                    value_hash,
+                    ctx,
+                    &mut operations,
+                )?;
+            }
+        }
+        operations.extend(self.lower_param_drop_scaffolds(
+            root,
+            &target_triple,
+            param_types,
+            value_hash,
+            ctx,
+        )?);
+        operations.push(LoweredOp::EarlyReturn {
+            value: value.value.clone(),
+            type_hash: return_type.clone(),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: value.value,
+            type_hash: return_type,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// Lower an `if`, producing a value of `result_type`. Like `lower_case`,
     /// `result_type` is the expression's own type on the ordinary path, but
@@ -4424,31 +4615,60 @@ impl CodeDb {
         let mut else_expr =
             self.lower_expr_as(root, else_hash, result_type, param_types, ctx, locals)?;
         let else_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
-        if then_expr.type_hash != else_expr.type_hash || then_expr.type_hash != result_type {
+        // Early exit (R7): a branch that always `return`s exits through its own
+        // `EarlyReturn` (which already dropped every value live at that point) and
+        // never reaches the merge. So a divergent branch (a) yields the return
+        // type, not `result_type`, so it is exempt from the branch-type check; and
+        // (b) contributes no moves to the continuation and receives no compensating
+        // drops — only the non-divergent branch(es) merge. With one branch
+        // divergent the post-`if` state is the other branch's; with both, the code
+        // after the `if` is unreachable.
+        let then_div = lowered_ops_diverge(&then_expr.operations);
+        let else_div = lowered_ops_diverge(&else_expr.operations);
+        if !then_div && then_expr.type_hash != result_type {
             bail!("if branch type mismatch while lowering");
         }
-        let union = normalize_moved_set(then_moved.union(&else_moved).cloned().collect());
-        self.emit_merge_compensation(
-            root,
-            &union,
-            &then_moved,
-            param_types,
-            then_hash,
-            ctx,
-            &mut then_expr.operations,
-        )?;
-        self.emit_merge_compensation(
-            root,
-            &union,
-            &else_moved,
-            param_types,
-            else_hash,
-            ctx,
-            &mut else_expr.operations,
-        )?;
-        ctx.moved = moved_before;
-        for place in union {
-            ctx.mark_moved_place(place);
+        if !else_div && else_expr.type_hash != result_type {
+            bail!("if branch type mismatch while lowering");
+        }
+        ctx.moved = moved_before.clone();
+        match (then_div, else_div) {
+            (false, false) => {
+                let union =
+                    normalize_moved_set(then_moved.union(&else_moved).cloned().collect());
+                self.emit_merge_compensation(
+                    root,
+                    &union,
+                    &then_moved,
+                    param_types,
+                    then_hash,
+                    ctx,
+                    &mut then_expr.operations,
+                )?;
+                self.emit_merge_compensation(
+                    root,
+                    &union,
+                    &else_moved,
+                    param_types,
+                    else_hash,
+                    ctx,
+                    &mut else_expr.operations,
+                )?;
+                for place in union {
+                    ctx.mark_moved_place(place);
+                }
+            }
+            (true, false) => {
+                for place in else_moved {
+                    ctx.mark_moved_place(place);
+                }
+            }
+            (false, true) => {
+                for place in then_moved {
+                    ctx.mark_moved_place(place);
+                }
+            }
+            (true, true) => {}
         }
         let id = ctx.value();
         ctx.push_debug_op(expr_hash, "if", &id);
@@ -4857,15 +5077,30 @@ impl CodeDb {
         // Conditional drop glue (SPEC_V3 §7): normalize every arm to the union of
         // their outer moves by emitting compensating drops in arms that left a unioned
         // place live, so the static scaffold drops each owned value exactly once across
-        // all arms — no runtime drop flags.
+        // all arms — no runtime drop flags. Early exit (R7): a divergent arm exits
+        // via its own `EarlyReturn` (already dropping every value live there) and
+        // never reaches the merge, so it is excluded from the union and skips
+        // compensation — only non-divergent arms merge.
+        let arm_diverges: Vec<bool> = lowered_arms
+            .iter()
+            .map(|arm| lowered_block_diverges(&arm.block))
+            .collect();
         let mut union = BTreeSet::new();
-        for arm_moves in &arm_move_sets {
+        for (idx, arm_moves) in arm_move_sets.iter().enumerate() {
+            if arm_diverges[idx] {
+                continue;
+            }
             for place in arm_moves {
                 union.insert(place.clone());
             }
         }
         let union = normalize_moved_set(union);
-        for (arm, arm_moves) in lowered_arms.iter_mut().zip(arm_move_sets.iter()) {
+        for (idx, (arm, arm_moves)) in
+            lowered_arms.iter_mut().zip(arm_move_sets.iter()).enumerate()
+        {
+            if arm_diverges[idx] {
+                continue;
+            }
             self.emit_merge_compensation(
                 root,
                 &union,
@@ -5142,7 +5377,8 @@ impl CodeDb {
         // then = this arm's body
         ctx.moved = moved_before.clone();
         let mut then_expr = self.lower_expr_as(root, body_hash, result_type, param_types, ctx, locals)?;
-        if then_expr.type_hash != result_type {
+        let then_div = lowered_ops_diverge(&then_expr.operations);
+        if !then_div && then_expr.type_hash != result_type {
             bail!("scalar case arm result type mismatch while lowering");
         }
         let then_moved = outer_branch_moves(&ctx.moved, moved_before, locals_boundary);
@@ -5162,13 +5398,18 @@ impl CodeDb {
             index + 1,
         )?;
         let else_moved = outer_branch_moves(&ctx.moved, moved_before, locals_boundary);
-        let union = normalize_moved_set(then_moved.union(&else_moved).cloned().collect());
-        self.emit_merge_compensation(root, &union, &then_moved, param_types, expr_hash, ctx, &mut then_expr.operations)?;
-        self.emit_merge_compensation(root, &union, &else_moved, param_types, expr_hash, ctx, &mut else_expr.operations)?;
-        ctx.moved = moved_before.clone();
-        for place in union {
-            ctx.mark_moved_place(place);
-        }
+        // Early exit (R7): merge only non-divergent branches (see `lower_if`).
+        self.merge_two_branch_moves(
+            root,
+            &mut then_expr,
+            &mut else_expr,
+            then_moved,
+            else_moved,
+            moved_before,
+            param_types,
+            expr_hash,
+            ctx,
+        )?;
         let id = ctx.value();
         ctx.push_debug_op(expr_hash, "if", &id);
         operations.push(LoweredOp::If {
@@ -5238,23 +5479,30 @@ impl CodeDb {
         let locals_boundary = ctx.next_local;
         ctx.moved = moved_before.clone();
         let mut then_expr = self.lower_expr_as(root, &then_body, result_type, param_types, ctx, locals)?;
-        if then_expr.type_hash != result_type {
+        let then_div = lowered_ops_diverge(&then_expr.operations);
+        if !then_div && then_expr.type_hash != result_type {
             bail!("scalar case arm result type mismatch while lowering");
         }
         let then_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
         ctx.moved = moved_before.clone();
         let mut else_expr = self.lower_expr_as(root, &else_body, result_type, param_types, ctx, locals)?;
-        if else_expr.type_hash != result_type {
+        let else_div = lowered_ops_diverge(&else_expr.operations);
+        if !else_div && else_expr.type_hash != result_type {
             bail!("scalar case arm result type mismatch while lowering");
         }
         let else_moved = outer_branch_moves(&ctx.moved, &moved_before, locals_boundary);
-        let union = normalize_moved_set(then_moved.union(&else_moved).cloned().collect());
-        self.emit_merge_compensation(root, &union, &then_moved, param_types, expr_hash, ctx, &mut then_expr.operations)?;
-        self.emit_merge_compensation(root, &union, &else_moved, param_types, expr_hash, ctx, &mut else_expr.operations)?;
-        ctx.moved = moved_before;
-        for place in union {
-            ctx.mark_moved_place(place);
-        }
+        // Early exit (R7): merge only non-divergent branches (see `lower_if`).
+        self.merge_two_branch_moves(
+            root,
+            &mut then_expr,
+            &mut else_expr,
+            then_moved,
+            else_moved,
+            &moved_before,
+            param_types,
+            expr_hash,
+            ctx,
+        )?;
         let id = ctx.value();
         ctx.push_debug_op(expr_hash, "if", &id);
         operations.push(LoweredOp::If {
@@ -6317,6 +6565,7 @@ impl CodeDb {
             body_ops,
             target_triple,
             param_types,
+            return_type,
             &ir.locals,
             &mut values,
             &mut addresses,
@@ -6346,6 +6595,7 @@ impl CodeDb {
         operations: &[LoweredOp],
         target_triple: &str,
         param_types: &[String],
+        return_type: &str,
         local_slots: &[LoweredLocalSlot],
         values: &mut BTreeMap<String, String>,
         addresses: &mut BTreeMap<String, String>,
@@ -6548,11 +6798,20 @@ impl CodeDb {
                     // is dead after the `if`. Address/value maps are branch-local.
                     let moved_before = drop_state.moved.clone();
                     let dropped_before = drop_state.dropped.clone();
+                    // Early exit (R7): a branch that always `return`s exits through
+                    // its own `EarlyReturn` (which already dropped its live values)
+                    // and never reaches the merge — so it yields the return type
+                    // (exempt from the result-type check) and is excluded from the
+                    // consumed-merge; only the non-divergent branch(es) flow into the
+                    // continuation.
+                    let then_div = lowered_block_diverges(then_block);
+                    let else_div = lowered_block_diverges(else_block);
                     let then_type = self.verify_lowered_block(
                         root,
                         then_block,
                         target_triple,
                         param_types,
+                        return_type,
                         local_slots,
                         values,
                         addresses,
@@ -6567,6 +6826,7 @@ impl CodeDb {
                         else_block,
                         target_triple,
                         param_types,
+                        return_type,
                         local_slots,
                         values,
                         addresses,
@@ -6574,12 +6834,22 @@ impl CodeDb {
                     )?;
                     let else_consumed =
                         newly_consumed_places(drop_state, &moved_before, &dropped_before);
-                    if then_type != else_type || then_type != *type_hash {
+                    if !then_div && then_type != *type_hash {
+                        bail!("lowered if branch type mismatch");
+                    }
+                    if !else_div && else_type != *type_hash {
                         bail!("lowered if branch type mismatch");
                     }
                     drop_state.moved = moved_before;
                     drop_state.dropped = dropped_before;
-                    merge_consumed_into_moved(drop_state, &[then_consumed, else_consumed]);
+                    let mut consumed = Vec::new();
+                    if !then_div {
+                        consumed.push(then_consumed);
+                    }
+                    if !else_div {
+                        consumed.push(else_consumed);
+                    }
+                    merge_consumed_into_moved(drop_state, &consumed);
                     insert_value(values, id, type_hash)?;
                 }
                 LoweredOp::Case {
@@ -6641,16 +6911,26 @@ impl CodeDb {
                             &arm.block,
                             target_triple,
                             param_types,
+                            return_type,
                             local_slots,
                             values,
                             addresses,
                             drop_state,
                         )?;
-                        if arm_type != *type_hash {
+                        // Early exit (R7): a divergent arm yields the return type and
+                        // exits, so it is exempt from the result-type check and from
+                        // the consumed-merge (it never reaches the continuation).
+                        let arm_div = lowered_block_diverges(&arm.block);
+                        if !arm_div && arm_type != *type_hash {
                             bail!("lowered case arm result type mismatch");
                         }
-                        arm_consumed
-                            .push(newly_consumed_places(drop_state, &moved_before, &dropped_before));
+                        if !arm_div {
+                            arm_consumed.push(newly_consumed_places(
+                                drop_state,
+                                &moved_before,
+                                &dropped_before,
+                            ));
+                        }
                     }
                     let expected = variants
                         .iter()
@@ -6724,6 +7004,7 @@ impl CodeDb {
                         body,
                         target_triple,
                         param_types,
+                        return_type,
                         local_slots,
                         values,
                         addresses,
@@ -7615,6 +7896,23 @@ impl CodeDb {
                 LoweredOp::Return { .. } => {
                     bail!("lowered return is only valid as the final function operation");
                 }
+                LoweredOp::EarlyReturn { value, type_hash } => {
+                    // Early exit (R7): the value placed in the return position must
+                    // be a known value of the function's return type. This is the
+                    // verifier-side operand-type gate; the early-exit drops were
+                    // checked as ordinary `Drop`/`FreeBoxShell` ops preceding it.
+                    // `EarlyReturn` terminates its (divergent) block, so nothing
+                    // follows it there.
+                    if type_hash != return_type {
+                        bail!("lowered early return type does not match function return type");
+                    }
+                    let actual = values.get(value).ok_or_else(|| {
+                        anyhow!("lowered early return references unknown value {value}")
+                    })?;
+                    if !self.type_assignable_in_root(root, actual, type_hash)? {
+                        bail!("lowered early return value type mismatch");
+                    }
+                }
             }
         }
         Ok(())
@@ -7627,6 +7925,7 @@ impl CodeDb {
         block: &LoweredBlock,
         target_triple: &str,
         param_types: &[String],
+        return_type: &str,
         local_slots: &[LoweredLocalSlot],
         parent_values: &BTreeMap<String, String>,
         parent_addresses: &BTreeMap<String, String>,
@@ -7643,6 +7942,7 @@ impl CodeDb {
             &block.operations,
             target_triple,
             param_types,
+            return_type,
             local_slots,
             &mut values,
             &mut addresses,
@@ -7816,7 +8116,9 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::Drop { .. }
         | LoweredOp::FreeBoxShell { .. }
         | LoweredOp::BorrowDebug { .. }
-        | LoweredOp::Return { .. } => None,
+        | LoweredOp::Return { .. }
+        // `EarlyReturn` places an existing value (R7); it defines no new value id.
+        | LoweredOp::EarlyReturn { .. } => None,
     }
 }
 
@@ -7833,6 +8135,7 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::If { .. } => "if",
         LoweredOp::Case { .. } => "case",
         LoweredOp::Fold { .. } => "fold",
+        LoweredOp::EarlyReturn { .. } => "early_return",
         LoweredOp::BorrowShared { .. } => "borrow_shared",
         LoweredOp::BorrowMut { .. } => "borrow_mut",
         LoweredOp::DerefShared { .. } => "deref_shared",
@@ -7975,7 +8278,8 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::Move { type_hash, .. }
             | LoweredOp::Drop { type_hash, .. }
             | LoweredOp::BorrowDebug { type_hash, .. }
-            | LoweredOp::Return { type_hash, .. } => {
+            | LoweredOp::Return { type_hash, .. }
+            | LoweredOp::EarlyReturn { type_hash, .. } => {
                 out.insert(type_hash.clone());
             }
             LoweredOp::HeapAlloc {

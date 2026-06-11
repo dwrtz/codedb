@@ -717,7 +717,8 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::Drop { .. }
             | LoweredOp::FreeBoxShell { .. }
             | LoweredOp::BorrowDebug { .. }
-            | LoweredOp::Return { .. } => {}
+            | LoweredOp::Return { .. }
+            | LoweredOp::EarlyReturn { .. } => {}
         }
     }
 }
@@ -797,7 +798,8 @@ fn validate_native_ops(
             | LoweredOp::Fold { type_hash, .. }
             | LoweredOp::HeapAlloc { type_hash, .. }
             | LoweredOp::PtrCast { type_hash, .. }
-            | LoweredOp::Return { type_hash, .. } => {
+            | LoweredOp::Return { type_hash, .. }
+            | LoweredOp::EarlyReturn { type_hash, .. } => {
                 native_supported_type(type_layouts, type_hash, i64_type, bool_type, unit_type)?;
             }
             LoweredOp::BorrowShared { .. }
@@ -1783,7 +1785,8 @@ fn validate_native_op_flow(
                 bail!("native object backend saw free_box_shell type mismatch");
             }
         }
-        LoweredOp::Return { value, type_hash } => {
+        LoweredOp::Return { value, type_hash }
+        | LoweredOp::EarlyReturn { value, type_hash } => {
             let actual = native_value_type(values, value)?;
             if actual != type_hash && !native_layout_compatible(type_layouts, actual, type_hash)? {
                 bail!("native object backend saw return type mismatch");
@@ -2448,7 +2451,9 @@ fn collect_value_ids_inner(
             | LoweredOp::Drop { .. }
             | LoweredOp::FreeBoxShell { .. }
             | LoweredOp::BorrowDebug { .. }
-            | LoweredOp::Return { .. } => {}
+            | LoweredOp::Return { .. }
+            // `EarlyReturn` (R7) places an existing value; it defines no new id.
+            | LoweredOp::EarlyReturn { .. } => {}
         }
     }
     Ok(())
@@ -3046,6 +3051,20 @@ impl FunctionEmitter {
             LoweredOp::BorrowDebug { .. } => {}
             LoweredOp::Return { .. } => {
                 bail!("return is only valid as the final lowered operation");
+            }
+            LoweredOp::EarlyReturn { value, type_hash } => {
+                // Early exit (R7): place the value in the return position exactly as
+                // the terminal return does, then emit the self-contained epilogue
+                // (leave; ret) inline — no jump/label needed, multiple `ret`s per
+                // function are fine. Drops for every value live here were already
+                // emitted as ordinary ops before this one.
+                if self.type_returns_indirect(type_hash)? {
+                    self.emit_aggregate_return(value, type_hash)?;
+                } else if type_hash != &type_hash_for("Unit") {
+                    let offset = self.value_offset(value)?;
+                    self.mov_rax_stack(offset);
+                }
+                self.emit_epilogue();
             }
         }
         if let Some(value_id) = debug_value_id {
@@ -4947,6 +4966,20 @@ impl Arm64Emitter {
             LoweredOp::BorrowDebug { .. } => {}
             LoweredOp::Return { .. } => {
                 bail!("return is only valid as the final lowered operation");
+            }
+            LoweredOp::EarlyReturn { value, type_hash } => {
+                // Early exit (R7): place the value in the return position exactly as
+                // the terminal return does, then emit the self-contained epilogue
+                // (restore sp; ldp; ret) inline — no jump/label needed, multiple
+                // `ret`s per function are fine. Drops for every value live here were
+                // already emitted as ordinary ops before this one.
+                if self.type_returns_indirect(type_hash)? {
+                    self.emit_aggregate_return(value, type_hash)?;
+                } else if type_hash != &type_hash_for("Unit") {
+                    let offset = self.value_offset(value)?;
+                    self.ldr_stack(0, offset)?;
+                }
+                self.emit_epilogue()?;
             }
         }
         if let Some(value_id) = debug_value_id {

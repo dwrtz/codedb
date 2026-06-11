@@ -520,12 +520,54 @@ sha256.cdb hashes a byte slice and matches a reference digest; fnv1a.cdb drops
 
 Goal: stop a function or loop early, for malformed-input and first-match paths.
 
-Status: planned. Resolves R7. Depends on Phase 4 (drop across the early-exit edge).
+Status: implemented (early `return`). Resolves R7. Settles the SPEC_V3 §14 open
+question — `return` lands first, as the early-exit primitive both `?`-propagation
+and scoped break/continue desugar toward (break/continue follow with loops in Phase
+11; `Result` + `?` await generics, Phase 14). In this expression-oriented language
+(no statements/loops yet) the load-bearing case is a `return` in a NON-tail position
+— an `if` branch or `case` arm whose value flows into a `let` continuation — which
+abandons that continuation. That is the genuine early exit a plain `if` cannot
+express without hoisting the continuation, and it exercises the real early-exit edge
+SPEC_V3 §7 requires verified.
 
-Deliverables:
+`return <value>` is a new `RawExpr`/typed node (`{expr_kind: "return", value,
+type}`) typed as its operand's type, so it slots into the existing `if`/`case`
+join, which is now divergence-aware: a branch that always `return`s ("diverges")
+fixes no result type and the non-divergent branch does (computed structurally by
+`raw_expr_diverges` / `typed_expr_diverges`, never a `never`/bottom type). A
+`return` is well-formed only in a "block-result" position (function body, `if`/`case`
+branch, `let` body); a `return` in a value/operand/condition/scrutinee/`let`-value/
+`fold`-body position fails closed before typing (`validate_return_positions`). The
+borrow/move checker excludes a divergent branch from the merge (its moves never
+reach the continuation), and the escape check treats the `return` operand as an
+escaping return value.
+
+Lowering adds a `LoweredOp::EarlyReturn` (a mid-stream control-flow terminator,
+distinct from the single terminal `Return`): at the `return`, every owned value
+still live is dropped — in-scope locals innermost-first, then params, each
+respecting what the operand consumed — exactly the drops the `let`-scope-exit and
+function-end param scaffolds place on the fall-through path, emitted here on the
+early-exit edge instead (SPEC_V3 §7). `lower_if`/`lower_case` (and the desugared
+scalar-`case` chains) merge only non-divergent branches; a fully-divergent body
+skips the (now unreachable) param scaffolds + terminal return. Divergence is
+detected structurally from the ops (`lowered_ops_diverge`), so no IR field is added
+and existing lowered-IR hashes are byte-stable. The backend emits `EarlyReturn` as
+the terminal return's value placement + the self-contained epilogue inline (no jump
+or label — multiple `ret`s per function are fine; the post-branch merge tail is
+unreachable dead code). The lowered-IR verifier proves at-most-once across the edge
+(divergence-aware `if`/`case`, `EarlyReturn` validated as a return of the function's
+return type). The evaluator and tracer unwind an early `return` via a thread-local +
+sentinel error caught at the function-call boundary (`eval_symbol`/`trace_symbol`),
+so the reference evaluator stays a faithful oracle with no per-call-site signature
+churn. Round-trips, native (x86_64 + arm64), `verify`, `trace`, and replay/export/
+import all support it. `examples/v3/tokenizer.cdb`, `tests/early_exit_native.rs`, and
+a `tests/leak_interposer.rs` early-exit case are the acceptance gates.
+
+Deliverables (delivered):
 
 ```text
-a Result type with `?` propagation, and/or scoped break/continue for loops
+early `return <value>`: the early-exit primitive (Result + `?` is its sugar, deferred
+  to generics; break/continue is its loop form, deferred to Phase 11)
 defined interaction with drop ordering and effects on the early-exit edge
 ```
 
@@ -536,12 +578,23 @@ src/expr.rs, src/types.rs, src/lowering.rs, src/verify.rs, src/backend/native.rs
 examples/v3/tokenizer.cdb, tests/early_exit_native.rs
 ```
 
-Acceptance fixture and oracle:
+Acceptance fixture and oracle (met):
 
 ```text
 tokenizer.cdb rejects malformed input and exits its loop early; verify proves
   drop/borrow correctness across the early-exit edge; oracle agrees
 ```
+
+`examples/v3/tokenizer.cdb` is a recursive decimal tokenizer that early-returns -1
+on a non-digit byte, abandoning the rest of the scan (the recursion stands in for
+the loop, which is Phase 11): `tokenize "123" = 123`, `tokenize "1x3" = -1`. It
+compiles native and matches the evaluator (`tests/early_exit_native.rs`).
+`tests/early_exit_native.rs` additionally pins early `return` in `if` branches and
+`case` arms, the non-tail continuation skip, the box-drop-across-the-edge case
+(double-free-on-run verified, the drop pinned in the lowered IR), the fail-closed
+position rejection, projection round-trip, and trace parity;
+`tests/leak_interposer.rs::early_return_drops_live_box_on_the_exit_edge_at_runtime`
+confirms the no-leak half at runtime scale.
 
 ## Phase 11 — Unbounded Loops (R8)
 
