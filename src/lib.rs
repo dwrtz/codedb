@@ -1326,6 +1326,9 @@ fn collect_call_names(expr: &RawExpr, out: &mut Vec<String>) {
                 collect_call_names(element, out);
             }
         }
+        RawExpr::ArrayFill { value, .. } => {
+            collect_call_names(value, out);
+        }
         RawExpr::Index { target, index } => {
             collect_call_names(target, out);
             collect_call_names(index, out);

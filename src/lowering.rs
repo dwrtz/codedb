@@ -1400,7 +1400,10 @@ impl CodeDb {
                         ctx,
                         locals,
                     )?);
-                } else if value_kind.as_deref() == Some("array_literal") {
+                } else if matches!(
+                    value_kind.as_deref(),
+                    Some("array_literal") | Some("array_fill")
+                ) {
                     operations.extend(self.lower_array_init_to_address(
                         root,
                         value_hash,
@@ -1714,7 +1717,7 @@ impl CodeDb {
                 ctx,
                 locals,
             ),
-            "array_literal" => self.lower_array_literal_into_slot(
+            "array_literal" | "array_fill" => self.lower_array_literal_into_slot(
                 root,
                 expr_hash,
                 &type_hash,
@@ -4343,10 +4346,59 @@ impl CodeDb {
         locals: &mut Vec<LocalLoweredBinding>,
     ) -> Result<Vec<LoweredOp>> {
         let payload = self.get_payload(expr_hash)?;
-        if payload.get("expr_kind").and_then(JsonValue::as_str) != Some("array_literal") {
-            bail!("array initializer must be array_literal");
-        }
         let array_info = self.lowered_array_info(root, ctx.target_triple(), target_type)?;
+        let kind = payload.get("expr_kind").and_then(JsonValue::as_str);
+        // `[value; count]` (R9): lower `value` ONCE, then store the (Copy) result into
+        // every slot. The single lowered value is reused by all stores — the type
+        // rule guarantees a non-reference Copy value, so replicating it is sound.
+        if kind == Some("array_fill") {
+            let value_hash = payload
+                .get("value")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("array_fill missing value"))?;
+            let value = self.lower_expr_as(
+                root,
+                value_hash,
+                &array_info.element_type_hash,
+                param_types,
+                ctx,
+                locals,
+            )?;
+            if !self.type_assignable_in_root(root, &value.type_hash, &array_info.element_type_hash)?
+            {
+                bail!("array fill value type mismatch while lowering");
+            }
+            let mut operations = value.operations;
+            for idx in 0..array_info.len {
+                let index_id = ctx.value();
+                ctx.push_debug_op(expr_hash, "const_i64", &index_id);
+                operations.push(LoweredOp::ConstI64 {
+                    id: index_id.clone(),
+                    value: idx.to_string(),
+                    type_hash: type_hash_for("I64"),
+                });
+                let element_address = ctx.value();
+                ctx.push_debug_op(expr_hash, "addr_of_index", &element_address);
+                operations.push(LoweredOp::AddrOfIndex {
+                    id: element_address.clone(),
+                    place: LoweredPlace::Index {
+                        base: target_address.to_string(),
+                        index: index_id,
+                        element_type_hash: array_info.element_type_hash.clone(),
+                        type_hash: array_info.element_type_hash.clone(),
+                    },
+                });
+                operations.push(LoweredOp::Store {
+                    address: element_address,
+                    value: value.value.clone(),
+                    type_hash: array_info.element_type_hash.clone(),
+                });
+            }
+            return Ok(operations);
+        }
+        if kind != Some("array_literal") {
+            bail!("array initializer must be array_literal or array_fill");
+        }
         let elements = payload
             .get("elements")
             .and_then(JsonValue::as_array)
@@ -5910,11 +5962,12 @@ impl CodeDb {
                 locals,
             );
         }
-        let is_array_literal = self
-            .get_payload(expr_hash)?
-            .get("expr_kind")
-            .and_then(JsonValue::as_str)
-            == Some("array_literal");
+        let is_array_literal = matches!(
+            self.get_payload(expr_hash)?
+                .get("expr_kind")
+                .and_then(JsonValue::as_str),
+            Some("array_literal") | Some("array_fill")
+        );
         if is_array_literal && self.type_is_fixed_array(root, expected_type)? {
             return self.lower_array_literal_into_slot(
                 root,

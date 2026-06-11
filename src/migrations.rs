@@ -1085,6 +1085,10 @@ fn append_default_arg_to_calls(expr: &RawExpr, target_name: &str, default: &RawE
                 .map(|element| append_default_arg_to_calls(element, target_name, default))
                 .collect(),
         },
+        RawExpr::ArrayFill { value, count } => RawExpr::ArrayFill {
+            value: Box::new(append_default_arg_to_calls(value, target_name, default)),
+            count: count.clone(),
+        },
         RawExpr::Index { target, index } => RawExpr::Index {
             target: Box::new(append_default_arg_to_calls(target, target_name, default)),
             index: Box::new(append_default_arg_to_calls(index, target_name, default)),
@@ -7650,6 +7654,16 @@ fn borrow_call_arg_to_calls(
                 })
                 .collect::<Result<Vec<_>>>()?,
         },
+        RawExpr::ArrayFill { value, count } => RawExpr::ArrayFill {
+            value: Box::new(borrow_call_arg_to_calls(
+                value,
+                target_name,
+                param_index,
+                region,
+                mutable,
+            )?),
+            count: count.clone(),
+        },
         RawExpr::Index { target, index } => RawExpr::Index {
             target: Box::new(borrow_call_arg_to_calls(
                 target,
@@ -7927,6 +7941,14 @@ fn normalize_param_refs_scoped(
                 .iter()
                 .map(|element| normalize_param_refs_scoped(element, local_params, local_bindings))
                 .collect(),
+        },
+        RawExpr::ArrayFill { value, count } => RawExpr::ArrayFill {
+            value: Box::new(normalize_param_refs_scoped(
+                value,
+                local_params,
+                local_bindings,
+            )),
+            count: count.clone(),
         },
         RawExpr::Index { target, index } => RawExpr::Index {
             target: Box::new(normalize_param_refs_scoped(

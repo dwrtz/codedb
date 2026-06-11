@@ -115,6 +115,15 @@ pub enum RawExpr {
     Array {
         elements: Vec<RawExpr>,
     },
+    /// `[<value>; <count>]` — array repeat/fill initializer (R9). `value` is
+    /// evaluated ONCE and replicated into all `count` slots, yielding an
+    /// `array<T, count>`. `value`'s type must be Copy (it is replicated). `count`
+    /// is a non-negative integer literal (the array size is a compile-time
+    /// constant), stored as its decimal digits.
+    ArrayFill {
+        value: Box<RawExpr>,
+        count: String,
+    },
     Index {
         target: Box<RawExpr>,
         index: Box<RawExpr>,
@@ -253,6 +262,7 @@ pub(crate) fn validate_return_positions(expr: &RawExpr, allowed: bool) -> Result
             }
             Ok(())
         }
+        RawExpr::ArrayFill { value, .. } => validate_return_positions(value, false),
         RawExpr::Index { target, index } => {
             validate_return_positions(target, false)?;
             validate_return_positions(index, false)
@@ -1793,6 +1803,24 @@ impl CodeDb {
                     values.push(value_cell(
                         self.eval_expr_with_locals(root_hash, value_hash, args, locals)?,
                     ));
+                }
+                Ok(Value::Array(values))
+            }
+            "array_fill" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_fill missing value"))?;
+                let count = payload
+                    .get("count")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("array_fill missing count"))?;
+                // Evaluate the value ONCE, then replicate (the type rule guarantees a
+                // Copy value, so the clones are independent).
+                let value = self.eval_expr_with_locals(root_hash, value_hash, args, locals)?;
+                let mut values = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    values.push(value_cell(semantic_clone_value(&value)));
                 }
                 Ok(Value::Array(values))
             }
@@ -3560,6 +3588,26 @@ impl CodeDb {
                     .collect::<Result<Vec<_>>>()?;
                 format!("[{}]", elements.join(", "))
             }
+            "array_fill" => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_fill missing value"))?;
+                let count = payload
+                    .get("count")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("array_fill missing count"))?;
+                let value = self.expr_to_source_with_locals(
+                    value,
+                    root,
+                    current_module,
+                    local_params,
+                    region_names,
+                    local_names,
+                    0,
+                )?;
+                format!("[{value}; {count}]")
+            }
             "array_index" => {
                 let target = payload
                     .get("target")
@@ -4756,6 +4804,23 @@ impl CodeDb {
                     })
                     .collect::<Result<Vec<_>>>()?,
             }),
+            "array_fill" => Ok(RawExpr::ArrayFill {
+                value: Box::new(self.typed_expr_to_raw_with_locals(
+                    payload
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array_fill missing value"))?,
+                    root,
+                    current_module,
+                    region_names,
+                    local_names,
+                )?),
+                count: payload
+                    .get("count")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("array_fill missing count"))?
+                    .to_string(),
+            }),
             "array_index" => Ok(RawExpr::Index {
                 target: Box::new(
                     self.typed_expr_to_raw_with_locals(
@@ -5425,6 +5490,13 @@ impl CodeDb {
                         .ok_or_else(|| anyhow!("array element missing value"))?;
                     self.collect_expr_deps(root, child, deps)?;
                 }
+            }
+            "array_fill" => {
+                let child = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_fill missing value"))?;
+                self.collect_expr_deps(root, child, deps)?;
             }
             "array_index" => {
                 for key in ["target", "index"] {
@@ -6346,10 +6418,27 @@ impl Parser {
                 Ok(RawExpr::Record { fields })
             }
             Token::Symbol(symbol) if symbol == "[" => {
-                let mut elements = Vec::new();
                 if self.consume_symbol("]") {
                     bail!("array literal must have at least one element");
                 }
+                let first = self.parse_expr()?;
+                // `[value; count]` repeat/fill form (R9): a `;` after the first
+                // element switches to the fill grammar; `count` is an integer literal.
+                if self.consume_symbol(";") {
+                    let RawExpr::LiteralI64 { value: count } = self.parse_expr()? else {
+                        bail!("array fill count must be an integer literal");
+                    };
+                    self.expect_symbol("]")?;
+                    return Ok(RawExpr::ArrayFill {
+                        value: Box::new(first),
+                        count,
+                    });
+                }
+                let mut elements = vec![first];
+                if self.consume_symbol("]") {
+                    return Ok(RawExpr::Array { elements });
+                }
+                self.expect_symbol(",")?;
                 loop {
                     elements.push(self.parse_expr()?);
                     if self.consume_symbol("]") {
@@ -6781,7 +6870,7 @@ pub(crate) fn value_cell(value: Value) -> ValueCell {
     Rc::new(RefCell::new(value))
 }
 
-fn semantic_clone_value(value: &Value) -> Value {
+pub(crate) fn semantic_clone_value(value: &Value) -> Value {
     match value {
         Value::I8(value) => Value::I8(*value),
         Value::I16(value) => Value::I16(*value),

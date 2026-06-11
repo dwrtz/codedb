@@ -4,7 +4,8 @@ use serde_json::Value as JsonValue;
 
 use crate::expr::{
     Value, ValueCell, array_cell, cast_int_value, eval_binary, eval_unary, field_cell,
-    slice_cells_from_array_cell, slice_len_from_value, subslice_value, value_cell,
+    semantic_clone_value, slice_cells_from_array_cell, slice_len_from_value, subslice_value,
+    value_cell,
 };
 use crate::model::ProgramRootPayload;
 use crate::store::{CodeDb, canonical_json};
@@ -1722,6 +1723,33 @@ impl CodeDb {
                         args,
                         locals,
                     )?));
+                }
+                let value = Value::Array(values);
+                state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
+                Ok(value)
+            }
+            "array_fill" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_fill missing value"))?;
+                let count = payload
+                    .get("count")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("array_fill missing count"))?;
+                // Evaluate the fill value once, then replicate the Copy result.
+                let filled = self.trace_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    value_hash,
+                    args,
+                    locals,
+                )?;
+                let mut values = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    values.push(value_cell(semantic_clone_value(&filled)));
                 }
                 let value = Value::Array(values);
                 state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);

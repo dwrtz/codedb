@@ -2630,6 +2630,9 @@ fn expression_child_hashes(expr_kind: &str, payload: &JsonValue) -> Result<Vec<S
                 );
             }
         }
+        "array_fill" => {
+            push_child_keys(payload, expr_kind, &["value"], &mut children)?;
+        }
         "array_index" | "vec_get" => {
             push_child_keys(payload, expr_kind, &["target", "index"], &mut children)?;
         }
@@ -3350,6 +3353,10 @@ fn substitute_param_refs(expr: &RawExpr, args: &[RawExpr]) -> Result<RawExpr> {
                 .map(|element| substitute_param_refs(element, args))
                 .collect::<Result<Vec<_>>>()?,
         },
+        RawExpr::ArrayFill { value, count } => RawExpr::ArrayFill {
+            value: Box::new(substitute_param_refs(value, args)?),
+            count: count.clone(),
+        },
         RawExpr::Index { target, index } => RawExpr::Index {
             target: Box::new(substitute_param_refs(target, args)?),
             index: Box::new(substitute_param_refs(index, args)?),
@@ -3488,6 +3495,9 @@ fn collect_free_param_names(
             for element in elements {
                 collect_free_param_names(element, bound_locals, names);
             }
+        }
+        RawExpr::ArrayFill { value, .. } => {
+            collect_free_param_names(value, bound_locals, names);
         }
         RawExpr::Index { target, index } => {
             collect_free_param_names(target, bound_locals, names);
@@ -3716,6 +3726,14 @@ fn alpha_rename_let_bindings_with_scope(
                     alpha_rename_let_bindings_with_scope(element, used_names, renamed_locals)
                 })
                 .collect(),
+        },
+        RawExpr::ArrayFill { value, count } => RawExpr::ArrayFill {
+            value: Box::new(alpha_rename_let_bindings_with_scope(
+                value,
+                used_names,
+                renamed_locals,
+            )),
+            count: count.clone(),
         },
         RawExpr::Index { target, index } => RawExpr::Index {
             target: Box::new(alpha_rename_let_bindings_with_scope(

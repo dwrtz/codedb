@@ -4230,6 +4230,76 @@ impl CodeDb {
                     type_hash,
                 })
             }
+            RawExpr::ArrayFill { value, count } => {
+                // `[value; count]` (R9): `value` is evaluated once and replicated into
+                // `count` slots, so its type must be Copy (replicating a move-only
+                // value would mint `count` owners of one resource). `count` is a
+                // non-negative integer literal; the result is `array<T, count>`.
+                let count: u64 = count
+                    .parse()
+                    .map_err(|_| anyhow!("array fill count must be a non-negative integer"))?;
+                if count == 0 {
+                    bail!("array fill count must be at least 1");
+                }
+                let expected_element = expected_type
+                    .and_then(|hash| self.type_spec_in_root(root, hash).ok())
+                    .and_then(|spec| match spec {
+                        TypeSpec::FixedArray { element, .. } => Some(element),
+                        _ => None,
+                    });
+                let value = self.type_expr_with_locals_expecting(
+                    current_module,
+                    value,
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                    expected_element.as_deref(),
+                )?;
+                let element_type = value.type_hash.clone();
+                // The value is replicated into `count` slots, so it must be Copy with
+                // trivial drop and hold no reference (replicating a reference would
+                // duplicate a loan into every slot; a move-only value would mint
+                // `count` owners). This mirrors the dynamic-buffer element discipline
+                // and keeps the array-fill borrow/move analyses trivial.
+                let class = self.value_class_in_root(root, &element_type)?;
+                if class.copy_kind != ValueCopyKind::Copy
+                    || class.drop_kind != ValueDropKind::Trivial
+                    || class.contains_reference
+                {
+                    bail!(
+                        "array fill value must be a non-reference Copy value with trivial drop \
+                         (it is replicated {count} times), got {}",
+                        self.type_name(&element_type)?
+                    );
+                }
+                let type_hash = self.put_structural_type(TypeSpec::FixedArray {
+                    element: element_type.clone(),
+                    len: count,
+                })?;
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "array_fill",
+                        "value": value.expr_hash,
+                        "element_type": element_type.clone(),
+                        "count": count,
+                        "type": type_hash.clone(),
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
             RawExpr::Index { target, index } => {
                 let target = self.type_expr_with_locals(
                     current_module,
@@ -6574,6 +6644,13 @@ impl CodeDb {
                 }
                 Ok(false)
             }
+            "array_fill" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_fill missing value"))?;
+                self.expr_escapes_local_borrow(root, value_hash, locals_with_local_borrows)
+            }
             "field_access" => {
                 let declared_type = payload
                     .get("type")
@@ -7807,6 +7884,16 @@ impl CodeDb {
                 self.add_checked_value_loans(&mut active, &value_loans)?;
                 Ok(())
             }
+            "array_fill" => {
+                // `[value; count]`: `value` is evaluated once (a non-reference Copy
+                // value, by the type rule), so its borrow behaviour IS the whole
+                // expression's — no per-slot loan or move bookkeeping is needed.
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_fill missing value"))?;
+                self.verify_expr_borrows(root, value_hash, param_types, state, ExprUse::Value)
+            }
             "field_access" => {
                 let target = payload
                     .get("target")
@@ -8153,6 +8240,13 @@ impl CodeDb {
                     out.extend(self.collect_value_loans(root, value, param_types, state)?);
                 }
             }
+            "array_fill" => {
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_fill missing value"))?;
+                out.extend(self.collect_value_loans(root, value, param_types, state)?);
+            }
             "let" => {
                 let value_hash = payload
                     .get("value")
@@ -8353,6 +8447,15 @@ impl CodeDb {
                     )?);
                 }
                 Ok(out)
+            }
+            "array_fill" => {
+                // A non-reference Copy value carries no loan to replicate into the
+                // slots; recursing reports the value's own (empty) store loans.
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_fill missing value"))?;
+                self.collect_value_loans_for_store(root, value, param_types, state, target_owner)
             }
             "if" => {
                 let then_hash = payload
@@ -8795,6 +8898,15 @@ impl CodeDb {
                 }
                 Ok(sources)
             }
+            Some("array_fill") => {
+                // The fill copies a Copy value into every slot; the only moves are
+                // whatever evaluating `value` once moves.
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_fill missing value"))?;
+                self.move_source_places_for_expr(root, value, param_types, locals)
+            }
             Some("enum_construct") => {
                 let value = payload
                     .get("value")
@@ -9220,6 +9332,7 @@ impl CodeDb {
                     }
                     required
                 }
+                "array_fill" => self.expr_child_requires_state(&payload, "value")?,
                 "array_index" => {
                     self.expr_child_requires_state(&payload, "target")?
                         || self.expr_child_requires_state(&payload, "index")?
@@ -9378,6 +9491,7 @@ impl CodeDb {
                     }
                     required
                 }
+                "array_fill" => self.expr_child_requires_alloc(&payload, "value")?,
                 "array_index" => {
                     self.expr_child_requires_alloc(&payload, "target")?
                         || self.expr_child_requires_alloc(&payload, "index")?
@@ -9533,6 +9647,7 @@ impl CodeDb {
                     }
                     required
                 }
+                "array_fill" => self.expr_child_requires_unsafe(&payload, "value")?,
                 "array_index" => {
                     self.expr_child_requires_unsafe(&payload, "target")?
                         || self.expr_child_requires_unsafe(&payload, "index")?
@@ -11145,6 +11260,45 @@ impl CodeDb {
                 hash_for_type_spec(&TypeSpec::FixedArray {
                     element: element_type,
                     len,
+                })?
+            }
+            "array_fill" => {
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_fill missing value"))?;
+                let element_type = payload
+                    .get("element_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_fill missing element_type"))?
+                    .to_string();
+                let count = payload
+                    .get("count")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| anyhow!("array_fill missing count"))?;
+                if count == 0 {
+                    bail!("array fill count must be at least 1");
+                }
+                let value_type = self.verify_expr_type_with_locals(
+                    value_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if value_type != element_type {
+                    bail!("array_fill element_type mismatch");
+                }
+                let class = self.value_class_in_root(root, &element_type)?;
+                if class.copy_kind != ValueCopyKind::Copy
+                    || class.drop_kind != ValueDropKind::Trivial
+                    || class.contains_reference
+                {
+                    bail!("array fill value must be a non-reference Copy value with trivial drop");
+                }
+                hash_for_type_spec(&TypeSpec::FixedArray {
+                    element: element_type,
+                    len: count,
                 })?
             }
             "array_index" => {

@@ -743,27 +743,56 @@ no-leak half of exactly-once at runtime scale (every `string_with_capacity` and 
 
 Goal: `[value; N]` so large fixed buffers are expressible as values.
 
-Status: planned. Resolves R9.
+Status: implemented. Resolves R9. `[value; count]` is a new `RawExpr::ArrayFill` /
+typed `array_fill` node — NOT a parse-time desugar to `count` copies, because the
+`.cdb` projection (a checked view) must round-trip the `[value; count]` form and the
+value must be evaluated exactly ONCE. `value` is evaluated once and replicated into
+all `count` slots of an `array<T, count>`; `count` is a non-negative integer literal
+(the array size is a compile-time constant). The value must be a non-reference Copy
+type with trivial drop (replicating a reference would duplicate a loan into every
+slot; a move-only value would mint `count` owners) — the same discipline as the
+dynamic-buffer element rule, which keeps the array-fill borrow/move analyses trivial:
+each just recurses into the single value (no per-slot loan/move attribution).
 
-Deliverables:
+Lowering evaluates the value once, then stores the (Copy) result into each slot,
+reusing the existing `AddrOfIndex` + `Store` machinery — so there is NO new lowered op
+and NO new native backend codegen (the fill is a per-slot store sequence). The lowered
+IR is one store per slot; `[0; 1024]` type-checks and lowers (its ~8 KB stack frame
+exceeds the v0 backend's frame limit, so large fills are gated at "lowers" per the
+plan, while in-frame fills compile and run native). The evaluator and tracer replicate
+the Copy result; eval == native. Round-trips, `verify`, and replay/export/import all
+support it; the projection round-trips `[value; count]` to a fixpoint.
+
+Deliverables (delivered):
 
 ```text
-`[expr; N]` parsing, type rules, and lowering to a fill/memset over the array place
+`[expr; N]` parsing, type rules, and lowering to a per-slot fill over the array place
 ```
 
-Files likely touched:
+Files touched:
 
 ```text
-src/expr.rs, src/types.rs, src/lowering.rs, src/backend/native.rs
-tests/array_fill_native.rs
+src/expr.rs (RawExpr::ArrayFill + parser + eval + projection + reconstruction + deps),
+  src/types.rs (type rule + the 9 expr analyses), src/lowering.rs (fill lowering),
+  src/trace.rs, src/patch.rs, src/bundle.rs, src/migrations.rs, src/lib.rs,
+  src/backend_c.rs (emit-c bails, as it already does for array_literal)
+tests/array_fill_native.rs (new)
 ```
 
-Acceptance fixture and oracle:
+Acceptance fixture and oracle (met):
 
 ```text
 `[0; 1024]` type-checks and lowers; http_server.cdb uses a stack array buffer
   instead of malloc
 ```
+
+`tests/array_fill_native.rs` pins `[0; 1024]` lowering (a store per slot, the value
+lowered exactly once), in-frame `[7; 4]` / `[3; 8]` / a Copy-record `[{x,y}; 3]` /
+`[42; 1]` running native (eval == native), the `[value; count]` projection round-trip,
+and four fail-closed rejections (move-only value, reference value, zero count,
+non-literal count). A stack-array buffer is now expressible as a value, so the
+http_server-style buffer no longer needs `malloc` (the dedicated example remains a
+follow-on).
 
 ## Phase 14 — Generics / Parametric Types (R11)
 
