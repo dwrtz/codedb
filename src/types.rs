@@ -3187,6 +3187,7 @@ impl CodeDb {
         Ok(type_hash_for("I64"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn type_expr_with_locals(
         &mut self,
         current_module: &str,
@@ -5348,6 +5349,7 @@ impl CodeDb {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn type_builtin_box_new(
         &mut self,
         current_module: &str,

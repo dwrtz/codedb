@@ -1718,18 +1718,13 @@ impl CodeDb {
             ) {
                 continue;
             }
-            match self.build_lowered_function_ir(root, entry, crate::DEFAULT_NATIVE_TARGET) {
-                Ok(ir) => {
-                    if let Err(err) =
-                        self.verify_lowered_ir(root, &ir, crate::DEFAULT_NATIVE_TARGET)
-                    {
-                        errors.push(format!(
-                            "bad_lowered_ir: {} in root {root_hash}: {err:#}",
-                            entry.symbol
-                        ));
-                    }
-                }
-                Err(_) => {}
+            if let Ok(ir) = self.build_lowered_function_ir(root, entry, crate::DEFAULT_NATIVE_TARGET)
+                && let Err(err) = self.verify_lowered_ir(root, &ir, crate::DEFAULT_NATIVE_TARGET)
+            {
+                errors.push(format!(
+                    "bad_lowered_ir: {} in root {root_hash}: {err:#}",
+                    entry.symbol
+                ));
             }
         }
     }

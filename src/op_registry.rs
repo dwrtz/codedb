@@ -260,6 +260,7 @@ pub fn operator_kinds() -> Vec<&'static str> {
     kinds
 }
 
+#[allow(clippy::too_many_arguments)]
 const fn bin(
     kind: &'static str,
     source_op: &'static str,

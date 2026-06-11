@@ -2186,6 +2186,7 @@ impl CodeDb {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn trace_place_cell(
         &self,
         state: &mut TraceState,

@@ -279,7 +279,9 @@ fn range_case_dispatches_native_and_matches_oracle() {
          fn main() -> i64 = \
            classify(0) + classify(9) + classify(10) + classify(100) + classify(-5) + classify(999)\n",
         "main",
-        100 + 1 + 2 + 0 + 9 + 0,
+        // classify(0)=100, classify(9)=1, classify(10)=2, classify(100)=0,
+        // classify(-5)=9, classify(999)=0  => 112
+        112,
     );
 }
 

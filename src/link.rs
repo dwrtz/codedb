@@ -680,17 +680,16 @@ impl CodeDb {
             // matches its declared `alloc` effect and the malloc/free it links.
             if (compiler_platform_usage.uses_malloc || compiler_platform_usage.uses_free)
                 && effects.iter().any(|effect| effect == "alloc")
+                && let Some(source) = qualified_symbol_display(root, &symbol)
             {
-                if let Some(source) = qualified_symbol_display(root, &symbol) {
-                    capabilities
-                        .entry(format!("alloc:{symbol}"))
-                        .or_insert(PlannedCapability {
-                            name: "alloc".to_string(),
-                            source,
-                            symbol_hash: symbol.clone(),
-                            effects: effects.clone(),
-                        });
-                }
+                capabilities
+                    .entry(format!("alloc:{symbol}"))
+                    .or_insert(PlannedCapability {
+                        name: "alloc".to_string(),
+                        source,
+                        symbol_hash: symbol.clone(),
+                        effects: effects.clone(),
+                    });
             }
             let dependency_implementation_hashes =
                 self.native_object_type_dependency_hashes(root, &lowered, target_triple)?;

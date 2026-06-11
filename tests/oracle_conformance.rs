@@ -80,7 +80,7 @@ const WIDTHS: &[(&str, u32, bool)] = &[
 /// the decimal text the `--expect-int` flag wants — the wrapping the evaluator and
 /// backend both apply.
 fn wrap_to_width(value: i128, width_bytes: u32, signed: bool) -> String {
-    let bits = u32::from(width_bytes) * 8;
+    let bits = width_bytes * 8;
     let modulus = 1i128 << bits;
     let masked = value.rem_euclid(modulus);
     if signed && masked >= (1i128 << (bits - 1)) {
