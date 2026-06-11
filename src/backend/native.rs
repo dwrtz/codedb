@@ -710,6 +710,9 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::VecLen { .. }
             | LoweredOp::StringNew { .. }
             | LoweredOp::StringLen { .. }
+            | LoweredOp::StringWithCapacity { .. }
+            | LoweredOp::StringPush { .. }
+            | LoweredOp::StringGet { .. }
             | LoweredOp::BoundsCheck { .. }
             | LoweredOp::SliceRangeCheck { .. }
             | LoweredOp::LoadEnumTag { .. }
@@ -822,7 +825,10 @@ fn validate_native_ops(
             | LoweredOp::VecGet { .. }
             | LoweredOp::VecLen { .. }
             | LoweredOp::StringNew { .. }
-            | LoweredOp::StringLen { .. } => {}
+            | LoweredOp::StringLen { .. }
+            | LoweredOp::StringWithCapacity { .. }
+            | LoweredOp::StringPush { .. }
+            | LoweredOp::StringGet { .. } => {}
             LoweredOp::AddrOfParam { place, .. } => {
                 let LoweredPlace::Param {
                     slot, type_hash, ..
@@ -1721,6 +1727,66 @@ fn validate_native_op_flow(
             }
             native_insert_value(values, id, type_hash)?;
         }
+        LoweredOp::StringWithCapacity {
+            id,
+            address,
+            capacity,
+            type_hash,
+        } => {
+            if native_address_type(addresses, address)? != type_hash {
+                bail!("native object backend saw string_with_capacity address mismatch");
+            }
+            if native_type_layout(type_layouts, type_hash)?.kind != "string" {
+                bail!("native object backend saw string_with_capacity for non-string");
+            }
+            if native_value_type(values, capacity)? != &type_hash_for("I64") {
+                bail!("native object backend saw string_with_capacity non-i64 capacity");
+            }
+            native_insert_value(values, id, type_hash)?;
+            native_insert_address(addresses, id, type_hash)?;
+        }
+        LoweredOp::StringPush {
+            id,
+            string_address,
+            value,
+            string_type_hash,
+            type_hash,
+        } => {
+            if native_address_type(addresses, string_address)? != string_type_hash {
+                bail!("native object backend saw string_push address mismatch");
+            }
+            if native_type_layout(type_layouts, string_type_hash)?.kind != "string" {
+                bail!("native object backend saw string_push for non-string");
+            }
+            if native_value_type(values, value)? != &type_hash_for("U8") {
+                bail!("native object backend saw string_push non-u8 value");
+            }
+            if type_hash != &type_hash_for("Unit") {
+                bail!("native object backend saw string_push non-unit result");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::StringGet {
+            id,
+            string_address,
+            index,
+            string_type_hash,
+            type_hash,
+        } => {
+            if native_address_type(addresses, string_address)? != string_type_hash {
+                bail!("native object backend saw string_get address mismatch");
+            }
+            if native_type_layout(type_layouts, string_type_hash)?.kind != "string" {
+                bail!("native object backend saw string_get for non-string");
+            }
+            if native_value_type(values, index)? != &type_hash_for("I64") {
+                bail!("native object backend saw string_get non-i64 index");
+            }
+            if type_hash != &type_hash_for("U8") {
+                bail!("native object backend saw string_get non-u8 result");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
         LoweredOp::BoundsCheck {
             id,
             index,
@@ -2489,6 +2555,9 @@ fn collect_value_ids_inner(
             | LoweredOp::VecLen { id, .. }
             | LoweredOp::StringNew { id, .. }
             | LoweredOp::StringLen { id, .. }
+            | LoweredOp::StringWithCapacity { id, .. }
+            | LoweredOp::StringPush { id, .. }
+            | LoweredOp::StringGet { id, .. }
             | LoweredOp::BoundsCheck { id, .. }
             | LoweredOp::SliceRangeCheck { id, .. }
             | LoweredOp::LoadEnumTag { id, .. }
@@ -2990,7 +3059,7 @@ impl FunctionEmitter {
                 vec_type_hash,
                 ..
             } => {
-                self.emit_vec_push_x86(id, vec_address, value, vec_type_hash)?;
+                self.emit_buffer_push_x86(id, vec_address, value, vec_type_hash, "vec")?;
             }
             LoweredOp::VecGet {
                 id,
@@ -2999,7 +3068,7 @@ impl FunctionEmitter {
                 vec_type_hash,
                 ..
             } => {
-                self.emit_vec_get_x86(id, vec_address, index, vec_type_hash)?;
+                self.emit_buffer_get_x86(id, vec_address, index, vec_type_hash, "vec")?;
             }
             LoweredOp::VecLen {
                 id,
@@ -3026,6 +3095,32 @@ impl FunctionEmitter {
                 ..
             } => {
                 self.emit_buffer_len_x86(id, string_address, string_type_hash, "string")?;
+            }
+            LoweredOp::StringWithCapacity {
+                id,
+                address,
+                capacity,
+                type_hash,
+            } => {
+                self.emit_string_with_capacity_x86(id, address, capacity, type_hash)?;
+            }
+            LoweredOp::StringPush {
+                id,
+                string_address,
+                value,
+                string_type_hash,
+                ..
+            } => {
+                self.emit_buffer_push_x86(id, string_address, value, string_type_hash, "string")?;
+            }
+            LoweredOp::StringGet {
+                id,
+                string_address,
+                index,
+                string_type_hash,
+                ..
+            } => {
+                self.emit_buffer_get_x86(id, string_address, index, string_type_hash, "string")?;
             }
             LoweredOp::BoundsCheck {
                 id,
@@ -3796,14 +3891,57 @@ impl FunctionEmitter {
         Ok(())
     }
 
-    fn emit_vec_push_x86(
+    /// Allocate an empty buffer header with a *runtime* capacity (the value in
+    /// `capacity`'s slot), for `string_with_capacity`. Element stride is 1 (`u8`),
+    /// so payload bytes == capacity; `malloc(max(capacity, 1))` keeps `malloc(0)`
+    /// (which may return NULL and trap) off the table.
+    fn emit_string_with_capacity_x86(
+        &mut self,
+        id: &str,
+        address: &str,
+        capacity: &str,
+        type_hash: &str,
+    ) -> Result<()> {
+        let buffer = native_buffer_layout(&self.type_layouts, type_hash, "string")?;
+        if buffer.element_stride != 1 {
+            bail!("native x86_64 string_with_capacity expects 1-byte element stride");
+        }
+        // rdi = max(capacity, 1) bytes to malloc (malloc(0) may return NULL → trap).
+        self.mov_rax_stack(self.value_offset(capacity)?);
+        self.cmp_rax_imm32(0);
+        let nonzero = self.emit_jne_placeholder();
+        self.mov_rax_imm32(1);
+        self.patch_rel32(nonzero)?;
+        self.mov_rdi_rax();
+        self.emit_platform_call_x86(PLATFORM_MALLOC_SYMBOL_HASH, PLATFORM_MALLOC_ABI_SYMBOL);
+        self.cmp_rax_imm32(0);
+        let ok = self.emit_jne_placeholder();
+        self.emit_ud2();
+        self.patch_rel32(ok)?;
+        self.mov_stack_rax(self.value_offset(id)?);
+        // header.ptr = malloc result; header.len = 0; header.capacity = capacity.
+        self.mov_rax_stack(self.value_offset(address)?);
+        self.mov_rcx_stack(self.value_offset(id)?);
+        self.mov_mem_rax_disp_rcx(i32::try_from(buffer.ptr_offset)?);
+        self.mov_rcx_imm64(0);
+        self.mov_mem_rax_disp_rcx(i32::try_from(buffer.len_offset)?);
+        self.mov_rcx_stack(self.value_offset(capacity)?);
+        self.mov_mem_rax_disp_rcx(i32::try_from(buffer.capacity_offset)?);
+        // The buffer value is the header address.
+        self.mov_rax_stack(self.value_offset(address)?);
+        self.mov_stack_rax(self.value_offset(id)?);
+        Ok(())
+    }
+
+    fn emit_buffer_push_x86(
         &mut self,
         id: &str,
         vec_address: &str,
         value: &str,
         vec_type_hash: &str,
+        kind: &str,
     ) -> Result<()> {
-        let buffer = native_buffer_layout(&self.type_layouts, vec_type_hash, "vec")?;
+        let buffer = native_buffer_layout(&self.type_layouts, vec_type_hash, kind)?;
         self.mov_rax_stack(self.value_offset(vec_address)?);
         self.mov_rcx_mem_rax_disp(i32::try_from(buffer.len_offset)?);
         self.mov_rdx_mem_rax_disp(i32::try_from(buffer.capacity_offset)?);
@@ -3839,14 +3977,15 @@ impl FunctionEmitter {
         Ok(())
     }
 
-    fn emit_vec_get_x86(
+    fn emit_buffer_get_x86(
         &mut self,
         id: &str,
         vec_address: &str,
         index: &str,
         vec_type_hash: &str,
+        kind: &str,
     ) -> Result<()> {
-        let buffer = native_buffer_layout(&self.type_layouts, vec_type_hash, "vec")?;
+        let buffer = native_buffer_layout(&self.type_layouts, vec_type_hash, kind)?;
         self.mov_rax_stack(self.value_offset(vec_address)?);
         self.mov_rcx_stack(self.value_offset(index)?);
         self.mov_rdx_mem_rax_disp(i32::try_from(buffer.len_offset)?);
@@ -4950,7 +5089,7 @@ impl Arm64Emitter {
                 vec_type_hash,
                 ..
             } => {
-                self.emit_vec_push_arm64(id, vec_address, value, vec_type_hash)?;
+                self.emit_buffer_push_arm64(id, vec_address, value, vec_type_hash, "vec")?;
             }
             LoweredOp::VecGet {
                 id,
@@ -4959,7 +5098,7 @@ impl Arm64Emitter {
                 vec_type_hash,
                 ..
             } => {
-                self.emit_vec_get_arm64(id, vec_address, index, vec_type_hash)?;
+                self.emit_buffer_get_arm64(id, vec_address, index, vec_type_hash, "vec")?;
             }
             LoweredOp::VecLen {
                 id,
@@ -4986,6 +5125,32 @@ impl Arm64Emitter {
                 ..
             } => {
                 self.emit_buffer_len_arm64(id, string_address, string_type_hash, "string")?;
+            }
+            LoweredOp::StringWithCapacity {
+                id,
+                address,
+                capacity,
+                type_hash,
+            } => {
+                self.emit_string_with_capacity_arm64(id, address, capacity, type_hash)?;
+            }
+            LoweredOp::StringPush {
+                id,
+                string_address,
+                value,
+                string_type_hash,
+                ..
+            } => {
+                self.emit_buffer_push_arm64(id, string_address, value, string_type_hash, "string")?;
+            }
+            LoweredOp::StringGet {
+                id,
+                string_address,
+                index,
+                string_type_hash,
+                ..
+            } => {
+                self.emit_buffer_get_arm64(id, string_address, index, string_type_hash, "string")?;
             }
             LoweredOp::BoundsCheck {
                 id,
@@ -5739,14 +5904,51 @@ impl Arm64Emitter {
         Ok(())
     }
 
-    fn emit_vec_push_arm64(
+    /// arm64 counterpart of `emit_string_with_capacity_x86`: malloc a `u8` buffer of
+    /// `max(capacity, 1)` bytes (stride 1), then write ptr / len=0 / capacity.
+    fn emit_string_with_capacity_arm64(
+        &mut self,
+        id: &str,
+        address: &str,
+        capacity: &str,
+        type_hash: &str,
+    ) -> Result<()> {
+        let buffer = native_buffer_layout(&self.type_layouts, type_hash, "string")?;
+        if buffer.element_stride != 1 {
+            bail!("native arm64 string_with_capacity expects 1-byte element stride");
+        }
+        // x0 = max(capacity, 1) bytes to malloc (malloc(0) may return NULL → trap).
+        self.ldr_stack(0, self.value_offset(capacity)?)?;
+        let nonzero = self.emit_cbnz_placeholder(0);
+        self.mov_u64(0, 1);
+        self.patch_imm19(nonzero)?;
+        self.emit_platform_call_arm64(PLATFORM_MALLOC_SYMBOL_HASH, PLATFORM_MALLOC_ABI_SYMBOL);
+        let ok = self.emit_cbnz_placeholder(0);
+        self.emit_u32(0xd4200000);
+        self.patch_imm19(ok)?;
+        self.str_stack(0, self.value_offset(id)?)?;
+        // header.ptr = malloc result; header.len = 0; header.capacity = capacity.
+        self.ldr_stack(0, self.value_offset(address)?)?;
+        self.ldr_stack(1, self.value_offset(id)?)?;
+        self.str_reg_addr_offset(1, 0, u32::try_from(buffer.ptr_offset)?)?;
+        self.mov_u64(1, 0);
+        self.str_reg_addr_offset(1, 0, u32::try_from(buffer.len_offset)?)?;
+        self.ldr_stack(1, self.value_offset(capacity)?)?;
+        self.str_reg_addr_offset(1, 0, u32::try_from(buffer.capacity_offset)?)?;
+        self.ldr_stack(0, self.value_offset(address)?)?;
+        self.str_stack(0, self.value_offset(id)?)?;
+        Ok(())
+    }
+
+    fn emit_buffer_push_arm64(
         &mut self,
         id: &str,
         vec_address: &str,
         value: &str,
         vec_type_hash: &str,
+        kind: &str,
     ) -> Result<()> {
-        let buffer = native_buffer_layout(&self.type_layouts, vec_type_hash, "vec")?;
+        let buffer = native_buffer_layout(&self.type_layouts, vec_type_hash, kind)?;
         self.ldr_stack(0, self.value_offset(vec_address)?)?;
         self.ldr_reg_addr_offset(1, 0, u32::try_from(buffer.len_offset)?)?;
         self.ldr_reg_addr_offset(2, 0, u32::try_from(buffer.capacity_offset)?)?;
@@ -5777,14 +5979,15 @@ impl Arm64Emitter {
         Ok(())
     }
 
-    fn emit_vec_get_arm64(
+    fn emit_buffer_get_arm64(
         &mut self,
         id: &str,
         vec_address: &str,
         index: &str,
         vec_type_hash: &str,
+        kind: &str,
     ) -> Result<()> {
-        let buffer = native_buffer_layout(&self.type_layouts, vec_type_hash, "vec")?;
+        let buffer = native_buffer_layout(&self.type_layouts, vec_type_hash, kind)?;
         self.ldr_stack(0, self.value_offset(vec_address)?)?;
         self.ldr_stack(1, self.value_offset(index)?)?;
         self.ldr_reg_addr_offset(2, 0, u32::try_from(buffer.len_offset)?)?;

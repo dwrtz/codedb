@@ -4623,6 +4623,9 @@ fn collect_lowered_call_targets(
             | LoweredOp::VecLen { .. }
             | LoweredOp::StringNew { .. }
             | LoweredOp::StringLen { .. }
+            | LoweredOp::StringWithCapacity { .. }
+            | LoweredOp::StringPush { .. }
+            | LoweredOp::StringGet { .. }
             | LoweredOp::BoundsCheck { .. }
             | LoweredOp::SliceRangeCheck { .. }
             | LoweredOp::BorrowShared { .. }

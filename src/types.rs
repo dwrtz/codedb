@@ -3417,7 +3417,15 @@ impl CodeDb {
                 }
                 if matches!(
                     name.as_str(),
-                    "vec_new" | "vec_push" | "vec_get" | "vec_len" | "string_new" | "string_len"
+                    "vec_new"
+                        | "vec_push"
+                        | "vec_get"
+                        | "vec_len"
+                        | "string_new"
+                        | "string_len"
+                        | "string_with_capacity"
+                        | "string_push"
+                        | "string_get"
                 ) {
                     return self.type_builtin_dynamic_buffer_call(
                         current_module,
@@ -5780,6 +5788,188 @@ impl CodeDb {
                     type_hash,
                 })
             }
+            "string_with_capacity" => {
+                // `string_with_capacity(n)` allocates an empty (len 0), growable-to-`n`
+                // string buffer. Unlike `vec_new`/`string_new` the capacity is a
+                // runtime `i64` (not a literal): concat/substring/fmt compute the
+                // needed size from runtime lengths. The buffer never reallocs; pushing
+                // past `n` traps, exactly like `vec_push`.
+                if args.len() != 1 {
+                    bail!("string_with_capacity expects 1 arg, got {}", args.len());
+                }
+                let capacity = self.type_expr_with_locals(
+                    current_module,
+                    &args[0],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                require_type(
+                    &capacity.type_hash,
+                    &type_hash_for("I64"),
+                    "string_with_capacity capacity",
+                    self,
+                )?;
+                let type_hash = self.put_structural_type(TypeSpec::String)?;
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "string_with_capacity",
+                        "capacity": capacity.expr_hash,
+                        "capacity_type": capacity.type_hash,
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
+            "string_push" => {
+                // `string_push(s, b)` appends byte `b` to string place `s` (no realloc;
+                // traps at capacity). Mirrors `vec_push` over a `u8` element.
+                if args.len() != 2 {
+                    bail!("string_push expects 2 args, got {}", args.len());
+                }
+                let target = self.type_expr_with_locals(
+                    current_module,
+                    &args[0],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                if !self.typed_expr_is_assignable_place(root, &target.expr_hash)? {
+                    bail!("string_push target must be a mutable string place");
+                }
+                if !matches!(
+                    self.type_spec_in_root(root, &target.type_hash)?,
+                    TypeSpec::String
+                ) {
+                    bail!(
+                        "string_push target must be string, got {}",
+                        self.type_name(&target.type_hash)?
+                    );
+                }
+                let value = self.type_expr_with_locals_expecting(
+                    current_module,
+                    &args[1],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                    Some(&type_hash_for("U8")),
+                )?;
+                require_type(
+                    &value.type_hash,
+                    &type_hash_for("U8"),
+                    "string_push value",
+                    self,
+                )?;
+                let type_hash = type_hash_for("Unit");
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "string_push",
+                        "target": target.expr_hash,
+                        "value": value.expr_hash,
+                        "string_type": target.type_hash,
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
+            "string_get" => {
+                // `string_get(s, i)` reads byte `i` of string place `s` (bounds-checked
+                // against `len`). Mirrors `vec_get`; result is a `u8` copy.
+                if args.len() != 2 {
+                    bail!("string_get expects 2 args, got {}", args.len());
+                }
+                let target = self.type_expr_with_locals(
+                    current_module,
+                    &args[0],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                if !self.typed_expr_is_place(&target.expr_hash)? {
+                    bail!("string_get target must be an addressable string place");
+                }
+                if !matches!(
+                    self.type_spec_in_root(root, &target.type_hash)?,
+                    TypeSpec::String
+                ) {
+                    bail!(
+                        "string_get target must be string, got {}",
+                        self.type_name(&target.type_hash)?
+                    );
+                }
+                let index = self.type_expr_with_locals(
+                    current_module,
+                    &args[1],
+                    root,
+                    param_names,
+                    param_types,
+                    region_scope,
+                    locals,
+                )?;
+                require_type(
+                    &index.type_hash,
+                    &type_hash_for("I64"),
+                    "string_get index",
+                    self,
+                )?;
+                if let Some(value) = self.typed_literal_i64_value(&index.expr_hash)?
+                    && value < 0
+                {
+                    bail!("string_get index must be non-negative, got {value}");
+                }
+                let type_hash = type_hash_for("U8");
+                let expr_hash = self.put_object(
+                    "Expression",
+                    &json!({
+                        "expr_kind": "string_get",
+                        "target": target.expr_hash,
+                        "index": index.expr_hash,
+                        "string_type": target.type_hash,
+                        "type": type_hash,
+                    }),
+                )?;
+                self.write_cache_json(
+                    &expr_hash,
+                    "typechecker",
+                    "typed-dag",
+                    ArtifactKind::TypedExpression,
+                    &json!({ "type": type_hash }),
+                )?;
+                Ok(TypeCheckResult {
+                    expr_hash,
+                    type_hash,
+                })
+            }
             _ => bail!("unknown dynamic buffer builtin {name}"),
         }
     }
@@ -6313,9 +6503,8 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("unbox missing value"))?;
                 self.expr_escapes_local_borrow(root, value, locals_with_local_borrows)
             }
-            "vec_new" | "vec_push" | "vec_get" | "vec_len" | "string_new" | "string_len" => {
-                Ok(false)
-            }
+            "vec_new" | "vec_push" | "vec_get" | "vec_len" | "string_new" | "string_len"
+            | "string_with_capacity" | "string_push" | "string_get" => Ok(false),
             "raw_ptr_cast" => {
                 let value = payload
                     .get("value")
@@ -7191,6 +7380,43 @@ impl CodeDb {
                 let place = self.loan_place_for_expr(target, param_types, &state.locals)?;
                 self.check_place_not_moved(&place, state)?;
                 self.check_shared_read_conflicts(&place, &state.active)
+            }
+            "string_with_capacity" => {
+                let capacity = payload
+                    .get("capacity")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_with_capacity missing capacity"))?;
+                self.verify_expr_borrows(root, capacity, param_types, state, ExprUse::Value)
+            }
+            "string_push" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_push missing target"))?;
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_push missing value"))?;
+                self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
+                let target_place = self.loan_place_for_expr(target, param_types, &state.locals)?;
+                self.check_place_not_moved(&target_place, state)?;
+                self.check_loan_conflicts(&LoanKind::Mutable, &target_place, true, &state.active)?;
+                self.verify_expr_borrows(root, value, param_types, state, ExprUse::Value)
+            }
+            "string_get" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_get missing target"))?;
+                let index = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_get missing index"))?;
+                self.verify_expr_borrows(root, target, param_types, state, ExprUse::Place)?;
+                let place = self.loan_place_for_expr(target, param_types, &state.locals)?;
+                self.check_place_not_moved(&place, state)?;
+                self.check_shared_read_conflicts(&place, &state.active)?;
+                self.verify_expr_borrows(root, index, param_types, state, ExprUse::Value)
             }
             "raw_ptr_cast" => {
                 let value = payload
@@ -8933,6 +9159,14 @@ impl CodeDb {
                 "vec_len" => self.expr_child_requires_state(&payload, "target")?,
                 "string_new" => self.expr_child_requires_state(&payload, "source")?,
                 "string_len" => self.expr_child_requires_state(&payload, "target")?,
+                "string_with_capacity" => {
+                    self.expr_child_requires_state(&payload, "capacity")?
+                }
+                "string_push" => true,
+                "string_get" => {
+                    self.expr_child_requires_state(&payload, "target")?
+                        || self.expr_child_requires_state(&payload, "index")?
+                }
                 "raw_ptr_cast" | "int_cast" => self.expr_child_requires_state(&payload, "value")?,
                 "raw_load" => self.expr_child_requires_state(&payload, "pointer")?,
                 "raw_store" => true,
@@ -9038,7 +9272,7 @@ impl CodeDb {
                 | "local_ref" => false,
                 // `unbox` frees the box shell, so it requires `alloc` just like the
                 // allocating builtins (the deallocation is in the alloc effect domain).
-                "box_new" | "unbox" | "vec_new" | "string_new" => true,
+                "box_new" | "unbox" | "vec_new" | "string_new" | "string_with_capacity" => true,
                 "assign" => {
                     self.expr_child_requires_alloc(&payload, "target")?
                         || self.expr_child_requires_alloc(&payload, "value")?
@@ -9086,6 +9320,14 @@ impl CodeDb {
                 }
                 "vec_len" => self.expr_child_requires_alloc(&payload, "target")?,
                 "string_len" => self.expr_child_requires_alloc(&payload, "target")?,
+                "string_push" => {
+                    self.expr_child_requires_alloc(&payload, "target")?
+                        || self.expr_child_requires_alloc(&payload, "value")?
+                }
+                "string_get" => {
+                    self.expr_child_requires_alloc(&payload, "target")?
+                        || self.expr_child_requires_alloc(&payload, "index")?
+                }
                 "let" => {
                     self.expr_child_requires_alloc(&payload, "value")?
                         || self.expr_child_requires_alloc(&payload, "body")?
@@ -9230,6 +9472,17 @@ impl CodeDb {
                 "vec_len" => self.expr_child_requires_unsafe(&payload, "target")?,
                 "string_new" => self.expr_child_requires_unsafe(&payload, "source")?,
                 "string_len" => self.expr_child_requires_unsafe(&payload, "target")?,
+                "string_with_capacity" => {
+                    self.expr_child_requires_unsafe(&payload, "capacity")?
+                }
+                "string_push" => {
+                    self.expr_child_requires_unsafe(&payload, "target")?
+                        || self.expr_child_requires_unsafe(&payload, "value")?
+                }
+                "string_get" => {
+                    self.expr_child_requires_unsafe(&payload, "target")?
+                        || self.expr_child_requires_unsafe(&payload, "index")?
+                }
                 "let" => {
                     self.expr_child_requires_unsafe(&payload, "value")?
                         || self.expr_child_requires_unsafe(&payload, "body")?
@@ -10276,6 +10529,110 @@ impl CodeDb {
                     bail!("string_len target must be string");
                 }
                 type_hash_for("I64")
+            }
+            "string_with_capacity" => {
+                let capacity_hash = payload
+                    .get("capacity")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_with_capacity missing capacity"))?;
+                let capacity_type = self.verify_expr_type_with_locals(
+                    capacity_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if capacity_type != type_hash_for("I64")
+                    || payload.get("capacity_type").and_then(JsonValue::as_str)
+                        != Some(capacity_type.as_str())
+                {
+                    bail!("string_with_capacity capacity_type mismatch");
+                }
+                hash_for_type_spec(&TypeSpec::String)?
+            }
+            "string_push" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_push missing target"))?;
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_push missing value"))?;
+                let target_type = self.verify_expr_type_with_locals(
+                    target_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if payload.get("string_type").and_then(JsonValue::as_str)
+                    != Some(target_type.as_str())
+                {
+                    bail!("string_push string_type mismatch");
+                }
+                if !self.typed_expr_is_assignable_place(root, target_hash)? {
+                    bail!("string_push target must be a mutable string place");
+                }
+                if !matches!(
+                    self.type_spec_in_root(root, &target_type)?,
+                    TypeSpec::String
+                ) {
+                    bail!("string_push target must be string");
+                }
+                let value_type = self.verify_expr_type_with_locals(
+                    value_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if value_type != type_hash_for("U8") {
+                    bail!("string_push value must be u8");
+                }
+                type_hash_for("Unit")
+            }
+            "string_get" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_get missing target"))?;
+                let index_hash = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_get missing index"))?;
+                let target_type = self.verify_expr_type_with_locals(
+                    target_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if payload.get("string_type").and_then(JsonValue::as_str)
+                    != Some(target_type.as_str())
+                {
+                    bail!("string_get string_type mismatch");
+                }
+                if !self.typed_expr_is_place(target_hash)? {
+                    bail!("string_get target must be an addressable string place");
+                }
+                if !matches!(
+                    self.type_spec_in_root(root, &target_type)?,
+                    TypeSpec::String
+                ) {
+                    bail!("string_get target must be string");
+                }
+                let index_type = self.verify_expr_type_with_locals(
+                    index_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if index_type != type_hash_for("I64") {
+                    bail!("string_get index must be i64");
+                }
+                type_hash_for("U8")
             }
             "raw_ptr_cast" => {
                 let value_hash = payload

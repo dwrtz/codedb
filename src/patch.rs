@@ -2679,6 +2679,15 @@ fn expression_child_hashes(expr_kind: &str, payload: &JsonValue) -> Result<Vec<S
         "string_new" => {
             push_child_keys(payload, expr_kind, &["source"], &mut children)?;
         }
+        "string_with_capacity" => {
+            push_child_keys(payload, expr_kind, &["capacity"], &mut children)?;
+        }
+        "string_push" => {
+            push_child_keys(payload, expr_kind, &["target", "value"], &mut children)?;
+        }
+        "string_get" => {
+            push_child_keys(payload, expr_kind, &["target", "index"], &mut children)?;
+        }
         "raw_store" => {
             push_child_keys(payload, expr_kind, &["pointer", "value"], &mut children)?;
         }

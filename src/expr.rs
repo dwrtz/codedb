@@ -1225,6 +1225,88 @@ impl CodeDb {
         Ok(accumulator)
     }
 
+    /// The dynamic-string builtins (`string_with_capacity`, `string_push`,
+    /// `string_get`), factored out of `eval_expr_with_locals` and marked
+    /// `#[inline(never)]` so their locals never inflate that hot recursive frame
+    /// (which would lower the depth the evaluator reaches before the host stack
+    /// overflows). A `string` is modeled as a growable byte buffer; the native
+    /// backend enforces the fixed capacity, an edge a correctly-sized program
+    /// never reaches.
+    #[inline(never)]
+    fn eval_string_builtin(
+        &self,
+        root_hash: &str,
+        kind: &str,
+        payload: &JsonValue,
+        args: &mut Vec<ValueCell>,
+        locals: &mut Vec<ValueCell>,
+    ) -> Result<Value> {
+        match kind {
+            "string_with_capacity" => {
+                let capacity_hash = payload
+                    .get("capacity")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_with_capacity missing capacity"))?;
+                // Evaluate the capacity for effect/error parity, then discard it.
+                let _ = eval_index_value(self.eval_expr_with_locals(
+                    root_hash,
+                    capacity_hash,
+                    args,
+                    locals,
+                )?)?;
+                Ok(Value::String(Vec::new()))
+            }
+            "string_push" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_push missing target"))?;
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_push missing value"))?;
+                let value = self.eval_expr_with_locals(root_hash, value_hash, args, locals)?;
+                let byte = match value {
+                    Value::U8(byte) => byte,
+                    other => bail!("string_push value evaluated to non-u8 {other}"),
+                };
+                let target = self.eval_place_cell(root_hash, target_hash, args, locals)?;
+                match &mut *target.borrow_mut() {
+                    Value::String(bytes) => {
+                        bytes.push(byte);
+                        Ok(Value::Unit)
+                    }
+                    other => bail!("string_push target evaluated to non-string {other}"),
+                }
+            }
+            "string_get" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_get missing target"))?;
+                let index_hash = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_get missing index"))?;
+                let index = eval_index_value(self.eval_expr_with_locals(
+                    root_hash,
+                    index_hash,
+                    args,
+                    locals,
+                )?)?;
+                let target = self.eval_place_cell(root_hash, target_hash, args, locals)?;
+                match &*target.borrow() {
+                    Value::String(bytes) => bytes
+                        .get(index)
+                        .map(|byte| Value::U8(*byte))
+                        .ok_or_else(|| anyhow!("string_get index {index} out of bounds")),
+                    other => bail!("string_get target evaluated to non-string {other}"),
+                }
+            }
+            other => bail!("eval_string_builtin called with non-string builtin {other}"),
+        }
+    }
+
     fn eval_expr_with_locals(
         &self,
         root_hash: &str,
@@ -1523,6 +1605,13 @@ impl CodeDb {
                     Value::String(bytes) => Ok(Value::I64(bytes.len() as i64)),
                     other => bail!("string_len target evaluated to non-string {other}"),
                 }
+            }
+            // The dynamic-string builtins live in an #[inline(never)] helper so their
+            // locals stay off this hot recursive frame — otherwise they shrink the
+            // evaluator's effective recursion depth before the host stack overflows
+            // (see eval_loop and MAX_EVAL_CALL_DEPTH).
+            kind @ ("string_with_capacity" | "string_push" | "string_get") => {
+                self.eval_string_builtin(root_hash, kind, &payload, args, locals)
             }
             "raw_ptr_cast" => {
                 let value_hash = payload
@@ -2980,6 +3069,86 @@ impl CodeDb {
                     )?
                 )
             }
+            "string_with_capacity" => {
+                let capacity = payload
+                    .get("capacity")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_with_capacity missing capacity"))?;
+                format!(
+                    "string_with_capacity({})",
+                    self.expr_to_source_with_locals(
+                        capacity,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
+            "string_push" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_push missing target"))?;
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_push missing value"))?;
+                format!(
+                    "string_push({}, {})",
+                    self.expr_to_source_with_locals(
+                        target,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?,
+                    self.expr_to_source_with_locals(
+                        value,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
+            "string_get" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_get missing target"))?;
+                let index = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_get missing index"))?;
+                format!(
+                    "string_get({}, {})",
+                    self.expr_to_source_with_locals(
+                        target,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?,
+                    self.expr_to_source_with_locals(
+                        index,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
             "raw_ptr_cast" => {
                 let value = payload
                     .get("value")
@@ -4189,6 +4358,71 @@ impl CodeDb {
                     )?,
                 ],
             }),
+            "string_with_capacity" => Ok(RawExpr::Call {
+                name: "string_with_capacity".to_string(),
+                args: vec![
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("capacity")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("string_with_capacity missing capacity"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ],
+            }),
+            "string_push" => Ok(RawExpr::Call {
+                name: "string_push".to_string(),
+                args: vec![
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("target")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("string_push missing target"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("string_push missing value"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ],
+            }),
+            "string_get" => Ok(RawExpr::Call {
+                name: "string_get".to_string(),
+                args: vec![
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("target")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("string_get missing target"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("index")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("string_get missing index"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?,
+                ],
+            }),
             "raw_ptr_cast" => {
                 let mutable = payload
                     .get("mutable")
@@ -5065,6 +5299,31 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("string_len missing target"))?;
                 self.collect_expr_deps(root, child, deps)?;
+            }
+            "string_with_capacity" => {
+                let child = payload
+                    .get("capacity")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_with_capacity missing capacity"))?;
+                self.collect_expr_deps(root, child, deps)?;
+            }
+            "string_push" => {
+                for key in ["target", "value"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("string_push missing {key}"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
+            }
+            "string_get" => {
+                for key in ["target", "index"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("string_get missing {key}"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
             }
             "raw_ptr_cast" => {
                 let child = payload

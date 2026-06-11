@@ -1,0 +1,52 @@
+module std.fmt {
+fn zero_byte() -> u8 = b"0"[0]
+fn minus_byte() -> u8 = b"-"[0]
+
+// digit (0..=9) -> ascii byte, and back. No hand-rolled digit table: the value
+// arithmetic is `'0' + d` / `b - '0'` over the byte codes (R3/SPEC_V3 §12).
+fn digit_byte(d: i64) -> u8 = to_u8(to_i64(zero_byte()) + d)
+fn digit_value(b: u8) -> i64 = to_i64(b) - to_i64(zero_byte())
+
+// Push the decimal digits of a non-positive `n` (most significant first) onto a
+// string place. Work entirely in the negative domain — `n` is never negated — so
+// `i64::MIN`, which has no positive counterpart, formats without a trap. Recurse
+// before pushing so the digits land big-endian; the buffer is threaded by move.
+fn push_neg_digits(s: string, n: i64) -> string effects[state] =
+  let next: string = if n <= 0 - 10 then push_neg_digits(s, n / 10) else s in
+  let pushed: unit = string_push(next, digit_byte(0 - (n % 10))) in
+  next
+
+// i64 -> decimal string (with a leading '-' for negatives). Capacity 20 covers
+// the widest case: '-' plus the 19 digits of i64::MIN's magnitude.
+fn i64_to_string(n: i64) -> string effects[alloc, state] =
+  if n == 0 then
+    let s: string = string_with_capacity(1) in
+    let p: unit = string_push(s, zero_byte()) in
+    s
+  else if n < 0 then
+    let s: string = string_with_capacity(20) in
+    let m: unit = string_push(s, minus_byte()) in
+    push_neg_digits(s, n)
+  else
+    let s: string = string_with_capacity(20) in
+    push_neg_digits(s, 0 - n)
+
+// Accumulate the magnitude in the negative domain (`acc <= 0`), again so that
+// parsing i64::MIN never overflows an intermediate. The string is threaded by
+// move; each byte is read before the recursive call consumes the buffer.
+fn parse_neg_from(s: string, i: i64, n: i64, acc: i64) -> i64 effects[state] =
+  if i >= n then acc
+  else
+    let d: i64 = digit_value(string_get(s, i)) in
+    parse_neg_from(s, i + 1, n, acc * 10 - d)
+
+// decimal string -> i64. A leading '-' selects the negative-domain result
+// directly; otherwise negate it. Empty string parses to 0.
+fn string_to_i64(s: string) -> i64 effects[state] =
+  let n: i64 = string_len(s) in
+  if n == 0 then 0
+  else if string_get(s, 0) == minus_byte() then
+    parse_neg_from(s, 1, n, 0)
+  else
+    0 - parse_neg_from(s, 0, n, 0)
+}

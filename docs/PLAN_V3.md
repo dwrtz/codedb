@@ -666,28 +666,78 @@ remains gated on that, not on loops.)
 Goal: a real string surface and int<->string formatting, as stdlib over the
 v2 dynamic buffer — required for text processing and diagnostics.
 
-Status: planned. Resolves R15, R3.
+Status: implemented. Resolves R15, R3. Three new dynamic-string primitives join
+the existing `string_new`/`string_len`: `string_with_capacity(n)` allocates an
+empty (len 0) buffer with a *runtime* capacity `n` (unlike the literal-capacity
+`vec_new`/`string_new`); `string_push(s, b)` appends a `u8`, trapping at capacity
+(no realloc, like `vec_push`); `string_get(s, i)` is a bounds-checked indexed `u8`
+read. They mirror the `vec<T>` ops over the same `{ptr,len,cap}` heap buffer — the
+backend push/get emitters are now shared `emit_buffer_{push,get}_{x86,arm64}` helpers
+parameterized by buffer kind, and the runtime-sized malloc is a new
+`emit_string_with_capacity_*` (it allocates `max(capacity, 1)` bytes so `malloc(0)`
+— which may return NULL and trap — is never called). Everything else is `.cdb`
+stdlib: `std/string.cdb` adds index/length/push wrappers, `push_range`, `concat`,
+`substring`, byte-wise `eq`, and lexicographic 3-way `compare`; `std/fmt.cdb` adds
+`i64_to_string` (signed decimal) and `string_to_i64` with **no hand-rolled digit
+table** — the digit codec is `'0' + d` / `b - '0'` byte arithmetic. Both work
+entirely in the NEGATIVE domain (`n` is never negated; digits accumulate as
+`acc*10 - d`) so `i64::MIN`, which has no positive magnitude, formats and parses
+without an overflow/trap.
 
-Deliverables:
+A `string` is move-only, so building one cannot use a `loop` (Phase 11's accumulator
+must be copyable): the buffer is threaded by MOVE through recursion, sound by Phases
+4/6 conditional + recursive drop glue. The full native-completion stack supports the
+new ops — type check + the six analyses (borrow/state/alloc/unsafe/escape/deps),
+evaluator, source projection, typed-expr reconstruction, patch child-keys, three
+`LoweredOp`s + lower fns + the lowered-IR verifier, native x86_64 + arm64 emit, and
+the native IR validator + `verify`. The reference evaluator models a string as a
+growable byte buffer (the native backend enforces the fixed capacity, an edge a
+correctly-sized program never reaches); for correct programs eval == native. The
+string-builtin evaluator bodies live in an `#[inline(never)]` helper so they do not
+inflate the hot recursive eval frame and shrink the depth-before-overflow (the
+documented eval GOTCHA from Phase 11). Round-trips, `verify`, and replay/export/import
+all support it; the exported projection round-trips the new ops to a fixpoint.
+
+Documented follow-on: the dynamic-buffer builtins (vec AND string) are not yet
+`trace`-able — the tracer traps on them, a uniform pre-existing gap, not new to this
+phase; read-only string helpers consume their arguments by move (a borrow-style API
+would need shared-ref deref support inside the buffer builtins). `bytes<->string`
+beyond `string_new` (static bytes -> string), and hex/unsigned formatting + a
+write-to-buffer `fmt` variant, are left as straightforward stdlib follow-ons over the
+same primitives.
+
+Deliverables (delivered: the core surface; the noted variants are follow-ons):
 
 ```text
-std.string: index, compare, concat, substring, push, bytes<->string
-std.fmt: i64<->string (decimal, plus hex/unsigned), and a write-to-buffer variant
+std.string: index, compare, concat, substring, push (bytes<->string: string_new only)
+std.fmt: i64<->string (decimal; hex/unsigned + write-to-buffer are follow-ons)
 ```
 
-Files likely touched:
+Files touched:
 
 ```text
-std/string.cdb, std/fmt.cdb (new), std/core.cdb
-tests/string_native.rs, tests/fmt_native.rs
+src/types.rs, src/expr.rs, src/lowering.rs, src/verify.rs, src/backend/native.rs,
+  src/patch.rs (the three new primitives, full native-completion stack)
+std/string.cdb, std/fmt.cdb (new)
+tests/string_native.rs (new), tests/fmt_native.rs (new), tests/leak_interposer.rs
 ```
 
-Acceptance fixture and oracle:
+Acceptance fixture and oracle (met):
 
 ```text
 a native program concatenates, compares, and indexes strings; format/parse
   round-trips i64 over a range including negatives, with no hand-rolled digit table
 ```
+
+`tests/string_native.rs`'s `acceptance` program does all four in one native binary
+(concat == "foobar", index byte 3 == 'b', compare apple<banana, and a -1234567
+round-trip), with eval == native; its first test pins the new `string_with_capacity`/
+`string_push`/`string_get` ops in the lowered IR. `tests/fmt_native.rs` pins the
+round-trip natively across 0 / positive / negative / i64::MAX / i64::MIN and asserts
+the exact formatted bytes (length and digit codes), not only invertibility.
+`tests/leak_interposer.rs::string_build_frees_every_buffer_at_runtime` confirms the
+no-leak half of exactly-once at runtime scale (every `string_with_capacity` and moved
+`string_new` buffer is freed; net alloc - free is invariant to the allocation count).
 
 ## Phase 13 — Array Fill / Repeat Initializer (R9)
 

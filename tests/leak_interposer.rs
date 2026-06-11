@@ -186,6 +186,29 @@ fn length(n: Node) -> i64 effects[alloc] =
 fn main() -> i64 effects[alloc] = length(build({K}))
 "#;
 
+// Phase 12 (R15): dynamic string buffers. Each iteration allocates two heap
+// buffers — `string_with_capacity(out)` and `string_new("abc")` — and must free
+// both: `push_range` consumes the `string_new` source (threaded by move, dropped
+// at its base case) while `out` is built, returned, bound to `s`, and dropped at
+// `build_n`'s scope exit. A skipped string drop (the moved-in source OR the
+// scope-local result) makes net `alloc - free` grow with {K}.
+const STRING_BUILD: &str = r#"
+fn push_range(dst: string, src: string, i: i64, n: i64) -> string effects[state] =
+  if i >= n then dst
+  else
+    let p: unit = string_push(dst, string_get(src, i)) in
+    push_range(dst, src, i + 1, n)
+fn make() -> string effects[alloc, state] =
+  let out: string = string_with_capacity(3) in
+  push_range(out, string_new("abc"), 0, 3)
+fn build_n(i: i64, n: i64) -> i64 effects[alloc, state] =
+  if i >= n then 0
+  else
+    let s: string = make() in
+    build_n(i + 1, n) + string_len(s)
+fn main() -> i64 effects[alloc, state] = build_n(0, {K})
+"#;
+
 fn bin() -> Command {
     Command::cargo_bin("codedb").expect("codedb binary")
 }
@@ -510,6 +533,11 @@ fn box_deref_partial_move_frees_every_box_at_runtime() {
 #[test]
 fn nested_box_deref_partial_move_frees_every_box_at_runtime() {
     assert_balanced_across_scale("nested_box_deref_move", NESTED_BOX_DEREF_MOVE, 4, 64);
+}
+
+#[test]
+fn string_build_frees_every_buffer_at_runtime() {
+    assert_balanced_across_scale("string_build", STRING_BUILD, 4, 64);
 }
 
 #[test]

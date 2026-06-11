@@ -5,4 +5,64 @@ fn tab_byte() -> u8 = b"\t"[0]
 
 fn is_ascii_space(ch: u8) -> bool =
   ch == space_byte() || ch == newline_byte() || ch == tab_byte()
+
+// Thin wrappers over the dynamic-buffer primitives (R15/SPEC_V3 §12). A `string`
+// is a fixed-capacity `{ptr,len,cap}` heap buffer; building one threads it by
+// move through recursion (a loop cannot, since its accumulator must be copyable
+// and a string is move-only).
+fn with_capacity(n: i64) -> string effects[alloc] = string_with_capacity(n)
+fn length(s: string) -> i64 = string_len(s)
+fn get(s: string, i: i64) -> u8 = string_get(s, i)
+fn push(s: string, b: u8) -> unit effects[state] = string_push(s, b)
+
+// Append `src[i..n)` onto `dst`, threading `dst` by move; each byte is read out
+// of `src` before the recursive call.
+fn push_range(dst: string, src: string, i: i64, n: i64) -> string effects[state] =
+  if i >= n then dst
+  else
+    let pushed: unit = string_push(dst, string_get(src, i)) in
+    push_range(dst, src, i + 1, n)
+
+// Concatenate two strings into a freshly sized buffer (consumes both).
+fn concat(a: string, b: string) -> string effects[alloc, state] =
+  let la: i64 = string_len(a) in
+  let lb: i64 = string_len(b) in
+  let out: string = string_with_capacity(la + lb) in
+  let head: string = push_range(out, a, 0, la) in
+  push_range(head, b, 0, lb)
+
+// Copy out the half-open byte range `[start, end)` (consumes the source).
+fn substring(s: string, start: i64, end: i64) -> string effects[alloc, state] =
+  let out: string = string_with_capacity(end - start) in
+  push_range(out, s, start, end)
+
+// Byte-wise equality (consumes both). Lengths gate the per-byte walk.
+fn eq_from(a: string, b: string, i: i64, n: i64) -> bool effects[state] =
+  if i >= n then true
+  else if string_get(a, i) == string_get(b, i) then eq_from(a, b, i + 1, n)
+  else false
+
+fn eq(a: string, b: string) -> bool effects[state] =
+  let la: i64 = string_len(a) in
+  let lb: i64 = string_len(b) in
+  if la == lb then eq_from(a, b, 0, la) else false
+
+// Lexicographic 3-way compare: negative / 0 / positive (consumes both).
+fn compare_from(a: string, b: string, i: i64, n: i64) -> i64 effects[state] =
+  if i >= n then 0
+  else
+    let ca: i64 = to_i64(string_get(a, i)) in
+    let cb: i64 = to_i64(string_get(b, i)) in
+    if ca == cb then compare_from(a, b, i + 1, n)
+    else if ca < cb then 0 - 1
+    else 1
+
+fn compare(a: string, b: string) -> i64 effects[state] =
+  let la: i64 = string_len(a) in
+  let lb: i64 = string_len(b) in
+  let bound: i64 = if la < lb then la else lb in
+  let head: i64 = compare_from(a, b, 0, bound) in
+  if head == 0 then
+    if la == lb then 0 else if la < lb then 0 - 1 else 1
+  else head
 }

@@ -424,6 +424,33 @@ pub(crate) enum LoweredOp {
         string_type_hash: String,
         type_hash: String,
     },
+    /// `string_with_capacity(n)` (R15): allocate an empty (len 0) string buffer with
+    /// a *runtime* capacity `n` (unlike `VecNew`/`StringNew`, whose capacity is a
+    /// compile-time literal). The buffer never reallocs; `StringPush` past `n` traps.
+    StringWithCapacity {
+        id: String,
+        address: String,
+        capacity: String,
+        type_hash: String,
+    },
+    /// `string_push(s, b)` (R15): append byte `b` to string place `s` (len += 1),
+    /// trapping if it would exceed capacity. The `string` analogue of `VecPush`.
+    StringPush {
+        id: String,
+        string_address: String,
+        value: String,
+        string_type_hash: String,
+        type_hash: String,
+    },
+    /// `string_get(s, i)` (R15): read byte `i` of string place `s` (bounds-checked
+    /// against `len`), yielding a `u8`. The `string` analogue of `VecGet`.
+    StringGet {
+        id: String,
+        string_address: String,
+        index: String,
+        string_type_hash: String,
+        type_hash: String,
+    },
     BoundsCheck {
         id: String,
         index: String,
@@ -1594,6 +1621,13 @@ impl CodeDb {
             "vec_len" => self.lower_vec_len(root, expr_hash, param_types, ctx, locals),
             "string_new" => self.lower_string_new(root, expr_hash, &type_hash, ctx),
             "string_len" => self.lower_string_len(root, expr_hash, param_types, ctx, locals),
+            "string_with_capacity" => {
+                self.lower_string_with_capacity(root, expr_hash, &type_hash, param_types, ctx, locals)
+            }
+            "string_push" => self.lower_string_push(root, expr_hash, param_types, ctx, locals),
+            "string_get" => {
+                self.lower_string_get(root, expr_hash, &type_hash, param_types, ctx, locals)
+            }
             "raw_ptr_cast" => {
                 self.lower_raw_ptr_cast(root, expr_hash, &type_hash, param_types, ctx, locals)
             }
@@ -3447,6 +3481,158 @@ impl CodeDb {
             operations,
             value: id,
             type_hash: type_hash_for("I64"),
+        })
+    }
+
+    fn lower_string_with_capacity(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        if !matches!(self.type_spec_in_root(root, type_hash)?, TypeSpec::String) {
+            bail!("string_with_capacity lowered type mismatch");
+        }
+        let payload = self.get_payload(expr_hash)?;
+        let capacity_hash = payload
+            .get("capacity")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("string_with_capacity missing capacity"))?;
+        let capacity = self.lower_expr(root, capacity_hash, param_types, ctx, locals)?;
+        if capacity.type_hash != type_hash_for("I64") {
+            bail!("string_with_capacity capacity must lower as i64");
+        }
+        let slot_size =
+            stack_slot_size_bytes(self.layout_size_bytes(root, ctx.target_triple(), type_hash)?);
+        let slot = ctx.local_slot(type_hash.to_string(), slot_size);
+        let address = ctx.value();
+        ctx.push_debug_op(expr_hash, "addr_of_local", &address);
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "string_with_capacity", &id);
+        let mut operations = capacity.operations;
+        operations.push(LoweredOp::AddrOfLocal {
+            id: address.clone(),
+            place: LoweredPlace::Local {
+                slot,
+                type_hash: type_hash.to_string(),
+            },
+        });
+        operations.push(LoweredOp::StringWithCapacity {
+            id: id.clone(),
+            address,
+            capacity: capacity.value,
+            type_hash: type_hash.to_string(),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash.to_string(),
+        })
+    }
+
+    fn lower_string_push(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let target_hash = payload
+            .get("target")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("string_push missing target"))?;
+        let value_hash = payload
+            .get("value")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("string_push missing value"))?;
+        let target = self.lower_place(root, target_hash, param_types, ctx, locals)?;
+        if !matches!(
+            self.type_spec_in_root(root, &target.type_hash)?,
+            TypeSpec::String
+        ) {
+            bail!("string_push target must lower as string");
+        }
+        let value = self.lower_expr_as(
+            root,
+            value_hash,
+            &type_hash_for("U8"),
+            param_types,
+            ctx,
+            locals,
+        )?;
+        if value.type_hash != type_hash_for("U8") {
+            bail!("string_push value must lower as u8");
+        }
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "string_push", &id);
+        let mut operations = target.operations;
+        operations.extend(value.operations);
+        operations.push(LoweredOp::StringPush {
+            id: id.clone(),
+            string_address: target.address,
+            value: value.value,
+            string_type_hash: target.type_hash,
+            type_hash: type_hash_for("Unit"),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash_for("Unit"),
+        })
+    }
+
+    fn lower_string_get(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        type_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        if type_hash != type_hash_for("U8") {
+            bail!("string_get lowered result must be u8");
+        }
+        let payload = self.get_payload(expr_hash)?;
+        let target_hash = payload
+            .get("target")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("string_get missing target"))?;
+        let index_hash = payload
+            .get("index")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("string_get missing index"))?;
+        let target = self.lower_place(root, target_hash, param_types, ctx, locals)?;
+        if !matches!(
+            self.type_spec_in_root(root, &target.type_hash)?,
+            TypeSpec::String
+        ) {
+            bail!("string_get target must lower as string");
+        }
+        let index = self.lower_expr(root, index_hash, param_types, ctx, locals)?;
+        if index.type_hash != type_hash_for("I64") {
+            bail!("string_get index type mismatch while lowering");
+        }
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "string_get", &id);
+        let mut operations = target.operations;
+        operations.extend(index.operations);
+        operations.push(LoweredOp::StringGet {
+            id: id.clone(),
+            string_address: target.address,
+            index: index.value,
+            string_type_hash: target.type_hash,
+            type_hash: type_hash_for("U8"),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash_for("U8"),
         })
     }
 
@@ -7795,6 +7981,66 @@ impl CodeDb {
                     }
                     insert_value(values, id, type_hash)?;
                 }
+                LoweredOp::StringWithCapacity {
+                    id,
+                    address,
+                    capacity,
+                    type_hash,
+                } => {
+                    if address_type(addresses, address)? != type_hash {
+                        bail!("lowered string_with_capacity address type mismatch");
+                    }
+                    if !matches!(self.type_spec(type_hash)?, TypeSpec::String) {
+                        bail!("lowered string_with_capacity type mismatch");
+                    }
+                    if value_type(values, capacity)? != &type_hash_for("I64") {
+                        bail!("lowered string_with_capacity capacity must be i64");
+                    }
+                    insert_value(values, id, type_hash)?;
+                    insert_address(addresses, id, type_hash)?;
+                }
+                LoweredOp::StringPush {
+                    id,
+                    string_address,
+                    value,
+                    string_type_hash,
+                    type_hash,
+                } => {
+                    if address_type(addresses, string_address)? != string_type_hash {
+                        bail!("lowered string_push address type mismatch");
+                    }
+                    if !matches!(self.type_spec(string_type_hash)?, TypeSpec::String) {
+                        bail!("lowered string_push target must be string");
+                    }
+                    if value_type(values, value)? != &type_hash_for("U8") {
+                        bail!("lowered string_push value must be u8");
+                    }
+                    if type_hash != &type_hash_for("Unit") {
+                        bail!("lowered string_push result type mismatch");
+                    }
+                    insert_value(values, id, type_hash)?;
+                }
+                LoweredOp::StringGet {
+                    id,
+                    string_address,
+                    index,
+                    string_type_hash,
+                    type_hash,
+                } => {
+                    if address_type(addresses, string_address)? != string_type_hash {
+                        bail!("lowered string_get address type mismatch");
+                    }
+                    if !matches!(self.type_spec(string_type_hash)?, TypeSpec::String) {
+                        bail!("lowered string_get target must be string");
+                    }
+                    if value_type(values, index)? != &type_hash_for("I64") {
+                        bail!("lowered string_get index must be i64");
+                    }
+                    if type_hash != &type_hash_for("U8") {
+                        bail!("lowered string_get result must be u8");
+                    }
+                    insert_value(values, id, type_hash)?;
+                }
                 LoweredOp::BoundsCheck {
                     id,
                     index,
@@ -8278,6 +8524,9 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::VecLen { id, .. }
         | LoweredOp::StringNew { id, .. }
         | LoweredOp::StringLen { id, .. }
+        | LoweredOp::StringWithCapacity { id, .. }
+        | LoweredOp::StringPush { id, .. }
+        | LoweredOp::StringGet { id, .. }
         | LoweredOp::BoundsCheck { id, .. }
         | LoweredOp::SliceRangeCheck { id, .. }
         | LoweredOp::LoadEnumTag { id, .. }
@@ -8334,6 +8583,9 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::VecLen { .. } => "vec_len",
         LoweredOp::StringNew { .. } => "string_new",
         LoweredOp::StringLen { .. } => "string_len",
+        LoweredOp::StringWithCapacity { .. } => "string_with_capacity",
+        LoweredOp::StringPush { .. } => "string_push",
+        LoweredOp::StringGet { .. } => "string_get",
         LoweredOp::BoundsCheck { .. } => "bounds_check",
         LoweredOp::SliceRangeCheck { .. } => "slice_range_check",
         LoweredOp::LoadEnumTag { .. } => "load_enum_tag",
@@ -8562,6 +8814,22 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
                 out.insert(type_hash.clone());
             }
             LoweredOp::StringLen {
+                type_hash,
+                string_type_hash,
+                ..
+            } => {
+                out.insert(type_hash.clone());
+                out.insert(string_type_hash.clone());
+            }
+            LoweredOp::StringWithCapacity { type_hash, .. } => {
+                out.insert(type_hash.clone());
+            }
+            LoweredOp::StringPush {
+                type_hash,
+                string_type_hash,
+                ..
+            }
+            | LoweredOp::StringGet {
                 type_hash,
                 string_type_hash,
                 ..
