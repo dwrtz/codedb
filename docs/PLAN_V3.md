@@ -490,7 +490,12 @@ the CodeDB-hosted evaluator agrees with the Rust evaluator on the entire existin
 
 Goal: the arithmetic/codec stack the importer's hashing and later codegen need.
 
-Status: planned. Resolves R5, R4, R6, R2.
+Status: implemented. Resolves R5, R4, R6, R2 — all-width operators with
+canonical sign/zero-extended slot form on both arches, `to_*` cast builtins,
+hex literals (signed widths read them as bit patterns), MIN literals via the
+negated-literal fold, and the per-width conformance fixtures.
+`fnv1a.cdb` native == eval; `sha256.cdb` (rolled into loops) native == eval ==
+the reference digest (tests/codec_native.rs).
 
 Deliverables:
 

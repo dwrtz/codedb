@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::MAIN_BRANCH;
-use crate::expr::{RawCaseArm, RawExpr, RawPattern, RawRecordField};
+use crate::expr::{RawCaseArm, RawExpr, RawHookOutcome, RawPattern, RawRecordField};
 use crate::migrations::{MigrationOutcome, MigrationReport, Operation};
 use crate::model::{ProgramRootPayload, param_names, resolve_name_in_root};
 use crate::store::{CodeDb, canonical_json, hash_bytes};
@@ -845,7 +845,7 @@ impl CodeDb {
             }
         }
 
-        for child in expression_child_hashes(expr_kind, &payload)? {
+        for child in expression_child_hashes(&payload)? {
             self.visit_patch_expr(
                 root,
                 owner_symbol,
@@ -1225,10 +1225,17 @@ impl CodeDb {
             let entry = self
                 .root_symbol(root, &symbol)
                 .ok_or_else(|| anyhow!("matched symbol missing from root {symbol}"))?;
-            let body = self.function_body_hash(&entry.definition)?;
             let name = self.symbol_display(root, &symbol)?;
-            let patched =
-                self.patched_raw_expr_inline(&body, root, &expr_hashes, &mut Vec::new())?;
+            // The complete typed→raw converter with an inline hook at the
+            // matched call hashes (#12) — every expression kind the projection
+            // supports is patchable through, instead of a partial walker.
+            let patched = self.patched_function_body(root, entry, &|hash, _payload| {
+                if expr_hashes.contains(hash) {
+                    Ok(RawHookOutcome::InlineCall)
+                } else {
+                    Ok(RawHookOutcome::Continue)
+                }
+            })?;
             operations.push(Operation::ReplaceFunctionBody {
                 module: MAIN_BRANCH.to_string(),
                 symbol,
@@ -1239,258 +1246,36 @@ impl CodeDb {
         Ok(operations)
     }
 
-    fn patched_raw_expr_inline(
+    /// Convert one function's typed body back to source-form `RawExpr` with a
+    /// patch hook active, scoping the converter with the function's declared
+    /// region names so borrows inside the body render like the projection.
+    fn patched_function_body(
         &self,
-        expr_hash: &str,
         root: &ProgramRootPayload,
-        inline_exprs: &BTreeSet<String>,
-        local_names: &mut Vec<String>,
+        entry: &crate::model::RootSymbolPayload,
+        hook: crate::expr::RawConversionHook<'_>,
     ) -> Result<RawExpr> {
-        let payload = self.get_payload(expr_hash)?;
-        let expr_kind = payload
-            .get("expr_kind")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?;
-        if inline_exprs.contains(expr_hash) {
-            if expr_kind != "call" {
-                bail!("inline_function matched non-call expression {expr_hash}");
-            }
-            return self.inline_call_payload(&payload, root, local_names);
-        }
-
-        match expr_kind {
-            "literal_i64" => Ok(RawExpr::LiteralI64 {
-                value: payload
-                    .get("value")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("literal_i64 missing value"))?
-                    .to_string(),
-            }),
-            "literal_bool" => Ok(RawExpr::LiteralBool {
-                value: payload
-                    .get("value")
-                    .and_then(JsonValue::as_bool)
-                    .ok_or_else(|| anyhow!("literal_bool missing value"))?,
-            }),
-            "literal_unit" => Ok(RawExpr::Unit),
-            "param_ref" => Ok(RawExpr::ParamRef {
-                index: payload
-                    .get("index")
-                    .and_then(JsonValue::as_u64)
-                    .ok_or_else(|| anyhow!("param_ref missing index"))?
-                    as usize,
-            }),
-            "local_ref" => {
-                let depth = payload
-                    .get("depth")
-                    .and_then(JsonValue::as_u64)
-                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
-                    as usize;
-                Ok(RawExpr::ParamName {
-                    name: local_at_depth(local_names, depth)
-                        .cloned()
-                        .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))?,
-                })
-            }
-            "call" => Ok(RawExpr::Call {
-                name: self.symbol_display(
-                    root,
-                    payload
-                        .get("symbol")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("call missing symbol"))?,
-                )?,
-                args: payload
-                    .get("args")
-                    .and_then(JsonValue::as_array)
-                    .ok_or_else(|| anyhow!("call missing args"))?
-                    .iter()
-                    .map(|arg| {
-                        let hash = arg
-                            .as_str()
-                            .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                        self.patched_raw_expr_inline(hash, root, inline_exprs, local_names)
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            }),
-            "binary" => Ok(RawExpr::Binary {
-                op: payload
-                    .get("op")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("binary missing op"))?
-                    .to_string(),
-                left: Box::new(
-                    self.patched_raw_expr_inline(
-                        payload
-                            .get("left")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("binary missing left"))?,
-                        root,
-                        inline_exprs,
-                        local_names,
-                    )?,
-                ),
-                right: Box::new(
-                    self.patched_raw_expr_inline(
-                        payload
-                            .get("right")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("binary missing right"))?,
-                        root,
-                        inline_exprs,
-                        local_names,
-                    )?,
-                ),
-            }),
-            "unary" => Ok(RawExpr::Unary {
-                op: payload
-                    .get("op")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("unary missing op"))?
-                    .to_string(),
-                expr: Box::new(
-                    self.patched_raw_expr_inline(
-                        payload
-                            .get("expr")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("unary missing expr"))?,
-                        root,
-                        inline_exprs,
-                        local_names,
-                    )?,
-                ),
-            }),
-            "let" => {
-                let name = payload
-                    .get("binding_name")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("let missing binding_name"))?
-                    .to_string();
-                let binding_type = payload
-                    .get("binding_type")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("let missing binding_type"))?;
-                let value = self.patched_raw_expr_inline(
-                    payload
-                        .get("value")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("let missing value"))?,
-                    root,
-                    inline_exprs,
-                    local_names,
-                )?;
-                local_names.push(name.clone());
-                let body = self.patched_raw_expr_inline(
-                    payload
-                        .get("body")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("let missing body"))?,
-                    root,
-                    inline_exprs,
-                    local_names,
-                );
-                local_names.pop();
-                Ok(RawExpr::Let {
-                    name,
-                    ty: self.type_name(binding_type)?.to_string(),
-                    value: Box::new(value),
-                    body: Box::new(body?),
-                })
-            }
-            "if" => Ok(RawExpr::If {
-                cond: Box::new(
-                    self.patched_raw_expr_inline(
-                        payload
-                            .get("cond")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("if missing cond"))?,
-                        root,
-                        inline_exprs,
-                        local_names,
-                    )?,
-                ),
-                then_expr: Box::new(
-                    self.patched_raw_expr_inline(
-                        payload
-                            .get("then")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("if missing then"))?,
-                        root,
-                        inline_exprs,
-                        local_names,
-                    )?,
-                ),
-                else_expr: Box::new(
-                    self.patched_raw_expr_inline(
-                        payload
-                            .get("else")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("if missing else"))?,
-                        root,
-                        inline_exprs,
-                        local_names,
-                    )?,
-                ),
-            }),
-            "fold" => {
-                let item = payload
-                    .get("item_name")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("fold missing item_name"))?
-                    .to_string();
-                let acc = payload
-                    .get("acc_name")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("fold missing acc_name"))?
-                    .to_string();
-                let target = self.patched_raw_expr_inline(
-                    payload
-                        .get("target")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("fold missing target"))?,
-                    root,
-                    inline_exprs,
-                    local_names,
-                )?;
-                let init = self.patched_raw_expr_inline(
-                    payload
-                        .get("init")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("fold missing init"))?,
-                    root,
-                    inline_exprs,
-                    local_names,
-                )?;
-                local_names.push(item.clone());
-                local_names.push(acc.clone());
-                let body = self.patched_raw_expr_inline(
-                    payload
-                        .get("body")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("fold missing body"))?,
-                    root,
-                    inline_exprs,
-                    local_names,
-                );
-                local_names.pop();
-                local_names.pop();
-                Ok(RawExpr::Fold {
-                    item,
-                    target: Box::new(target),
-                    acc,
-                    init: Box::new(init),
-                    body: Box::new(body?),
-                })
-            }
-            other => bail!("unknown expression kind {other}"),
-        }
+        let body = self.function_body_hash(&entry.definition)?;
+        let region_names = self
+            .signature_region_params(&entry.signature)?
+            .into_iter()
+            .map(|param| (param.region, param.name))
+            .collect::<BTreeMap<_, _>>();
+        self.typed_expr_to_raw_hooked(
+            &body,
+            root,
+            MAIN_BRANCH,
+            &region_names,
+            &mut Vec::new(),
+            hook,
+        )
     }
 
-    fn inline_call_payload(
+    pub(crate) fn inline_call_payload(
         &self,
         call_payload: &JsonValue,
         root: &ProgramRootPayload,
-        caller_locals: &mut Vec<String>,
+        caller_locals: &mut [String],
     ) -> Result<RawExpr> {
         let target_symbol = call_payload
             .get("symbol")
@@ -1501,7 +1286,6 @@ impl CodeDb {
             .ok_or_else(|| anyhow!("call target missing from root {target_symbol}"))?;
         let target_body = self.function_body_hash(&target_entry.definition)?;
         let target_raw_body = self.typed_expr_to_raw(&target_body, root)?;
-        let empty_replacements = BTreeMap::new();
         let args = call_payload
             .get("args")
             .and_then(JsonValue::as_array)
@@ -1511,7 +1295,15 @@ impl CodeDb {
                 let hash = arg
                     .as_str()
                     .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                self.patched_raw_expr_specific(hash, root, &empty_replacements, caller_locals)
+                // Plain conversion: nested patch targets inside an inlined
+                // call's arguments are not rewritten (preserved behavior).
+                self.typed_expr_to_raw_in_module_with_regions_and_locals(
+                    hash,
+                    root,
+                    MAIN_BRANCH,
+                    &BTreeMap::new(),
+                    caller_locals,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -1779,10 +1571,35 @@ impl CodeDb {
             let entry = self
                 .root_symbol(root, &symbol)
                 .ok_or_else(|| anyhow!("matched symbol missing from root {symbol}"))?;
-            let body = self.function_body_hash(&entry.definition)?;
             let name = self.symbol_display(root, &symbol)?;
-            let patched =
-                self.patched_raw_expr(&body, root, &expr_hashes, &replacement, &mut Vec::new())?;
+            // The complete typed→raw converter with a replacement hook at the
+            // matched hashes (#12); a call-target replacement keeps converting
+            // the arguments (hook still active) under the new callee name.
+            let patched = self.patched_function_body(root, entry, &|hash, _payload| {
+                if !expr_hashes.contains(hash) {
+                    return Ok(RawHookOutcome::Continue);
+                }
+                Ok(match &replacement {
+                    ExprReplacement::LiteralI64(value) => {
+                        RawHookOutcome::Replace(RawExpr::LiteralI64 {
+                            value: value.clone(),
+                        })
+                    }
+                    ExprReplacement::LiteralBool(value) => {
+                        RawHookOutcome::Replace(RawExpr::LiteralBool { value: *value })
+                    }
+                    ExprReplacement::Unit => RawHookOutcome::Replace(RawExpr::Unit),
+                    ExprReplacement::CallTarget { target_name } => {
+                        RawHookOutcome::RenameCall(target_name.clone())
+                    }
+                    ExprReplacement::NewCall { target_name, args } => {
+                        RawHookOutcome::Replace(RawExpr::Call {
+                            name: target_name.clone(),
+                            args: args.clone(),
+                        })
+                    }
+                })
+            })?;
             operations.push(Operation::ReplaceFunctionBody {
                 module: MAIN_BRANCH.to_string(),
                 symbol,
@@ -1791,541 +1608,6 @@ impl CodeDb {
             });
         }
         Ok(operations)
-    }
-
-    fn patched_raw_expr(
-        &self,
-        expr_hash: &str,
-        root: &ProgramRootPayload,
-        replacements: &BTreeSet<String>,
-        replacement: &ExprReplacement,
-        local_names: &mut Vec<String>,
-    ) -> Result<RawExpr> {
-        let payload = self.get_payload(expr_hash)?;
-        let expr_kind = payload
-            .get("expr_kind")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?;
-        if replacements.contains(expr_hash) {
-            return match replacement {
-                ExprReplacement::LiteralI64(value) => Ok(RawExpr::LiteralI64 {
-                    value: value.clone(),
-                }),
-                ExprReplacement::LiteralBool(value) => Ok(RawExpr::LiteralBool { value: *value }),
-                ExprReplacement::Unit => Ok(RawExpr::Unit),
-                ExprReplacement::CallTarget { target_name } => {
-                    if expr_kind != "call" {
-                        bail!("call replacement matched non-call expression {expr_hash}");
-                    }
-                    Ok(RawExpr::Call {
-                        name: target_name.clone(),
-                        args: payload
-                            .get("args")
-                            .and_then(JsonValue::as_array)
-                            .ok_or_else(|| anyhow!("call missing args"))?
-                            .iter()
-                            .map(|arg| {
-                                let hash = arg
-                                    .as_str()
-                                    .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                                self.patched_raw_expr(
-                                    hash,
-                                    root,
-                                    replacements,
-                                    replacement,
-                                    local_names,
-                                )
-                            })
-                            .collect::<Result<Vec<_>>>()?,
-                    })
-                }
-                ExprReplacement::NewCall { target_name, args } => Ok(RawExpr::Call {
-                    name: target_name.clone(),
-                    args: args.clone(),
-                }),
-            };
-        }
-
-        match expr_kind {
-            "literal_i64" => Ok(RawExpr::LiteralI64 {
-                value: payload
-                    .get("value")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("literal_i64 missing value"))?
-                    .to_string(),
-            }),
-            "literal_bool" => Ok(RawExpr::LiteralBool {
-                value: payload
-                    .get("value")
-                    .and_then(JsonValue::as_bool)
-                    .ok_or_else(|| anyhow!("literal_bool missing value"))?,
-            }),
-            "literal_unit" => Ok(RawExpr::Unit),
-            "param_ref" => Ok(RawExpr::ParamRef {
-                index: payload
-                    .get("index")
-                    .and_then(JsonValue::as_u64)
-                    .ok_or_else(|| anyhow!("param_ref missing index"))?
-                    as usize,
-            }),
-            "local_ref" => {
-                let depth = payload
-                    .get("depth")
-                    .and_then(JsonValue::as_u64)
-                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
-                    as usize;
-                Ok(RawExpr::ParamName {
-                    name: local_at_depth(local_names, depth)
-                        .cloned()
-                        .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))?,
-                })
-            }
-            "call" => Ok(RawExpr::Call {
-                name: self.symbol_display(
-                    root,
-                    payload
-                        .get("symbol")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("call missing symbol"))?,
-                )?,
-                args: payload
-                    .get("args")
-                    .and_then(JsonValue::as_array)
-                    .ok_or_else(|| anyhow!("call missing args"))?
-                    .iter()
-                    .map(|arg| {
-                        let hash = arg
-                            .as_str()
-                            .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                        self.patched_raw_expr(hash, root, replacements, replacement, local_names)
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            }),
-            "binary" => Ok(RawExpr::Binary {
-                op: payload
-                    .get("op")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("binary missing op"))?
-                    .to_string(),
-                left: Box::new(
-                    self.patched_raw_expr(
-                        payload
-                            .get("left")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("binary missing left"))?,
-                        root,
-                        replacements,
-                        replacement,
-                        local_names,
-                    )?,
-                ),
-                right: Box::new(
-                    self.patched_raw_expr(
-                        payload
-                            .get("right")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("binary missing right"))?,
-                        root,
-                        replacements,
-                        replacement,
-                        local_names,
-                    )?,
-                ),
-            }),
-            "unary" => Ok(RawExpr::Unary {
-                op: payload
-                    .get("op")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("unary missing op"))?
-                    .to_string(),
-                expr: Box::new(
-                    self.patched_raw_expr(
-                        payload
-                            .get("expr")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("unary missing expr"))?,
-                        root,
-                        replacements,
-                        replacement,
-                        local_names,
-                    )?,
-                ),
-            }),
-            "let" => {
-                let name = payload
-                    .get("binding_name")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("let missing binding_name"))?
-                    .to_string();
-                let binding_type = payload
-                    .get("binding_type")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("let missing binding_type"))?;
-                let value = self.patched_raw_expr(
-                    payload
-                        .get("value")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("let missing value"))?,
-                    root,
-                    replacements,
-                    replacement,
-                    local_names,
-                )?;
-                local_names.push(name.clone());
-                let body = self.patched_raw_expr(
-                    payload
-                        .get("body")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("let missing body"))?,
-                    root,
-                    replacements,
-                    replacement,
-                    local_names,
-                );
-                local_names.pop();
-                Ok(RawExpr::Let {
-                    name,
-                    ty: self.type_name(binding_type)?.to_string(),
-                    value: Box::new(value),
-                    body: Box::new(body?),
-                })
-            }
-            "if" => Ok(RawExpr::If {
-                cond: Box::new(
-                    self.patched_raw_expr(
-                        payload
-                            .get("cond")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("if missing cond"))?,
-                        root,
-                        replacements,
-                        replacement,
-                        local_names,
-                    )?,
-                ),
-                then_expr: Box::new(
-                    self.patched_raw_expr(
-                        payload
-                            .get("then")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("if missing then"))?,
-                        root,
-                        replacements,
-                        replacement,
-                        local_names,
-                    )?,
-                ),
-                else_expr: Box::new(
-                    self.patched_raw_expr(
-                        payload
-                            .get("else")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("if missing else"))?,
-                        root,
-                        replacements,
-                        replacement,
-                        local_names,
-                    )?,
-                ),
-            }),
-            "fold" => {
-                let item = payload
-                    .get("item_name")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("fold missing item_name"))?
-                    .to_string();
-                let acc = payload
-                    .get("acc_name")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("fold missing acc_name"))?
-                    .to_string();
-                let target = self.patched_raw_expr(
-                    payload
-                        .get("target")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("fold missing target"))?,
-                    root,
-                    replacements,
-                    replacement,
-                    local_names,
-                )?;
-                let init = self.patched_raw_expr(
-                    payload
-                        .get("init")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("fold missing init"))?,
-                    root,
-                    replacements,
-                    replacement,
-                    local_names,
-                )?;
-                local_names.push(item.clone());
-                local_names.push(acc.clone());
-                let body = self.patched_raw_expr(
-                    payload
-                        .get("body")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("fold missing body"))?,
-                    root,
-                    replacements,
-                    replacement,
-                    local_names,
-                );
-                local_names.pop();
-                local_names.pop();
-                Ok(RawExpr::Fold {
-                    item,
-                    target: Box::new(target),
-                    acc,
-                    init: Box::new(init),
-                    body: Box::new(body?),
-                })
-            }
-            other => bail!("unknown expression kind {other}"),
-        }
-    }
-
-    fn patched_raw_expr_specific(
-        &self,
-        expr_hash: &str,
-        root: &ProgramRootPayload,
-        replacements: &BTreeMap<String, RawExpr>,
-        local_names: &mut Vec<String>,
-    ) -> Result<RawExpr> {
-        if let Some(replacement) = replacements.get(expr_hash) {
-            return Ok(replacement.clone());
-        }
-        let payload = self.get_payload(expr_hash)?;
-        let expr_kind = payload
-            .get("expr_kind")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?;
-        match expr_kind {
-            "literal_i64" => Ok(RawExpr::LiteralI64 {
-                value: payload
-                    .get("value")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("literal_i64 missing value"))?
-                    .to_string(),
-            }),
-            "literal_bool" => Ok(RawExpr::LiteralBool {
-                value: payload
-                    .get("value")
-                    .and_then(JsonValue::as_bool)
-                    .ok_or_else(|| anyhow!("literal_bool missing value"))?,
-            }),
-            "literal_unit" => Ok(RawExpr::Unit),
-            "param_ref" => Ok(RawExpr::ParamRef {
-                index: payload
-                    .get("index")
-                    .and_then(JsonValue::as_u64)
-                    .ok_or_else(|| anyhow!("param_ref missing index"))?
-                    as usize,
-            }),
-            "local_ref" => {
-                let depth = payload
-                    .get("depth")
-                    .and_then(JsonValue::as_u64)
-                    .ok_or_else(|| anyhow!("local_ref missing depth"))?
-                    as usize;
-                Ok(RawExpr::ParamName {
-                    name: local_at_depth(local_names, depth)
-                        .cloned()
-                        .ok_or_else(|| anyhow!("local_ref depth out of bounds: {depth}"))?,
-                })
-            }
-            "call" => Ok(RawExpr::Call {
-                name: self.symbol_display(
-                    root,
-                    payload
-                        .get("symbol")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("call missing symbol"))?,
-                )?,
-                args: payload
-                    .get("args")
-                    .and_then(JsonValue::as_array)
-                    .ok_or_else(|| anyhow!("call missing args"))?
-                    .iter()
-                    .map(|arg| {
-                        let hash = arg
-                            .as_str()
-                            .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                        self.patched_raw_expr_specific(hash, root, replacements, local_names)
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            }),
-            "binary" => Ok(RawExpr::Binary {
-                op: payload
-                    .get("op")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("binary missing op"))?
-                    .to_string(),
-                left: Box::new(
-                    self.patched_raw_expr_specific(
-                        payload
-                            .get("left")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("binary missing left"))?,
-                        root,
-                        replacements,
-                        local_names,
-                    )?,
-                ),
-                right: Box::new(
-                    self.patched_raw_expr_specific(
-                        payload
-                            .get("right")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("binary missing right"))?,
-                        root,
-                        replacements,
-                        local_names,
-                    )?,
-                ),
-            }),
-            "unary" => Ok(RawExpr::Unary {
-                op: payload
-                    .get("op")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("unary missing op"))?
-                    .to_string(),
-                expr: Box::new(
-                    self.patched_raw_expr_specific(
-                        payload
-                            .get("expr")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("unary missing expr"))?,
-                        root,
-                        replacements,
-                        local_names,
-                    )?,
-                ),
-            }),
-            "let" => {
-                let name = payload
-                    .get("binding_name")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("let missing binding_name"))?
-                    .to_string();
-                let binding_type = payload
-                    .get("binding_type")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("let missing binding_type"))?;
-                let value = self.patched_raw_expr_specific(
-                    payload
-                        .get("value")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("let missing value"))?,
-                    root,
-                    replacements,
-                    local_names,
-                )?;
-                local_names.push(name.clone());
-                let body = self.patched_raw_expr_specific(
-                    payload
-                        .get("body")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("let missing body"))?,
-                    root,
-                    replacements,
-                    local_names,
-                );
-                local_names.pop();
-                Ok(RawExpr::Let {
-                    name,
-                    ty: self.type_name(binding_type)?.to_string(),
-                    value: Box::new(value),
-                    body: Box::new(body?),
-                })
-            }
-            "if" => Ok(RawExpr::If {
-                cond: Box::new(
-                    self.patched_raw_expr_specific(
-                        payload
-                            .get("cond")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("if missing cond"))?,
-                        root,
-                        replacements,
-                        local_names,
-                    )?,
-                ),
-                then_expr: Box::new(
-                    self.patched_raw_expr_specific(
-                        payload
-                            .get("then")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("if missing then"))?,
-                        root,
-                        replacements,
-                        local_names,
-                    )?,
-                ),
-                else_expr: Box::new(
-                    self.patched_raw_expr_specific(
-                        payload
-                            .get("else")
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| anyhow!("if missing else"))?,
-                        root,
-                        replacements,
-                        local_names,
-                    )?,
-                ),
-            }),
-            "fold" => {
-                let item = payload
-                    .get("item_name")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("fold missing item_name"))?
-                    .to_string();
-                let acc = payload
-                    .get("acc_name")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("fold missing acc_name"))?
-                    .to_string();
-                let target = self.patched_raw_expr_specific(
-                    payload
-                        .get("target")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("fold missing target"))?,
-                    root,
-                    replacements,
-                    local_names,
-                )?;
-                let init = self.patched_raw_expr_specific(
-                    payload
-                        .get("init")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("fold missing init"))?,
-                    root,
-                    replacements,
-                    local_names,
-                )?;
-                local_names.push(item.clone());
-                local_names.push(acc.clone());
-                let body = self.patched_raw_expr_specific(
-                    payload
-                        .get("body")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("fold missing body"))?,
-                    root,
-                    replacements,
-                    local_names,
-                );
-                local_names.pop();
-                local_names.pop();
-                Ok(RawExpr::Fold {
-                    item,
-                    target: Box::new(target),
-                    acc,
-                    init: Box::new(init),
-                    body: Box::new(body?),
-                })
-            }
-            other => bail!("unknown expression kind {other}"),
-        }
     }
 
     fn resolve_patch_symbol(
@@ -2524,201 +1806,12 @@ fn expression_literal_value(expr_kind: &str, payload: &JsonValue) -> Option<Json
     }
 }
 
-fn expression_child_hashes(expr_kind: &str, payload: &JsonValue) -> Result<Vec<String>> {
-    let mut children = Vec::new();
-    match expr_kind {
-        "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref"
-        | "local_ref" => {}
-        "call" => {
-            for arg in payload
-                .get("args")
-                .and_then(JsonValue::as_array)
-                .ok_or_else(|| anyhow!("call missing args"))?
-            {
-                children.push(
-                    arg.as_str()
-                        .ok_or_else(|| anyhow!("call arg must be hash"))?
-                        .to_string(),
-                );
-            }
-        }
-        "binary" => {
-            for key in ["left", "right"] {
-                children.push(
-                    payload
-                        .get(key)
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("binary missing {key}"))?
-                        .to_string(),
-                );
-            }
-        }
-        "unary" => {
-            children.push(
-                payload
-                    .get("expr")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("unary missing expr"))?
-                    .to_string(),
-            );
-        }
-        "let" => {
-            for key in ["value", "body"] {
-                children.push(
-                    payload
-                        .get(key)
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("let missing {key}"))?
-                        .to_string(),
-                );
-            }
-        }
-        "if" => {
-            for key in ["cond", "then", "else"] {
-                children.push(
-                    payload
-                        .get(key)
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("if missing {key}"))?
-                        .to_string(),
-                );
-            }
-        }
-        "fold" => {
-            for key in ["target", "init", "body"] {
-                children.push(
-                    payload
-                        .get(key)
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("fold missing {key}"))?
-                        .to_string(),
-                );
-            }
-        }
-        "borrow_shared" | "borrow_mut" | "slice_from_array" | "slice_len" => {
-            push_child_keys(payload, expr_kind, &["target"], &mut children)?;
-        }
-        "assign" => {
-            push_child_keys(payload, expr_kind, &["target", "value"], &mut children)?;
-        }
-        "record_literal" => {
-            for field in payload
-                .get("fields")
-                .and_then(JsonValue::as_array)
-                .ok_or_else(|| anyhow!("record_literal missing fields"))?
-            {
-                children.push(
-                    field
-                        .get("value")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("record field missing value"))?
-                        .to_string(),
-                );
-            }
-        }
-        "array_literal" => {
-            for element in payload
-                .get("elements")
-                .and_then(JsonValue::as_array)
-                .ok_or_else(|| anyhow!("array_literal missing elements"))?
-            {
-                children.push(
-                    element
-                        .get("value")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("array element missing value"))?
-                        .to_string(),
-                );
-            }
-        }
-        "array_fill" => {
-            push_child_keys(payload, expr_kind, &["value"], &mut children)?;
-        }
-        "array_set" => {
-            push_child_keys(payload, expr_kind, &["array", "index", "value"], &mut children)?;
-        }
-        "array_index" | "vec_get" => {
-            push_child_keys(payload, expr_kind, &["target", "index"], &mut children)?;
-        }
-        "field_access" => {
-            push_child_keys(payload, expr_kind, &["target"], &mut children)?;
-        }
-        "enum_construct" | "box_new" | "unbox" | "raw_ptr_cast" | "raw_load" | "int_cast" => {
-            let key = if expr_kind == "raw_load" {
-                "pointer"
-            } else {
-                "value"
-            };
-            push_child_keys(payload, expr_kind, &[key], &mut children)?;
-        }
-        "case" => {
-            push_child_keys(payload, expr_kind, &["expr"], &mut children)?;
-            for arm in payload
-                .get("arms")
-                .and_then(JsonValue::as_array)
-                .ok_or_else(|| anyhow!("case missing arms"))?
-            {
-                children.push(
-                    arm.get("body")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("case arm missing body"))?
-                        .to_string(),
-                );
-            }
-        }
-        "subslice" => {
-            push_child_keys(
-                payload,
-                expr_kind,
-                &["target", "start", "len"],
-                &mut children,
-            )?;
-        }
-        "vec_new" => {
-            push_child_keys(payload, expr_kind, &["capacity"], &mut children)?;
-        }
-        "vec_push" => {
-            push_child_keys(payload, expr_kind, &["target", "value"], &mut children)?;
-        }
-        "vec_len" | "string_len" => {
-            push_child_keys(payload, expr_kind, &["target"], &mut children)?;
-        }
-        "string_new" => {
-            push_child_keys(payload, expr_kind, &["source"], &mut children)?;
-        }
-        "string_with_capacity" => {
-            push_child_keys(payload, expr_kind, &["capacity"], &mut children)?;
-        }
-        "string_push" => {
-            push_child_keys(payload, expr_kind, &["target", "value"], &mut children)?;
-        }
-        "string_get" => {
-            push_child_keys(payload, expr_kind, &["target", "index"], &mut children)?;
-        }
-        "raw_store" => {
-            push_child_keys(payload, expr_kind, &["pointer", "value"], &mut children)?;
-        }
-        other => bail!("unknown expression kind {other}"),
-    }
-    Ok(children)
-}
-
-fn push_child_keys(
-    payload: &JsonValue,
-    expr_kind: &str,
-    keys: &[&str],
-    children: &mut Vec<String>,
-) -> Result<()> {
-    for key in keys {
-        children.push(
-            payload
-                .get(*key)
-                .and_then(JsonValue::as_str)
-                .ok_or_else(|| anyhow!("{expr_kind} missing {key}"))?
-                .to_string(),
-        );
-    }
-    Ok(())
+/// Child expression hashes for patch-pattern matching, from the central
+/// typed-DAG child table (#12). The old hand-maintained per-kind match here
+/// missed `return`/`loop` (and case guards), so ANY patch against a root
+/// containing such a function failed root-wide during match traversal.
+fn expression_child_hashes(payload: &JsonValue) -> Result<Vec<String>> {
+    crate::types::child_expr_hashes(payload)
 }
 
 fn validate_same_args(args: Option<&JsonValue>) -> Result<()> {
@@ -3888,13 +2981,6 @@ fn unique_inline_local_name(name: &str, used_names: &BTreeSet<String>) -> String
         }
     }
     unreachable!()
-}
-
-fn local_at_depth<T>(locals: &[T], depth: usize) -> Option<&T> {
-    locals
-        .len()
-        .checked_sub(depth + 1)
-        .and_then(|idx| locals.get(idx))
 }
 
 fn default_branch() -> String {

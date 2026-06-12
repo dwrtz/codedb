@@ -177,6 +177,47 @@ fn fixtures() -> Vec<Fixture> {
             format!("{t}:{}", wrap_to_width(!a, width, signed)),
         );
     }
+
+    // Edge operands the safe (12, 3) pair never reaches. MIN / -1 (and MIN % -1)
+    // is the x86_64 `idiv` #DE case (#8): eval and arm64 wrap to (MIN, 0), so
+    // x86_64 must too instead of SIGFPEing. MIN is built by shifting (1 << bits-1
+    // wraps) so the fixture does not depend on MIN literals. Distinct `entry`
+    // names keep one runnable test per fixture; the `kind` stays the registered
+    // operator so the lowering proof and the coverage gate keep working.
+    for &(t, width, signed) in WIDTHS {
+        if !signed {
+            continue;
+        }
+        let int_flag = "--expect-int";
+        let bits = width * 8;
+        let min: i128 = -(1i128 << (bits - 1));
+        let bind_min = |expr: &str| {
+            format!(
+                "let one: {t} = 1 in let m: {t} = one << {} in let n: {t} = -1 in {expr}",
+                bits - 1
+            )
+        };
+        let edges: &[(&str, &str, i128)] = &[
+            ("div_min_neg1", "m / n", -min), // wraps back to MIN
+            ("mod_min_neg1", "m % n", 0),
+            ("div_min_pos1", "m / one", min),
+            ("mod_neg7_pos2", "(0 - 7) % 2", -7 % 2),
+        ];
+        for &(label, expr, result) in edges {
+            let verb = if expr.contains('%') { "mod" } else { "div" };
+            push(
+                &mut out,
+                format!("{verb}_{t}"),
+                t,
+                bind_min(expr),
+                int_flag,
+                format!("{t}:{}", wrap_to_width(result, width, signed)),
+            );
+            // Re-label the entry so each edge case is its own function/test.
+            let fixture = out.last_mut().expect("just pushed");
+            fixture.entry = format!("op_{label}_{t}");
+        }
+    }
     out
 }
 
@@ -248,19 +289,21 @@ fn every_operator_lowers_to_its_kind_and_agrees_across_eval_and_native() {
         );
     }
 
-    // Step 2: register a native-required test per operator (reference + native).
+    // Step 2: register a native-required test per fixture (reference + native).
+    // Named by entry, not kind: the edge-operand fixtures share an operator kind
+    // with the base fixture but are separate runnable cases.
     for fixture in &fixtures {
         let created = parse_json(&run(&[
             "create-test",
             path(&db),
-            &format!("conf_{}", fixture.kind),
+            &format!("conf_{}", fixture.entry),
             "--entry",
             fixture.entry.as_str(),
             &format!("{}={}", fixture.expect_flag, fixture.expect),
             "--native-required",
             "--json",
         ]));
-        assert_eq!(created["status"], "applied", "create-test {}", fixture.kind);
+        assert_eq!(created["status"], "applied", "create-test {}", fixture.entry);
     }
 
     // Step 3: one run executes reference and native for every operator.
@@ -268,7 +311,7 @@ fn every_operator_lowers_to_its_kind_and_agrees_across_eval_and_native() {
     let tests = report["tests"].as_array().expect("tests array");
     let toolchain = can_build_default_native_target();
     for fixture in &fixtures {
-        let name = format!("conf_{}", fixture.kind);
+        let name = format!("conf_{}", fixture.entry);
         let test = tests
             .iter()
             .find(|test| test["name"].as_str() == Some(name.as_str()))
@@ -276,20 +319,20 @@ fn every_operator_lowers_to_its_kind_and_agrees_across_eval_and_native() {
         assert_eq!(
             test["reference"]["status"], "passed",
             "reference evaluator disagreed on {}",
-            fixture.kind
+            fixture.entry
         );
         if toolchain {
             assert_eq!(
                 test["native"]["status"], "passed",
                 "native backend disagreed with the evaluator on {}",
-                fixture.kind
+                fixture.entry
             );
         } else {
             // No toolchain: the native-required gate must fire, never pass vacuously.
             assert_eq!(
                 test["native"]["status"], "unsupported",
                 "native-required gate must fire without a toolchain ({})",
-                fixture.kind
+                fixture.entry
             );
         }
     }

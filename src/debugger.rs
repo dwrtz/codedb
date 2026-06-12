@@ -908,93 +908,16 @@ fn expr_reachable_from(
     if !seen.insert(current_hash.to_string()) {
         return Ok(false);
     }
+    // Children come from the central typed-DAG table (#12) so a new expression
+    // kind extends break-expr reachability automatically instead of silently
+    // (or loudly) missing here.
     let payload = db.get_payload(current_hash)?;
-    let expr_kind = payload
-        .get("expr_kind")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| anyhow!("expression missing expr_kind {current_hash}"))?;
-    match expr_kind {
-        "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" | "local_ref" => Ok(false),
-        "call" => {
-            for arg in payload
-                .get("args")
-                .and_then(JsonValue::as_array)
-                .ok_or_else(|| anyhow!("call missing args"))?
-            {
-                let child = arg
-                    .as_str()
-                    .ok_or_else(|| anyhow!("call arg must be hash"))?;
-                if expr_reachable_from(db, child, target_hash, seen)? {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+    for child in crate::types::child_expr_hashes(&payload)? {
+        if expr_reachable_from(db, &child, target_hash, seen)? {
+            return Ok(true);
         }
-        "binary" => {
-            if expr_reachable_child_field(db, &payload, "left", target_hash, seen)? {
-                return Ok(true);
-            }
-            expr_reachable_child_field(db, &payload, "right", target_hash, seen)
-        }
-        "unary" => expr_reachable_child_field(db, &payload, "expr", target_hash, seen),
-        "raw_ptr_cast" => expr_reachable_child_field(db, &payload, "value", target_hash, seen),
-        "raw_load" => expr_reachable_child_field(db, &payload, "pointer", target_hash, seen),
-        "raw_store" => {
-            if expr_reachable_child_field(db, &payload, "pointer", target_hash, seen)? {
-                return Ok(true);
-            }
-            expr_reachable_child_field(db, &payload, "value", target_hash, seen)
-        }
-        "let" => {
-            if expr_reachable_child_field(db, &payload, "value", target_hash, seen)? {
-                return Ok(true);
-            }
-            expr_reachable_child_field(db, &payload, "body", target_hash, seen)
-        }
-        "if" => {
-            if expr_reachable_child_field(db, &payload, "cond", target_hash, seen)? {
-                return Ok(true);
-            }
-            if expr_reachable_child_field(db, &payload, "then", target_hash, seen)? {
-                return Ok(true);
-            }
-            expr_reachable_child_field(db, &payload, "else", target_hash, seen)
-        }
-        "return" => expr_reachable_child_field(db, &payload, "value", target_hash, seen),
-        "fold" => {
-            if expr_reachable_child_field(db, &payload, "target", target_hash, seen)? {
-                return Ok(true);
-            }
-            if expr_reachable_child_field(db, &payload, "init", target_hash, seen)? {
-                return Ok(true);
-            }
-            expr_reachable_child_field(db, &payload, "body", target_hash, seen)
-        }
-        "loop" => {
-            if expr_reachable_child_field(db, &payload, "init", target_hash, seen)? {
-                return Ok(true);
-            }
-            if expr_reachable_child_field(db, &payload, "cond", target_hash, seen)? {
-                return Ok(true);
-            }
-            expr_reachable_child_field(db, &payload, "body", target_hash, seen)
-        }
-        other => bail!("unknown expression kind {other}"),
     }
-}
-
-fn expr_reachable_child_field(
-    db: &CodeDb,
-    payload: &JsonValue,
-    key: &str,
-    target_hash: &str,
-    seen: &mut BTreeSet<String>,
-) -> Result<bool> {
-    let child = payload
-        .get(key)
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| anyhow!("expression missing {key}"))?;
-    expr_reachable_from(db, child, target_hash, seen)
+    Ok(false)
 }
 
 fn event_view(event_index: usize, event: &TraceEvent) -> DebugEventView {

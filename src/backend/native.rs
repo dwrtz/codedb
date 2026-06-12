@@ -3549,10 +3549,25 @@ impl FunctionEmitter {
         self.text.extend_from_slice(&[0x48, 0x85, 0xc9]); // test rcx, rcx
         self.text.extend_from_slice(&[0x75, 0x02]); // jne +2
         self.text.extend_from_slice(&[0x0f, 0x0b]); // ud2
-        if k.signed || k.width < 8 {
-            // Signed divide. Narrow unsigned operands are zero-extended and thus
-            // non-negative in 64 bits, so a signed `idiv` yields the same quotient
-            // and the result is re-normalized to the width afterward.
+        if k.signed {
+            // `idiv` also #DE-faults on i64::MIN / -1 (quotient 2^63 is
+            // unrepresentable), where eval and arm64 wrap to MIN (#8). Divisor
+            // -1 is computed directly instead: quotient = -x (`neg` wraps
+            // MIN -> MIN exactly like wrapping_div), remainder = 0. Narrow
+            // signed widths can't fault the 64-bit idiv, but the fast path is
+            // equally exact for them (negate, then renormalize re-wraps).
+            self.text.extend_from_slice(&[0x48, 0x83, 0xf9, 0xff]); // cmp rcx, -1
+            self.text.extend_from_slice(&[0x75, 0x07]); // jne +7 (to cqo)
+            self.text.extend_from_slice(&[0x48, 0xf7, 0xd8]); // neg rax (quotient)
+            self.text.extend_from_slice(&[0x31, 0xd2]); // xor edx, edx (remainder 0)
+            self.text.extend_from_slice(&[0xeb, 0x05]); // jmp +5 (over cqo+idiv)
+            self.text.extend_from_slice(&[0x48, 0x99]); // cqo
+            self.text.extend_from_slice(&[0x48, 0xf7, 0xf9]); // idiv rcx
+        } else if k.width < 8 {
+            // Narrow unsigned operands are zero-extended and thus non-negative
+            // in 64 bits, so a signed `idiv` yields the same quotient (and can
+            // neither overflow nor see a -1 divisor); the result is
+            // re-normalized to the width afterward.
             self.text.extend_from_slice(&[0x48, 0x99]); // cqo
             self.text.extend_from_slice(&[0x48, 0xf7, 0xf9]); // idiv rcx
         } else {

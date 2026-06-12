@@ -125,3 +125,61 @@ fn sha256_hashes_abc_to_reference_digest() {
         assert_eq!(report["unsupported"], 0);
     }
 }
+
+#[test]
+fn codec_and_string_programs_project_to_a_fixpoint() {
+    // SPEC_V3 §11: import → export → import is a root-hash FIXPOINT and the
+    // re-exported projection is byte-stable. Pinned for the two acceptance
+    // surfaces that previously had no fixpoint test: the Phase 9 codec
+    // fixtures (sized ints / hex / casts / loops) and a Phase 12 program built
+    // on the std string/fmt capsules.
+    let fmt_driver = "fn show(n: i64) -> i64 effects[alloc, state] =\n\
+                      \u{20} std.fmt.string_to_i64(std.fmt.i64_to_string(n))\n";
+    let temp = tempdir().unwrap();
+    let p12 = temp.path().join("p12.cdb");
+    std::fs::write(
+        &p12,
+        format!(
+            "{}{}",
+            std::fs::read_to_string("std/fmt.cdb").unwrap(),
+            fmt_driver
+        ),
+    )
+    .unwrap();
+    let cases: &[(&str, &Path)] = &[
+        ("sha256", Path::new("examples/v3/sha256.cdb")),
+        ("fnv1a", Path::new("examples/fnv1a.cdb")),
+        ("p12_fmt", &p12),
+    ];
+    for (label, source) in cases {
+        let db = temp.path().join(format!("{label}.sqlite"));
+        run(&["init", path(&db)]);
+        run(&["import", path(&db), path(source)]);
+        let export1 = temp.path().join(format!("{label}.export1.cdb"));
+        run(&["export", path(&db), "--branch", "main", "--out", path(&export1)]);
+
+        let db2 = temp.path().join(format!("{label}-rebuilt.sqlite"));
+        run(&["init", path(&db2)]);
+        run(&["import", path(&db2), path(&export1)]);
+        run(&["verify", path(&db2)]);
+        let export2 = temp.path().join(format!("{label}.export2.cdb"));
+        run(&["export", path(&db2), "--branch", "main", "--out", path(&export2)]);
+
+        assert_eq!(
+            std::fs::read_to_string(&export1).unwrap(),
+            std::fs::read_to_string(&export2).unwrap(),
+            "{label}: projection must be byte-stable"
+        );
+        let root = |db: &Path| {
+            parse_json(&run(&["history", path(db), "--json"]))["root_hash"]
+                .as_str()
+                .expect("root_hash")
+                .to_string()
+        };
+        assert_eq!(
+            root(&db),
+            root(&db2),
+            "{label}: import→export→import must be a root-hash fixpoint"
+        );
+    }
+}

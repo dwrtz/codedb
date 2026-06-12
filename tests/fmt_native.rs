@@ -48,6 +48,12 @@ const CASES: &[(&str, &str)] = &[
     ("neg_second", "57"),
     ("min_len", "20"),
     ("zero_len", "1"),
+    // Digit validation: any non-digit byte poisons the parse to 0 (a `'+'`
+    // used to be treated as the digit -5, so "+5" parsed to -5... or worse).
+    ("bad_plus", "0"),
+    ("bad_tail", "0"),
+    ("bad_alpha", "0"),
+    ("good_digits", "405"),
 ];
 
 const DRIVER: &str = r#"
@@ -68,6 +74,10 @@ fn min_len() -> i64 effects[state, alloc] =
   let s: string = std.fmt.i64_to_string(0 - 9223372036854775807 - 1) in string_len(s)
 fn zero_len() -> i64 effects[state, alloc] =
   let s: string = std.fmt.i64_to_string(0) in string_len(s)
+fn bad_plus() -> i64 effects[state, alloc] = std.fmt.string_to_i64(string_new("+5"))
+fn bad_tail() -> i64 effects[state, alloc] = std.fmt.string_to_i64(string_new("12x"))
+fn bad_alpha() -> i64 effects[state, alloc] = std.fmt.string_to_i64(string_new("abc"))
+fn good_digits() -> i64 effects[state, alloc] = std.fmt.string_to_i64(string_new("405"))
 "#;
 
 #[test]

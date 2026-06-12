@@ -375,6 +375,11 @@ struct MoveBorrowState {
     active: Vec<ActiveLoan>,
     moved: Vec<LoanPlace>,
     next_local: usize,
+    /// Monotone count of move events recorded so far. Unlike `moved`, entries
+    /// are never retired when a scope pops, so a multi-execution region (a
+    /// `loop` cond/body) can detect that ANY place was moved during it — the
+    /// typecheck-time mirror of the native-lowering `ctx.moved` snapshot gate.
+    move_events: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -574,7 +579,17 @@ pub(crate) fn int_literal_in_range(value: &str, int: &ScalarIntType) -> bool {
         Some(hex) => (16, hex),
         None => (10, value),
     };
+    // A hex literal at a SIGNED width is a bit pattern (#9): `0x80` as i8 is
+    // -128, `0xff` is -1 — parsed at the unsigned width, reinterpreted. The
+    // previously accepted range (no high bit) parses to the same values, so
+    // only previously-REJECTED literals gain meaning. Decimal stays a signed
+    // value (incl. a leading `-`, used by the negated-literal fold).
+    let signed_hex = int.signed && radix == 16;
     match (int.signed, int.width) {
+        (true, 1) if signed_hex => u8::from_str_radix(digits, radix).is_ok(),
+        (true, 2) if signed_hex => u16::from_str_radix(digits, radix).is_ok(),
+        (true, 4) if signed_hex => u32::from_str_radix(digits, radix).is_ok(),
+        (true, 8) if signed_hex => u64::from_str_radix(digits, radix).is_ok(),
         (true, 1) => i8::from_str_radix(digits, radix).is_ok(),
         (true, 2) => i16::from_str_radix(digits, radix).is_ok(),
         (true, 4) => i32::from_str_radix(digits, radix).is_ok(),
@@ -1699,7 +1714,7 @@ impl CodeDb {
             return Ok(());
         }
         let mut seen = std::collections::BTreeSet::new();
-        self.materialize_instance(root, type_symbol, region_args, type_args, &mut seen)
+        self.materialize_instance(root, type_symbol, region_args, type_args, &mut seen, 0)
     }
 
     /// Eagerly store the substituted member types of one named-type instantiation,
@@ -1709,6 +1724,10 @@ impl CodeDb {
     /// — would otherwise have no stored expansion for layout/lowering to load. The
     /// `seen` set keeps a recursive generic (`List<T>` whose `cons` holds a
     /// `box<List<T>>`) terminating: the box also breaks the layout size cycle.
+    /// `seen` does NOT terminate an instantiation whose arguments GROW each level
+    /// (`Grow<T>` containing `Grow<box<T>>` — every instance hash is new), so
+    /// `depth` caps the chain fail-closed (#7) instead of overflowing the host
+    /// stack.
     fn materialize_instance(
         &mut self,
         root: &ProgramRootPayload,
@@ -1716,7 +1735,13 @@ impl CodeDb {
         region_args: &[String],
         type_args: &[String],
         seen: &mut std::collections::BTreeSet<String>,
+        depth: usize,
     ) -> Result<()> {
+        if depth > GENERIC_INSTANTIATION_DEPTH_LIMIT {
+            bail!(
+                "generic type instantiation exceeds the depth limit ({GENERIC_INSTANTIATION_DEPTH_LIMIT}) at {type_symbol}: a recursive generic whose type arguments grow each level (polymorphic recursion) does not converge"
+            );
+        }
         let instance_hash = self.put_structural_type(TypeSpec::Named {
             type_symbol: type_symbol.to_string(),
             region_args: region_args.to_vec(),
@@ -1734,7 +1759,7 @@ impl CodeDb {
         for member in members {
             let substituted =
                 self.put_substituted_type(&member.type_hash, &region_substitutions, &param_args)?;
-            self.materialize_nested_instances(root, &substituted, seen)?;
+            self.materialize_nested_instances(root, &substituted, seen, depth + 1)?;
         }
         Ok(())
     }
@@ -1744,6 +1769,7 @@ impl CodeDb {
         root: &ProgramRootPayload,
         type_hash: &str,
         seen: &mut std::collections::BTreeSet<String>,
+        depth: usize,
     ) -> Result<()> {
         match self.type_spec(type_hash)? {
             TypeSpec::Named {
@@ -1758,6 +1784,7 @@ impl CodeDb {
                         &region_args,
                         &type_args,
                         seen,
+                        depth,
                     )?;
                 }
                 Ok(())
@@ -1770,11 +1797,11 @@ impl CodeDb {
                 referent: element, ..
             }
             | TypeSpec::RawPointer { pointee: element, .. } => {
-                self.materialize_nested_instances(root, &element, seen)
+                self.materialize_nested_instances(root, &element, seen, depth)
             }
             TypeSpec::Record(members) | TypeSpec::Enum(members) => {
                 for member in members {
-                    self.materialize_nested_instances(root, &member.type_hash, seen)?;
+                    self.materialize_nested_instances(root, &member.type_hash, seen, depth)?;
                 }
                 Ok(())
             }
@@ -2099,7 +2126,7 @@ impl CodeDb {
         type_hash: &str,
     ) -> Result<()> {
         let mut seen = std::collections::BTreeSet::new();
-        self.materialize_nested_instances(root, type_hash, &mut seen)
+        self.materialize_nested_instances(root, type_hash, &mut seen, 0)
     }
 
     /// Type-check a call to a generic function (R11): infer the callee's type
@@ -2177,8 +2204,11 @@ impl CodeDb {
             let typed = match typed {
                 Ok(typed) => typed,
                 Err(original) => {
+                    // The storing twin: the anchor can be a NEW type (`&'r T` at
+                    // T=i64 mints `&'r i64`), and typing the argument against it
+                    // loads it — an unstored hash is a `missing object` (#11).
                     let anchor =
-                        self.substitute_type_hash(&expected_params[idx], &no_regions, &partial_args)?;
+                        self.put_substituted_type(&expected_params[idx], &no_regions, &partial_args)?;
                     if !self.type_is_concrete(&anchor)? {
                         return Err(original.context(format!(
                             "cannot infer the type arguments of generic function {name} for \
@@ -2217,7 +2247,13 @@ impl CodeDb {
         //    parameter types, and check each argument is assignable.
         let mut region_substitutions = BTreeMap::new();
         for (idx, expected) in expected_params.iter().enumerate() {
-            let concrete = self.substitute_type_hash(expected, &no_regions, &type_args)?;
+            // The storing twin, not `substitute_type_hash`: substitution can mint
+            // a type that exists nowhere else (`&'r T` at T=i64 → `&'r i64`), and
+            // the assignability/region walks below load it by hash — an unstored
+            // hash failed with an internal `missing object` (#11). Storing here
+            // also guarantees verify's non-storing recompute of this signature
+            // resolves.
+            let concrete = self.put_substituted_type(expected, &no_regions, &type_args)?;
             if !self.type_assignable_for_call_in_root(
                 root,
                 &arg_types[idx],
@@ -2285,13 +2321,33 @@ impl CodeDb {
         root: &mut ProgramRootPayload,
         body: &str,
     ) -> Result<()> {
-        let mut worklist = Vec::new();
-        self.collect_concrete_generic_calls(body, &mut worklist)?;
+        let mut seeds = Vec::new();
+        self.collect_concrete_generic_calls(body, &mut seeds)?;
+        // Each worklist entry carries its instantiation-chain depth: 0 for calls
+        // written in the source body, +1 for calls discovered inside an instance's
+        // body. The `done` set terminates ordinary (mutual) generic recursion —
+        // `f<T>` calling `f<T>` revisits the same instance symbol — but NOT
+        // polymorphic recursion (`f<T>` calling `f<box<T>>`), where every link
+        // mints a fresh symbol and the worklist would grow forever (#7). The
+        // depth cap rejects those chains fail-closed; breadth (many distinct
+        // shallow instantiations) stays unlimited.
+        let mut worklist: Vec<(String, Vec<String>, usize)> = seeds
+            .into_iter()
+            .map(|(generic, type_args)| (generic, type_args, 0))
+            .collect();
         let mut done = std::collections::BTreeSet::new();
         let mut next = 0;
         while next < worklist.len() {
-            let (generic, type_args) = worklist[next].clone();
+            let (generic, type_args, depth) = worklist[next].clone();
             next += 1;
+            if depth > GENERIC_INSTANTIATION_DEPTH_LIMIT {
+                let shown = self
+                    .symbol_display(root, &generic)
+                    .unwrap_or_else(|_| generic.clone());
+                bail!(
+                    "generic function instantiation exceeds the depth limit ({GENERIC_INSTANTIATION_DEPTH_LIMIT}) at {shown}: a recursive generic whose type arguments grow each call (polymorphic recursion) does not converge"
+                );
+            }
             let instance = monomorphic_instance_symbol(&generic, &type_args);
             if !done.insert(instance.clone()) {
                 continue;
@@ -2313,7 +2369,13 @@ impl CodeDb {
             // The instance body's own generic calls (a generic function calling
             // another generic function) are now concrete — instantiate them too.
             let instance_body = self.function_body_hash(&definition)?;
-            self.collect_concrete_generic_calls(&instance_body, &mut worklist)?;
+            let mut nested = Vec::new();
+            self.collect_concrete_generic_calls(&instance_body, &mut nested)?;
+            worklist.extend(
+                nested
+                    .into_iter()
+                    .map(|(generic, type_args)| (generic, type_args, depth + 1)),
+            );
         }
         Ok(())
     }
@@ -2321,14 +2383,16 @@ impl CodeDb {
     /// Verify every monomorphic generic-function instance in a root (R11),
     /// returning one error string per inconsistency. An instance's symbol is its
     /// descriptor's content hash (so `verify_objects` already proves the symbol
-    /// matches its `generic` + `type_args`); this recomputes the *signature* —
-    /// the generic's parameters and return type with the recorded arguments
-    /// substituted in — and rejects an instance whose stored signature does not
-    /// derive from its generic, the generic missing or non-generic, or the
-    /// argument count not matching the generic's arity. The instance's body is
-    /// validated as an ordinary concrete function by `type_check_root`.
+    /// matches its `generic` + `type_args`); this re-runs the import-side
+    /// instantiation (`build_function_instance`) at the recorded arguments and
+    /// rejects an instance whose stored signature OR body definition does not
+    /// derive from its generic (H7 — the signature-only check let a tampered
+    /// body that still typechecked pose as derived), plus the generic missing
+    /// or non-generic, or the argument count not matching the generic's arity.
+    /// Re-running stores only content-addressed objects the importer would have
+    /// stored — byte-identical no-ops on an intact database.
     pub(crate) fn verify_generic_instances_in_root(
-        &self,
+        &mut self,
         root: &ProgramRootPayload,
     ) -> Result<Vec<String>> {
         let mut errors = Vec::new();
@@ -2369,18 +2433,27 @@ impl CodeDb {
                 ));
                 continue;
             }
-            let (generic_params, generic_return) = self.signature_parts(&template.signature)?;
-            let no_regions = BTreeMap::new();
-            let expected_params = generic_params
-                .iter()
-                .map(|param| self.substitute_type_hash(param, &no_regions, &type_args))
-                .collect::<Result<Vec<_>>>()?;
-            let expected_return =
-                self.substitute_type_hash(&generic_return, &no_regions, &type_args)?;
-            let (instance_params, instance_return) = self.signature_parts(&entry.signature)?;
-            if instance_params != expected_params || instance_return != expected_return {
+            let generic = generic.to_string();
+            let (expected_signature, expected_definition) =
+                match self.build_function_instance(root, &generic, &type_args) {
+                    Ok((signature, definition, _names)) => (signature, definition),
+                    Err(err) => {
+                        errors.push(format!(
+                            "bad_generic_instance: instance {} does not rebuild from generic {generic}: {err:#}",
+                            entry.symbol
+                        ));
+                        continue;
+                    }
+                };
+            if entry.signature != expected_signature {
                 errors.push(format!(
                     "bad_generic_instance: instance {} signature does not derive from generic {generic} at its type arguments",
+                    entry.symbol
+                ));
+            }
+            if entry.definition != expected_definition {
+                errors.push(format!(
+                    "bad_generic_instance: instance {} body does not derive from generic {generic} at its type arguments",
                     entry.symbol
                 ));
             }
@@ -5140,6 +5213,43 @@ impl CodeDb {
                     "-" | "~" => expected_type,
                     _ => None,
                 };
+                // `-LITERAL` where the positive digits overflow the signed width
+                // but the NEGATED value fits (exactly the MINs: `-128` as i8,
+                // `-9223372036854775808`) folds into one negative literal node
+                // (#9) — the positive half is unrepresentable, so the plain
+                // Unary(literal) shape cannot type it. Previously-valid
+                // programs never take this path (their positive literal is in
+                // range), so existing typed hashes are unchanged; projection
+                // prints the negative literal as `-N`, which re-parses right
+                // back through this fold (round-trip stable).
+                if op == "-"
+                    && let RawExpr::LiteralI64 { value } = expr.as_ref()
+                    && !value.starts_with("0x")
+                    && !value.starts_with("0X")
+                {
+                    let target = expected_type
+                        .and_then(|hash| match self.type_spec(hash) {
+                            Ok(TypeSpec::Builtin(name)) => scalar_int_type(&name),
+                            _ => None,
+                        })
+                        .filter(|int| int.signed)
+                        .unwrap_or_else(|| scalar_int_type("I64").expect("I64 is scalar"));
+                    let negated = format!("-{value}");
+                    if !int_literal_in_range(value, target)
+                        && int_literal_in_range(&negated, target)
+                    {
+                        return self.type_expr_with_locals_expecting(
+                            current_module,
+                            &RawExpr::LiteralI64 { value: negated },
+                            root,
+                            param_names,
+                            param_types,
+                            region_scope,
+                            locals,
+                            expected_type,
+                        );
+                    }
+                }
                 let typed = self.type_expr_with_locals_expecting(
                     current_module,
                     expr,
@@ -5528,9 +5638,10 @@ impl CodeDb {
                 // branch can fix the join's result type (see the `If`/`Case` arms).
                 // Two facts are checked elsewhere, where the function's return type
                 // is in scope: (1) the operand is assignable to the declared return
-                // type (`check_return_operand_types`, at the body/return-type gate);
+                // type (the `return` arm of `verify_expr_type_with_locals`, which
+                // `type_check_root` runs on every apply and verify runs again);
                 // (2) the `return` sits in a block-result position
-                // (`ensure_return_positions`). The operand is typed against the
+                // (`validate_return_positions`). The operand is typed against the
                 // ambient `expected_type`, which is the return type in tail position
                 // so a context-typed literal (`return 0` for a sized-int return)
                 // takes the right width.
@@ -5689,6 +5800,14 @@ impl CodeDb {
                     .map_err(|_| anyhow!("array fill count must be a non-negative integer"))?;
                 if count == 0 {
                     bail!("array fill count must be at least 1");
+                }
+                // The count is replicated storage (eval allocates it, lowering
+                // unrolls a store per slot), so an unbounded literal is a
+                // resource bomb (#10) — capped fail-closed at import.
+                if count > MAX_FIXED_ARRAY_LEN {
+                    bail!(
+                        "array fill count {count} exceeds the supported maximum {MAX_FIXED_ARRAY_LEN}"
+                    );
                 }
                 let expected_element = expected_type
                     .and_then(|hash| self.type_spec_in_root(root, hash).ok())
@@ -8081,7 +8200,13 @@ impl CodeDb {
                 continue;
             }
             let body = self.function_body_hash(&entry.definition)?;
-            let actual = self.verify_expr_type(&body, &root, &param_types, &allowed_regions)?;
+            let actual = self.verify_expr_type(
+                &body,
+                &root,
+                &param_types,
+                &allowed_regions,
+                Some(&return_type),
+            )?;
             if !self.type_assignable_in_root(&root, &actual, &return_type)? {
                 bail!(
                     "bad_type: function {} returns {}, body is {}",
@@ -8707,7 +8832,14 @@ impl CodeDb {
                 }
                 recurse(self, &element)
             }
-            TypeSpec::FixedArray { element, .. } => recurse(self, &element),
+            TypeSpec::FixedArray { element, len } => {
+                if len > MAX_FIXED_ARRAY_LEN {
+                    bail!(
+                        "fixed array length {len} exceeds the supported maximum {MAX_FIXED_ARRAY_LEN}"
+                    );
+                }
+                recurse(self, &element)
+            }
             TypeSpec::Record(fields) | TypeSpec::Enum(fields) => {
                 for field in fields {
                     recurse(self, &field.type_hash)?;
@@ -8779,6 +8911,7 @@ impl CodeDb {
             active: Vec::new(),
             moved: Vec::new(),
             next_local: 0,
+            move_events: 0,
         };
         self.verify_expr_borrows(root, &body, param_types, &mut state, ExprUse::Value)
             .with_context(|| {
@@ -9391,8 +9524,18 @@ impl CodeDb {
                 let acc_local = state.next_local;
                 state.next_local += 1;
                 state.locals.push(acc_local);
+                // The body runs once per element: like `loop` (#14a), any move it
+                // performs would repeat, and lowering rejects it (`ctx.moved`
+                // snapshot) — reject at typecheck too so eval stays a faithful
+                // oracle of the native envelope.
+                let move_events_before = state.move_events;
                 let body_result =
                     self.verify_expr_borrows(root, body, param_types, state, ExprUse::Value);
+                if body_result.is_ok() && state.move_events != move_events_before {
+                    bail!(
+                        "unsupported_move: fold body cannot move owned values in phase 13; loop-aware drop glue is not yet implemented"
+                    );
+                }
                 let item_owner = LoanPlace {
                     root: LoanRoot::Local(item_local),
                     fields: Vec::new(),
@@ -9436,15 +9579,29 @@ impl CodeDb {
                 // `acc` is a loop-local; `cond` and `body` see it. One representative
                 // iteration is checked (cond then body, sharing state); the
                 // accumulator's loans/moves are loop-local and retired afterward.
-                // Whether the body moves any *outer* owned value is rejected at
-                // lowering (no loop-carried drop glue yet), mirroring `fold`.
                 let acc_local = state.next_local;
                 state.next_local += 1;
                 state.locals.push(acc_local);
+                // `cond`/`body` run 0..N times: a move of an OUTER place would
+                // repeat (double-free), and even a per-iteration place move is
+                // not lowerable yet (no loop-carried drop glue). Reject ANY move
+                // event here fail-closed (#14a) so import/eval/verify agree with
+                // the native-lowering `ctx.moved` snapshot gate instead of the
+                // evaluator happily running what native rejects. `moved` entries
+                // retire when scopes pop, so this uses the monotone event count.
+                let move_events_before = state.move_events;
                 let cond_result =
                     self.verify_expr_borrows(root, cond, param_types, state, ExprUse::Value);
                 let body_result =
                     self.verify_expr_borrows(root, body, param_types, state, ExprUse::Value);
+                if cond_result.is_ok()
+                    && body_result.is_ok()
+                    && state.move_events != move_events_before
+                {
+                    bail!(
+                        "unsupported_move: loop body cannot move owned values; loop-carried drop glue is not yet implemented"
+                    );
+                }
                 let acc_owner = LoanPlace {
                     root: LoanRoot::Local(acc_local),
                     fields: Vec::new(),
@@ -10432,6 +10589,7 @@ impl CodeDb {
             // *borrowed* box content is still rejected by the move-out-of-loan check.)
             self.check_move_conflicts(&place, &state.active)?;
             state.moved.push(place);
+            state.move_events += 1;
         } else {
             self.check_shared_read_conflicts(&place, &state.active)?;
         }
@@ -11351,6 +11509,7 @@ impl CodeDb {
         root: &ProgramRootPayload,
         param_types: &[String],
         allowed_regions: &BTreeSet<String>,
+        fn_return: Option<&str>,
     ) -> Result<String> {
         self.verify_expr_type_with_locals(
             expr_hash,
@@ -11358,6 +11517,7 @@ impl CodeDb {
             param_types,
             allowed_regions,
             &mut Vec::new(),
+            fn_return,
         )
     }
 
@@ -11407,6 +11567,7 @@ impl CodeDb {
         param_types: &[String],
         allowed_regions: &BTreeSet<String>,
         locals: &mut Vec<String>,
+        fn_return: Option<&str>,
     ) -> Result<String> {
         let is_i64 = scrutinee_type == type_hash_for("I64");
         let mut result_type: Option<String> = None;
@@ -11490,6 +11651,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if guard_type != type_hash_for("Bool") {
                     bail!("case guard must be a bool expression");
@@ -11505,6 +11667,7 @@ impl CodeDb {
                 param_types,
                 allowed_regions,
                 locals,
+                fn_return,
             )?;
             if fallback_type.is_none() {
                 fallback_type = Some(body_type.clone());
@@ -11539,6 +11702,7 @@ impl CodeDb {
         param_types: &[String],
         allowed_regions: &BTreeSet<String>,
         locals: &mut Vec<String>,
+        fn_return: Option<&str>,
     ) -> Result<String> {
         if self.get_kind(expr_hash)? != "Expression" {
             bail!("bad_type: object is not expression {expr_hash}");
@@ -11677,6 +11841,7 @@ impl CodeDb {
                         param_types,
                         allowed_regions,
                         locals,
+                        fn_return,
                     )?;
                     if !self.type_assignable_for_call_in_root(
                         root,
@@ -11715,6 +11880,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 let right = self.verify_expr_type_with_locals(
                     right_hash,
@@ -11722,6 +11888,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 let bool_hash = type_hash_for("Bool");
                 match op {
@@ -11767,6 +11934,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 match op {
                     "-" | "~" => {
@@ -11795,6 +11963,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 let region = payload
                     .get("region")
@@ -11831,6 +12000,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 let region = payload
                     .get("region")
@@ -11870,6 +12040,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if payload.get("target_type").and_then(JsonValue::as_str)
                     != Some(target_type.as_str())
@@ -11926,6 +12097,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if payload.get("slice_type").and_then(JsonValue::as_str)
                     != Some(target_type.as_str())
@@ -11959,6 +12131,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 let TypeSpec::Slice { element, .. } = self.type_spec_in_root(root, &target_type)?
                 else {
@@ -11977,6 +12150,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )? != type_hash_for("I64")
                     || self.verify_expr_type_with_locals(
                         len,
@@ -11984,6 +12158,7 @@ impl CodeDb {
                         param_types,
                         allowed_regions,
                         locals,
+                        fn_return,
                     )? != type_hash_for("I64")
                 {
                     bail!("subslice start and len must be i64");
@@ -12001,6 +12176,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if payload.get("element_type").and_then(JsonValue::as_str)
                     != Some(value_type.as_str())
@@ -12022,6 +12198,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 let element_type = match self.type_spec(&box_type)? {
                     TypeSpec::Box { element } => element,
@@ -12051,6 +12228,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if scalar_int_type_by_hash(&source).is_none() {
                     bail!("int_cast operand is not a sized integer");
@@ -12078,6 +12256,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if capacity_type != type_hash_for("I64")
                     || payload.get("capacity_type").and_then(JsonValue::as_str)
@@ -12120,6 +12299,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if payload.get("vec_type").and_then(JsonValue::as_str) != Some(target_type.as_str())
                 {
@@ -12142,6 +12322,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if !self.type_assignable_in_root(root, &value_type, &element)? {
                     bail!("vec_push value type mismatch");
@@ -12163,6 +12344,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if payload.get("vec_type").and_then(JsonValue::as_str) != Some(target_type.as_str())
                 {
@@ -12185,6 +12367,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )? != type_hash_for("I64")
                 {
                     bail!("vec_get index must be i64");
@@ -12207,6 +12390,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if payload.get("vec_type").and_then(JsonValue::as_str) != Some(target_type.as_str())
                 {
@@ -12236,6 +12420,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if payload.get("source_type").and_then(JsonValue::as_str)
                     != Some(source_type.as_str())
@@ -12289,6 +12474,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if payload.get("string_type").and_then(JsonValue::as_str)
                     != Some(target_type.as_str())
@@ -12317,6 +12503,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if capacity_type != type_hash_for("I64")
                     || payload.get("capacity_type").and_then(JsonValue::as_str)
@@ -12341,6 +12528,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if payload.get("string_type").and_then(JsonValue::as_str)
                     != Some(target_type.as_str())
@@ -12362,6 +12550,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if value_type != type_hash_for("U8") {
                     bail!("string_push value must be u8");
@@ -12383,6 +12572,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if payload.get("string_type").and_then(JsonValue::as_str)
                     != Some(target_type.as_str())
@@ -12404,6 +12594,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if index_type != type_hash_for("I64") {
                     bail!("string_get index must be i64");
@@ -12421,6 +12612,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if payload.get("source_type").and_then(JsonValue::as_str)
                     != Some(value_type.as_str())
@@ -12479,6 +12671,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if payload.get("pointer_type").and_then(JsonValue::as_str)
                     != Some(pointer_type.as_str())
@@ -12520,6 +12713,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if payload.get("pointer_type").and_then(JsonValue::as_str)
                     != Some(pointer_type.as_str())
@@ -12543,6 +12737,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if !self.type_assignable_in_root(root, &value_type, &pointee)? {
                     bail!("raw_store value type mismatch");
@@ -12573,6 +12768,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 let value_type = self.verify_expr_type_with_locals(
                     value,
@@ -12580,6 +12776,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if payload.get("target_type").and_then(JsonValue::as_str)
                     != Some(target_type.as_str())
@@ -12619,6 +12816,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if !self.type_assignable_in_root(root, &value_type, &binding_type)? {
                     bail!("let binding type mismatch");
@@ -12630,6 +12828,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 );
                 locals.pop();
                 body_type?
@@ -12653,6 +12852,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if cond_type != type_hash_for("Bool") {
                     bail!("if condition must be bool");
@@ -12665,6 +12865,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 let else_type = self.verify_expr_type_with_locals(
                     else_hash,
@@ -12672,6 +12873,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 // Early exit (R7): a divergent branch fixes no type — the
                 // non-divergent branch does (mirrors the type-checker join).
@@ -12689,17 +12891,32 @@ impl CodeDb {
             "return" => {
                 // `return <value>` (R7): re-derive the operand's type; the node's
                 // declared type is the operand's, so this matches by construction.
+                // The operand is what the function actually delivers, so it must
+                // be assignable to the enclosing function's declared return type
+                // regardless of the position the `return` node sits in (#13).
                 let value = payload
                     .get("value")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("return missing value"))?;
-                self.verify_expr_type_with_locals(
+                let operand_type = self.verify_expr_type_with_locals(
                     value,
                     root,
                     param_types,
                     allowed_regions,
                     locals,
-                )?
+                    fn_return,
+                )?;
+                let Some(return_type) = fn_return else {
+                    bail!("bad_type: return used outside a function body context");
+                };
+                if !self.type_assignable_in_root(root, &operand_type, return_type)? {
+                    bail!(
+                        "bad_type: return operand is {}, function returns {}",
+                        self.type_name(&operand_type)?,
+                        self.type_name(return_type)?
+                    );
+                }
+                operand_type
             }
             "fold" => {
                 let item_name = payload
@@ -12733,6 +12950,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if payload.get("target_type").and_then(JsonValue::as_str)
                     != Some(target_type.as_str())
@@ -12775,6 +12993,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 // `acc_type` may be anchored to an enclosing binding's named type
                 // (see `type_fold_expr`), so require the init to be assignable to
@@ -12803,6 +13022,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 );
                 locals.pop();
                 locals.pop();
@@ -12836,6 +13056,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 let acc_type = payload
                     .get("acc_type")
@@ -12859,6 +13080,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 );
                 let body_type = self.verify_expr_type_with_locals(
                     body_hash,
@@ -12866,6 +13088,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 );
                 locals.pop();
                 let cond_type = cond_type?;
@@ -12909,6 +13132,7 @@ impl CodeDb {
                         param_types,
                         allowed_regions,
                         locals,
+                        fn_return,
                     )?;
                     if element.get("type").and_then(JsonValue::as_str) != Some(value_type.as_str())
                     {
@@ -12940,12 +13164,18 @@ impl CodeDb {
                 if count == 0 {
                     bail!("array fill count must be at least 1");
                 }
+                if count > MAX_FIXED_ARRAY_LEN {
+                    bail!(
+                        "array fill count {count} exceeds the supported maximum {MAX_FIXED_ARRAY_LEN}"
+                    );
+                }
                 let value_type = self.verify_expr_type_with_locals(
                     value_hash,
                     root,
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if value_type != element_type {
                     bail!("array_fill element_type mismatch");
@@ -12984,6 +13214,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 let TypeSpec::FixedArray { element, len } =
                     self.type_spec_in_root(root, &array_type)?
@@ -13009,6 +13240,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if index_type != type_hash_for("I64") {
                     bail!("array_set index must be i64");
@@ -13024,6 +13256,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if !self.type_assignable_in_root(root, &value_type, &element)? {
                     bail!("array_set value type does not match element type");
@@ -13045,6 +13278,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 let index_type = self.verify_expr_type_with_locals(
                     index_hash,
@@ -13052,6 +13286,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if index_type != type_hash_for("I64") {
                     bail!("array index must be i64");
@@ -13132,6 +13367,7 @@ impl CodeDb {
                         param_types,
                         allowed_regions,
                         locals,
+                        fn_return,
                     )?;
                     if field.get("type").and_then(JsonValue::as_str) != Some(field_type.as_str()) {
                         bail!("record field type mismatch for {name}");
@@ -13159,6 +13395,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 self.field_access_type_in_root(root, &target_type, field)?
             }
@@ -13186,6 +13423,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 if value_type != variant_type
                     && !self.type_assignable_in_root(root, &value_type, &variant_type)?
@@ -13205,6 +13443,7 @@ impl CodeDb {
                     param_types,
                     allowed_regions,
                     locals,
+                    fn_return,
                 )?;
                 let arms = payload
                     .get("arms")
@@ -13222,6 +13461,7 @@ impl CodeDb {
                         param_types,
                         allowed_regions,
                         locals,
+                        fn_return,
                     );
                 }
                 let TypeSpec::Enum(variants) = self.type_spec_in_root(root, &scrutinee_type)?
@@ -13327,6 +13567,7 @@ impl CodeDb {
                         param_types,
                         allowed_regions,
                         locals,
+                        fn_return,
                     );
                     if scoped_type.is_some() {
                         locals.pop();
@@ -13487,6 +13728,9 @@ fn merge_branch_state(
 
 fn merged_branch_states(mut left: MoveBorrowState, right: MoveBorrowState) -> MoveBorrowState {
     left.next_local = left.next_local.max(right.next_local);
+    // Either branch may run, so the merged "has anything moved" watermark is
+    // the larger of the two (each already includes the pre-branch count).
+    left.move_events = left.move_events.max(right.move_events);
     for loan in right.active {
         if !left.active.contains(&loan) {
             left.active.push(loan);
@@ -14645,12 +14889,120 @@ pub(crate) fn validate_type_params(params: &[TypeParamDef]) -> Result<()> {
 /// `objects` table — while keeping it a pure function of `(generic, type_args)`.
 pub(crate) const MONOMORPHIC_INSTANCE_KIND: &str = "MonomorphicFunctionInstance";
 
+/// Cap on `array<T, N>` lengths (#10). Fixed arrays are frame-allocated and
+/// `[v; N]`/`array_set` lower to per-slot operations, so the length multiplies
+/// evaluator memory AND lowered-IR size; an uncapped literal count
+/// (`[0; u64::MAX]`) imported fine and then host-panicked eval ("capacity
+/// overflow") or amplified gigabytes into the artifact store. 64Ki elements is
+/// far beyond what the v0 frame layout can compile anyway (arm64 caps frames
+/// at 4095 bytes) while keeping every pathological import bounded.
+pub(crate) const MAX_FIXED_ARRAY_LEN: u64 = 65536;
+
+/// Cap on a generic instantiation CHAIN (#7): the worklist depth for function
+/// instances and the member-walk depth for type instances. Ordinary generic
+/// recursion revisits the same instance and terminates via its `seen`/`done`
+/// set; only polymorphic recursion (`f<T>` → `f<box<T>>`, `Grow<T>` containing
+/// `Grow<box<T>>`) builds chains, and those never converge — so a depth past
+/// this limit is rejected fail-closed instead of hanging the importer or
+/// overflowing the host stack. Generous: legitimate nesting is single digits.
+pub(crate) const GENERIC_INSTANTIATION_DEPTH_LIMIT: usize = 64;
+
 /// The plain child-expression payload keys for an expression kind (R11) — the
 /// single- and multi-child kinds. The leaves return no children; the kinds with
 /// structured children (`call`, `record_literal`, `array_literal`, `case`) are
 /// handled directly by the monomorphization traversals and never reach here. An
 /// unknown kind fails closed.
-fn plain_child_expr_keys(kind: &str) -> Result<&'static [&'static str]> {
+/// Visit every CHILD EXPRESSION hash of one typed-DAG expression payload — the
+/// single authority for "what are this node's subexpressions". Consumers that
+/// walk the typed DAG (patch matching, bundle closure, blame/break-expr,
+/// verify, reachability) MUST use this instead of a hand-maintained per-kind
+/// match: six such walkers each drifted on a different subset of the V3.3
+/// kinds (#12 — `loop`/`return` broke patching root-wide, vec/string programs
+/// broke bundling). Plain single/multi-child kinds come from
+/// [`plain_child_expr_keys`]; the four structured kinds (call args, record
+/// fields, array elements, case scrutinee/guards/bodies) are enumerated here.
+/// Unknown kinds FAIL CLOSED, so forgetting to extend the table for a new
+/// expression kind is a loud error in every consumer, not a silent skip.
+pub(crate) fn for_each_child_expr_hash(
+    payload: &JsonValue,
+    f: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let kind = payload
+        .get("expr_kind")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| anyhow!("expression missing expr_kind"))?;
+    let child = |payload: &JsonValue, key: &str| -> Result<String> {
+        Ok(payload
+            .get(key)
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("{kind} missing {key}"))?
+            .to_string())
+    };
+    match kind {
+        "call" => {
+            for arg in payload
+                .get("args")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| anyhow!("call missing args"))?
+            {
+                f(arg
+                    .as_str()
+                    .ok_or_else(|| anyhow!("call arg must be hash"))?)?;
+            }
+        }
+        "record_literal" => {
+            for field in payload
+                .get("fields")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| anyhow!("record_literal missing fields"))?
+            {
+                f(&child(field, "value")?)?;
+            }
+        }
+        "array_literal" => {
+            for element in payload
+                .get("elements")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| anyhow!("array_literal missing elements"))?
+            {
+                f(&child(element, "value")?)?;
+            }
+        }
+        "case" => {
+            f(&child(payload, "expr")?)?;
+            for arm in payload
+                .get("arms")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| anyhow!("case missing arms"))?
+            {
+                // The guard (R14) is an ordinary child expression of its arm.
+                if let Some(guard) = arm.get("guard").and_then(JsonValue::as_str) {
+                    f(guard)?;
+                }
+                f(&child(arm, "body")?)?;
+            }
+        }
+        other => {
+            for key in plain_child_expr_keys(other)? {
+                f(&child(payload, key)?)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Collect the child expression hashes of one typed-DAG node, in evaluation
+/// order — the `Vec` form of [`for_each_child_expr_hash`].
+pub(crate) fn child_expr_hashes(payload: &JsonValue) -> Result<Vec<String>> {
+    let mut children = Vec::new();
+    for_each_child_expr_hash(payload, &mut |hash| {
+        children.push(hash.to_string());
+        Ok(())
+    })?;
+    Ok(children)
+}
+
+pub(crate) fn plain_child_expr_keys(kind: &str) -> Result<&'static [&'static str]> {
     Ok(match kind {
         "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref"
         | "local_ref" => &[],

@@ -2076,11 +2076,7 @@ impl CodeDb {
             return Ok(false);
         }
         let payload = self.get_payload(current_hash)?;
-        let expr_kind = payload
-            .get("expr_kind")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| anyhow!("expression missing expr_kind {current_hash}"))?;
-        for child in expression_child_hashes(expr_kind, &payload)? {
+        for child in expression_child_hashes(&payload)? {
             if self.expr_tree_contains(&child, wanted_hash, seen)? {
                 return Ok(true);
             }
@@ -3281,99 +3277,11 @@ fn push_blame_line(out: &mut String, label: &str, value: &JsonValue) {
     out.push_str(&format!("{label} {migration_hash} {operation_kind}\n"));
 }
 
-fn expression_child_hashes(expr_kind: &str, payload: &JsonValue) -> Result<Vec<String>> {
-    let mut children = Vec::new();
-    match expr_kind {
-        "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" | "local_ref" => {}
-        "call" => {
-            for arg in payload
-                .get("args")
-                .and_then(JsonValue::as_array)
-                .ok_or_else(|| anyhow!("call missing args"))?
-            {
-                children.push(
-                    arg.as_str()
-                        .ok_or_else(|| anyhow!("call arg must be hash"))?
-                        .to_string(),
-                );
-            }
-        }
-        "binary" => {
-            for key in ["left", "right"] {
-                children.push(
-                    payload
-                        .get(key)
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("binary missing {key}"))?
-                        .to_string(),
-                );
-            }
-        }
-        "unary" => {
-            children.push(
-                payload
-                    .get("expr")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("unary missing expr"))?
-                    .to_string(),
-            );
-        }
-        "let" => {
-            for key in ["value", "body"] {
-                children.push(
-                    payload
-                        .get(key)
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("let missing {key}"))?
-                        .to_string(),
-                );
-            }
-        }
-        "if" => {
-            for key in ["cond", "then", "else"] {
-                children.push(
-                    payload
-                        .get(key)
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("if missing {key}"))?
-                        .to_string(),
-                );
-            }
-        }
-        "return" => {
-            children.push(
-                payload
-                    .get("value")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| anyhow!("return missing value"))?
-                    .to_string(),
-            );
-        }
-        "fold" => {
-            for key in ["target", "init", "body"] {
-                children.push(
-                    payload
-                        .get(key)
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("fold missing {key}"))?
-                        .to_string(),
-                );
-            }
-        }
-        "loop" => {
-            for key in ["init", "cond", "body"] {
-                children.push(
-                    payload
-                        .get(key)
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| anyhow!("loop missing {key}"))?
-                        .to_string(),
-                );
-            }
-        }
-        other => bail!("unknown expression kind {other}"),
-    }
-    Ok(children)
+/// Child expression hashes for blame ancestry, from the central typed-DAG
+/// child table (#12). The old hand-maintained per-kind match here missed the
+/// newer kinds (array_fill/array_set/vec/string ops), truncating blame paths.
+fn expression_child_hashes(payload: &JsonValue) -> Result<Vec<String>> {
+    crate::types::child_expr_hashes(payload)
 }
 
 fn sorted_symbol_names(root: &ProgramRootPayload, symbol: &str) -> Vec<(String, String, bool)> {

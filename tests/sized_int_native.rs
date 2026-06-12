@@ -245,3 +245,96 @@ fn rotate_and_wrapping_arithmetic_agree_with_native() {
         },
     ]);
 }
+
+#[test]
+fn min_literals_and_signed_hex_bit_patterns_agree_with_native() {
+    // #9: the two literal families that were previously unwritable. (1) A
+    // negated literal whose positive half overflows the width (`-128` as i8,
+    // i64::MIN) folds into one negative literal node at typing and renders
+    // back as the unary form (projection round-trip is part of `check`).
+    // (2) A hex literal at a signed width is a bit pattern: `0xff` as i8 is
+    // -1, `0x8000000000000000` is i64::MIN.
+    check(&[
+        Case {
+            entry: "min_i64",
+            decl: "fn min_i64() -> i64 = -9223372036854775808",
+            expect_flag: "--expect-i64",
+            expect: "-9223372036854775808",
+            eval: "-9223372036854775808",
+        },
+        Case {
+            entry: "min_i8",
+            decl: "fn min_i8() -> i8 = -128",
+            expect_flag: "--expect-int",
+            expect: "i8:-128",
+            eval: "-128",
+        },
+        Case {
+            entry: "min_i8_arith",
+            decl: "fn min_i8_arith() -> i8 = let x: i8 = -128 in x + 1",
+            expect_flag: "--expect-int",
+            expect: "i8:-127",
+            eval: "-127",
+        },
+        Case {
+            entry: "hex_i8_neg1",
+            decl: "fn hex_i8_neg1() -> i8 = 0xff",
+            expect_flag: "--expect-int",
+            expect: "i8:-1",
+            eval: "-1",
+        },
+        Case {
+            entry: "hex_i8_min",
+            decl: "fn hex_i8_min() -> i8 = 0x80",
+            expect_flag: "--expect-int",
+            expect: "i8:-128",
+            eval: "-128",
+        },
+        Case {
+            entry: "hex_i64_min",
+            decl: "fn hex_i64_min() -> i64 = 0x8000000000000000",
+            expect_flag: "--expect-i64",
+            expect: "-9223372036854775808",
+            eval: "-9223372036854775808",
+        },
+        Case {
+            entry: "hex_i32_pos",
+            decl: "fn hex_i32_pos() -> i32 = 0x7fffffff",
+            expect_flag: "--expect-int",
+            expect: "i32:2147483647",
+            eval: "2147483647",
+        },
+    ]);
+}
+
+#[test]
+fn eval_and_trace_accept_sized_int_arguments() {
+    // The CLI arg parser used to support only i64/bool/unit, so a sized-int
+    // entry could not be driven by `eval`/`trace`/`debug` at all.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("cliargs.sqlite");
+    let src = temp.path().join("cliargs.cdb");
+    std::fs::write(
+        &src,
+        "fn double8(x: i8) -> i8 = x + x\nfn maskit(x: u32) -> u32 = x & 0xff\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+    // i8 arithmetic wraps at the width even when fed from the CLI.
+    assert_eq!(run(&["eval", path(&db), "double8", "--", "-100"]).trim(), "56");
+    assert_eq!(run(&["eval", path(&db), "maskit", "4660"]).trim(), "52");
+    let trace = parse_json(&run(&["trace", path(&db), "double8", "7", "--json"]));
+    assert_eq!(trace["result"]["value"], "14");
+    // Out-of-range still fails with a width-specific message.
+    let err = {
+        let output = bin()
+            .args(["eval", path(&db), "double8", "999"])
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        String::from_utf8(output.stderr).expect("utf8 stderr")
+    };
+    assert!(err.contains("must be i8"), "got: {err}");
+}

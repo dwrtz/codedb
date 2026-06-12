@@ -19,6 +19,31 @@ use crate::types::{
     static_data_payload, visible_effects,
 };
 
+/// What a [`RawConversionHook`] tells the typed→raw converter to do at one
+/// node. Patch reconstruction (#12) hooks the ONE complete converter instead
+/// of maintaining parallel partial converters per patch flavor — those drifted
+/// (loop/return/case/record kinds missing) and broke patching for programs
+/// using newer expression kinds.
+pub(crate) enum RawHookOutcome {
+    /// Use this raw expression instead of converting the node (and do not
+    /// descend into it).
+    Replace(RawExpr),
+    /// The node must be a call: convert its arguments normally (the hook stays
+    /// active inside them), but rename the callee.
+    RenameCall(String),
+    /// The node must be a call: inline the callee's body at the call site
+    /// (patch `inline_function`).
+    InlineCall,
+    /// Convert the node normally.
+    Continue,
+}
+
+/// Node-level hook for [`CodeDb::typed_expr_to_raw_hooked`], consulted at
+/// every node before ordinary conversion. Keyed by content hash, so every
+/// occurrence of an identical subtree replaces alike (content addressing has
+/// no positional identity).
+pub(crate) type RawConversionHook<'a> = &'a dyn Fn(&str, &JsonValue) -> Result<RawHookOutcome>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RawExpr {
@@ -218,9 +243,14 @@ pub(crate) fn validate_return_positions(expr: &RawExpr, allowed: bool) -> Result
             }
             Ok(())
         }
-        // A `fold` body's value is the accumulator, not the function's result — a
-        // `return` there would be a break out of a loop (R8, a later phase), so it
-        // is a strict value position here.
+        // A `fold` body's value is the accumulator, so a DIRECT `return` (the
+        // always-diverges degenerate form — the fold would be pointless) is a
+        // strict value position. An `if`/`case` branch inside it re-grants the
+        // block-result position (the arms above pass `true` unconditionally),
+        // so a CONDITIONAL `return` is allowed — it exits the whole function,
+        // not just the fold, identically in eval and native (#14c, blessed and
+        // pinned by tests/early_exit_native.rs). `break` (exit the loop with a
+        // value, R8) remains deferred and is a different construct.
         RawExpr::Fold {
             target, init, body, ..
         } => {
@@ -228,9 +258,10 @@ pub(crate) fn validate_return_positions(expr: &RawExpr, allowed: bool) -> Result
             validate_return_positions(init, false)?;
             validate_return_positions(body, false)
         }
-        // A `loop` body produces the next accumulator, not the function's result; a
-        // `return` there would be a break (deferred), so init/cond/body are all
-        // strict value positions.
+        // Same rule as `fold`: a DIRECT `return` as init/cond/body is the
+        // degenerate always-diverges form and is rejected; a conditional
+        // `return` under an `if`/`case` inside them exits the whole function
+        // and is supported (#14c — the search-loop early exit).
         RawExpr::Loop {
             init, cond, body, ..
         } => {
@@ -740,7 +771,22 @@ pub(crate) fn int_literal_value(value: &str, int: &crate::types::ScalarIntType) 
         None => (10, value),
     };
     let parse_err = || anyhow!("integer literal {value} out of range for {}", int.name);
+    // Signed hex is a bit pattern (#9), mirroring `int_literal_in_range`:
+    // parsed at the unsigned width, reinterpreted two's-complement.
+    let signed_hex = int.signed && radix == 16;
     Ok(match (int.signed, int.width) {
+        (true, 1) if signed_hex => {
+            Value::I8(u8::from_str_radix(digits, radix).map_err(|_| parse_err())? as i8)
+        }
+        (true, 2) if signed_hex => {
+            Value::I16(u16::from_str_radix(digits, radix).map_err(|_| parse_err())? as i16)
+        }
+        (true, 4) if signed_hex => {
+            Value::I32(u32::from_str_radix(digits, radix).map_err(|_| parse_err())? as i32)
+        }
+        (true, 8) if signed_hex => {
+            Value::I64(u64::from_str_radix(digits, radix).map_err(|_| parse_err())? as i64)
+        }
         (true, 1) => Value::I8(i8::from_str_radix(digits, radix).map_err(|_| parse_err())?),
         (true, 2) => Value::I16(i16::from_str_radix(digits, radix).map_err(|_| parse_err())?),
         (true, 4) => Value::I32(i32::from_str_radix(digits, radix).map_err(|_| parse_err())?),
@@ -4054,6 +4100,7 @@ impl CodeDb {
             current_module,
             region_names,
             &mut Vec::new(),
+            None,
         )
     }
 
@@ -4072,6 +4119,30 @@ impl CodeDb {
             current_module,
             region_names,
             &mut local_names,
+            None,
+        )
+    }
+
+    /// The complete typed→raw converter with a patch hook active — see
+    /// [`RawConversionHook`]. `local_names` seeds the let-binding scope (the
+    /// function's parameter names are NOT locals; depth-indexed `local_ref`s
+    /// resolve against this stack).
+    pub(crate) fn typed_expr_to_raw_hooked(
+        &self,
+        expr_hash: &str,
+        root: &ProgramRootPayload,
+        current_module: &str,
+        region_names: &BTreeMap<String, String>,
+        local_names: &mut Vec<String>,
+        hook: RawConversionHook<'_>,
+    ) -> Result<RawExpr> {
+        self.typed_expr_to_raw_with_locals(
+            expr_hash,
+            root,
+            current_module,
+            region_names,
+            local_names,
+            Some(hook),
         )
     }
 
@@ -4082,20 +4153,73 @@ impl CodeDb {
         current_module: &str,
         region_names: &BTreeMap<String, String>,
         local_names: &mut Vec<String>,
+        hook: Option<RawConversionHook<'_>>,
     ) -> Result<RawExpr> {
         let payload = self.get_payload(expr_hash)?;
+        if let Some(active) = hook {
+            match active(expr_hash, &payload)? {
+                RawHookOutcome::Replace(raw) => return Ok(raw),
+                RawHookOutcome::RenameCall(name) => {
+                    if payload.get("expr_kind").and_then(JsonValue::as_str) != Some("call") {
+                        bail!("call replacement matched non-call expression {expr_hash}");
+                    }
+                    let args = payload
+                        .get("args")
+                        .and_then(JsonValue::as_array)
+                        .ok_or_else(|| anyhow!("call missing args"))?
+                        .iter()
+                        .map(|arg| {
+                            let hash = arg
+                                .as_str()
+                                .ok_or_else(|| anyhow!("call arg must be hash"))?;
+                            self.typed_expr_to_raw_with_locals(
+                                hash,
+                                root,
+                                current_module,
+                                region_names,
+                                local_names,
+                                hook,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    return Ok(RawExpr::Call { name, args });
+                }
+                RawHookOutcome::InlineCall => {
+                    if payload.get("expr_kind").and_then(JsonValue::as_str) != Some("call") {
+                        bail!("inline_function matched non-call expression {expr_hash}");
+                    }
+                    return self.inline_call_payload(&payload, root, local_names);
+                }
+                RawHookOutcome::Continue => {}
+            }
+        }
         match payload
             .get("expr_kind")
             .and_then(JsonValue::as_str)
             .ok_or_else(|| anyhow!("expression missing expr_kind {expr_hash}"))?
         {
-            "literal_i64" => Ok(RawExpr::LiteralI64 {
-                value: payload
+            "literal_i64" => {
+                let value = payload
                     .get("value")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("literal_i64 missing value"))?
-                    .to_string(),
-            }),
+                    .to_string();
+                // A NEGATIVE literal node exists only via the typing-side fold
+                // of `-MIN_DIGITS` (#9 — the positive half is unrepresentable
+                // at the width). Its source form is the unary minus the user
+                // wrote, so render it back as one: the raw view never sees
+                // folded literals and `function_source_matches`/projection
+                // round-trips stay exact.
+                if let Some(digits) = value.strip_prefix('-') {
+                    return Ok(RawExpr::Unary {
+                        op: "-".to_string(),
+                        expr: Box::new(RawExpr::LiteralI64 {
+                            value: digits.to_string(),
+                        }),
+                    });
+                }
+                Ok(RawExpr::LiteralI64 { value })
+            }
             "literal_bool" => Ok(RawExpr::LiteralBool {
                 value: payload
                     .get("value")
@@ -4165,6 +4289,7 @@ impl CodeDb {
                                 current_module,
                                 region_names,
                                 local_names,
+                                hook,
                             )
                         })
                         .collect::<Result<Vec<_>>>()?,
@@ -4186,6 +4311,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ),
                 right: Box::new(
@@ -4198,6 +4324,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ),
             }),
@@ -4217,6 +4344,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ),
             }),
@@ -4235,6 +4363,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ),
             }),
@@ -4253,6 +4382,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ),
             }),
@@ -4277,6 +4407,7 @@ impl CodeDb {
                             current_module,
                             region_names,
                             local_names,
+                            hook,
                         )?,
                     ],
                 })
@@ -4293,6 +4424,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ],
             }),
@@ -4308,6 +4440,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                     self.typed_expr_to_raw_with_locals(
                         payload
@@ -4318,6 +4451,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                     self.typed_expr_to_raw_with_locals(
                         payload
@@ -4328,6 +4462,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ],
             }),
@@ -4343,6 +4478,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ],
             }),
@@ -4358,6 +4494,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ],
             }),
@@ -4379,6 +4516,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?],
                 })
             }
@@ -4394,6 +4532,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ],
             }),
@@ -4409,6 +4548,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                     self.typed_expr_to_raw_with_locals(
                         payload
@@ -4419,6 +4559,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ],
             }),
@@ -4434,6 +4575,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                     self.typed_expr_to_raw_with_locals(
                         payload
@@ -4444,6 +4586,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ],
             }),
@@ -4459,6 +4602,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ],
             }),
@@ -4474,6 +4618,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ],
             }),
@@ -4489,6 +4634,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ],
             }),
@@ -4504,6 +4650,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ],
             }),
@@ -4519,6 +4666,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                     self.typed_expr_to_raw_with_locals(
                         payload
@@ -4529,6 +4677,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ],
             }),
@@ -4544,6 +4693,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                     self.typed_expr_to_raw_with_locals(
                         payload
@@ -4554,6 +4704,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ],
             }),
@@ -4578,6 +4729,7 @@ impl CodeDb {
                             current_module,
                             region_names,
                             local_names,
+                            hook,
                         )?,
                     ],
                 })
@@ -4594,6 +4746,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ],
             }),
@@ -4609,6 +4762,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                     self.typed_expr_to_raw_with_locals(
                         payload
@@ -4619,6 +4773,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ],
             }),
@@ -4633,6 +4788,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ),
                 value: Box::new(
@@ -4645,6 +4801,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ),
             }),
@@ -4667,6 +4824,7 @@ impl CodeDb {
                     current_module,
                     region_names,
                     local_names,
+                    hook,
                 )?;
                 local_names.push(name.clone());
                 let body = self.typed_expr_to_raw_with_locals(
@@ -4678,6 +4836,7 @@ impl CodeDb {
                     current_module,
                     region_names,
                     local_names,
+                    hook,
                 );
                 local_names.pop();
                 Ok(RawExpr::Let {
@@ -4705,6 +4864,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ),
                 then_expr: Box::new(
@@ -4717,6 +4877,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ),
                 else_expr: Box::new(
@@ -4729,6 +4890,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ),
             }),
@@ -4743,6 +4905,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ),
             }),
@@ -4766,6 +4929,7 @@ impl CodeDb {
                     current_module,
                     region_names,
                     local_names,
+                    hook,
                 )?;
                 let init = self.typed_expr_to_raw_with_locals(
                     payload
@@ -4776,6 +4940,7 @@ impl CodeDb {
                     current_module,
                     region_names,
                     local_names,
+                    hook,
                 )?;
                 local_names.push(item.clone());
                 local_names.push(acc.clone());
@@ -4788,6 +4953,7 @@ impl CodeDb {
                     current_module,
                     region_names,
                     local_names,
+                    hook,
                 );
                 local_names.pop();
                 local_names.pop();
@@ -4814,6 +4980,7 @@ impl CodeDb {
                     current_module,
                     region_names,
                     local_names,
+                    hook,
                 )?;
                 local_names.push(acc.clone());
                 let cond = self.typed_expr_to_raw_with_locals(
@@ -4825,6 +4992,7 @@ impl CodeDb {
                     current_module,
                     region_names,
                     local_names,
+                    hook,
                 );
                 let body = self.typed_expr_to_raw_with_locals(
                     payload
@@ -4835,6 +5003,7 @@ impl CodeDb {
                     current_module,
                     region_names,
                     local_names,
+                    hook,
                 );
                 local_names.pop();
                 Ok(RawExpr::Loop {
@@ -4865,6 +5034,7 @@ impl CodeDb {
                             current_module,
                             region_names,
                             local_names,
+                            hook,
                         )?;
                         Ok(RawRecordField { name, value })
                     })
@@ -4886,6 +5056,7 @@ impl CodeDb {
                             current_module,
                             region_names,
                             local_names,
+                            hook,
                         )
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -4900,6 +5071,7 @@ impl CodeDb {
                     current_module,
                     region_names,
                     local_names,
+                    hook,
                 )?),
                 count: payload
                     .get("count")
@@ -4921,6 +5093,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?);
                 }
                 Ok(RawExpr::Call {
@@ -4939,6 +5112,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ),
                 index: Box::new(
@@ -4951,6 +5125,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ),
             }),
@@ -4965,6 +5140,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ),
                 field: payload
@@ -4998,6 +5174,7 @@ impl CodeDb {
                         current_module,
                         region_names,
                         local_names,
+                        hook,
                     )?,
                 ),
             }),
@@ -5011,6 +5188,7 @@ impl CodeDb {
                     current_module,
                     region_names,
                     local_names,
+                    hook,
                 )?;
                 let arms = payload
                     .get("arms")
@@ -5031,6 +5209,7 @@ impl CodeDb {
                                 current_module,
                                 region_names,
                                 local_names,
+                                hook,
                             )?)),
                             None => None,
                         };
@@ -5046,6 +5225,7 @@ impl CodeDb {
                                 current_module,
                                 region_names,
                                 local_names,
+                                hook,
                             )?;
                             return Ok(RawCaseArm {
                                 variant: None,
@@ -5068,6 +5248,7 @@ impl CodeDb {
                                 current_module,
                                 region_names,
                                 local_names,
+                                hook,
                             )?;
                             return Ok(RawCaseArm {
                                 variant: None,
@@ -5090,6 +5271,7 @@ impl CodeDb {
                                 current_module,
                                 region_names,
                                 local_names,
+                                hook,
                             )?;
                             return Ok(RawCaseArm {
                                 variant: None,
@@ -5130,6 +5312,7 @@ impl CodeDb {
                                 current_module,
                                 region_names,
                                 local_names,
+                                hook,
                             )
                         });
                         let body = self.typed_expr_to_raw_with_locals(
@@ -5140,6 +5323,7 @@ impl CodeDb {
                             current_module,
                             region_names,
                             local_names,
+                            hook,
                         );
                         if scoped_binding.is_some() {
                             local_names.pop();

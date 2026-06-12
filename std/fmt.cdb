@@ -34,19 +34,28 @@ fn i64_to_string(n: i64) -> string effects[alloc, state] =
 // Accumulate the magnitude in the negative domain (`acc <= 0`), again so that
 // parsing i64::MIN never overflows an intermediate. The string is threaded by
 // move; each byte is read before the recursive call consumes the buffer.
+// A non-digit byte yields the poison value +1 — unreachable for valid input,
+// whose accumulator only ever decreases from 0 — so the caller can reject
+// garbage (`"+5"` used to parse as if `'+'` were the digit -5) without an
+// option type or a second pass over the moved-only buffer.
 fn parse_neg_from(s: string, i: i64, n: i64, acc: i64) -> i64 effects[state] =
   if i >= n then acc
   else
     let d: i64 = digit_value(string_get(s, i)) in
-    parse_neg_from(s, i + 1, n, acc * 10 - d)
+    if d < 0 || d > 9 then 1
+    else parse_neg_from(s, i + 1, n, acc * 10 - d)
 
 // decimal string -> i64. A leading '-' selects the negative-domain result
-// directly; otherwise negate it. Empty string parses to 0.
+// directly; otherwise negate it. Total: the empty string, any non-digit byte
+// (a poisoned parse), or an overflowing magnitude (which would wrap positive)
+// parses to 0.
 fn string_to_i64(s: string) -> i64 effects[state] =
   let n: i64 = string_len(s) in
   if n == 0 then 0
   else if string_get(s, 0) == minus_byte() then
-    parse_neg_from(s, 1, n, 0)
+    let r: i64 = parse_neg_from(s, 1, n, 0) in
+    if r > 0 then 0 else r
   else
-    0 - parse_neg_from(s, 0, n, 0)
+    let r: i64 = parse_neg_from(s, 0, n, 0) in
+    if r > 0 then 0 else 0 - r
 }

@@ -187,6 +187,20 @@ fn array_fill_rejects_unsound_or_malformed_forms() {
             "fn bad(n: i64) -> i64 =\n  let xs: array<i64, 4> = [5; n] in 0\n",
             "integer literal",
         ),
+        (
+            // #10: an unbounded count imported fine, then host-panicked the
+            // evaluator ("capacity overflow") and unrolled per-slot lowering.
+            "huge-count",
+            "fn bad() -> i64 =\n  let xs: array<i64, 18446744073709551615> = [0; 18446744073709551615] in 0\n",
+            "exceeds the supported maximum",
+        ),
+        (
+            // The cap also binds the declared TYPE (no fill needed), so a
+            // huge frame type can't arrive through a signature either.
+            "huge-declared-type",
+            "fn bad(a: array<i64, 99999999999>) -> i64 = a[0]\n",
+            "exceeds the supported maximum",
+        ),
     ];
 
     for (label, program, expected) in cases {

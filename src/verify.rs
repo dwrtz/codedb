@@ -210,208 +210,21 @@ impl CodeDb {
                 self.check_signature_effects(parent_hash, payload.get("effects"), errors)?;
             }
             "Expression" => {
-                self.check_hash_ref(parent_hash, "type", payload.get("type"), errors)?;
-                match payload.get("expr_kind").and_then(JsonValue::as_str) {
-                    Some(
-                        "literal_i64" | "literal_bool" | "literal_unit" | "param_ref" | "local_ref",
-                    ) => {}
-                    Some("static_bytes") => {
-                        self.check_hash_ref(
-                            parent_hash,
-                            "static_data",
-                            payload.get("static_data"),
-                            errors,
-                        )?;
-                        self.check_hash_ref(parent_hash, "region", payload.get("region"), errors)?;
-                        self.check_hash_ref(
-                            parent_hash,
-                            "element_type",
-                            payload.get("element_type"),
-                            errors,
-                        )?;
-                    }
-                    Some("call") => {
-                        self.check_hash_ref(parent_hash, "symbol", payload.get("symbol"), errors)?;
-                        self.check_hash_array_refs(
-                            parent_hash,
-                            "args",
-                            payload.get("args"),
-                            errors,
-                        )?;
-                    }
-                    Some("binary") => {
-                        self.check_hash_ref(parent_hash, "left", payload.get("left"), errors)?;
-                        self.check_hash_ref(parent_hash, "right", payload.get("right"), errors)?;
-                    }
-                    Some("unary") => {
-                        self.check_hash_ref(parent_hash, "expr", payload.get("expr"), errors)?;
-                    }
-                    Some("borrow_shared" | "borrow_mut") => {
-                        self.check_hash_ref(parent_hash, "target", payload.get("target"), errors)?;
-                        self.check_hash_ref(parent_hash, "region", payload.get("region"), errors)?;
-                        self.check_hash_ref(
-                            parent_hash,
-                            "referent_type",
-                            payload.get("referent_type"),
-                            errors,
-                        )?;
-                    }
-                    Some("slice_from_array") => {
-                        self.check_hash_ref(parent_hash, "target", payload.get("target"), errors)?;
-                        self.check_hash_ref(
-                            parent_hash,
-                            "target_type",
-                            payload.get("target_type"),
-                            errors,
-                        )?;
-                        self.check_hash_ref(
-                            parent_hash,
-                            "array_type",
-                            payload.get("array_type"),
-                            errors,
-                        )?;
-                        self.check_hash_ref(
-                            parent_hash,
-                            "element_type",
-                            payload.get("element_type"),
-                            errors,
-                        )?;
-                        self.check_hash_ref(parent_hash, "region", payload.get("region"), errors)?;
-                    }
-                    Some("slice_len") => {
-                        self.check_hash_ref(parent_hash, "target", payload.get("target"), errors)?;
-                        self.check_hash_ref(
-                            parent_hash,
-                            "slice_type",
-                            payload.get("slice_type"),
-                            errors,
-                        )?;
-                    }
-                    Some("subslice") => {
-                        self.check_hash_ref(parent_hash, "target", payload.get("target"), errors)?;
-                        self.check_hash_ref(parent_hash, "start", payload.get("start"), errors)?;
-                        self.check_hash_ref(parent_hash, "len", payload.get("len"), errors)?;
-                        self.check_hash_ref(
-                            parent_hash,
-                            "slice_type",
-                            payload.get("slice_type"),
-                            errors,
-                        )?;
-                        self.check_hash_ref(
-                            parent_hash,
-                            "element_type",
-                            payload.get("element_type"),
-                            errors,
-                        )?;
-                    }
-                    Some("assign") => {
-                        self.check_hash_ref(parent_hash, "target", payload.get("target"), errors)?;
-                        self.check_hash_ref(parent_hash, "value", payload.get("value"), errors)?;
-                        self.check_hash_ref(
-                            parent_hash,
-                            "target_type",
-                            payload.get("target_type"),
-                            errors,
-                        )?;
-                    }
-                    Some("let") => {
-                        self.check_hash_ref(
-                            parent_hash,
-                            "binding_type",
-                            payload.get("binding_type"),
-                            errors,
-                        )?;
-                        self.check_hash_ref(parent_hash, "value", payload.get("value"), errors)?;
-                        self.check_hash_ref(parent_hash, "body", payload.get("body"), errors)?;
-                    }
-                    Some("if") => {
-                        self.check_hash_ref(parent_hash, "cond", payload.get("cond"), errors)?;
-                        self.check_hash_ref(parent_hash, "then", payload.get("then"), errors)?;
-                        self.check_hash_ref(parent_hash, "else", payload.get("else"), errors)?;
-                    }
-                    Some("fold") => {
-                        self.check_hash_ref(parent_hash, "target", payload.get("target"), errors)?;
-                        self.check_hash_ref(
-                            parent_hash,
-                            "target_type",
-                            payload.get("target_type"),
-                            errors,
-                        )?;
-                        self.check_hash_ref(
-                            parent_hash,
-                            "element_type",
-                            payload.get("element_type"),
-                            errors,
-                        )?;
-                        self.check_hash_ref(parent_hash, "init", payload.get("init"), errors)?;
-                        self.check_hash_ref(
-                            parent_hash,
-                            "acc_type",
-                            payload.get("acc_type"),
-                            errors,
-                        )?;
-                        self.check_hash_ref(parent_hash, "body", payload.get("body"), errors)?;
-                    }
-                    Some("record_literal") => {
-                        for (idx, field) in payload
-                            .get("fields")
-                            .and_then(JsonValue::as_array)
-                            .into_iter()
-                            .flatten()
-                            .enumerate()
-                        {
-                            self.check_hash_ref(
-                                parent_hash,
-                                &format!("fields[{idx}].value"),
-                                field.get("value"),
-                                errors,
-                            )?;
-                            self.check_hash_ref(
-                                parent_hash,
-                                &format!("fields[{idx}].type"),
-                                field.get("type"),
-                                errors,
-                            )?;
-                        }
-                    }
-                    Some("field_access") => {
-                        self.check_hash_ref(parent_hash, "target", payload.get("target"), errors)?;
-                    }
-                    Some("enum_construct") => {
-                        self.check_hash_ref(
-                            parent_hash,
-                            "enum_type",
-                            payload.get("enum_type"),
-                            errors,
-                        )?;
-                        self.check_hash_ref(parent_hash, "value", payload.get("value"), errors)?;
-                    }
-                    Some("case") => {
-                        self.check_hash_ref(parent_hash, "expr", payload.get("expr"), errors)?;
-                        for (idx, arm) in payload
-                            .get("arms")
-                            .and_then(JsonValue::as_array)
-                            .into_iter()
-                            .flatten()
-                            .enumerate()
-                        {
-                            // `guard` is optional (R14); `check_hash_ref` no-ops on a
-                            // missing field, so this validates it only when present.
-                            self.check_hash_ref(
-                                parent_hash,
-                                &format!("arms[{idx}].guard"),
-                                arm.get("guard"),
-                                errors,
-                            )?;
-                            self.check_hash_ref(
-                                parent_hash,
-                                &format!("arms[{idx}].body"),
-                                arm.get("body"),
-                                errors,
-                            )?;
-                        }
-                    }
-                    Some(_) | None => {}
+                // Every hash-valued field of an expression payload must
+                // reference a stored object (children, `type`/`*_type`,
+                // `type_args`, regions, call symbols, static data) — checked
+                // generically over the whole payload (#12: the old per-kind
+                // match silently skipped kinds it didn't know, so the newer
+                // expression kinds were never field-checked at all).
+                let mut refs = Vec::new();
+                crate::store::extract_hash_strings(payload, &mut refs);
+                for child_hash in refs {
+                    self.check_hash_ref(
+                        parent_hash,
+                        "payload",
+                        Some(&JsonValue::String(child_hash)),
+                        errors,
+                    )?;
                 }
             }
             "FunctionDef" => {
@@ -1582,7 +1395,7 @@ impl CodeDb {
         Ok(())
     }
 
-    fn verify_roots(&self, errors: &mut Vec<String>) -> Result<()> {
+    fn verify_roots(&mut self, errors: &mut Vec<String>) -> Result<()> {
         let mut stmt = self
             .conn
             .prepare("SELECT hash FROM objects WHERE kind = 'ProgramRoot' ORDER BY hash")?;

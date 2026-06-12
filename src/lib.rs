@@ -67,10 +67,40 @@ pub(crate) const PIPELINE_VERSION: &str = "pipeline:v1";
 
 pub(crate) fn parse_eval_arg(arg: &str, type_name: &str, idx: usize) -> Result<Value> {
     match type_name {
+        // Sized integers (R5): decimal text parsed at the parameter's width,
+        // so `eval`/`trace`/`debug` can drive sized-int entries from the CLI.
+        "i8" => arg
+            .parse::<i8>()
+            .map(Value::I8)
+            .with_context(|| format!("argument {idx} must be i8, got {arg:?}")),
+        "i16" => arg
+            .parse::<i16>()
+            .map(Value::I16)
+            .with_context(|| format!("argument {idx} must be i16, got {arg:?}")),
+        "i32" => arg
+            .parse::<i32>()
+            .map(Value::I32)
+            .with_context(|| format!("argument {idx} must be i32, got {arg:?}")),
         "i64" => arg
             .parse::<i64>()
             .map(Value::I64)
             .with_context(|| format!("argument {idx} must be i64, got {arg:?}")),
+        "u8" => arg
+            .parse::<u8>()
+            .map(Value::U8)
+            .with_context(|| format!("argument {idx} must be u8, got {arg:?}")),
+        "u16" => arg
+            .parse::<u16>()
+            .map(Value::U16)
+            .with_context(|| format!("argument {idx} must be u16, got {arg:?}")),
+        "u32" => arg
+            .parse::<u32>()
+            .map(Value::U32)
+            .with_context(|| format!("argument {idx} must be u32, got {arg:?}")),
+        "u64" => arg
+            .parse::<u64>()
+            .map(Value::U64)
+            .with_context(|| format!("argument {idx} must be u64, got {arg:?}")),
         "bool" => match arg {
             "true" => Ok(Value::Bool(true)),
             "false" => Ok(Value::Bool(false)),

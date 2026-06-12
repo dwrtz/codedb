@@ -5903,6 +5903,33 @@ impl CodeDb {
                     })
                     .collect::<Result<Vec<_>>>()?;
             }
+            // A builtin call-shaped node (vec_*/string_*/array_set/box_new/
+            // unbox/subslice/slice ops/raw ops/int_cast): its raw form is a
+            // `Call` whose args mirror the typed node's children in the central
+            // table's order (#12 — these previously fell through undescended,
+            // so a member rename under them failed to rewrite).
+            (RawExpr::Call { args, .. }, kind) => {
+                let keys = crate::types::plain_child_expr_keys(kind)?;
+                if keys.len() != args.len() {
+                    bail!(
+                        "builtin {kind} raw/typed arg count mismatch: {} != {}",
+                        args.len(),
+                        keys.len()
+                    );
+                }
+                for (arg, key) in args.iter_mut().zip(keys) {
+                    *arg = self.rewrite_expr_child_for_member_rename(
+                        old_root,
+                        module,
+                        region_names,
+                        local_names,
+                        &payload,
+                        key,
+                        None,
+                        rename,
+                    )?;
+                }
+            }
             (RawExpr::Binary { left, right, .. }, "binary") => {
                 *left = Box::new(self.rewrite_expr_child_for_member_rename(
                     old_root,
@@ -6098,6 +6125,84 @@ impl CodeDb {
                 local_names.pop();
                 local_names.pop();
                 *body = Box::new(rewritten_body?);
+            }
+            (RawExpr::Return { value }, "return") => {
+                // The operand's expectation is the ambient one (the return
+                // type in tail position) — same as construction typing.
+                *value = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "value",
+                    expected_type,
+                    rename,
+                )?);
+            }
+            (
+                RawExpr::Loop {
+                    acc,
+                    init,
+                    cond,
+                    body,
+                },
+                "loop",
+            ) => {
+                let acc_type = payload
+                    .get("acc_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("loop missing acc_type"))?;
+                *init = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "init",
+                    Some(acc_type),
+                    rename,
+                )?);
+                local_names.push(acc.clone());
+                let rewritten_cond = self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "cond",
+                    None,
+                    rename,
+                );
+                let rewritten_body = self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "body",
+                    Some(acc_type),
+                    rename,
+                );
+                local_names.pop();
+                *cond = Box::new(rewritten_cond?);
+                *body = Box::new(rewritten_body?);
+            }
+            (RawExpr::ArrayFill { value, .. }, "array_fill") => {
+                let element_type = payload
+                    .get("element_type")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_fill missing element_type"))?;
+                *value = Box::new(self.rewrite_expr_child_for_member_rename(
+                    old_root,
+                    module,
+                    region_names,
+                    local_names,
+                    &payload,
+                    "value",
+                    Some(element_type),
+                    rename,
+                )?);
             }
             (RawExpr::Array { elements }, "array_literal") => {
                 let element_payloads = payload

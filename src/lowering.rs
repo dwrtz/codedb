@@ -1057,7 +1057,13 @@ impl CodeDb {
         }
         self.ensure_lowerable_return_type(root, &return_type)?;
         let body = self.function_body_hash(&entry.definition)?;
-        let actual_return = self.verify_expr_type(&body, root, &param_types, &allowed_regions)?;
+        let actual_return = self.verify_expr_type(
+            &body,
+            root,
+            &param_types,
+            &allowed_regions,
+            Some(&return_type),
+        )?;
         if !self.type_assignable_in_root(root, &actual_return, &return_type)? {
             bail!(
                 "function body type {} does not match return type {}",
@@ -6840,6 +6846,7 @@ impl CodeDb {
             root,
             &param_types,
             &allowed_regions,
+            Some(&return_type),
         )?;
         if !self.type_assignable_in_root(root, &actual_return, &return_type)?
             || ir.return_type_hash != return_type

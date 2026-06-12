@@ -251,6 +251,14 @@ fn array_set_rejects_unsound_or_malformed_forms() {
             "fn bad() -> i64 =\n  let a: array<i64, 3> = [0; 3] in array_set(a, 0)[0]\n",
             "expects 3 args",
         ),
+        (
+            // Indexing requires an addressable place; the array_set RESULT is
+            // an rvalue, so `array_set(a, i, v)[j]` is rejected fail-closed
+            // (bind it with a `let` first). Pinned so the envelope is explicit.
+            "rvalue-indexing",
+            "fn bad() -> i64 =\n  let a: array<i64, 3> = [0; 3] in array_set(a, 0, 9)[0]\n",
+            "not an addressable place",
+        ),
     ];
 
     for (label, program, expected) in cases {

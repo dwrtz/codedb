@@ -775,3 +775,44 @@ fn mutually_recursive_generic_program_round_trips_to_a_fixpoint() {
     assert!(projection.contains("fn even_steps<T>"), "{projection}");
     assert!(projection.contains("fn odd_steps<T>"), "{projection}");
 }
+
+#[test]
+fn polymorphic_recursion_is_rejected_fail_closed() {
+    // #7: a recursive generic whose recursive call instantiates a GROWING type
+    // never converges — every link mints a fresh instance. Before the depth cap
+    // the importer hung (function side) or overflowed the host stack (type
+    // side); both must instead fail with a clean depth-limit error.
+    let fn_side = "fn grow<T>(x: T, n: i64) -> i64 effects[alloc] =\n\
+                     if n < 1 then 0 else grow(box_new(x), n - 1)\n\
+                   fn main() -> i64 effects[alloc] = grow(1, 3)\n";
+    let type_side = "record Grow<T> { next: box<Grow<box<T>>> }\n\
+                     fn probe(g: Grow<i64>) -> i64 = 0\n";
+    for (label, source) in [("fn_side", fn_side), ("type_side", type_side)] {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join(format!("{label}.sqlite"));
+        let src = temp.path().join(format!("{label}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let err = run_fail(&["import", path(&db), path(&src)]);
+        assert!(
+            err.contains("exceeds the depth limit"),
+            "{label}: expected the instantiation depth limit, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn generic_with_region_param_and_type_param_under_a_reference() {
+    // #11: instantiating `&'r T` at T=i64 mints a Reference type that exists
+    // nowhere else in the program. The call-site substitution used the
+    // non-storing hash twin, so the assignability walk loaded an unstored hash
+    // and died with an internal `missing object`. Must import, verify, and run
+    // eval==native.
+    check_native(
+        "region_and_type_param",
+        "fn peek<'r, T>(x: &'r T) -> i64 = 7\n\
+         fn use_it<'a>(p: &'a i64) -> i64 = peek(p)\n\
+         fn main<'a>() -> i64 = let v: i64 = 41 in use_it(&'a v) + 35\n",
+        42,
+    );
+}

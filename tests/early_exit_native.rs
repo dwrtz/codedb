@@ -252,6 +252,90 @@ fn return_in_a_value_position_is_rejected_fail_closed() {
 }
 
 #[test]
+fn conditional_return_inside_loop_and_fold_positions_is_blessed() {
+    // #14c: a DIRECT `return` as a loop/fold init/cond/body is rejected (the
+    // degenerate always-diverges form), but an `if`/`case` branch re-grants
+    // the block-result position, so a CONDITIONAL `return` inside them exits
+    // the WHOLE FUNCTION — the search-loop early exit. Decision: blessed (not
+    // enforced away) — the behavior is coherent end to end, pinned here as
+    // eval == native across all four positions.
+    let cases: &[(&str, &str, i64)] = &[
+        (
+            "loop_body",
+            "fn find_first_ge(n: i64, limit: i64) -> i64 =\n\
+               loop acc = 0 while acc < limit do\n\
+                 (if acc * acc >= n then return acc else acc + 1)\n\
+             fn main() -> i64 = find_first_ge(10, 100)\n",
+            4,
+        ),
+        (
+            "loop_cond",
+            "fn f(n: i64) -> i64 =\n\
+               loop acc = 0 while (if acc > 50 then return acc else acc < n) do acc + 1\n\
+             fn main() -> i64 = f(1000)\n",
+            51,
+        ),
+        (
+            "loop_init",
+            "fn g(n: i64) -> i64 =\n\
+               loop acc = (if n < 0 then return 0 else n) while acc > 3 do acc - 1\n\
+             fn main() -> i64 = g(-7)\n",
+            0,
+        ),
+        (
+            "fold_body",
+            "fn first_neg(xs: array<i64, 4>) -> i64 =\n\
+               fold x in xs with acc = 0 do (if x < 0 then return x else acc + x)\n\
+             fn main() -> i64 = let a: array<i64, 4> = [3, 5, -7, 100] in first_neg(a)\n",
+            -7,
+        ),
+    ];
+    for (label, source, expected) in cases {
+        check_native(label, source, "main", *expected);
+    }
+}
+
+#[test]
+fn return_operand_must_match_the_function_return_type() {
+    // #13: the operand of `return` is what the function actually delivers, so it
+    // must be assignable to the declared return type — in every position, not just
+    // tail. Before this gate a `bool` could flow out of an `i64` function (import
+    // and `verify` both said ok; only eval/native diverged downstream).
+    let cases: &[(&str, &str)] = &[
+        (
+            "bool_from_i64_fn",
+            "fn f(c: bool) -> i64 = if c then return true else 0\n",
+        ),
+        ("i64_from_bool_fn", "fn f(n: i64) -> bool = return n\n"),
+        (
+            "wider_int_from_narrow_fn",
+            "fn f(c: bool, n: i64) -> u8 = if c then return n else 0\n",
+        ),
+        (
+            "case_arm_return",
+            "fn f(n: i64) -> i64 = case n of 0 => return false | _ => n\n",
+        ),
+    ];
+    for (label, source) in cases {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join(format!("{label}.sqlite"));
+        let src = temp.path().join(format!("{label}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let err = run_fail(&["import", path(&db), path(&src)]);
+        // Tail-position returns hit the body-vs-return gate; non-tail ones hit the
+        // dedicated return-operand gate; sized-int literal mismatches surface as
+        // literal range errors. All are import-time rejections.
+        assert!(
+            err.contains("bad_type")
+                || err.contains("does not match return type")
+                || err.contains("literal"),
+            "{label}: expected a return-operand type rejection, got: {err}"
+        );
+    }
+}
+
+#[test]
 fn early_return_round_trips_through_projection() {
     // The `.cdb` projection of a `return` re-parses to the same program (SPEC_V3
     // §11 checked view): export, re-import, and confirm value stability.

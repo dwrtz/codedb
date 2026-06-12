@@ -184,26 +184,84 @@ fn move_only_accumulator_is_rejected_fail_closed() {
 
 #[test]
 fn loop_body_that_moves_an_owned_value_is_rejected_fail_closed() {
-    // A loop runs 0..N times, so moving an owned param/local out of the body would
-    // move it more than once — rejected fail-closed at lowering (like `fold`), until
-    // loop-carried drop glue lands. `take` consumes its box param by moving it into
-    // the (move-only) return; calling it on a param in the loop body moves the param.
+    // A loop cond/body runs 0..N times, so moving an owned place from it would move
+    // more than once (double-free) — rejected at TYPECHECK (#14a), so import, the
+    // reference evaluator, and verify agree with the native-lowering gate instead of
+    // eval happily re-running the move. Each case must hit the dedicated gate
+    // message, not some incidental earlier rejection.
+    let cases: &[(&str, &str)] = &[
+        (
+            // The review repro: moving an outer box param from the body imported
+            // cleanly before the gate (the borrow checker saw only one move).
+            "outer_param_move",
+            "record Node { v: i64 }\n\
+             fn drop_it(b: box<Node>) -> i64 effects[alloc] = let n: Node = unbox(b) in n.v\n\
+             fn go(outer: box<Node>, n: i64) -> i64 effects[alloc] =\n\
+               loop acc = 0 while acc < n do acc + drop_it(outer)\n",
+        ),
+        (
+            // A per-iteration let-bound box move is also unlowerable today (no
+            // loop-carried drop glue); the typecheck gate mirrors lowering exactly.
+            "iteration_local_move",
+            "record Node { v: i64 }\n\
+             fn drop_it(b: box<Node>) -> i64 effects[alloc] = let n: Node = unbox(b) in n.v\n\
+             fn go(n: i64) -> i64 effects[alloc] =\n\
+               loop acc = 0 while acc < n do\n\
+                 let b: box<Node> = box_new({ v: 1 }) in acc + drop_it(b)\n",
+        ),
+    ];
+    for (label, source) in cases {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join(format!("{label}.sqlite"));
+        let src = temp.path().join(format!("{label}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let err = run_fail(&["import", path(&db), path(&src)]);
+        assert!(
+            err.contains("loop body cannot move owned values"),
+            "{label}: expected the loop-body move gate, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn loop_body_consuming_an_rvalue_temporary_stays_lowerable() {
+    // The move gate is about PLACES (params/locals): consuming a freshly built
+    // rvalue box per iteration never re-moves storage that outlives an iteration,
+    // and lowering accepts it — so typecheck must too (eval==native envelope).
     let source = "record Node { v: i64 }\n\
-                  fn take(b: box<Node>) -> box<Node> = b\n\
-                  fn drop_it(b: box<Node>) -> i64 effects[alloc] = unbox(take(b)).v\n\
-                  fn go(outer: box<Node>, n: i64) -> i64 effects[alloc] =\n\
-                    loop acc = 0 while acc < n do acc + drop_it(outer)\n";
+                  fn consume(b: box<Node>) -> i64 effects[alloc] = let n: Node = unbox(b) in n.v\n\
+                  fn go(n: i64) -> i64 effects[alloc] =\n\
+                    loop acc = 0 while acc < n do acc + consume(box_new({ v: 1 }))\n\
+                  fn main() -> i64 effects[alloc] = go(3)\n";
     let temp = tempdir().unwrap();
-    let db = temp.path().join("bodymove.sqlite");
-    let src = temp.path().join("bodymove.cdb");
+    let db = temp.path().join("rvalue.sqlite");
+    let src = temp.path().join("rvalue.cdb");
+    std::fs::write(&src, source).unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+    assert_eq!(run(&["eval", path(&db), "main"]).trim(), "3");
+    run(&["verify", path(&db)]);
+}
+
+#[test]
+fn fold_body_that_moves_an_owned_value_is_rejected_fail_closed() {
+    // The fold counterpart of the loop gate: the body runs once per element, so an
+    // outer move would repeat. Before #14a this imported and EVALED (the reference
+    // evaluator moved the box N times) while native lowering rejected it.
+    let source = "record Node { v: i64 }\n\
+                  fn drop_it(b: box<Node>) -> i64 effects[alloc] = let n: Node = unbox(b) in n.v\n\
+                  fn go(outer: box<Node>, xs: array<i64, 3>) -> i64 effects[alloc] =\n\
+                    fold x in xs with a = 0 do a + drop_it(outer)\n";
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("foldmove.sqlite");
+    let src = temp.path().join("foldmove.cdb");
     std::fs::write(&src, source).unwrap();
     run(&["init", path(&db)]);
     let err = run_fail(&["import", path(&db), path(&src)]);
-    // Either the borrow checker (use-after-move across the conceptual back-edge) or
-    // the lowering no-move guard rejects it; both are fail-closed, not a miscompile.
     assert!(
-        err.contains("bad_borrow") || err.contains("loop body cannot move owned values"),
-        "expected a loop-body move rejection, got: {err}"
+        err.contains("fold body cannot move owned values"),
+        "expected the fold-body move gate, got: {err}"
     );
 }
 
