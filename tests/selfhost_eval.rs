@@ -1,4 +1,4 @@
-// Phase 8 (ladder rung 0) Stage 2: the CodeDB-hosted evaluator's scalar core.
+// Phase 8 (ladder rung 0): the CodeDB-hosted evaluator, stages 2-4.
 //
 // `compiler/eval/eval.cdb` is imported, verified, built to a NATIVE binary,
 // and fed real `emit-cir` artifacts on stdin. It must EXECUTE the entry and
@@ -7,12 +7,15 @@
 // rung-0 result-equality oracle (SPEC_V3 §5), with the native backend as the
 // transitive third leg via the existing per-feature eval==native suites.
 //
-// Coverage here: scalar control flow (if, early return, calls, recursion),
-// every registry operator kind at its own width/signedness (the generated
-// three-way sweep below asserts a fixture per `codedb::operator_kinds()`
-// entry), int casts, div/mod trap parity, and the fail-closed shell.
-// Aggregates/case/fold/loop/heap are pinned to `trap:unsupported_op` until
-// Stages 3/4 flip them.
+// Coverage: scalar control flow (if, early return, calls, recursion), every
+// registry operator kind at its own width/signedness (the generated sweep
+// asserts a fixture per `codedb::operator_kinds()` entry), int casts,
+// div/mod trap parity, aggregates (records/enums/arrays/slices/static data/
+// case/fold/loop + the aggregate call ABI, gated by the tokenizer and
+// sha256 examples), the heap (boxes incl. a recursive cons list, vec/string
+// buffers, std.fmt round-trips, argv forwarded 1:1), the documented
+// capacity-trap divergence (the .cdb evaluator mirrors the NATIVE runtime,
+// not the growable eval model), and the fail-closed shell.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -76,6 +79,17 @@ fn import_fixture(temp: &Path, name: &str, source: &str) -> PathBuf {
     db
 }
 
+/// Init + import std/fmt.cdb then a fixture source; return the db path.
+fn import_fixture_with_fmt(temp: &Path, name: &str, source: &str) -> PathBuf {
+    let db = temp.join(format!("{name}.sqlite"));
+    let src = temp.join(format!("{name}.cdb"));
+    std::fs::write(&src, source).unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), "std/fmt.cdb"]);
+    run(&["import", path(&db), path(&src)]);
+    db
+}
+
 /// Emit the CIR for `entry` of `db` into `<entry>.cir` under temp.
 fn emit_cir(temp: &Path, db: &Path, entry: &str) -> PathBuf {
     let cir = temp.join(format!("{entry}.cir"));
@@ -83,9 +97,11 @@ fn emit_cir(temp: &Path, db: &Path, entry: &str) -> PathBuf {
     cir
 }
 
-/// Run the native evaluator with `input` on stdin; return (exit, stdout).
-fn run_evaluator(exe: &Path, input: &Path) -> (i32, String) {
+/// Run the native evaluator with `input` on stdin (and the evaluated
+/// program's process arguments, forwarded 1:1); return (exit, stdout).
+fn run_evaluator_with_args(exe: &Path, input: &Path, args: &[&str]) -> (i32, String) {
     let output = StdCommand::new(exe)
+        .args(args)
         .stdin(Stdio::from(File::open(input).expect("open evaluator input")))
         .output()
         .expect("run evaluator binary");
@@ -93,6 +109,10 @@ fn run_evaluator(exe: &Path, input: &Path) -> (i32, String) {
         output.status.code().expect("evaluator exit code"),
         String::from_utf8(output.stdout).expect("utf8 evaluator stdout"),
     )
+}
+
+fn run_evaluator(exe: &Path, input: &Path) -> (i32, String) {
+    run_evaluator_with_args(exe, input, &[])
 }
 
 /// Map the Rust evaluator's printed value onto the .cdb evaluator's output
@@ -335,30 +355,120 @@ fn aggregate_programs_match_the_rust_evaluator() {
     );
 }
 
+const HEAP_FIXTURE: &str = "\
+record Node {\n  v: i64\n}\n\
+record Wide {\n  a: i64\n  b: i64\n}\n\
+record Cons {\n  head: i64\n  tail: List\n}\n\
+enum List {\n  nil: unit\n  cons: box<Cons>\n}\n\
+fn t_box() -> i64 effects[alloc] =\n\
+  let b: box<Node> = box_new({ v: 41 }) in\n\
+  let n: Node = unbox(b) in\n\
+  n.v + 1\n\
+fn t_box_wide() -> i64 effects[alloc] =\n\
+  let b: box<Wide> = box_new({ a: 30, b: 12 }) in\n\
+  let w: Wide = unbox(b) in\n\
+  w.a + w.b\n\
+fn build(n: i64) -> List effects[alloc] =\n\
+  if n == 0 then List::nil(())\n\
+  else List::cons(box_new({ head: n, tail: build(n - 1) }))\n\
+fn sum(l: List) -> i64 effects[alloc] =\n\
+  case l of nil(u) => 0 | cons(b) => let c: Cons = unbox(b) in c.head + sum(c.tail)\n\
+fn t_cons() -> i64 effects[alloc] = sum(build(10))\n\
+fn t_vec() -> i64 effects[alloc, state] =\n\
+  let v: vec<i64> = vec_new(4) in\n\
+  let p1: unit = vec_push(v, 10) in\n\
+  let p2: unit = vec_push(v, 32) in\n\
+  vec_get(v, 0) + vec_get(v, 1) + vec_len(v)\n\
+fn t_swc() -> i64 effects[alloc, state] =\n\
+  let s: string = string_with_capacity(3 + 2) in\n\
+  let p: unit = string_push(s, to_u8(65)) in\n\
+  let w: unit = string_set(s, 0, to_u8(66)) in\n\
+  to_i64(string_get(s, 0)) + string_len(s)\n\
+fn t_str_new() -> i64 effects[alloc, state] =\n\
+  let s: string = string_new(\"hi\") in\n\
+  to_i64(string_get(s, 0)) + to_i64(string_get(s, 1)) + string_len(s)\n\
+fn t_fmt() -> i64 effects[io, alloc, state] =\n\
+  let s: string = std.fmt.i64_to_string(0 - 1234567) in\n\
+  let n: i64 = std.fmt.string_to_i64(s) in\n\
+  let s2: string = std.fmt.i64_to_string(90210) in\n\
+  n + 1234567 + string_len(s2)\n\
+fn t_args() -> i64 effects[io] = arg_count() * 100 + arg_len(0) * 10 + to_i64(arg_byte(0, 0)) - 100\n";
+
 #[test]
-fn stage4_frontier_is_pinned_fail_closed() {
+fn heap_programs_match_the_rust_evaluator() {
     if !can_build_default_native_target() {
         return;
     }
     let temp = tempdir().unwrap();
     let exe = evaluator();
 
-    // The heap ops await Stage 4; the expectation FLIPS when it lands.
+    // Boxes (aggregate + by-value-record payloads), a recursive cons list
+    // through enum payloads + unbox, vecs, dynamic strings, std.fmt's
+    // formatting round-trip over the bump heap.
+    let db = import_fixture_with_fmt(temp.path(), "heap", HEAP_FIXTURE);
+    for entry in [
+        "t_box",
+        "t_box_wide",
+        "t_cons",
+        "t_vec",
+        "t_swc",
+        "t_str_new",
+        "t_fmt",
+    ] {
+        assert_three_way(temp.path(), exe, &db, entry);
+    }
+
+    // argv forwards 1:1 (the CIR rides stdin, so no argument is consumed):
+    // the .cdb evaluator run with [zap, qq] must match the Rust evaluator
+    // seeded with the same --process-arg list.
+    let cir = emit_cir(temp.path(), &db, "t_args");
+    let rust = normalize_rust_eval(&run(&[
+        "eval",
+        path(&db),
+        "t_args",
+        "--process-arg",
+        "zap",
+        "--process-arg",
+        "qq",
+    ]));
+    let (code, stdout) = run_evaluator_with_args(exe, &cir, &["zap", "qq"]);
+    assert_eq!(
+        (code, stdout.trim()),
+        (0, format!("ok:{rust}").as_str()),
+        "argv forwarding parity"
+    );
+}
+
+#[test]
+fn capacity_traps_mirror_the_native_runtime_not_the_growable_eval_model() {
+    if !can_build_default_native_target() {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let exe = evaluator();
+
+    // A DOCUMENTED divergence inherited from upstream: the Rust evaluator
+    // models strings as growable buffers, while the native runtime traps a
+    // push past capacity; the .cdb evaluator mirrors the NATIVE semantics
+    // (a correctly-sized program never reaches this edge — Phase 12). The
+    // Rust evaluator returns 2 here; the .cdb evaluator traps like native.
     let db = import_fixture(
         temp.path(),
-        "boxed",
-        "record Node {\n  v: i64\n}\n\
-         fn t_box() -> i64 effects[alloc] =\n\
-           let b: box<Node> = box_new({ v: 41 }) in\n\
-           let n: Node = unbox(b) in\n\
-           n.v + 1\n",
+        "cap",
+        "fn t_cap() -> i64 effects[alloc, state] =
+           let s: string = string_with_capacity(1) in
+           let p1: unit = string_push(s, to_u8(1)) in
+           let p2: unit = string_push(s, to_u8(2)) in
+           string_len(s)
+",
     );
-    let cir = emit_cir(temp.path(), &db, "t_box");
+    let cir = emit_cir(temp.path(), &db, "t_cap");
+    assert_eq!(run(&["eval", path(&db), "t_cap"]).trim(), "2");
     let (code, stdout) = run_evaluator(exe, &cir);
     assert_eq!(
         (code, stdout.trim()),
-        (101, "trap:unsupported_op"),
-        "box programs await Stage 4 heap ops"
+        (101, "trap:bounds_check"),
+        "capacity trap mirrors native"
     );
 }
 

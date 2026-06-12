@@ -1,8 +1,10 @@
 # compiler/eval - Reference Evaluator in CodeDB (Ladder Rung 0)
 
-Status: substrate landed (docs/PLAN_V3.md Phase 8; milestone V3.2) — the CIR
-input artifact and the `string_set` primitive are in place; the `.cdb`
-evaluator itself is the next stage.
+Status: the `.cdb` evaluator EXECUTES (docs/PLAN_V3.md Phase 8; milestone
+V3.2) — stages 1-4 are in: the loader, the scalar core, aggregates, and the
+heap all run natively, result-equal to the Rust evaluator on the staged
+corpora (`tests/selfhost_eval.rs`); the corpus-wide sweep and the §11
+checked-view gate (stage 5) remain.
 
 Re-expresses the reference evaluator — the lowered-IR walker, the Value model,
 and per-op evaluation — as CodeDB objects. This rung is off the compilation path:
@@ -191,9 +193,15 @@ stay out until something forces them.
    and the call ABI's hidden return slot + indirect-param entry copies —
    gated by the tokenizer + sha256 digest examples and a per-feature
    aggregate fixture, all result-equal to the Rust evaluator;
-5. heap (box ops over the bump allocator, vec/string ops with capacity traps,
-   argv forwarded 1:1 to the evaluated program) — gated by the box-recursion,
-   string/fmt, and tokenizer corpora;
+5. **(done — Stage 4)** heap: `heap_alloc` bumps (the pointer cell lives at
+   the stack/heap boundary; drops and shell frees are validated no-ops),
+   `unbox` copies the payload out (by-value records are raw byte patterns in
+   cells, mirroring the backend's `passes_indirect == false` path), and the
+   vec/string buffers run over `{ptr, len, capacity}` headers described by
+   the layout rows' buffer consumer columns, trapping at capacity exactly
+   like the native runtime (a DOCUMENTED divergence from the growable
+   Rust-eval string model, pinned by a test); argv forwards 1:1 — gated by
+   box-recursion (cons list), vec/string/fmt, and argv-parity fixtures;
 6. the corpus harness (`tests/selfhost_eval.rs`): manifest-driven
    Rust-eval-vs-CodeDB-evaluator sweep, plus the §11 checked-view gate for
    `compiler/eval/*.cdb`.

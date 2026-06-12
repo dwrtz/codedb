@@ -37,7 +37,9 @@
 //! typed_body_expr_hash str
 //! layout table: count u32, then per layout:
 //!   type_hash str, kind str, size_bytes u64, align_bytes u64,
-//!   abi_pass str, abi_return str, metadata canonical-JSON str
+//!   abi_pass str, abi_return str, metadata canonical-JSON str,
+//!   buffer columns: ptr_off u64, len_off u64, cap_off u64,
+//!   element_size u64, element_stride u64 (zero for non-vec/string kinds)
 //! type table: count u32, then per type:
 //!   type_hash str, layout_index u32, meta_kind u8, meta_size u64
 //!   (layout_index = u32::MAX when the type has no layout entry; scalar types)
@@ -253,6 +255,30 @@ fn type_meta_columns(type_hash: &str, layout: Option<&LoweredTypeLayout>) -> (u8
         Some(layout) => (typemeta::AGG_BY_VALUE, layout.size_bytes),
         None => (typemeta::POINTER, 8),
     }
+}
+
+/// Derive a vec/string layout's buffer consumer columns from its metadata
+/// (`{ptr,len,capacity}` header offsets plus the element size/stride); other
+/// kinds carry zeros. Renames facts the layout engine already wrote into the
+/// metadata JSON, so the `.cdb` walker never parses JSON.
+fn buffer_columns(layout: &LoweredTypeLayout) -> Result<[u64; 5]> {
+    if layout.kind != "vec" && layout.kind != "string" {
+        return Ok([0; 5]);
+    }
+    let field = |key: &str| -> Result<u64> {
+        layout
+            .metadata
+            .get(key)
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| anyhow!("CIR buffer layout missing metadata key {key}"))
+    };
+    Ok([
+        field("ptr_offset_bytes")?,
+        field("len_offset_bytes")?,
+        field("capacity_offset_bytes")?,
+        field("element_size_bytes")?,
+        field("element_stride_bytes")?,
+    ])
 }
 
 /// Derive a binary/unary op's consumer columns (verb, width-in-bytes, signed)
@@ -1346,6 +1372,9 @@ fn encode_function(
         write_u32(&mut out, encoder.pools.istr(&layout.abi.pass));
         write_u32(&mut out, encoder.pools.istr(&layout.abi.return_));
         write_u32(&mut out, encoder.pools.istr(&canonical_json(&layout.metadata)));
+        for column in buffer_columns(layout)? {
+            write_u64(&mut out, column);
+        }
     }
     let layout_index: BTreeMap<&str, u32> = ir
         .type_layouts
@@ -2061,14 +2090,28 @@ fn decode_function(
         let metadata_json = decoder.rstr(&mut reader)?;
         let metadata: JsonValue = serde_json::from_str(&metadata_json)
             .map_err(|err| anyhow!("CIR layout metadata is not valid JSON: {err}"))?;
-        type_layouts.push(LoweredTypeLayout {
+        let layout = LoweredTypeLayout {
             type_hash,
             kind,
             size_bytes,
             align_bytes,
             abi: LoweredTypeAbi { pass, return_ },
             metadata,
-        });
+        };
+        let stored = [
+            reader.u64()?,
+            reader.u64()?,
+            reader.u64()?,
+            reader.u64()?,
+            reader.u64()?,
+        ];
+        if stored != buffer_columns(&layout)? {
+            bail!(
+                "CIR buffer consumer columns are inconsistent for {}",
+                layout.type_hash
+            );
+        }
+        type_layouts.push(layout);
     }
     let type_count = decoder.rusize(&mut reader)?;
     let mut types = Vec::with_capacity(type_count);

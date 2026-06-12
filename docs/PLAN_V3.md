@@ -544,8 +544,25 @@ to the Rust evaluator; param-taking and aggregate-result entries stay
 outside the protocol fail-closed. Two more v0 frame realities documented:
 calls cap at 8 machine parameters (driver headers ride in Copy records) and
 the dispatcher/driver split keeps every frame under the 4095-byte budget.
-The heap ops (box/vec/string/argv) trap `unsupported_op` until Stage 4
-(pinned by the frontier test).
+(7) **Stage 4 — the heap executes.** `heap_alloc` bumps (the pointer cell
+sits at the stack/heap boundary; drops and box-shell frees are validated
+no-ops — result equality cannot observe them and the bump heap makes
+use-after-free unrepresentable), `unbox` copies payloads out (and BY-VALUE
+records — small aggregates the ABI passes `by_value` — ride in cells as raw
+byte patterns, the backend's `passes_indirect == false` path), and vec/
+string buffers run over `{ptr, len, capacity}` headers located by a second
+round of consumer columns (per-layout buffer offsets + element size/stride,
+derived from the layout metadata so the walker never parses JSON). Buffer
+ops trap at capacity exactly like the native runtime — a DOCUMENTED
+divergence from the growable Rust-eval string model, pinned by its own test
+(a correctly-sized program never reaches the edge, per Phase 12). argv
+forwards 1:1 (the CIR rides stdin). Gate: boxes (aggregate, by-value, and a
+recursive cons list through enum payloads), vec/string ops, std.fmt's
+negative-domain round-trip over the bump heap, and argv parity against
+--process-arg — all result-equal to the Rust evaluator. With Stage 4 every
+one of the 56 CIR opcodes is routed; what remains for V3.2 is Stage 5: the
+corpus-wide manifest sweep and the §11 checked-view gate for
+compiler/eval/*.cdb.
 
 Deliverables:
 
