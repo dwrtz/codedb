@@ -451,6 +451,17 @@ pub(crate) enum LoweredOp {
         string_type_hash: String,
         type_hash: String,
     },
+    /// `string_set(s, i, b)` (Phase 8 substrate): overwrite byte `i` of string
+    /// place `s` (bounds-checked against `len`) with `b`. The random-access
+    /// write twin of `StringGet`; `len` and `capacity` are unchanged.
+    StringSet {
+        id: String,
+        string_address: String,
+        index: String,
+        value: String,
+        string_type_hash: String,
+        type_hash: String,
+    },
     /// `arg_count()` (R12): the number of process command-line arguments
     /// (program name excluded). Lowers to a call into the link harness's
     /// argv runtime (`codedb_arg_count`), the platform-symbol pattern of
@@ -1686,6 +1697,7 @@ impl CodeDb {
             "string_get" => {
                 self.lower_string_get(root, expr_hash, &type_hash, param_types, ctx, locals)
             }
+            "string_set" => self.lower_string_set(root, expr_hash, param_types, ctx, locals),
             kind @ ("arg_count" | "arg_len" | "arg_byte") => {
                 self.lower_process_arg(root, expr_hash, kind, &type_hash, param_types, ctx, locals)
             }
@@ -3765,6 +3777,69 @@ impl CodeDb {
             operations,
             value: id,
             type_hash: type_hash_for("U8"),
+        })
+    }
+
+    fn lower_string_set(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let target_hash = payload
+            .get("target")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("string_set missing target"))?;
+        let index_hash = payload
+            .get("index")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("string_set missing index"))?;
+        let value_hash = payload
+            .get("value")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("string_set missing value"))?;
+        let target = self.lower_place(root, target_hash, param_types, ctx, locals)?;
+        if !matches!(
+            self.type_spec_in_root(root, &target.type_hash)?,
+            TypeSpec::String
+        ) {
+            bail!("string_set target must lower as string");
+        }
+        let index = self.lower_expr(root, index_hash, param_types, ctx, locals)?;
+        if index.type_hash != type_hash_for("I64") {
+            bail!("string_set index type mismatch while lowering");
+        }
+        let value = self.lower_expr_as(
+            root,
+            value_hash,
+            &type_hash_for("U8"),
+            param_types,
+            ctx,
+            locals,
+        )?;
+        if value.type_hash != type_hash_for("U8") {
+            bail!("string_set value must lower as u8");
+        }
+        let id = ctx.value();
+        ctx.push_debug_op(expr_hash, "string_set", &id);
+        let mut operations = target.operations;
+        operations.extend(index.operations);
+        operations.extend(value.operations);
+        operations.push(LoweredOp::StringSet {
+            id: id.clone(),
+            string_address: target.address,
+            index: index.value,
+            value: value.value,
+            string_type_hash: target.type_hash,
+            type_hash: type_hash_for("Unit"),
+        });
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: type_hash_for("Unit"),
         })
     }
 
@@ -8531,6 +8606,31 @@ impl CodeDb {
                     }
                     insert_value(values, id, type_hash)?;
                 }
+                LoweredOp::StringSet {
+                    id,
+                    string_address,
+                    index,
+                    value,
+                    string_type_hash,
+                    type_hash,
+                } => {
+                    if address_type(addresses, string_address)? != string_type_hash {
+                        bail!("lowered string_set address type mismatch");
+                    }
+                    if !matches!(self.type_spec(string_type_hash)?, TypeSpec::String) {
+                        bail!("lowered string_set target must be string");
+                    }
+                    if value_type(values, index)? != &type_hash_for("I64") {
+                        bail!("lowered string_set index must be i64");
+                    }
+                    if value_type(values, value)? != &type_hash_for("U8") {
+                        bail!("lowered string_set value must be u8");
+                    }
+                    if type_hash != &type_hash_for("Unit") {
+                        bail!("lowered string_set result type mismatch");
+                    }
+                    insert_value(values, id, type_hash)?;
+                }
                 LoweredOp::BoundsCheck {
                     id,
                     index,
@@ -9017,6 +9117,7 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::StringWithCapacity { id, .. }
         | LoweredOp::StringPush { id, .. }
         | LoweredOp::StringGet { id, .. }
+        | LoweredOp::StringSet { id, .. }
         | LoweredOp::ArgCount { id, .. }
         | LoweredOp::ArgLen { id, .. }
         | LoweredOp::ArgByte { id, .. }
@@ -9079,6 +9180,7 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::StringWithCapacity { .. } => "string_with_capacity",
         LoweredOp::StringPush { .. } => "string_push",
         LoweredOp::StringGet { .. } => "string_get",
+        LoweredOp::StringSet { .. } => "string_set",
         LoweredOp::ArgCount { .. } => "arg_count",
         LoweredOp::ArgLen { .. } => "arg_len",
         LoweredOp::ArgByte { .. } => "arg_byte",
@@ -9329,6 +9431,11 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
                 ..
             }
             | LoweredOp::StringGet {
+                type_hash,
+                string_type_hash,
+                ..
+            }
+            | LoweredOp::StringSet {
                 type_hash,
                 string_type_hash,
                 ..

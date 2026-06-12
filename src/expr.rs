@@ -1534,6 +1534,42 @@ impl CodeDb {
                     other => bail!("string_get target evaluated to non-string {other}"),
                 }
             }
+            "string_set" => {
+                let target_hash = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_set missing target"))?;
+                let index_hash = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_set missing index"))?;
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_set missing value"))?;
+                let index = eval_index_value(self.eval_expr_with_locals(
+                    root_hash,
+                    index_hash,
+                    args,
+                    locals,
+                )?)?;
+                let value = self.eval_expr_with_locals(root_hash, value_hash, args, locals)?;
+                let byte = match value {
+                    Value::U8(byte) => byte,
+                    other => bail!("string_set value evaluated to non-u8 {other}"),
+                };
+                let target = self.eval_place_cell(root_hash, target_hash, args, locals)?;
+                match &mut *target.borrow_mut() {
+                    Value::String(bytes) => {
+                        let slot = bytes
+                            .get_mut(index)
+                            .ok_or_else(|| anyhow!("string_set index {index} out of bounds"))?;
+                        *slot = byte;
+                        Ok(Value::Unit)
+                    }
+                    other => bail!("string_set target evaluated to non-string {other}"),
+                }
+            }
             other => bail!("eval_string_builtin called with non-string builtin {other}"),
         }
     }
@@ -1841,7 +1877,7 @@ impl CodeDb {
             // locals stay off this hot recursive frame — otherwise they shrink the
             // evaluator's effective recursion depth before the host stack overflows
             // (see eval_loop and MAX_EVAL_CALL_DEPTH).
-            kind @ ("string_with_capacity" | "string_push" | "string_get") => {
+            kind @ ("string_with_capacity" | "string_push" | "string_get" | "string_set") => {
                 self.eval_string_builtin(root_hash, kind, &payload, args, locals)
             }
             kind @ ("arg_count" | "arg_len" | "arg_byte") => {
@@ -3437,6 +3473,50 @@ impl CodeDb {
                     )?
                 )
             }
+            "string_set" => {
+                let target = payload
+                    .get("target")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_set missing target"))?;
+                let index = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_set missing index"))?;
+                let value = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("string_set missing value"))?;
+                format!(
+                    "string_set({}, {}, {})",
+                    self.expr_to_source_with_locals(
+                        target,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?,
+                    self.expr_to_source_with_locals(
+                        index,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?,
+                    self.expr_to_source_with_locals(
+                        value,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?
+                )
+            }
             "raw_ptr_cast" => {
                 let value = payload
                     .get("value")
@@ -4882,6 +4962,44 @@ impl CodeDb {
                     )?,
                 ],
             }),
+            "string_set" => Ok(RawExpr::Call {
+                name: "string_set".to_string(),
+                args: vec![
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("target")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("string_set missing target"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                        hook,
+                    )?,
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("index")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("string_set missing index"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                        hook,
+                    )?,
+                    self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get("value")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("string_set missing value"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                        hook,
+                    )?,
+                ],
+            }),
             "raw_ptr_cast" => {
                 let mutable = payload
                     .get("mutable")
@@ -5958,6 +6076,15 @@ impl CodeDb {
                         .get(key)
                         .and_then(JsonValue::as_str)
                         .ok_or_else(|| anyhow!("string_get missing {key}"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
+            }
+            "string_set" => {
+                for key in ["target", "index", "value"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("string_set missing {key}"))?;
                     self.collect_expr_deps(root, child, deps)?;
                 }
             }

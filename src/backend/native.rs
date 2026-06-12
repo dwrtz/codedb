@@ -719,6 +719,7 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::StringWithCapacity { .. }
             | LoweredOp::StringPush { .. }
             | LoweredOp::StringGet { .. }
+            | LoweredOp::StringSet { .. }
             | LoweredOp::ArgCount { .. }
             | LoweredOp::ArgLen { .. }
             | LoweredOp::ArgByte { .. }
@@ -838,6 +839,7 @@ fn validate_native_ops(
             | LoweredOp::StringWithCapacity { .. }
             | LoweredOp::StringPush { .. }
             | LoweredOp::StringGet { .. }
+            | LoweredOp::StringSet { .. }
             | LoweredOp::ArgCount { .. }
             | LoweredOp::ArgLen { .. }
             | LoweredOp::ArgByte { .. } => {}
@@ -1834,6 +1836,31 @@ fn validate_native_op_flow(
             }
             native_insert_value(values, id, type_hash)?;
         }
+        LoweredOp::StringSet {
+            id,
+            string_address,
+            index,
+            value,
+            string_type_hash,
+            type_hash,
+        } => {
+            if native_address_type(addresses, string_address)? != string_type_hash {
+                bail!("native object backend saw string_set address mismatch");
+            }
+            if native_type_layout(type_layouts, string_type_hash)?.kind != "string" {
+                bail!("native object backend saw string_set for non-string");
+            }
+            if native_value_type(values, index)? != &type_hash_for("I64") {
+                bail!("native object backend saw string_set non-i64 index");
+            }
+            if native_value_type(values, value)? != &type_hash_for("U8") {
+                bail!("native object backend saw string_set non-u8 value");
+            }
+            if type_hash != &type_hash_for("Unit") {
+                bail!("native object backend saw string_set non-unit result");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
         LoweredOp::BoundsCheck {
             id,
             index,
@@ -2605,6 +2632,7 @@ fn collect_value_ids_inner(
             | LoweredOp::StringWithCapacity { id, .. }
             | LoweredOp::StringPush { id, .. }
             | LoweredOp::StringGet { id, .. }
+            | LoweredOp::StringSet { id, .. }
             | LoweredOp::ArgCount { id, .. }
             | LoweredOp::ArgLen { id, .. }
             | LoweredOp::ArgByte { id, .. }
@@ -3200,6 +3228,23 @@ impl FunctionEmitter {
                 ..
             } => {
                 self.emit_buffer_get_x86(id, string_address, index, string_type_hash, "string")?;
+            }
+            LoweredOp::StringSet {
+                id,
+                string_address,
+                index,
+                value,
+                string_type_hash,
+                ..
+            } => {
+                self.emit_buffer_set_x86(
+                    id,
+                    string_address,
+                    index,
+                    value,
+                    string_type_hash,
+                    "string",
+                )?;
             }
             LoweredOp::BoundsCheck {
                 id,
@@ -4098,6 +4143,45 @@ impl FunctionEmitter {
             8 => self.mov_rax_mem_rax(),
             size => bail!("native x86_64 vec_get unsupported element size {size}"),
         }
+        self.mov_stack_rax(self.value_offset(id)?);
+        Ok(())
+    }
+
+    fn emit_buffer_set_x86(
+        &mut self,
+        id: &str,
+        address: &str,
+        index: &str,
+        value: &str,
+        type_hash: &str,
+        kind: &str,
+    ) -> Result<()> {
+        let buffer = native_buffer_layout(&self.type_layouts, type_hash, kind)?;
+        self.mov_rax_stack(self.value_offset(address)?);
+        self.mov_rcx_stack(self.value_offset(index)?);
+        self.mov_rdx_mem_rax_disp(i32::try_from(buffer.len_offset)?);
+        self.cmp_rcx_rdx();
+        let ok = self.emit_jb_placeholder();
+        self.emit_ud2();
+        self.patch_rel32(ok)?;
+
+        self.mov_rax_mem_rax_disp(i32::try_from(buffer.ptr_offset)?);
+        if buffer.element_stride != 1 {
+            self.imul_rcx_imm32(i32::try_from(buffer.element_stride)?);
+        }
+        self.add_rax_rcx();
+        match buffer.element_size {
+            1 => {
+                self.mov_rcx_stack(self.value_offset(value)?);
+                self.mov_memb_rax_cl();
+            }
+            8 => {
+                self.mov_rcx_stack(self.value_offset(value)?);
+                self.mov_mem_rax_rcx();
+            }
+            size => bail!("native x86_64 {kind}_set unsupported element size {size}"),
+        }
+        self.mov_rax_imm32(0);
         self.mov_stack_rax(self.value_offset(id)?);
         Ok(())
     }
@@ -5274,6 +5358,23 @@ impl Arm64Emitter {
             } => {
                 self.emit_buffer_get_arm64(id, string_address, index, string_type_hash, "string")?;
             }
+            LoweredOp::StringSet {
+                id,
+                string_address,
+                index,
+                value,
+                string_type_hash,
+                ..
+            } => {
+                self.emit_buffer_set_arm64(
+                    id,
+                    string_address,
+                    index,
+                    value,
+                    string_type_hash,
+                    "string",
+                )?;
+            }
             LoweredOp::BoundsCheck {
                 id,
                 index,
@@ -6129,6 +6230,41 @@ impl Arm64Emitter {
             8 => self.ldr_reg_addr(0, 0)?,
             size => bail!("native arm64 vec_get unsupported element size {size}"),
         }
+        self.str_stack(0, self.value_offset(id)?)?;
+        Ok(())
+    }
+
+    fn emit_buffer_set_arm64(
+        &mut self,
+        id: &str,
+        address: &str,
+        index: &str,
+        value: &str,
+        type_hash: &str,
+        kind: &str,
+    ) -> Result<()> {
+        let buffer = native_buffer_layout(&self.type_layouts, type_hash, kind)?;
+        self.ldr_stack(0, self.value_offset(address)?)?;
+        self.ldr_stack(1, self.value_offset(index)?)?;
+        self.ldr_reg_addr_offset(2, 0, u32::try_from(buffer.len_offset)?)?;
+        self.cmp_reg(1, 2);
+        let ok = self.emit_b_cond_placeholder(3);
+        self.emit_u32(0xd4200000);
+        self.patch_imm19(ok)?;
+
+        self.ldr_reg_addr_offset(0, 0, u32::try_from(buffer.ptr_offset)?)?;
+        if buffer.element_stride != 1 {
+            self.mov_u64(2, buffer.element_stride);
+            self.mul_reg(1, 1, 2);
+        }
+        self.add_reg(0, 0, 1);
+        self.ldr_stack(4, self.value_offset(value)?)?;
+        match buffer.element_size {
+            1 => self.strb_reg_addr(4, 0)?,
+            8 => self.str_reg_addr(4, 0)?,
+            size => bail!("native arm64 {kind}_set unsupported element size {size}"),
+        }
+        self.mov_u64(0, 0);
         self.str_stack(0, self.value_offset(id)?)?;
         Ok(())
     }

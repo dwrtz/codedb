@@ -4473,6 +4473,7 @@ fn collect_lowered_call_targets(
             | LoweredOp::StringWithCapacity { .. }
             | LoweredOp::StringPush { .. }
             | LoweredOp::StringGet { .. }
+            | LoweredOp::StringSet { .. }
             | LoweredOp::ArgCount { .. }
             | LoweredOp::ArgLen { .. }
             | LoweredOp::ArgByte { .. }

@@ -6,6 +6,7 @@ mod backend_c;
 mod branches;
 mod build_plan;
 mod bundle;
+mod cir;
 pub mod debugger;
 mod diff;
 mod expr;
@@ -34,6 +35,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::params;
 use serde_json::json;
 
+pub use cir::{CIR_SCHEMA, CirEmission};
 pub use expr::{
     ExternalFunctionSource, FunctionSource, ProgramItem, RawExpr, TypeDefinitionSource, Value,
     set_process_args,

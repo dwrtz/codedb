@@ -164,6 +164,19 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    #[command(
+        about = "Emit the flat binary CIR artifact (the lowered-IR closure of an entry, for the CodeDB-hosted evaluator)"
+    )]
+    EmitCir {
+        db: PathBuf,
+        entry_name: String,
+        #[arg(long, default_value = codedb::DEFAULT_NATIVE_TARGET)]
+        target: String,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Emit and cache a deterministic native type layout artifact")]
     EmitTypeLayout {
         db: PathBuf,
@@ -873,6 +886,30 @@ fn main() -> Result<()> {
             let ir = codedb.emit_ir_main_branch(&function_name)?;
             std::fs::write(&out, ir)?;
             println!("emitted lowered IR {}", out.display());
+        }
+        Command::EmitCir {
+            db,
+            entry_name,
+            target,
+            out,
+            json,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            let emission = codedb.emit_cir_main_branch(&entry_name, &target)?;
+            std::fs::write(&out, &emission.bytes)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&emission.summary)?);
+            } else {
+                println!(
+                    "emitted CIR {} ({} functions, {} bytes, {})",
+                    out.display(),
+                    emission.summary["function_count"],
+                    emission.summary["byte_len"],
+                    emission.summary["cir_hash"]
+                        .as_str()
+                        .unwrap_or("missing hash"),
+                );
+            }
         }
         Command::EmitTypeLayout {
             db,

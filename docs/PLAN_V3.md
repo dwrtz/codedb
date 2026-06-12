@@ -461,8 +461,30 @@ a native program dispatches on integer literals with a `_` default and a nested
 Goal: re-express the reference evaluator as CodeDB objects — the first
 self-hosting completion and the Pillar-1 warm-up.
 
-Status: planned. Self-hosts rung 0. Depends on Phases 6 (recursion) and 7
-(patterns).
+Status: substrate landed; the `.cdb` evaluator itself is next. Self-hosts rung
+0. Depends on Phases 6 (recursion) and 7 (patterns). Two design pins, settled:
+the CodeDB-hosted evaluator walks the **lowered IR** (SPEC_V3 §5's "smallest
+recursive IR-walker"), not typed expressions — the IR is layout-resolved
+(explicit offsets/slot sizes, desugared patterns, monomorphized generics,
+explicit drops/traps), so the Value model is a byte machine over simulated
+memory and no type/layout/pattern machinery needs re-expression at this rung;
+and it consumes a new deterministic flat-binary **CIR** artifact rather than
+parsing the canonical-JSON IR. Landed substrate: (1) `string_set(s, i, b)` —
+the random-access write twin of `string_get`, full native-completion stack,
+making a `string` usable as mutable byte memory (simulated frames/heap);
+`tests/string_set_native.rs`. (2) `src/cir.rs` + `emit-cir <db> <entry>
+--target --out`: the lowered-IR closure of an entry as flat bytes (interned
+string/data pools; function table sorted by symbol hash with the entry named
+by index; per-function type/value tables; one stable opcode byte per lowered
+op, blocks nested inline) with calls pre-resolved to function indices, type
+hashes to type-table indices, and value ids to dense indices. Every emission
+decodes its own output and fails unless the decoded IR is structurally
+identical to the lowered original (the built-in honesty gate); bytes are
+deterministic across re-emission AND an independent rebuild from the same
+source; extern-reachable closures are rejected fail-closed (the rung-0 corpus
+is the Rust evaluator's domain, which cannot execute externs either);
+monomorphic instances appear as ordinary functions, templates never do.
+`tests/cir_artifact.rs`; format doc in `src/cir.rs` + `compiler/eval/README.md`.
 
 Deliverables:
 
