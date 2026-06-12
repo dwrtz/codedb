@@ -505,6 +505,27 @@ entry index, entry op/param/local counts) that must match `emit-cir`'s summary
 on the tokenizer and sha256 examples (`tests/selfhost_eval.rs`). The walk also
 exercised real `.cdb` authoring: the structural-literal-in-let anchoring
 gotcha and the value-id frame tax are both documented in the source.
+(5) **Stage 2 — the scalar core EXECUTES.** The `.cdb` evaluator builds
+per-function metadata (frame sizes, local offsets, return-type meta) at load,
+then runs the entry over `[param cells | locals | value cells]` frames on a
+simulated stack: consts, params, every binary/unary operator width and
+signedness — semantics inherited BY CONSTRUCTION by casting the canonical
+cells to the .cdb type of the op's consumer columns and applying the .cdb
+operator itself — `int_cast` renormalization, `if` with block skipping (a
+structure-only `skip_op` walker doubles as the not-taken-branch validator),
+scalar load/store/copy/move, borrows/derefs as address cells, bounds checks,
+calls by function-table index (callee frames bump past the caller's cells),
+return/early-return unwinding, and div/mod trap parity. Gate:
+`tests/selfhost_eval.rs` asserts CodeDB-eval == Rust-eval on scalar
+control-flow/recursion programs (early return, fib, width edges, u64
+rendering) AND on a generated conformance sweep with one fixture per
+`codedb::operator_kinds()` entry (the coverage assert makes a kind without a
+fixture fail), with div0/mod0 trapping identically on both sides. The
+authoring tax surfaced one more backend reality, now documented: every op's
+value id costs 8 frame bytes, so big dispatchers must split (`exec_op_*`
+routers + one-literal-site record constructors `mk_rv`/`mk_ex`).
+Case/fold/loop, aggregates, static data, and the heap ops trap
+`unsupported_op` until Stages 3/4 (pinned by the frontier test).
 
 Deliverables:
 

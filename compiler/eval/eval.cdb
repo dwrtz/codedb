@@ -1,34 +1,38 @@
 // compiler/eval/eval.cdb - the CodeDB-hosted reference evaluator (ladder rung 0).
 //
-// Stage 1 (loader + probe): read a CIR file (docs/PLAN_V3.md Phase 8;
-// format doc in src/cir.rs) from STDIN into the memory string and walk its
-// header, pools, function table, and the entry's function section. The probe
-// prints five numbers, one per line - function count, entry index, entry op
-// count, entry param count, entry local count - cross-checked by
-// tests/selfhost_eval.rs against `emit-cir`'s summary JSON. Exit codes:
-// 0 ok, 65 not a CIR file.
+// Stage 2 (scalar core): read a CIR file (docs/PLAN_V3.md Phase 8; format doc
+// in src/cir.rs) from STDIN, build per-function metadata, and EXECUTE the
+// entry over a simulated byte machine: consts, params, every binary/unary
+// operator width, int_cast, if, scalar load/store/copy/move, borrows/derefs
+// (address identity), bounds checks, call/return/early-return. Aggregates,
+// case/fold/loop, static data, and the heap ops trap `unsupported_op` until
+// Stages 3/4. Output protocol (compiler/eval/README.md): `ok:<value>` and
+// exit 0, or `trap:<code>` and exit 101; a non-CIR input exits 65.
 //
-// The CIR arrives on stdin (`eval-bin < program.cir [args...]`) rather than
-// as a path argument: the shell then needs no path buffer, no open/close,
-// and every process argument belongs to the evaluated program (forwarded
-// 1:1, from Stage 4 on). A path argument was the original sketch, but the
-// v0 backend gives every op's value id an 8-byte frame slot, so a
-// `[0x0; N]` stack buffer costs ~24N frame bytes (fill stores + their
-// address/bounds ids) and any N >= ~150 busts the 4095-byte arm64 frame
-// budget. Stdin needs only a 1-byte bounce buffer: the read loop costs one
-// syscall per byte, which at rung-0 corpus sizes (CIR files of tens of KB)
-// is well under suite noise.
+// The CIR arrives on stdin (`eval-bin < program.cir [args...]`): the v0
+// backend gives every op's value id an 8-byte frame slot, so a `[0x0; N]`
+// path/chunk buffer costs ~24N frame bytes and any N >= ~150 busts the
+// 4095-byte arm64 frame budget; stdin needs only a 1-byte bounce buffer.
 //
-// The shell (stdin -> read through the bounce byte) is the only
-// extern-touching part; everything after "bytes are in memory" is pure
-// compute over `string_get` place reads, with the memory string threaded by
-// move through helpers that return it inside a record (see the execution
-// design in compiler/eval/README.md).
+// Memory is ONE string (the byte machine): [CIR image | fn metadata | frame
+// stack | heap (reserved)]. Addresses are byte offsets into it. The string
+// threads by MOVE through every helper (returned inside a record); loops
+// consume their move-only accumulator wholly per iteration and only ever
+// READ outer storage. Operator semantics are inherited by construction: a
+// CIR binary/unary/cast op is applied by casting the canonically-extended
+// cell values to the .cdb type of the op's own width/signedness columns and
+// using the .cdb operator itself - the same registry semantics the
+// oracle-conformance corpus pins against the Rust evaluator and the native
+// backend.
 
 module std.platform {
 extern fn write(fd: i64, ptr: raw_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "write" library "c"
 extern fn read(fd: i64, ptr: raw_mut_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "read" library "c"
 }
+
+// ---------------------------------------------------------------------------
+// shared records
+// ---------------------------------------------------------------------------
 
 // The memory string plus one scalar result: the return shape of every reader
 // that consumes the memory by move and hands it back.
@@ -49,45 +53,121 @@ record OutBuf {
   i: i64
 }
 
-// The stdin pump's move-only loop accumulator: the memory string under
-// construction plus the "keep reading" flag.
+// The stdin pump's move-only loop accumulator.
 record Pump {
   mem: string
   more: bool
 }
 
-// Little-endian u32 read at `off` (the CIR's only multi-byte header integer).
+// The file-global geometry, fixed once the header is walked (all Copy).
+record Vm {
+  fns: i64
+  entry: i64
+  table_base: i64
+  region_base: i64
+  meta_index: i64
+  stack_base: i64
+  stack_end: i64
+}
+
+// One function's execution context (all Copy): frame base, value-cell base,
+// param count, the function's meta-blob offset, and its type-table base.
+record Frame {
+  fb: i64
+  vb: i64
+  pcount: i64
+  mb: i64
+  tb: i64
+}
+
+// An execution step: the memory, the program counter after the step, a
+// status (0 = fell through, 3 = returned, 2 = trapped), and the value
+// (block/return result, or the trap code when status = 2).
+record Ex {
+  mem: string
+  pc: i64
+  status: i64
+  val: i64
+}
+
+// Record constructors: the one literal site per shape. Every branch result
+// is built through these, so branches stay nominally typed and a function's
+// frame carries call ops instead of per-literal field stores.
+fn mk_rv(mem: string, val: i64) -> RV =
+  { mem: mem, val: val }
+
+fn mk_ex(mem: string, pc: i64, status: i64, val: i64) -> Ex =
+  { mem: mem, pc: pc, status: status, val: val }
+
+// trap codes (rendered by print_trap)
+fn trap_div0() -> i64 = 1
+fn trap_mod0() -> i64 = 2
+fn trap_bounds() -> i64 = 3
+fn trap_unsupported() -> i64 = 4
+fn trap_stack_overflow() -> i64 = 5
+fn trap_entry_params() -> i64 = 6
+fn trap_malformed() -> i64 = 7
+
+// type-meta kinds (the CIR consumer column; src/cir.rs::typemeta)
+fn tk_unit() -> i64 = 0
+fn tk_bool() -> i64 = 1
+fn tk_u64() -> i64 = 9
+fn tk_pointer() -> i64 = 10
+
+// memory geometry
+fn mem_cap() -> i64 = 8388608
+fn meta_size() -> i64 = 262144
+fn stack_size() -> i64 = 1048576
+
+fn align8(n: i64) -> i64 = (n + 7) & (0 - 8)
+
+// ---------------------------------------------------------------------------
+// byte readers/writers over the memory string
+// ---------------------------------------------------------------------------
+
+// Little-endian u32 read at `off`.
 fn rd_u32(mem: string, off: i64) -> RV =
   let b0: i64 = to_i64(string_get(mem, off)) in
   let b1: i64 = to_i64(string_get(mem, off + 1)) in
   let b2: i64 = to_i64(string_get(mem, off + 2)) in
   let b3: i64 = to_i64(string_get(mem, off + 3)) in
   let v: i64 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) in
-  { mem: mem, val: v }
+  mk_rv(mem, v)
 
-// Sum `count` little-endian u32s starting at `base` (a pool's byte-length
-// prefix -> the pool's total byte size). The u32 assembly is inlined because a
-// loop body may only read outer storage, never move it into a call; the final
-// record is anchored by a typed let (the structural-literal propagation gap).
-fn sum_lens(mem: string, base: i64, count: i64) -> RV =
-  let done: Sum =
-    loop s = { i: 0, total: 0 } while s.i < count do
-      let off: i64 = base + s.i * 4 in
-      let b0: i64 = to_i64(string_get(mem, off)) in
-      let b1: i64 = to_i64(string_get(mem, off + 1)) in
-      let b2: i64 = to_i64(string_get(mem, off + 2)) in
-      let b3: i64 = to_i64(string_get(mem, off + 3)) in
-      let next: Sum = { i: s.i + 1, total: s.total + (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) } in
-      next
-  in
-  { mem: mem, val: done.total }
+// Little-endian u64 read at `off` (an i64 carrying the bit pattern).
+fn rd_u64(mem: string, off: i64) -> RV =
+  let lo: RV = rd_u32(mem, off) in
+  let hi: RV = rd_u32(lo.mem, off + 4) in
+  mk_rv(hi.mem, lo.val | (hi.val << 32))
+
+// One byte as i64.
+fn rd_byte(mem: string, off: i64) -> RV =
+  let v: i64 = to_i64(string_get(mem, off)) in
+  mk_rv(mem, v)
+
+// Little-endian u32 write at `off`.
+fn wr_u32(mem: string, off: i64, v: i64) -> string effects[state] =
+  let s0: unit = string_set(mem, off, to_u8(v & 0xff)) in
+  let s1: unit = string_set(mem, off + 1, to_u8((v >> 8) & 0xff)) in
+  let s2: unit = string_set(mem, off + 2, to_u8((v >> 16) & 0xff)) in
+  let s3: unit = string_set(mem, off + 3, to_u8((v >> 24) & 0xff)) in
+  mem
+
+// Little-endian u64 write at `off` (shifts in the u64 domain: the cell is a
+// bit pattern and an arithmetic i64 shift would smear the sign).
+fn wr_u64(mem: string, off: i64, v: i64) -> string effects[state] =
+  let u: u64 = to_u64(v) in
+  let lo: string = wr_u32(mem, off, to_i64(to_u32(u & 0xffffffff))) in
+  wr_u32(lo, off + 4, to_i64(to_u32(u >> 32)))
+
+// ---------------------------------------------------------------------------
+// the stdin shell
+// ---------------------------------------------------------------------------
 
 // Append everything stdin yields onto `mem`, one byte per read() through a
 // 1-byte stack bounce buffer (the todo_cli idiom, minimized so the frame
 // stays small). A loop, not recursion, so the input size is bounded by the
-// memory capacity alone; the move-only accumulator is consumed wholly each
-// iteration (a loop body may read outer storage - the bounce byte - but
-// never move it, and may not project fields out of the accumulator itself).
+// memory capacity alone.
 fn read_all<'r>(mem: string) -> string effects[io, state, ffi, unsafe] =
   let bounce: array<u8, 1> = [0x0; 1] in
   let done: Pump =
@@ -106,10 +186,21 @@ fn read_all<'r>(mem: string) -> string effects[io, state, ffi, unsafe] =
   in
   done.mem
 
-// Print `n` as decimal plus a newline: format into a heap string, copy it to
-// a stack buffer, and write(1) once.
-fn print_num<'r>(n: i64) -> i64 effects[io, alloc, state, ffi, unsafe] =
-  let s: string = std.fmt.i64_to_string(n) in
+// Grow the memory with zero bytes until its length reaches `upto` (the
+// metadata/stack/heap regions live past the image and need len coverage
+// before string_set can write them).
+fn zero_fill(mem: string, upto: i64) -> string effects[state] =
+  loop m = mem while string_len(m) < upto do
+    let pushed: unit = string_push(m, to_u8(0)) in
+    m
+
+// ---------------------------------------------------------------------------
+// output: ok:<value> / trap:<code> over write(1)
+// ---------------------------------------------------------------------------
+
+// Copy a (short) heap string into a stack buffer and write(1) it, with a
+// trailing newline.
+fn print_line<'r>(s: string) -> i64 effects[io, state, ffi, unsafe] =
   let ln: i64 = string_len(s) in
   let done: OutBuf =
     loop st = { b: [0x0; 32], i: 0 } while st.i < ln do
@@ -118,22 +209,789 @@ fn print_num<'r>(n: i64) -> i64 effects[io, alloc, state, ffi, unsafe] =
   let out: array<u8, 32> = array_set(done.b, ln, 0xa) in
   std.platform.write(1, raw_ptr(&'r out[0]), ln + 1)
 
-// The five probe lines. Consumes (and thereby frees) the memory string.
-fn print_probe(mem: string, fns: i64, entry: i64, ops: i64, params: i64, locals: i64) -> i64 effects[io, alloc, state, ffi, unsafe] =
-  let p1: i64 = print_num(fns) in
-  let p2: i64 = print_num(entry) in
-  let p3: i64 = print_num(ops) in
-  let p4: i64 = print_num(params) in
-  let p5: i64 = print_num(locals) in
-  0
+fn print_static(s: slice<'static, u8>) -> i64 effects[io, ffi, unsafe] =
+  std.platform.write(1, raw_ptr(&'static s[0]), len(s))
 
-// Walk the image: magic/version, the two pools (count + lens + bytes), the
-// header tail (target str, entry index, function count), the function table
-// (12-byte rows), then the entry's section up to its op count. Table rows are
-// fixed-width, so every hop is offset arithmetic over `string_get` reads:
-// layout rows 36 bytes, type rows 17 (with the consumer columns), value rows
-// 4, param rows 8, local rows 16 (src/cir.rs has the authoritative layout).
-fn probe(mem: string) -> i64 effects[io, alloc, state, ffi, unsafe] =
+// Push the decimal digits of a u64 (most significant first; the whole walk
+// stays in the u64 domain so values past i64::MAX render unsigned).
+fn push_u64_digits(s: string, u: u64) -> string effects[state] =
+  let next: string = if u >= 10 then push_u64_digits(s, u / 10) else s in
+  let pushed: unit = string_push(next, std.fmt.digit_byte(to_i64(u % 10))) in
+  next
+
+// Render the entry result per its return-type meta kind (the consumer
+// column): unit, bool as 0/1, u64 unsigned, every other scalar through the
+// canonically-extended cell as signed decimal.
+fn print_ok<'r>(kind: i64, v: i64) -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let prefix: i64 = print_static("ok:") in
+  if kind == tk_unit() then print_static("unit\n")
+  else if kind == tk_bool() then
+    (if v == 0 then print_static("0\n") else print_static("1\n"))
+  else if kind == tk_u64() then
+    let s: string = string_with_capacity(20) in
+    let filled: string = push_u64_digits(s, to_u64(v)) in
+    print_line(filled)
+  else
+    print_line(std.fmt.i64_to_string(v))
+
+fn print_trap<'r>(code: i64) -> i64 effects[io, ffi, unsafe] =
+  let prefix: i64 = print_static("trap:") in
+  if code == trap_div0() then print_static("division_by_zero\n")
+  else if code == trap_mod0() then print_static("modulo_by_zero\n")
+  else if code == trap_bounds() then print_static("bounds_check\n")
+  else if code == trap_stack_overflow() then print_static("stack_overflow\n")
+  else if code == trap_entry_params() then print_static("entry_params\n")
+  else if code == trap_malformed() then print_static("malformed\n")
+  else print_static("unsupported_op\n")
+
+// ---------------------------------------------------------------------------
+// loader: header walk + per-function metadata
+//
+// Meta blob per function (u32 fields, abs offsets into the memory string):
+//   +0 ops_base (offset of the body's op-count u32)
+//   +4 type_base (first 17-byte type row)
+//   +8 value_count | +12 param_count | +16 local_count | +20 locals_total
+//   +24 return-type meta kind
+//   +28.. local_count x local frame offset (relative to the locals region)
+// Frame layout: [param cells 8 x p][locals locals_total][value cells 8 x v].
+// ---------------------------------------------------------------------------
+
+// Walk one function section and write its meta blob at `blob`; yields the
+// next free blob offset. Section layout: 5 header strs, layout table
+// (36-byte rows), type table (17-byte rows), value table (4-byte rows),
+// return tref, params (8-byte rows), locals (16-byte rows), op count.
+fn build_fn_meta(mem: string, sec: i64, blob: i64) -> RV effects[state] =
+  let layouts: RV = rd_u32(mem, sec + 20) in
+  let tbase: i64 = sec + 24 + layouts.val * 36 in
+  let types: RV = rd_u32(layouts.mem, tbase) in
+  let vco: i64 = tbase + 4 + types.val * 17 in
+  let vals: RV = rd_u32(types.mem, vco) in
+  let rco: i64 = vco + 4 + vals.val * 4 in
+  let rtref: RV = rd_u32(vals.mem, rco) in
+  let rkind: RV = rd_byte(rtref.mem, tbase + 4 + rtref.val * 17 + 8) in
+  let pco: i64 = rco + 4 in
+  let params: RV = rd_u32(rkind.mem, pco) in
+  let lco: i64 = pco + 4 + params.val * 8 in
+  let locals: RV = rd_u32(params.mem, lco) in
+  let oco: i64 = lco + 4 + locals.val * 16 in
+  let m1: string = wr_u32(locals.mem, blob, oco) in
+  let m2: string = wr_u32(m1, blob + 4, tbase + 4) in
+  let m3: string = wr_u32(m2, blob + 8, vals.val) in
+  let m4: string = wr_u32(m3, blob + 12, params.val) in
+  let m5: string = wr_u32(m4, blob + 16, locals.val) in
+  let m6: string = wr_u32(m5, blob + 24, rkind.val) in
+  // local offsets: 8-aligned running sum of the locals' declared sizes
+  let lt: RV = write_local_offsets(m6, lco + 4, blob + 28, locals.val, 0, 0) in
+  let m7: string = wr_u32(lt.mem, blob + 20, lt.val) in
+  mk_rv(m7, blob + 28 + locals.val * 4)
+
+// Walk the 16-byte local rows from `row`, writing each local's frame offset
+// (a running 8-aligned sum) at `out`; yields the locals-region total.
+fn write_local_offsets(mem: string, row: i64, out: i64, count: i64, i: i64, off: i64) -> RV effects[state] =
+  if i >= count then
+    mk_rv(mem, off)
+  else
+    let size: RV = rd_u64(mem, row + 8) in
+    let m1: string = wr_u32(size.mem, out, off) in
+    write_local_offsets(m1, row + 16, out + 4, count, i + 1, off + align8(size.val))
+
+// Build every function's meta blob and the meta index (fns x u32 blob
+// offsets at meta_index). Recursion over the function table.
+fn build_meta(mem: string, vm: Vm, i: i64, blob: i64) -> string effects[state] =
+  if i >= vm.fns then mem
+  else
+    let secoff: RV = rd_u32(mem, vm.table_base + i * 12 + 4) in
+    let m1: string = wr_u32(secoff.mem, vm.meta_index + i * 4, blob) in
+    let next: RV = build_fn_meta(m1, vm.region_base + secoff.val, blob) in
+    build_meta(next.mem, vm, i + 1, next.val)
+
+// ---------------------------------------------------------------------------
+// operator semantics, inherited from the language's own sized operators
+// ---------------------------------------------------------------------------
+
+// verbs (the CIR consumer column; src/cir.rs::opverb):
+// 1 add 2 sub 3 mul 4 div 5 rem 6 and 7 or 8 xor 9 shl 10 shr
+// 11 eq 12 ne 13 lt 14 le 15 gt 16 ge 17 neg 18 bitnot
+// 19 and_bool 20 or_bool 21 not_bool
+
+fn bin_i8(verb: i64, a: i64, b: i64) -> i64 =
+  let x: i8 = to_i8(a) in
+  let y: i8 = to_i8(b) in
+  case verb of
+    1 => to_i64(x + y) | 2 => to_i64(x - y) | 3 => to_i64(x * y)
+  | 4 => to_i64(x / y) | 5 => to_i64(x % y) | 6 => to_i64(x & y)
+  | 7 => to_i64((x | y)) | 8 => to_i64(x ^ y) | 9 => to_i64(x << y)
+  | 10 => to_i64(x >> y)
+  | 11 => (if x == y then 1 else 0) | 12 => (if x != y then 1 else 0)
+  | 13 => (if x < y then 1 else 0) | 14 => (if x <= y then 1 else 0)
+  | 15 => (if x > y then 1 else 0) | 16 => (if x >= y then 1 else 0)
+  | _ => 0
+
+fn bin_i16(verb: i64, a: i64, b: i64) -> i64 =
+  let x: i16 = to_i16(a) in
+  let y: i16 = to_i16(b) in
+  case verb of
+    1 => to_i64(x + y) | 2 => to_i64(x - y) | 3 => to_i64(x * y)
+  | 4 => to_i64(x / y) | 5 => to_i64(x % y) | 6 => to_i64(x & y)
+  | 7 => to_i64((x | y)) | 8 => to_i64(x ^ y) | 9 => to_i64(x << y)
+  | 10 => to_i64(x >> y)
+  | 11 => (if x == y then 1 else 0) | 12 => (if x != y then 1 else 0)
+  | 13 => (if x < y then 1 else 0) | 14 => (if x <= y then 1 else 0)
+  | 15 => (if x > y then 1 else 0) | 16 => (if x >= y then 1 else 0)
+  | _ => 0
+
+fn bin_i32(verb: i64, a: i64, b: i64) -> i64 =
+  let x: i32 = to_i32(a) in
+  let y: i32 = to_i32(b) in
+  case verb of
+    1 => to_i64(x + y) | 2 => to_i64(x - y) | 3 => to_i64(x * y)
+  | 4 => to_i64(x / y) | 5 => to_i64(x % y) | 6 => to_i64(x & y)
+  | 7 => to_i64((x | y)) | 8 => to_i64(x ^ y) | 9 => to_i64(x << y)
+  | 10 => to_i64(x >> y)
+  | 11 => (if x == y then 1 else 0) | 12 => (if x != y then 1 else 0)
+  | 13 => (if x < y then 1 else 0) | 14 => (if x <= y then 1 else 0)
+  | 15 => (if x > y then 1 else 0) | 16 => (if x >= y then 1 else 0)
+  | _ => 0
+
+fn bin_i64(verb: i64, a: i64, b: i64) -> i64 =
+  case verb of
+    1 => a + b | 2 => a - b | 3 => a * b
+  | 4 => a / b | 5 => a % b | 6 => a & b
+  | 7 => (a | b) | 8 => a ^ b | 9 => a << b
+  | 10 => a >> b
+  | 11 => (if a == b then 1 else 0) | 12 => (if a != b then 1 else 0)
+  | 13 => (if a < b then 1 else 0) | 14 => (if a <= b then 1 else 0)
+  | 15 => (if a > b then 1 else 0) | 16 => (if a >= b then 1 else 0)
+  | _ => 0
+
+fn bin_u8(verb: i64, a: i64, b: i64) -> i64 =
+  let x: u8 = to_u8(a) in
+  let y: u8 = to_u8(b) in
+  case verb of
+    1 => to_i64(x + y) | 2 => to_i64(x - y) | 3 => to_i64(x * y)
+  | 4 => to_i64(x / y) | 5 => to_i64(x % y) | 6 => to_i64(x & y)
+  | 7 => to_i64((x | y)) | 8 => to_i64(x ^ y) | 9 => to_i64(x << y)
+  | 10 => to_i64(x >> y)
+  | 11 => (if x == y then 1 else 0) | 12 => (if x != y then 1 else 0)
+  | 13 => (if x < y then 1 else 0) | 14 => (if x <= y then 1 else 0)
+  | 15 => (if x > y then 1 else 0) | 16 => (if x >= y then 1 else 0)
+  | _ => 0
+
+fn bin_u16(verb: i64, a: i64, b: i64) -> i64 =
+  let x: u16 = to_u16(a) in
+  let y: u16 = to_u16(b) in
+  case verb of
+    1 => to_i64(x + y) | 2 => to_i64(x - y) | 3 => to_i64(x * y)
+  | 4 => to_i64(x / y) | 5 => to_i64(x % y) | 6 => to_i64(x & y)
+  | 7 => to_i64((x | y)) | 8 => to_i64(x ^ y) | 9 => to_i64(x << y)
+  | 10 => to_i64(x >> y)
+  | 11 => (if x == y then 1 else 0) | 12 => (if x != y then 1 else 0)
+  | 13 => (if x < y then 1 else 0) | 14 => (if x <= y then 1 else 0)
+  | 15 => (if x > y then 1 else 0) | 16 => (if x >= y then 1 else 0)
+  | _ => 0
+
+fn bin_u32(verb: i64, a: i64, b: i64) -> i64 =
+  let x: u32 = to_u32(a) in
+  let y: u32 = to_u32(b) in
+  case verb of
+    1 => to_i64(x + y) | 2 => to_i64(x - y) | 3 => to_i64(x * y)
+  | 4 => to_i64(x / y) | 5 => to_i64(x % y) | 6 => to_i64(x & y)
+  | 7 => to_i64((x | y)) | 8 => to_i64(x ^ y) | 9 => to_i64(x << y)
+  | 10 => to_i64(x >> y)
+  | 11 => (if x == y then 1 else 0) | 12 => (if x != y then 1 else 0)
+  | 13 => (if x < y then 1 else 0) | 14 => (if x <= y then 1 else 0)
+  | 15 => (if x > y then 1 else 0) | 16 => (if x >= y then 1 else 0)
+  | _ => 0
+
+fn bin_u64(verb: i64, a: i64, b: i64) -> i64 =
+  let x: u64 = to_u64(a) in
+  let y: u64 = to_u64(b) in
+  case verb of
+    1 => to_i64(x + y) | 2 => to_i64(x - y) | 3 => to_i64(x * y)
+  | 4 => to_i64(x / y) | 5 => to_i64(x % y) | 6 => to_i64(x & y)
+  | 7 => to_i64((x | y)) | 8 => to_i64(x ^ y) | 9 => to_i64(x << y)
+  | 10 => to_i64(x >> y)
+  | 11 => (if x == y then 1 else 0) | 12 => (if x != y then 1 else 0)
+  | 13 => (if x < y then 1 else 0) | 14 => (if x <= y then 1 else 0)
+  | 15 => (if x > y then 1 else 0) | 16 => (if x >= y then 1 else 0)
+  | _ => 0
+
+// Apply a binary verb at (width, signed); the bool verbs ride on 0/1 cells.
+fn apply_binary(verb: i64, width: i64, sgn: i64, a: i64, b: i64) -> i64 =
+  if verb == 19 then (if a != 0 && b != 0 then 1 else 0)
+  else if verb == 20 then (if a != 0 || b != 0 then 1 else 0)
+  else if sgn == 1 then
+    (if width == 8 then bin_i64(verb, a, b)
+     else if width == 4 then bin_i32(verb, a, b)
+     else if width == 2 then bin_i16(verb, a, b)
+     else bin_i8(verb, a, b))
+  else
+    (if width == 8 then bin_u64(verb, a, b)
+     else if width == 4 then bin_u32(verb, a, b)
+     else if width == 2 then bin_u16(verb, a, b)
+     else bin_u8(verb, a, b))
+
+fn neg_at(width: i64, sgn: i64, a: i64) -> i64 =
+  if sgn == 1 then
+    (if width == 8 then 0 - a
+     else if width == 4 then to_i64(to_i32(0) - to_i32(a))
+     else if width == 2 then to_i64(to_i16(0) - to_i16(a))
+     else to_i64(to_i8(0) - to_i8(a)))
+  else
+    (if width == 8 then to_i64(to_u64(0) - to_u64(a))
+     else if width == 4 then to_i64(to_u32(0) - to_u32(a))
+     else if width == 2 then to_i64(to_u16(0) - to_u16(a))
+     else to_i64(to_u8(0) - to_u8(a)))
+
+fn bitnot_at(width: i64, sgn: i64, a: i64) -> i64 =
+  if sgn == 1 then
+    (if width == 8 then ~a
+     else if width == 4 then to_i64(~to_i32(a))
+     else if width == 2 then to_i64(~to_i16(a))
+     else to_i64(~to_i8(a)))
+  else
+    (if width == 8 then to_i64(~to_u64(a))
+     else if width == 4 then to_i64(~to_u32(a))
+     else if width == 2 then to_i64(~to_u16(a))
+     else to_i64(~to_u8(a)))
+
+// 17 neg / 18 bitnot / 21 not_bool over a canonically-extended cell.
+fn apply_unary(verb: i64, width: i64, sgn: i64, a: i64) -> i64 =
+  if verb == 21 then (if a == 0 then 1 else 0)
+  else if verb == 17 then neg_at(width, sgn, a)
+  else bitnot_at(width, sgn, a)
+
+// int_cast: renormalize the cell to the target meta kind (truncate to the
+// target width, re-extend by the target signedness) via the cast builtins.
+fn apply_cast(kind: i64, v: i64) -> i64 =
+  case kind of
+    2 => to_i64(to_i8(v)) | 3 => to_i64(to_i16(v)) | 4 => to_i64(to_i32(v))
+  | 5 => v
+  | 6 => to_i64(to_u8(v)) | 7 => to_i64(to_u16(v)) | 8 => to_i64(to_u32(v))
+  | 9 => to_i64(to_u64(v))
+  | _ => v
+
+// ---------------------------------------------------------------------------
+// type rows, cells, and scalar memory access
+// ---------------------------------------------------------------------------
+
+// A type-table row's consumer columns: meta kind at row+8, size at row+9.
+fn type_kind(mem: string, fr: Frame, tref: i64) -> RV =
+  rd_byte(mem, fr.tb + tref * 17 + 8)
+
+fn cell_addr(fr: Frame, vref: i64) -> i64 = fr.vb + vref * 8
+
+fn cell_rd(mem: string, fr: Frame, vref: i64) -> RV =
+  rd_u64(mem, fr.vb + vref * 8)
+
+fn cell_wr(mem: string, fr: Frame, vref: i64, v: i64) -> string effects[state] =
+  wr_u64(mem, fr.vb + vref * 8, v)
+
+// Scalar load: read the kind's width at `addr`, canonically extended (the
+// cast builtins do the sign/zero extension).
+fn load_scalar(mem: string, kind: i64, addr: i64) -> RV =
+  if kind == tk_unit() then
+    mk_rv(mem, 0)
+  else if kind == 2 then
+    let b: RV = rd_byte(mem, addr) in
+    mk_rv(b.mem, to_i64(to_i8(b.val)))
+  else if kind == 3 then
+    let b0: RV = rd_byte(mem, addr) in
+    let b1: RV = rd_byte(b0.mem, addr + 1) in
+    mk_rv(b1.mem, to_i64(to_i16(b0.val | (b1.val << 8))))
+  else if kind == 4 then
+    let w: RV = rd_u32(mem, addr) in
+    mk_rv(w.mem, to_i64(to_i32(w.val)))
+  else if kind == 5 || kind == 9 || kind == tk_pointer() then rd_u64(mem, addr)
+  else if kind == 7 then
+    let b0: RV = rd_byte(mem, addr) in
+    let b1: RV = rd_byte(b0.mem, addr + 1) in
+    mk_rv(b1.mem, b0.val | (b1.val << 8))
+  else if kind == 8 then rd_u32(mem, addr)
+  else
+    // bool and u8: one zero-extended byte
+    rd_byte(mem, addr)
+
+// Scalar store: write the kind's width at `addr` from a canonical cell.
+fn store_scalar(mem: string, kind: i64, addr: i64, v: i64) -> string effects[state] =
+  if kind == tk_unit() then mem
+  else if kind == tk_bool() || kind == 2 || kind == 6 then
+    let s: unit = string_set(mem, addr, to_u8(v & 0xff)) in
+    mem
+  else if kind == 3 || kind == 7 then
+    let s0: unit = string_set(mem, addr, to_u8(v & 0xff)) in
+    let s1: unit = string_set(mem, addr + 1, to_u8((v >> 8) & 0xff)) in
+    mem
+  else if kind == 4 || kind == 8 then wr_u32(mem, addr, to_i64(to_u32(v)))
+  else wr_u64(mem, addr, v)
+
+// ---------------------------------------------------------------------------
+// op skipping (structure-only walk; the not-taken branch of an `if`)
+// ---------------------------------------------------------------------------
+
+// Skip an optional string/value (flag u8 + u32 when present).
+fn skip_opt(mem: string, pc: i64) -> RV =
+  let flag: RV = rd_byte(mem, pc) in
+  mk_rv(flag.mem, pc + 1 + (if flag.val == 0 then 0 else 4))
+
+// Skip a place (kind u8 + fields; src/cir.rs::placekind).
+fn skip_place(mem: string, pc: i64) -> RV =
+  let kind: RV = rd_byte(mem, pc) in
+  let body: i64 = pc + 1 in
+  if kind.val == 0 then mk_rv(kind.mem, body + 9)
+  else if kind.val == 1 then mk_rv(kind.mem, body + 8)
+  else if kind.val == 2 then
+    let o: RV = skip_opt(kind.mem, body + 8) in
+    mk_rv(o.mem, o.val + 16)
+  else if kind.val == 3 then
+    let o: RV = skip_opt(kind.mem, body + 8) in
+    mk_rv(o.mem, o.val + 24)
+  else mk_rv(kind.mem, body + 16)
+
+// Skip one op starting at `pc` (the opcode byte); yields the offset just
+// past it. Field widths follow src/cir.rs::encode_op exactly.
+fn skip_op(mem: string, pc: i64) -> RV =
+  let code: RV = rd_byte(mem, pc) in
+  let body: i64 = pc + 1 in
+  if code.val < 12 then skip_op_low(code.mem, code.val, body)
+  else if code.val < 21 then skip_op_ptr(code.mem, code.val, body)
+  else if code.val < 43 then skip_op_mid(code.mem, code.val, body)
+  else skip_op_high(code.mem, code.val, body)
+
+// opcodes 0..11: params/consts/operators/control (the block-recursing ops).
+fn skip_op_low(mem: string, code: i64, body: i64) -> RV =
+  if code == 0 then mk_rv(mem, body + 12)
+  else if code == 1 then mk_rv(mem, body + 16)
+  else if code == 2 then mk_rv(mem, body + 9)
+  else if code == 3 then mk_rv(mem, body + 8)
+  else if code == 4 then mk_rv(mem, body + 19)
+  else if code == 5 then mk_rv(mem, body + 12)
+  else if code == 6 then
+    let flag: RV = rd_byte(mem, body + 23) in
+    mk_rv(flag.mem, body + 24 + (if flag.val == 0 then 0 else 8))
+  else if code == 7 then
+    let abi: RV = skip_opt(mem, body + 8) in
+    let argc: RV = rd_u32(abi.mem, abi.val) in
+    let ret: RV = skip_opt(argc.mem, abi.val + 4 + argc.val * 4) in
+    mk_rv(ret.mem, ret.val + 4)
+  else if code == 8 then
+    let t: RV = skip_block(mem, body + 8) in
+    let e: RV = skip_block(t.mem, t.val) in
+    mk_rv(e.mem, e.val + 4)
+  else if code == 9 then
+    let arms: RV = rd_u32(mem, body + 8) in
+    let done: RV = skip_case_arms(arms.mem, body + 12, arms.val) in
+    mk_rv(done.mem, done.val + 4)
+  else if code == 10 then
+    let b: RV = skip_block(mem, body + 32) in
+    mk_rv(b.mem, b.val + 12)
+  else if code == 11 then
+    let c: RV = skip_block(mem, body + 12) in
+    let b: RV = skip_block(c.mem, c.val) in
+    mk_rv(b.mem, b.val + 8)
+  else mk_rv(mem, body)
+
+// opcodes 12..20: borrows, derefs, box/heap intro, pointer casts.
+fn skip_op_ptr(mem: string, code: i64, body: i64) -> RV =
+  if code == 12 || code == 13 then mk_rv(mem, body + 20)
+  else if code == 14 || code == 15 then mk_rv(mem, body + 12)
+  else if code == 16 then mk_rv(mem, body + 16)
+  else if code == 17 then mk_rv(mem, body + 20)
+  else if code == 18 then mk_rv(mem, body + 28)
+  else if code == 19 then mk_rv(mem, body + 16)
+  else mk_rv(mem, body + 17)
+
+// opcodes 21..42: addr-of places, static data, slices, vec/string, argv.
+fn skip_op_mid(mem: string, code: i64, body: i64) -> RV =
+  if code <= 25 then
+    let p: RV = skip_place(mem, body + 4) in
+    mk_rv(p.mem, p.val)
+  else if code == 26 then mk_rv(mem, body + 24)
+  else if code == 27 then mk_rv(mem, body + 24)
+  else if code == 28 then mk_rv(mem, body + 16)
+  else if code == 29 then mk_rv(mem, body + 16)
+  else if code == 30 then mk_rv(mem, body + 24)
+  else if code == 31 then mk_rv(mem, body + 24)
+  else if code == 32 then mk_rv(mem, body + 24)
+  else if code == 33 then mk_rv(mem, body + 16)
+  else if code == 34 then mk_rv(mem, body + 28)
+  else if code == 35 then mk_rv(mem, body + 16)
+  else if code == 36 then mk_rv(mem, body + 16)
+  else if code == 37 then mk_rv(mem, body + 20)
+  else if code == 38 then mk_rv(mem, body + 20)
+  else if code == 39 then mk_rv(mem, body + 24)
+  else if code == 40 then mk_rv(mem, body + 8)
+  else if code == 41 then mk_rv(mem, body + 12)
+  else mk_rv(mem, body + 16)
+
+// opcodes 43..55: checks, enum tags, load/store/copy/move/drop, returns.
+fn skip_op_high(mem: string, code: i64, body: i64) -> RV =
+  if code == 43 then
+    let o: RV = skip_opt(mem, body + 16) in
+    mk_rv(o.mem, o.val + 4)
+  else if code == 44 then mk_rv(mem, body + 20)
+  else if code == 45 then mk_rv(mem, body + 12)
+  else if code == 46 then
+    let o: RV = skip_opt(mem, body + 12) in
+    mk_rv(o.mem, o.val + 8)
+  else if code == 47 then mk_rv(mem, body + 12)
+  else if code == 48 then mk_rv(mem, body + 12)
+  else if code == 49 then mk_rv(mem, body + 12)
+  else if code == 50 then mk_rv(mem, body + 12)
+  else if code == 51 then mk_rv(mem, body + 8)
+  else if code == 52 then mk_rv(mem, body + 8)
+  else if code == 53 then
+    let o: RV = skip_opt(mem, body + 5) in
+    mk_rv(o.mem, o.val + 4)
+  else mk_rv(mem, body + 8)
+
+// Skip a whole block: count u32, count ops, result vref u32.
+fn skip_block(mem: string, pc: i64) -> RV =
+  let count: RV = rd_u32(mem, pc) in
+  let done: RV = skip_ops(count.mem, pc + 4, count.val) in
+  mk_rv(done.mem, done.val + 4)
+
+fn skip_ops(mem: string, pc: i64, remaining: i64) -> RV =
+  if remaining <= 0 then
+    mk_rv(mem, pc)
+  else
+    let next: RV = skip_op(mem, pc) in
+    skip_ops(next.mem, next.val, remaining - 1)
+
+// Skip `case` arms: variant str, optional symbol, tag u64, payload tref,
+// payload offset u64, block.
+fn skip_case_arms(mem: string, pc: i64, remaining: i64) -> RV =
+  if remaining <= 0 then
+    mk_rv(mem, pc)
+  else
+    let o: RV = skip_opt(mem, pc + 4) in
+    let b: RV = skip_block(o.mem, o.val + 20) in
+    skip_case_arms(b.mem, b.val, remaining - 1)
+
+// ---------------------------------------------------------------------------
+// the executor
+// ---------------------------------------------------------------------------
+
+// Execute the ops of one block body in sequence. status 0 = fell through
+// (pc points at the block's result vref); 3 = returned; 2 = trapped.
+fn exec_ops(mem: string, vm: Vm, fr: Frame, pc: i64, remaining: i64) -> Ex effects[state] =
+  if remaining <= 0 then
+        mk_ex(mem, pc, 0, 0)
+  else
+    let step: Ex = exec_op(mem, vm, fr, pc) in
+    if step.status == 0 then exec_ops(step.mem, vm, fr, step.pc, remaining - 1)
+    else step
+
+// Execute a block: run its ops; on fall-through read the result vref's cell.
+fn exec_block(mem: string, vm: Vm, fr: Frame, pc: i64) -> Ex effects[state] =
+  let count: RV = rd_u32(mem, pc) in
+  let run: Ex = exec_ops(count.mem, vm, fr, pc + 4, count.val) in
+  if run.status == 0 then
+    let res: RV = rd_u32(run.mem, run.pc) in
+    let v: RV = cell_rd(res.mem, fr, res.val) in
+        mk_ex(v.mem, run.pc + 4, 0, v.val)
+  else run
+
+// One op. Dispatch by opcode range to keep each dispatcher's frame small.
+fn exec_op(mem: string, vm: Vm, fr: Frame, pc: i64) -> Ex effects[state] =
+  let code: RV = rd_byte(mem, pc) in
+  let body: i64 = pc + 1 in
+  if code.val <= 8 then exec_op_core(code.mem, vm, fr, code.val, body)
+  else if code.val >= 43 then exec_op_mem(code.mem, vm, fr, code.val, body)
+  else if code.val >= 12 && code.val <= 15 then exec_op_ref(code.mem, vm, fr, code.val, body)
+  else if code.val >= 21 && code.val <= 22 then exec_op_addr(code.mem, vm, fr, code.val, body)
+  else
+        mk_ex(code.mem, body, 2, trap_unsupported())
+
+// opcodes 0..8: param, consts, unary, int_cast, binary, call, if - a thin
+// router over the per-op handlers.
+fn exec_op_core(mem: string, vm: Vm, fr: Frame, code: i64, body: i64) -> Ex effects[state] =
+  if code == 0 then exec_param(mem, fr, body)
+  else if code == 1 then exec_const_i64(mem, fr, body)
+  else if code == 2 then exec_const_bool(mem, fr, body)
+  else if code == 3 then exec_const_unit(mem, fr, body)
+  else if code == 4 then exec_unary(mem, fr, body)
+  else if code == 5 then exec_cast(mem, fr, body)
+  else if code == 6 then exec_binary(mem, fr, body)
+  else if code == 7 then exec_call(mem, vm, fr, body)
+  else exec_if(mem, vm, fr, body)
+
+// param: id, slot, tref -> the param cell.
+fn exec_param(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let slot: RV = rd_u32(id.mem, body + 4) in
+  let v: RV = rd_u64(slot.mem, fr.fb + slot.val * 8) in
+  let m: string = cell_wr(v.mem, fr, id.val, v.val) in
+  mk_ex(m, body + 12, 0, 0)
+
+// const_i64: id, value i64, tref.
+fn exec_const_i64(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let v: RV = rd_u64(id.mem, body + 4) in
+  let m: string = cell_wr(v.mem, fr, id.val, v.val) in
+  mk_ex(m, body + 16, 0, 0)
+
+// const_bool: id, value u8, tref.
+fn exec_const_bool(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let v: RV = rd_byte(id.mem, body + 4) in
+  let m: string = cell_wr(v.mem, fr, id.val, v.val) in
+  mk_ex(m, body + 9, 0, 0)
+
+// const_unit: id, tref.
+fn exec_const_unit(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let m: string = cell_wr(id.mem, fr, id.val, 0) in
+  mk_ex(m, body + 8, 0, 0)
+
+// unary: id, kind str, verb/width/signed, value, tref.
+fn exec_unary(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let verb: RV = rd_byte(id.mem, body + 8) in
+  let width: RV = rd_byte(verb.mem, body + 9) in
+  let sgn: RV = rd_byte(width.mem, body + 10) in
+  let vref: RV = rd_u32(sgn.mem, body + 11) in
+  let a: RV = cell_rd(vref.mem, fr, vref.val) in
+  let m: string = cell_wr(a.mem, fr, id.val, apply_unary(verb.val, width.val, sgn.val, a.val)) in
+  mk_ex(m, body + 19, 0, 0)
+
+// int_cast: id, value, tref -> renormalize to the target type's meta kind.
+fn exec_cast(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let vref: RV = rd_u32(id.mem, body + 4) in
+  let tref: RV = rd_u32(vref.mem, body + 8) in
+  let kind: RV = type_kind(tref.mem, fr, tref.val) in
+  let a: RV = cell_rd(kind.mem, fr, vref.val) in
+  let m: string = cell_wr(a.mem, fr, id.val, apply_cast(kind.val, a.val)) in
+  mk_ex(m, body + 12, 0, 0)
+
+// binary: id, kind str, verb/width/signed, left, right, tref, trap option.
+// The trap option's presence marks div/mod; a zero right operand traps.
+fn exec_binary(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let verb: RV = rd_byte(id.mem, body + 8) in
+  let width: RV = rd_byte(verb.mem, body + 9) in
+  let sgn: RV = rd_byte(width.mem, body + 10) in
+  let lref: RV = rd_u32(sgn.mem, body + 11) in
+  let rref: RV = rd_u32(lref.mem, body + 15) in
+  let flag: RV = rd_byte(rref.mem, body + 23) in
+  let end: i64 = body + 24 + (if flag.val == 0 then 0 else 8) in
+  let a: RV = cell_rd(flag.mem, fr, lref.val) in
+  let b: RV = cell_rd(a.mem, fr, rref.val) in
+  if flag.val == 1 && b.val == 0 then
+    mk_ex(b.mem, end, 2, (if verb.val == 4 then trap_div0() else trap_mod0()))
+  else
+    let m: string = cell_wr(b.mem, fr, id.val, apply_binary(verb.val, width.val, sgn.val, a.val, b.val)) in
+    mk_ex(m, end, 0, 0)
+
+// call: id, target fn index, abi opt, argc, args, return-address opt, tref.
+// Scalar calls only in Stage 2: a present return address traps unsupported.
+fn exec_call(mem: string, vm: Vm, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let target: RV = rd_u32(id.mem, body + 4) in
+  let abi: RV = skip_opt(target.mem, body + 8) in
+  let argc: RV = rd_u32(abi.mem, abi.val) in
+  let retflag: RV = rd_byte(argc.mem, abi.val + 4 + argc.val * 4) in
+  if retflag.val != 0 then
+        mk_ex(retflag.mem, abi.val, 2, trap_unsupported())
+  else
+    let end: i64 = abi.val + 4 + argc.val * 4 + 1 + 4 in
+    // callee frame sits just past this frame's value cells
+    let callee_mb: RV = rd_u32(retflag.mem, vm.meta_index + target.val * 4) in
+    let vcount: RV = rd_u32(callee_mb.mem, fr.mb + 8) in
+    let frame_end: i64 = fr.vb + vcount.val * 8 in
+    let copied: Ex = copy_args(vcount.mem, fr, abi.val + 4, argc.val, frame_end, 0) in
+    if copied.status != 0 then copied
+    else
+      let run: Ex = call_function(copied.mem, vm, target.val, frame_end) in
+      if run.status == 2 then run
+      else
+        let m: string = cell_wr(run.mem, fr, id.val, run.val) in
+                mk_ex(m, end, 0, 0)
+
+// Copy `argc` argument cells (vrefs at `argp`) into the callee's param
+// slots starting at `callee_fb`.
+fn copy_args(mem: string, fr: Frame, argp: i64, argc: i64, callee_fb: i64, j: i64) -> Ex effects[state] =
+  if j >= argc then
+        mk_ex(mem, argp, 0, 0)
+  else
+    let aref: RV = rd_u32(mem, argp) in
+    let v: RV = cell_rd(aref.mem, fr, aref.val) in
+    let m: string = wr_u64(v.mem, callee_fb + j * 8, v.val) in
+    copy_args(m, fr, argp + 4, argc, callee_fb, j + 1)
+
+// if: id, cond, then block, else block, tref. Execute the taken branch,
+// skip the other, store the branch result into the if's own cell.
+fn exec_if(mem: string, vm: Vm, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let cref: RV = rd_u32(id.mem, body + 4) in
+  let c: RV = cell_rd(cref.mem, fr, cref.val) in
+  if c.val != 0 then
+    let t: Ex = exec_block(c.mem, vm, fr, body + 8) in
+    (if t.status != 0 then t
+     else
+       let e: RV = skip_block(t.mem, t.pc) in
+       let m: string = cell_wr(e.mem, fr, id.val, t.val) in
+              mk_ex(m, e.val + 4, 0, 0))
+  else
+    let tskip: RV = skip_block(c.mem, body + 8) in
+    let e: Ex = exec_block(tskip.mem, vm, fr, tskip.val) in
+    (if e.status != 0 then e
+     else
+       let m: string = cell_wr(e.mem, fr, id.val, e.val) in
+              mk_ex(m, e.pc + 4, 0, 0))
+
+// opcodes 12..15: borrows yield their referent's address; derefs are the
+// identity on an address cell (a reference IS an address in this machine).
+fn exec_op_ref(mem: string, vm: Vm, fr: Frame, code: i64, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let vref: RV = rd_u32(id.mem, body + 4) in
+  let v: RV = cell_rd(vref.mem, fr, vref.val) in
+  let m: string = cell_wr(v.mem, fr, id.val, v.val) in
+  let end: i64 = body + (if code <= 13 then 20 else 12) in
+  mk_ex(m, end, 0, 0)
+
+// opcodes 21..22: addr_of_param / addr_of_local.
+fn exec_op_addr(mem: string, vm: Vm, fr: Frame, code: i64, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let pk: RV = rd_byte(id.mem, body + 4) in
+  let slot: RV = rd_u32(pk.mem, body + 5) in
+  if code == 21 then
+    let ind: RV = rd_byte(slot.mem, body + 13) in
+    (if ind.val != 0 then mk_ex(ind.mem, body, 2, trap_unsupported())
+     else
+       let m: string = cell_wr(ind.mem, fr, id.val, fr.fb + slot.val * 8) in
+       mk_ex(m, body + 14, 0, 0))
+  else
+    let loff: RV = rd_u32(slot.mem, fr.mb + 28 + slot.val * 4) in
+    let m: string = cell_wr(loff.mem, fr, id.val, fr.fb + fr.pcount * 8 + loff.val) in
+    mk_ex(m, body + 13, 0, 0)
+
+// opcodes 43..55: bounds check, scalar load/store/copy/move, drop (no-op),
+// borrow_debug (no-op), return, early_return - a thin router; the data ops
+// live in their own functions to keep every frame inside the v0 budget.
+fn exec_op_mem(mem: string, vm: Vm, fr: Frame, code: i64, body: i64) -> Ex effects[state] =
+  if code == 43 then exec_bounds(mem, fr, body)
+  else if code == 47 || code == 50 then exec_load_move(mem, fr, body)
+  else if code == 48 then exec_store(mem, fr, body)
+  else if code == 49 then exec_copy_cell(mem, fr, body)
+  else if code == 51 then mk_ex(mem, body + 8, 0, 0)
+  else if code == 53 then exec_bdebug(mem, body)
+  else if code == 54 || code == 55 then exec_return(mem, fr, body)
+  else mk_ex(mem, body, 2, trap_unsupported())
+
+// load / move: id, address, tref -> scalar read through the address cell.
+fn exec_load_move(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let aref: RV = rd_u32(id.mem, body + 4) in
+  let tref: RV = rd_u32(aref.mem, body + 8) in
+  let kind: RV = type_kind(tref.mem, fr, tref.val) in
+  if kind.val >= 11 then mk_ex(kind.mem, body, 2, trap_unsupported())
+  else
+    let addr: RV = cell_rd(kind.mem, fr, aref.val) in
+    let v: RV = load_scalar(addr.mem, kind.val, addr.val) in
+    let m: string = cell_wr(v.mem, fr, id.val, v.val) in
+    mk_ex(m, body + 12, 0, 0)
+
+// store: address, value, tref -> scalar write through the address cell.
+fn exec_store(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
+  let aref: RV = rd_u32(mem, body) in
+  let vref: RV = rd_u32(aref.mem, body + 4) in
+  let tref: RV = rd_u32(vref.mem, body + 8) in
+  let kind: RV = type_kind(tref.mem, fr, tref.val) in
+  if kind.val >= 11 then mk_ex(kind.mem, body, 2, trap_unsupported())
+  else
+    let addr: RV = cell_rd(kind.mem, fr, aref.val) in
+    let v: RV = cell_rd(addr.mem, fr, vref.val) in
+    let m: string = store_scalar(v.mem, kind.val, addr.val, v.val) in
+    mk_ex(m, body + 12, 0, 0)
+
+// copy: id, value, tref -> cell copy.
+fn exec_copy_cell(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let vref: RV = rd_u32(id.mem, body + 4) in
+  let v: RV = cell_rd(vref.mem, fr, vref.val) in
+  let m: string = cell_wr(v.mem, fr, id.val, v.val) in
+  mk_ex(m, body + 12, 0, 0)
+
+// borrow_debug: address, mutable u8, region opt, tref -> no-op.
+fn exec_bdebug(mem: string, body: i64) -> Ex =
+  let o: RV = skip_opt(mem, body + 5) in
+  mk_ex(o.mem, o.val + 4, 0, 0)
+
+// return / early_return: value, tref -> unwind to the function boundary.
+fn exec_return(mem: string, fr: Frame, body: i64) -> Ex =
+  let vref: RV = rd_u32(mem, body) in
+  let v: RV = cell_rd(vref.mem, fr, vref.val) in
+  mk_ex(v.mem, body + 8, 3, v.val)
+
+// bounds_check: id, index, len u64, len_value opt, tref. Out of range traps.
+fn exec_bounds(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let iref: RV = rd_u32(id.mem, body + 4) in
+  let len: RV = rd_u64(iref.mem, body + 8) in
+  let flag: RV = rd_byte(len.mem, body + 16) in
+  let lv: RV = (if flag.val == 0 then
+    mk_rv(flag.mem, len.val)
+  else
+    let lref: RV = rd_u32(flag.mem, body + 17) in
+    cell_rd(lref.mem, fr, lref.val)) in
+  let end: i64 = body + 17 + (if flag.val == 0 then 0 else 4) + 4 in
+  let idx: RV = cell_rd(lv.mem, fr, iref.val) in
+  if idx.val < 0 || idx.val >= lv.val then
+    mk_ex(idx.mem, end, 2, trap_bounds())
+  else
+    let m: string = cell_wr(idx.mem, fr, id.val, idx.val) in
+    mk_ex(m, end, 0, 0)
+
+// Run function `fidx` with its params already written at `frame_base`.
+// status 3 (returned) is the normal outcome; falling off the end without a
+// terminal return is malformed.
+fn call_function(mem: string, vm: Vm, fidx: i64, frame_base: i64) -> Ex effects[state] =
+  let mb: RV = rd_u32(mem, vm.meta_index + fidx * 4) in
+  let ops_base: RV = rd_u32(mb.mem, mb.val) in
+  let tb: RV = rd_u32(ops_base.mem, mb.val + 4) in
+  let vcount: RV = rd_u32(tb.mem, mb.val + 8) in
+  let pcount: RV = rd_u32(vcount.mem, mb.val + 12) in
+  let ltotal: RV = rd_u32(pcount.mem, mb.val + 20) in
+  let vb: i64 = frame_base + pcount.val * 8 + ltotal.val in
+  let frame_end: i64 = vb + vcount.val * 8 in
+  if frame_end > vm.stack_end then
+        mk_ex(ltotal.mem, 0, 2, trap_stack_overflow())
+  else
+    let fr: Frame = { fb: frame_base, vb: vb, pcount: pcount.val, mb: mb.val, tb: tb.val } in
+    let count: RV = rd_u32(ltotal.mem, ops_base.val) in
+    let run: Ex = exec_ops(count.mem, vm, fr, ops_base.val + 4, count.val) in
+    if run.status == 0 then
+            mk_ex(run.mem, run.pc, 2, trap_malformed())
+    else run
+
+// ---------------------------------------------------------------------------
+// entry
+// ---------------------------------------------------------------------------
+
+// Look up the entry's meta blob and run it on a fresh stack, rendering the
+// result (or trap) through the output protocol.
+fn execute_entry<'r>(mem: string, vm: Vm) -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let emb: RV = rd_u32(mem, vm.meta_index + vm.entry * 4) in
+  let epcount: RV = rd_u32(emb.mem, emb.val + 12) in
+  if epcount.val > 0 then
+    let t: i64 = print_trap(trap_entry_params()) in
+    101
+  else
+    let rkind: RV = rd_u32(epcount.mem, emb.val + 24) in
+    let result: Ex = call_function(rkind.mem, vm, vm.entry, vm.stack_base) in
+    if result.status == 3 then
+      let p: i64 = print_ok(rkind.val, result.val) in
+      0
+    else
+      let t: i64 = print_trap(result.val) in
+      101
+
+// Header walk (probe-validated in Stage 1): magic/version, the two pools,
+// target/entry/function count, the function table. Then build the metadata
+// region, zero-fill the machine regions, and execute the entry.
+fn run(mem: string) -> i64 effects[io, alloc, state, ffi, unsafe] =
   if string_len(mem) < 32 then 65
   else
     let magic: RV = rd_u32(mem, 0) in
@@ -148,25 +1006,40 @@ fn probe(mem: string) -> i64 effects[io, alloc, state, ffi, unsafe] =
     let tail: i64 = doff + 4 + datas.val * 4 + databytes.val in
     let entry: RV = rd_u32(databytes.mem, tail + 4) in
     let fns: RV = rd_u32(entry.mem, tail + 8) in
-    let table_base: i64 = tail + 12 in
-    let region_base: i64 = table_base + fns.val * 12 in
-    let secoff: RV = rd_u32(fns.mem, table_base + entry.val * 12 + 4) in
-    let sec: i64 = region_base + secoff.val in
-    let layouts: RV = rd_u32(secoff.mem, sec + 20) in
-    let tco: i64 = sec + 24 + layouts.val * 36 in
-    let types: RV = rd_u32(layouts.mem, tco) in
-    let vco: i64 = tco + 4 + types.val * 17 in
-    let vals: RV = rd_u32(types.mem, vco) in
-    let pco: i64 = vco + 4 + vals.val * 4 + 4 in
-    let params: RV = rd_u32(vals.mem, pco) in
-    let lco: i64 = pco + 4 + params.val * 8 in
-    let locals: RV = rd_u32(params.mem, lco) in
-    let oco: i64 = lco + 4 + locals.val * 16 in
-    let ops: RV = rd_u32(locals.mem, oco) in
-    print_probe(ops.mem, fns.val, entry.val, ops.val, params.val, locals.val)
+    let image_len: i64 = string_len(fns.mem) in
+    let meta_base: i64 = align8(image_len) in
+    let stack_base: i64 = meta_base + meta_size() in
+    let vm: Vm = {
+      fns: fns.val,
+      entry: entry.val,
+      table_base: tail + 12,
+      region_base: tail + 12 + fns.val * 12,
+      meta_index: meta_base,
+      stack_base: stack_base,
+      stack_end: stack_base + stack_size()
+    } in
+    let filled: string = zero_fill(fns.mem, vm.stack_end) in
+    let built: string = build_meta(filled, vm, 0, meta_base + fns.val * 4) in
+    execute_entry(built, vm)
+
+// Sum `count` little-endian u32s starting at `base` (a pool's byte-length
+// prefix -> the pool's total byte size). The u32 assembly is inlined because
+// a loop body may only read outer storage, never move it into a call; the
+// final record is anchored by a typed let (the structural-literal gap).
+fn sum_lens(mem: string, base: i64, count: i64) -> RV =
+  let done: Sum =
+    loop s = { i: 0, total: 0 } while s.i < count do
+      let off: i64 = base + s.i * 4 in
+      let b0: i64 = to_i64(string_get(mem, off)) in
+      let b1: i64 = to_i64(string_get(mem, off + 1)) in
+      let b2: i64 = to_i64(string_get(mem, off + 2)) in
+      let b3: i64 = to_i64(string_get(mem, off + 3)) in
+      let next: Sum = { i: s.i + 1, total: s.total + (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) } in
+      next
+  in
+  mk_rv(mem, done.total)
 
 // eval-bin < program.cir [program-args...]: the CIR arrives on stdin; every
 // process argument belongs to the evaluated program (forwarded from Stage 4).
 fn main<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
-  let mem: string = read_all(string_with_capacity(4194304)) in
-  probe(mem)
+  run(read_all(string_with_capacity(mem_cap())))

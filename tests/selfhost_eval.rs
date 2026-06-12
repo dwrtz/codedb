@@ -1,24 +1,26 @@
-// Phase 8 (ladder rung 0) Stage 1: the CodeDB-hosted evaluator's loader.
+// Phase 8 (ladder rung 0) Stage 2: the CodeDB-hosted evaluator's scalar core.
 //
-// `compiler/eval/eval.cdb` is imported, verified, and built to a NATIVE
-// binary, then fed real `emit-cir` artifacts on stdin. Its Stage-1 probe
-// prints five numbers - function count, entry index, entry op count, entry
-// param count, entry local count - which must equal the emission summary's
-// values: the probe only gets them right if the .cdb loader walked the
-// header, both pools, the function table, and the entry's section tables
-// (layout/type/value/param/local rows, all fixed-width) at the exact byte
-// offsets the Rust encoder produced. Non-CIR stdin exits 65, fail-closed.
+// `compiler/eval/eval.cdb` is imported, verified, built to a NATIVE binary,
+// and fed real `emit-cir` artifacts on stdin. It must EXECUTE the entry and
+// print `ok:<value>` (exit 0) or `trap:<code>` (exit 101), and its results
+// must equal the Rust reference evaluator's on the same programs — the
+// rung-0 result-equality oracle (SPEC_V3 §5), with the native backend as the
+// transitive third leg via the existing per-feature eval==native suites.
 //
-// The full three-way result oracle (CodeDB-eval == Rust-eval == native) is
-// the later stages' gate; this pins the substrate they decode with.
+// Coverage here: scalar control flow (if, early return, calls, recursion),
+// every registry operator kind at its own width/signedness (the generated
+// three-way sweep below asserts a fixture per `codedb::operator_kinds()`
+// entry), int casts, div/mod trap parity, and the fail-closed shell.
+// Aggregates/case/fold/loop/heap are pinned to `trap:unsupported_op` until
+// Stages 3/4 flip them.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::OnceLock;
 
 use assert_cmd::Command;
-use serde_json::Value as JsonValue;
-use tempfile::tempdir;
+use tempfile::{tempdir, TempDir};
 
 fn bin() -> Command {
     Command::cargo_bin("codedb").expect("codedb binary")
@@ -29,12 +31,13 @@ fn run(args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("utf8 stdout")
 }
 
-fn path(path: &Path) -> &str {
-    path.to_str().expect("utf8 path")
+fn run_fail(args: &[&str]) -> String {
+    let output = bin().args(args).assert().failure().get_output().clone();
+    String::from_utf8(output.stderr).expect("utf8 stderr")
 }
 
-fn parse_json(text: &str) -> JsonValue {
-    serde_json::from_str(text).unwrap_or_else(|err| panic!("invalid json: {err}\n{text}"))
+fn path(path: &Path) -> &str {
+    path.to_str().expect("utf8 path")
 }
 
 fn can_build_default_native_target() -> bool {
@@ -44,37 +47,43 @@ fn can_build_default_native_target() -> bool {
 }
 
 /// Import the committed evaluator sources, verify, and build the native
-/// evaluator binary.
-fn build_evaluator(temp: &Path) -> PathBuf {
-    let db = temp.join("selfhost-eval.sqlite");
-    run(&["init", path(&db)]);
-    run(&["import", path(&db), "std/fmt.cdb"]);
-    run(&["import", path(&db), "compiler/eval/eval.cdb"]);
-    run(&["verify", path(&db)]);
-    let exe = temp.join("eval-bin");
-    run(&["build", path(&db), "main", "--out", path(&exe)]);
-    exe
+/// evaluator binary — once per test process (the tests share the artifact).
+fn evaluator() -> &'static Path {
+    static EVALUATOR: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    EVALUATOR
+        .get_or_init(|| {
+            let temp = tempdir().unwrap();
+            let db = temp.path().join("selfhost-eval.sqlite");
+            run(&["init", path(&db)]);
+            run(&["import", path(&db), "std/fmt.cdb"]);
+            run(&["import", path(&db), "compiler/eval/eval.cdb"]);
+            run(&["verify", path(&db)]);
+            let exe = temp.path().join("eval-bin");
+            run(&["build", path(&db), "main", "--out", path(&exe)]);
+            (temp, exe)
+        })
+        .1
+        .as_path()
 }
 
-/// Emit the CIR artifact for `entry` of a committed example and return the
-/// artifact path plus the emission summary the probe is checked against.
-fn emit_example_cir(temp: &Path, name: &str, source: &str, entry: &str) -> (PathBuf, JsonValue) {
+/// Init + import a fixture source file; return the db path.
+fn import_fixture(temp: &Path, name: &str, source: &str) -> PathBuf {
     let db = temp.join(format!("{name}.sqlite"));
+    let src = temp.join(format!("{name}.cdb"));
+    std::fs::write(&src, source).unwrap();
     run(&["init", path(&db)]);
-    run(&["import", path(&db), source]);
-    let cir = temp.join(format!("{name}.cir"));
-    let summary = parse_json(&run(&[
-        "emit-cir",
-        path(&db),
-        entry,
-        "--out",
-        path(&cir),
-        "--json",
-    ]));
-    (cir, summary)
+    run(&["import", path(&db), path(&src)]);
+    db
 }
 
-/// Run the native evaluator with `input` on stdin; return (exit code, stdout).
+/// Emit the CIR for `entry` of `db` into `<entry>.cir` under temp.
+fn emit_cir(temp: &Path, db: &Path, entry: &str) -> PathBuf {
+    let cir = temp.join(format!("{entry}.cir"));
+    run(&["emit-cir", path(db), entry, "--out", path(&cir)]);
+    cir
+}
+
+/// Run the native evaluator with `input` on stdin; return (exit, stdout).
 fn run_evaluator(exe: &Path, input: &Path) -> (i32, String) {
     let output = StdCommand::new(exe)
         .stdin(Stdio::from(File::open(input).expect("open evaluator input")))
@@ -86,70 +95,205 @@ fn run_evaluator(exe: &Path, input: &Path) -> (i32, String) {
     )
 }
 
-fn probe_lines(stdout: &str) -> Vec<i64> {
-    stdout
-        .lines()
-        .map(|line| {
-            line.parse::<i64>()
-                .unwrap_or_else(|err| panic!("non-numeric probe line {line:?}: {err}"))
-        })
-        .collect()
+/// Map the Rust evaluator's printed value onto the .cdb evaluator's output
+/// protocol: bool as 0/1, unit as `unit`, numbers as-is.
+fn normalize_rust_eval(out: &str) -> String {
+    match out.trim() {
+        "true" => "1".to_string(),
+        "false" => "0".to_string(),
+        "()" => "unit".to_string(),
+        other => other.to_string(),
+    }
 }
 
+/// Assert that the .cdb evaluator's result equals the Rust evaluator's for
+/// one entry of one fixture db.
+fn assert_three_way(temp: &Path, exe: &Path, db: &Path, entry: &str) {
+    let cir = emit_cir(temp, db, entry);
+    let rust = normalize_rust_eval(&run(&["eval", path(db), entry]));
+    let (code, stdout) = run_evaluator(exe, &cir);
+    assert_eq!(
+        (code, stdout.trim()),
+        (0, format!("ok:{rust}").as_str()),
+        "{entry}: CodeDB-eval vs Rust-eval"
+    );
+}
+
+const SCALAR_FIXTURE: &str = "\
+fn pick(n: i64) -> i64 = if n > 10 then n * 2 else n - 1\n\
+fn guard(n: i64) -> i64 =\n\
+  let d: i64 = (if n == 0 then return 0 - 99 else 1000 / n) in\n\
+  d + 1\n\
+fn wrap32(a: u32, b: u32) -> u32 = a + b\n\
+fn sgn8(x: i64) -> i64 = to_i64(to_i8(x))\n\
+fn fib(n: i64) -> i64 = if n < 2 then n else fib(n - 1) + fib(n - 2)\n\
+fn main() -> i64 = pick(7) + pick(20) + guard(8) + guard(0) + to_i64(wrap32(0xffffffff, 2)) + sgn8(255) + fib(15)\n\
+fn t_bool() -> bool = 3 < 5 && !(2 == 2) || 7 >= 7\n\
+fn t_unit() -> unit = ()\n\
+fn t_u64() -> u64 = 0xffffffffffffffff - 4\n\
+fn t_u32() -> u32 = wrap32(0xfffffff0, 0x20)\n\
+fn t_div0() -> i64 = 7 / (3 - 3)\n\
+fn t_mod0() -> i64 = 7 % (3 - 3)\n\
+fn t_shift() -> i64 = to_i64(to_u8(1) << to_u8(9)) + (0 - 8 >> 1) + to_i64(to_u32(0x80000000) >> to_u32(4))\n\
+fn t_neg() -> i64 = to_i64(~to_u16(0)) + to_i64(to_i32(0) - to_i32(0x80000000))\n";
+
 #[test]
-fn stage1_probe_matches_the_emission_summary_for_real_examples() {
+fn scalar_programs_match_the_rust_evaluator() {
     if !can_build_default_native_target() {
         return;
     }
     let temp = tempdir().unwrap();
-    let exe = build_evaluator(temp.path());
+    let exe = evaluator();
+    let db = import_fixture(temp.path(), "scalar", SCALAR_FIXTURE);
 
-    // Three entries with different table shapes: tokenize_ok (closure of 4
-    // fns), scan (4 params - exercises the param-row walk), and sha256's
-    // digest_0 (12 fns, real layout/type tables, a later function-table row).
-    for (name, source, entry) in [
-        ("tokenizer", "examples/v3/tokenizer.cdb", "tokenize_ok"),
-        ("tokenizer-scan", "examples/v3/tokenizer.cdb", "scan"),
-        ("sha256", "examples/v3/sha256.cdb", "digest_0"),
+    // Control flow, early return, recursion, casts, widths, rendering.
+    for entry in [
+        "main", "t_bool", "t_unit", "t_u64", "t_u32", "t_shift", "t_neg",
     ] {
-        let (cir, summary) = emit_example_cir(temp.path(), name, source, entry);
-        let (code, stdout) = run_evaluator(&exe, &cir);
-        assert_eq!(code, 0, "{name}: probe exit code, stdout:\n{stdout}");
-        let expected: Vec<i64> = [
-            "function_count",
-            "entry_index",
-            "entry_op_count",
-            "entry_param_count",
-            "entry_local_count",
-        ]
-        .iter()
-        .map(|key| {
-            summary[key]
-                .as_i64()
-                .unwrap_or_else(|| panic!("{name}: summary key {key} missing: {summary}"))
-        })
-        .collect();
-        assert_eq!(probe_lines(&stdout), expected, "{name}: probe vs summary");
+        assert_three_way(temp.path(), exe, &db, entry);
+    }
+
+    // Trap parity: the Rust evaluator errors; the .cdb evaluator prints the
+    // trap code and exits 101.
+    for (entry, code_name) in [("t_div0", "division_by_zero"), ("t_mod0", "modulo_by_zero")] {
+        let cir = emit_cir(temp.path(), &db, entry);
+        let rust_err = run_fail(&["eval", path(&db), entry]);
+        assert!(
+            rust_err.contains("by zero"),
+            "{entry}: rust eval should trap: {rust_err}"
+        );
+        let (code, stdout) = run_evaluator(exe, &cir);
+        assert_eq!(
+            (code, stdout.trim()),
+            (101, format!("trap:{code_name}").as_str()),
+            "{entry}: trap parity"
+        );
     }
 }
 
+/// One generated fixture per registry operator kind, at that kind's own
+/// width and signedness, with operands that exercise wrap/sign edges (an
+/// unsigned high-bit left operand discriminates unsigned from signed
+/// compares; an over-MAX sum discriminates wrapping from promotion).
+fn operator_fixture(kind: &str) -> (String, String) {
+    let name = format!("k_{kind}");
+    if let Some(body) = match kind {
+        "and_bool" => Some("true && (1 == 2)".to_string()),
+        "or_bool" => Some("(1 == 2) || true".to_string()),
+        "not_bool" => Some("!(3 == 3)".to_string()),
+        _ => None,
+    } {
+        return (name.clone(), format!("fn {name}() -> bool = {body}\n"));
+    }
+    let (verb, ty) = kind.rsplit_once('_').expect("kind has a width suffix");
+    let (a, b) = match ty {
+        "i8" => ("0x75", "0x2c"),
+        "i16" => ("0x7ff5", "0x2d"),
+        "i32" => ("0x7ffffff5", "0x3d"),
+        "i64" => ("0x7ffffffffffffff5", "0x4d"),
+        "u8" => ("0xf3", "0x1d"),
+        "u16" => ("0xfff3", "0x2d"),
+        "u32" => ("0xfffffff3", "0x3d"),
+        "u64" => ("0xfffffffffffffff3", "0x4d"),
+        other => panic!("unknown operator width {other}"),
+    };
+    let cast = |v: &str| format!("to_{ty}({v})");
+    let (expr, ret) = match verb {
+        "add" => (format!("{} + {}", cast(a), cast(b)), ty),
+        "sub" => (format!("{} - {}", cast(b), cast(a)), ty),
+        "mul" => (format!("{} * {}", cast(a), cast(b)), ty),
+        "div" => (format!("{} / {}", cast(a), cast(b)), ty),
+        "mod" => (format!("{} % {}", cast(a), cast(b)), ty),
+        "and" => (format!("{} & {}", cast(a), cast(b)), ty),
+        "or" => (format!("({} | {})", cast(a), cast(b)), ty),
+        "xor" => (format!("{} ^ {}", cast(a), cast(b)), ty),
+        "shl" => (format!("{} << {}", cast(a), cast("3")), ty),
+        "shr" => (format!("{} >> {}", cast(a), cast("3")), ty),
+        "eq" => (format!("{} == {}", cast(a), cast(b)), "bool"),
+        "ne" => (format!("{} != {}", cast(a), cast(b)), "bool"),
+        "lt" => (format!("{} < {}", cast(a), cast(b)), "bool"),
+        "le" => (format!("{} <= {}", cast(a), cast(b)), "bool"),
+        "gt" => (format!("{} > {}", cast(a), cast(b)), "bool"),
+        "ge" => (format!("{} >= {}", cast(a), cast(b)), "bool"),
+        "neg" => (format!("-{}", cast(a)), ty),
+        "bitnot" => (format!("~{}", cast(a)), ty),
+        other => panic!("unknown operator verb {other}"),
+    };
+    (name.clone(), format!("fn {name}() -> {ret} = {expr}\n"))
+}
+
 #[test]
-fn stage1_probe_rejects_non_cir_input_fail_closed() {
+fn every_operator_kind_agrees_three_way() {
     if !can_build_default_native_target() {
         return;
     }
     let temp = tempdir().unwrap();
-    let exe = build_evaluator(temp.path());
+    let exe = evaluator();
 
-    // Empty input: too short to even carry the magic.
+    let kinds = codedb::operator_kinds();
+    let mut source = String::new();
+    let mut entries = Vec::new();
+    for kind in &kinds {
+        let (name, fn_src) = operator_fixture(kind);
+        source.push_str(&fn_src);
+        entries.push(name);
+    }
+    // The coverage gate: a registry kind without a fixture fails loudly.
+    assert_eq!(entries.len(), kinds.len(), "fixture per operator kind");
+
+    let db = import_fixture(temp.path(), "conformance", &source);
+    for entry in &entries {
+        assert_three_way(temp.path(), exe, &db, entry);
+    }
+}
+
+#[test]
+fn stage3_frontier_is_pinned_fail_closed() {
+    if !can_build_default_native_target() {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let exe = evaluator();
+
+    // Aggregate examples execute under the Rust evaluator but trap
+    // unsupported in the .cdb evaluator until Stage 3 lands; an entry with
+    // params cannot be executed at all. These expectations FLIP as stages
+    // land — they document the frontier, not a permanent contract.
+    let tok = temp.path().join("tok.sqlite");
+    run(&["init", path(&tok)]);
+    run(&["import", path(&tok), "examples/v3/tokenizer.cdb"]);
+    let cir = emit_cir(temp.path(), &tok, "tokenize_ok");
+    let (code, stdout) = run_evaluator(exe, &cir);
+    assert_eq!(
+        (code, stdout.trim()),
+        (101, "trap:unsupported_op"),
+        "tokenizer awaits Stage 3 aggregates"
+    );
+
+    let scan_cir = emit_cir(temp.path(), &tok, "scan");
+    let (code, stdout) = run_evaluator(exe, &scan_cir);
+    assert_eq!(
+        (code, stdout.trim()),
+        (101, "trap:entry_params"),
+        "an entry with params is not executable"
+    );
+}
+
+#[test]
+fn non_cir_input_fails_closed() {
+    if !can_build_default_native_target() {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let exe = evaluator();
+
     let empty = temp.path().join("empty.bin");
     std::fs::write(&empty, b"").unwrap();
-    let (code, stdout) = run_evaluator(&exe, &empty);
+    let (code, stdout) = run_evaluator(exe, &empty);
     assert_eq!((code, stdout.as_str()), (65, ""), "empty input");
 
-    // Long enough, but the magic is wrong.
     let garbage = temp.path().join("garbage.bin");
     std::fs::write(&garbage, b"this is definitely not a CIR artifact").unwrap();
-    let (code, stdout) = run_evaluator(&exe, &garbage);
+    let (code, stdout) = run_evaluator(exe, &garbage);
     assert_eq!((code, stdout.as_str()), (65, ""), "non-CIR input");
 }

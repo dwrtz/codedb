@@ -146,11 +146,11 @@ runtime's.
 **Output protocol.** On success the evaluator prints `ok:<value>` — the entry
 result rendered from its return-type consumer column (signed widths as signed
 decimal, unsigned as unsigned decimal, bool as `0`/`1`, unit as `unit`) — and
-exits 0. On a trap it prints `trap:<code>` (the trap-code pool string, e.g.
-`trap:division_by_zero`, or the checker's code for bounds/capacity traps) and
-exits nonzero. The Stage-1 probe instead prints five numbers, one per line —
-function count, entry index, entry op count, entry param count, entry local
-count — cross-checked against `emit-cir`'s summary JSON.
+exits 0. On a trap it prints `trap:<code>` (e.g. `trap:division_by_zero`,
+`trap:bounds_check`, or `trap:unsupported_op` past the implemented frontier)
+and exits 101; a non-CIR input exits 65 silently. (Stage 1's five-number
+loader probe was superseded by execution — its walk correctness is now
+re-proven by every executed program.)
 
 **State threading.** The memory string is move-only: helpers take it and
 return it inside a small record (`{ mem: string, val: i64 }`); scalar loop
@@ -172,12 +172,16 @@ stay out until something forces them.
 1. **(done — substrate)** `string_set` + the CIR artifact + consumer columns;
 2. **(done — Stage 1)** loader in `.cdb` (stdin -> 1-byte bounce reads ->
    image in the memory string -> header/pool/function-table/section walk),
-   gated by the five-line probe vs `emit-cir`'s summary on real examples
-   (`tests/selfhost_eval.rs`); the per-function frame prepass lands with the
-   first executing stage;
-3. scalar core (consts, all binary/unary widths with wrap+trap semantics,
-   `int_cast`, `if`, load/store/copy/move, call/return/early-return) — gated
-   by the three-way operator-conformance corpus;
+   gated by a five-line probe vs `emit-cir`'s summary on real examples
+   (superseded by execution in Stage 2);
+3. **(done — Stage 2)** scalar core: per-function metadata + frames, consts,
+   params, every binary/unary operator width and signedness (semantics
+   inherited by construction through the language's own sized operators),
+   `int_cast`, `if`, scalar load/store/copy/move, borrows/derefs as address
+   cells, bounds checks, call/return/early-return, div/mod trap parity, and
+   the `ok:`/`trap:` protocol — gated by a generated three-way conformance
+   sweep with a fixture per `codedb::operator_kinds()` entry plus scalar
+   control-flow/recursion programs (`tests/selfhost_eval.rs`);
 4. aggregates (records/enums/arrays: addr-of ops, sized load/store, enum tags,
    `case`, bounds checks, slices, static data, `fold`, `loop`) — gated by the
    sha256 digest and the aggregate corpora;
