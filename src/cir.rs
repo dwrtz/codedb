@@ -165,9 +165,11 @@ mod placekind {
 
 /// Type-table consumer column: how a value of this type lives in a cell/slot.
 /// 0-9 are the scalar kinds (cells hold the canonically extended value), 10 is
-/// pointer-like (box / reference / raw pointer — an 8-byte address cell), 11/12
-/// are layout-bearing aggregates split by ABI pass mode (cells hold the address
-/// of the value's bytes; `meta_size` is the byte size of the bytes themselves).
+/// pointer-like (box / reference / raw pointer — an 8-byte address cell),
+/// 11/12 are layout-bearing aggregates split by ABI pass mode (cells hold the
+/// address of the value's bytes; `meta_size` is the byte size of the bytes
+/// themselves), and 13 is the slice sub-kind of 12 (a `{data_ptr, len}` pair;
+/// a fold target of this kind iterates the pointed-to data, not the pair).
 mod typemeta {
     pub const UNIT: u8 = 0;
     pub const BOOL: u8 = 1;
@@ -182,6 +184,7 @@ mod typemeta {
     pub const POINTER: u8 = 10;
     pub const AGG_BY_VALUE: u8 = 11;
     pub const AGG_INDIRECT: u8 = 12;
+    pub const SLICE: u8 = 13;
 }
 
 /// Binary/unary consumer column: the registry kind's verb, decoupled from its
@@ -243,6 +246,7 @@ fn type_meta_columns(type_hash: &str, layout: Option<&LoweredTypeLayout>) -> (u8
     }
     match layout {
         Some(layout) if layout.kind == "box" => (typemeta::POINTER, 8),
+        Some(layout) if layout.kind == "slice" => (typemeta::SLICE, layout.size_bytes),
         Some(layout) if layout.abi.pass == "by_indirect" => {
             (typemeta::AGG_INDIRECT, layout.size_bytes)
         }

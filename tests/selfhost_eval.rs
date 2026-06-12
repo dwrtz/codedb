@@ -247,35 +247,118 @@ fn every_operator_kind_agrees_three_way() {
     }
 }
 
+const AGGREGATE_FIXTURE: &str = "\
+record P {\n  x: i64\n  y: u32\n}\n\
+record Outer {\n  p: P\n  tag: i64\n}\n\
+enum Shape {\n  circle: i64\n  square: P\n  empty: unit\n}\n\
+fn t_record() -> i64 =\n\
+  let o: Outer = { p: { x: 40, y: 0x10 }, tag: 7 } in\n\
+  o.p.x + to_i64(o.p.y) + o.tag\n\
+fn mk(n: i64) -> Shape =\n\
+  if n > 0 then Shape::circle(n)\n\
+  else if n == 0 then Shape::empty(())\n\
+  else Shape::square({ x: n, y: 3 })\n\
+fn classify(s: Shape) -> i64 =\n\
+  case s of circle(r) => r * 2 | square(p) => p.x | empty(u) => 0 - 5\n\
+fn t_enum() -> i64 = classify(mk(21)) + classify(mk(0)) + classify(mk(0 - 9))\n\
+fn t_array() -> i64 =\n\
+  let xs: array<i64, 5> = [10, 20, 30, 40, 50] in\n\
+  let i: i64 = 3 in\n\
+  xs[i] + xs[0]\n\
+fn t_fill_set() -> i64 =\n\
+  let xs: array<u32, 8> = array_set([0x5; 8], 2, 0xff) in\n\
+  to_i64(xs[2]) + to_i64(xs[7])\n\
+fn t_fold() -> i64 =\n\
+  let xs: array<i64, 4> = [2, 4, 6, 8] in\n\
+  fold b in xs with acc = 100 do acc + b\n\
+fn t_early_fold() -> i64 =\n\
+  let xs: array<i64, 3> = [1, 2, 3] in\n\
+  fold b in xs with acc = 0 do (if b == 2 then return 99 else acc + b)\n\
+fn t_static() -> i64 = to_i64(b\"hello\"[1]) + len(b\"hello\")\n\
+fn t_fold_slice() -> i64 =\n\
+  let s: slice<'static, u8> = b\"abc\" in\n\
+  fold b in s with acc = 0 do acc + to_i64(b)\n\
+fn flip(p: P) -> P = { x: p.x + 1, y: p.y }\n\
+fn t_agg_call() -> i64 =\n\
+  let p: P = flip(flip({ x: 5, y: 2 })) in\n\
+  p.x\n";
+
 #[test]
-fn stage3_frontier_is_pinned_fail_closed() {
+fn aggregate_programs_match_the_rust_evaluator() {
     if !can_build_default_native_target() {
         return;
     }
     let temp = tempdir().unwrap();
     let exe = evaluator();
 
-    // Aggregate examples execute under the Rust evaluator but trap
-    // unsupported in the .cdb evaluator until Stage 3 lands; an entry with
-    // params cannot be executed at all. These expectations FLIP as stages
-    // land — they document the frontier, not a permanent contract.
+    // The Stage-3 acceptance examples: the tokenizer (arrays + early exit
+    // through recursion) and a sha256 digest word (records, loops with
+    // record accumulators, array_set stores, the aggregate call ABI).
     let tok = temp.path().join("tok.sqlite");
     run(&["init", path(&tok)]);
     run(&["import", path(&tok), "examples/v3/tokenizer.cdb"]);
-    let cir = emit_cir(temp.path(), &tok, "tokenize_ok");
-    let (code, stdout) = run_evaluator(exe, &cir);
-    assert_eq!(
-        (code, stdout.trim()),
-        (101, "trap:unsupported_op"),
-        "tokenizer awaits Stage 3 aggregates"
-    );
+    for entry in ["tokenize_ok", "tokenize_bad", "tokenize_empty"] {
+        assert_three_way(temp.path(), exe, &tok, entry);
+    }
+    let sha = temp.path().join("sha.sqlite");
+    run(&["init", path(&sha)]);
+    run(&["import", path(&sha), "examples/v3/sha256.cdb"]);
+    assert_three_way(temp.path(), exe, &sha, "digest_0");
 
+    // Per-feature aggregate coverage: nested records, enum payloads through
+    // case (with a default arm), arrays with runtime indices, fill +
+    // array_set, fold (including an early return from its body), static
+    // data + slices, and aggregate params/returns (hidden return slot +
+    // indirect param copies).
+    let db = import_fixture(temp.path(), "aggregate", AGGREGATE_FIXTURE);
+    for entry in [
+        "t_record",
+        "t_enum",
+        "t_array",
+        "t_fill_set",
+        "t_fold",
+        "t_early_fold",
+        "t_static",
+        "t_fold_slice",
+        "t_agg_call",
+    ] {
+        assert_three_way(temp.path(), exe, &db, entry);
+    }
+
+    // An entry with params stays outside the execution protocol.
     let scan_cir = emit_cir(temp.path(), &tok, "scan");
     let (code, stdout) = run_evaluator(exe, &scan_cir);
     assert_eq!(
         (code, stdout.trim()),
         (101, "trap:entry_params"),
         "an entry with params is not executable"
+    );
+}
+
+#[test]
+fn stage4_frontier_is_pinned_fail_closed() {
+    if !can_build_default_native_target() {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let exe = evaluator();
+
+    // The heap ops await Stage 4; the expectation FLIPS when it lands.
+    let db = import_fixture(
+        temp.path(),
+        "boxed",
+        "record Node {\n  v: i64\n}\n\
+         fn t_box() -> i64 effects[alloc] =\n\
+           let b: box<Node> = box_new({ v: 41 }) in\n\
+           let n: Node = unbox(b) in\n\
+           n.v + 1\n",
+    );
+    let cir = emit_cir(temp.path(), &db, "t_box");
+    let (code, stdout) = run_evaluator(exe, &cir);
+    assert_eq!(
+        (code, stdout.trim()),
+        (101, "trap:unsupported_op"),
+        "box programs await Stage 4 heap ops"
     );
 }
 

@@ -182,9 +182,15 @@ stay out until something forces them.
    the `ok:`/`trap:` protocol — gated by a generated three-way conformance
    sweep with a fixture per `codedb::operator_kinds()` entry plus scalar
    control-flow/recursion programs (`tests/selfhost_eval.rs`);
-4. aggregates (records/enums/arrays: addr-of ops, sized load/store, enum tags,
-   `case`, bounds checks, slices, static data, `fold`, `loop`) — gated by the
-   sha256 digest and the aggregate corpora;
+4. **(done — Stage 3)** aggregates: addr-of field/payload/index through the
+   explicit place offsets, aggregate load/move/copy as address aliases with
+   byte copies only at stores (backend parity), enum tags (8 bytes at offset
+   0), `case` with the last arm as default, `fold`/`loop` drivers over
+   accumulator locals (early returns propagate out of iteration bodies),
+   slices, static data via a load-time data-pool offset index, range checks,
+   and the call ABI's hidden return slot + indirect-param entry copies —
+   gated by the tokenizer + sha256 digest examples and a per-feature
+   aggregate fixture, all result-equal to the Rust evaluator;
 5. heap (box ops over the bump allocator, vec/string ops with capacity traps,
    argv forwarded 1:1 to the evaluated program) — gated by the box-recursion,
    string/fmt, and tokenizer corpora;

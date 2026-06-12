@@ -1,13 +1,19 @@
 // compiler/eval/eval.cdb - the CodeDB-hosted reference evaluator (ladder rung 0).
 //
-// Stage 2 (scalar core): read a CIR file (docs/PLAN_V3.md Phase 8; format doc
-// in src/cir.rs) from STDIN, build per-function metadata, and EXECUTE the
-// entry over a simulated byte machine: consts, params, every binary/unary
-// operator width, int_cast, if, scalar load/store/copy/move, borrows/derefs
-// (address identity), bounds checks, call/return/early-return. Aggregates,
-// case/fold/loop, static data, and the heap ops trap `unsupported_op` until
-// Stages 3/4. Output protocol (compiler/eval/README.md): `ok:<value>` and
-// exit 0, or `trap:<code>` and exit 101; a non-CIR input exits 65.
+// Stages 2+3 (scalar core + aggregates): read a CIR file (docs/PLAN_V3.md
+// Phase 8; format doc in src/cir.rs) from STDIN, build per-function
+// metadata, and EXECUTE the entry over a simulated byte machine: consts,
+// params, every binary/unary operator width, int_cast, if, load/store/copy/
+// move (aggregates are aliased addresses in cells; only Store copies bytes),
+// borrows/derefs (address identity), records/enums/arrays through the
+// explicit place offsets, enum tags (8 bytes at offset 0), case dispatch
+// (last arm = default), fold and loop drivers over accumulator locals,
+// slices ({ptr,len} pairs), static data (pool bytes addressed in the image),
+// bounds/range checks, and calls with the hidden-return-slot + indirect-
+// param-copy ABI the native backend uses. The heap ops (box/vec/string/argv)
+// trap `unsupported_op` until Stage 4. Output protocol
+// (compiler/eval/README.md): `ok:<value>` and exit 0, or `trap:<code>` and
+// exit 101; a non-CIR input exits 65.
 //
 // The CIR arrives on stdin (`eval-bin < program.cir [args...]`): the v0
 // backend gives every op's value id an 8-byte frame slot, so a `[0x0; N]`
@@ -66,18 +72,62 @@ record Vm {
   table_base: i64
   region_base: i64
   meta_index: i64
+  data_index: i64
   stack_base: i64
   stack_end: i64
 }
 
 // One function's execution context (all Copy): frame base, value-cell base,
-// param count, the function's meta-blob offset, and its type-table base.
+// param count, the hidden-return flag, the copies/locals region bases, the
+// function's meta-blob offset, and its type/layout table bases. The frame is
+// [cells (hidden+pcount) x 8][indirect-param copies][locals][value cells].
 record Frame {
   fb: i64
   vb: i64
   pcount: i64
+  hidden: i64
+  cb: i64
+  lb: i64
   mb: i64
   tb: i64
+  lt: i64
+}
+
+// A fold/loop driver step: the memory, a propagated status/value (an early
+// return or trap from an iteration), and one auxiliary counter/flag.
+record St4 {
+  mem: string
+  st: i64
+  val: i64
+  aux: i64
+}
+
+// The fold driver's decoded header (one Copy record: the v0 backend caps
+// calls at 8 machine parameters).
+record FoldArgs {
+  id: i64
+  tgt: i64
+  ttref: i64
+  lref: i64
+  iref: i64
+  islot: i64
+  aslot: i64
+  itslot: i64
+  bpc: i64
+  etref: i64
+  atref: i64
+  end: i64
+}
+
+// The loop driver's decoded header.
+record LoopArgs {
+  id: i64
+  iref: i64
+  aslot: i64
+  cpc: i64
+  bpc: i64
+  atref: i64
+  end: i64
 }
 
 // An execution step: the memory, the program counter after the step, a
@@ -98,6 +148,9 @@ fn mk_rv(mem: string, val: i64) -> RV =
 
 fn mk_ex(mem: string, pc: i64, status: i64, val: i64) -> Ex =
   { mem: mem, pc: pc, status: status, val: val }
+
+fn mk_st4(mem: string, st: i64, val: i64, aux: i64) -> St4 =
+  { mem: mem, st: st, val: val, aux: aux }
 
 // trap codes (rendered by print_trap)
 fn trap_div0() -> i64 = 1
@@ -186,6 +239,18 @@ fn read_all<'r>(mem: string) -> string effects[io, state, ffi, unsafe] =
   in
   done.mem
 
+// Copy `n` bytes inside the memory from `src` to `dst` (the regions never
+// overlap in practice: copies go place->place between distinct slots).
+fn mem_copy(mem: string, dst: i64, src: i64, n: i64) -> string effects[state] =
+  let done: St4 =
+    loop s = mk_st4(mem, 0, 0, 0) while s.aux < n do
+      let cur: St4 = s in
+      let m: string = cur.mem in
+      let b: unit = string_set(m, dst + cur.aux, string_get(m, src + cur.aux)) in
+      mk_st4(m, 0, 0, cur.aux + 1)
+  in
+  done.mem
+
 // Grow the memory with zero bytes until its length reaches `upto` (the
 // metadata/stack/heap regions live past the image and need len coverage
 // before string_set can write them).
@@ -260,6 +325,10 @@ fn print_trap<'r>(code: i64) -> i64 effects[io, ffi, unsafe] =
 // next free blob offset. Section layout: 5 header strs, layout table
 // (36-byte rows), type table (17-byte rows), value table (4-byte rows),
 // return tref, params (8-byte rows), locals (16-byte rows), op count.
+// Blob (u32 fields): +0 ops_base, +4 type_base, +8 layout_base, +12
+// value_count, +16 param_count, +20 local_count, +24 locals_total,
+// +28 return meta kind, +32 return size, +36 copies_total, +40 per-param
+// (copy_off, size) pairs, then per-local frame offsets.
 fn build_fn_meta(mem: string, sec: i64, blob: i64) -> RV effects[state] =
   let layouts: RV = rd_u32(mem, sec + 20) in
   let tbase: i64 = sec + 24 + layouts.val * 36 in
@@ -269,21 +338,45 @@ fn build_fn_meta(mem: string, sec: i64, blob: i64) -> RV effects[state] =
   let rco: i64 = vco + 4 + vals.val * 4 in
   let rtref: RV = rd_u32(vals.mem, rco) in
   let rkind: RV = rd_byte(rtref.mem, tbase + 4 + rtref.val * 17 + 8) in
+  let rsize: RV = rd_u64(rkind.mem, tbase + 4 + rtref.val * 17 + 9) in
   let pco: i64 = rco + 4 in
-  let params: RV = rd_u32(rkind.mem, pco) in
+  let params: RV = rd_u32(rsize.mem, pco) in
   let lco: i64 = pco + 4 + params.val * 8 in
   let locals: RV = rd_u32(params.mem, lco) in
   let oco: i64 = lco + 4 + locals.val * 16 in
   let m1: string = wr_u32(locals.mem, blob, oco) in
   let m2: string = wr_u32(m1, blob + 4, tbase + 4) in
-  let m3: string = wr_u32(m2, blob + 8, vals.val) in
-  let m4: string = wr_u32(m3, blob + 12, params.val) in
-  let m5: string = wr_u32(m4, blob + 16, locals.val) in
-  let m6: string = wr_u32(m5, blob + 24, rkind.val) in
+  let m2b: string = wr_u32(m2, blob + 8, sec + 24) in
+  let m3: string = wr_u32(m2b, blob + 12, vals.val) in
+  let m4: string = wr_u32(m3, blob + 16, params.val) in
+  let m5: string = wr_u32(m4, blob + 20, locals.val) in
+  let m6: string = wr_u32(m5, blob + 28, rkind.val) in
+  let m6b: string = wr_u32(m6, blob + 32, rsize.val) in
+  let pe: RV = write_param_entries(m6b, pco + 4, tbase + 4, blob + 40, params.val, 0, 0) in
+  let m6c: string = wr_u32(pe.mem, blob + 36, pe.val) in
   // local offsets: 8-aligned running sum of the locals' declared sizes
-  let lt: RV = write_local_offsets(m6, lco + 4, blob + 28, locals.val, 0, 0) in
-  let m7: string = wr_u32(lt.mem, blob + 20, lt.val) in
-  mk_rv(m7, blob + 28 + locals.val * 4)
+  let lt: RV = write_local_offsets(m6c, lco + 4, blob + 40 + params.val * 8, locals.val, 0, 0) in
+  let m7: string = wr_u32(lt.mem, blob + 24, lt.val) in
+  mk_rv(m7, blob + 40 + params.val * 8 + locals.val * 4)
+
+// Walk the 8-byte param rows from `row`, writing each param's
+// (copy_off, size) pair at `out`: an aggregate-indirect param gets a copy
+// slot (8-aligned running sum); everything else writes the no-copy sentinel.
+// Yields the copies-region total.
+fn write_param_entries(mem: string, row: i64, tb: i64, out: i64, count: i64, j: i64, copies: i64) -> RV effects[state] =
+  if j >= count then mk_rv(mem, copies)
+  else
+    let tref: RV = rd_u32(mem, row + 4) in
+    let kind: RV = rd_byte(tref.mem, tb + tref.val * 17 + 8) in
+    let size: RV = rd_u64(kind.mem, tb + tref.val * 17 + 9) in
+    if kind.val >= 12 then
+      let m1: string = wr_u32(size.mem, out, copies) in
+      let m2: string = wr_u32(m1, out + 4, size.val) in
+      write_param_entries(m2, row + 8, tb, out + 8, count, j + 1, copies + align8(size.val))
+    else
+      let m1: string = wr_u32(size.mem, out, 0xffffffff) in
+      let m2: string = wr_u32(m1, out + 4, size.val) in
+      write_param_entries(m2, row + 8, tb, out + 8, count, j + 1, copies)
 
 // Walk the 16-byte local rows from `row`, writing each local's frame offset
 // (a running 8-aligned sum) at `out`; yields the locals-region total.
@@ -294,6 +387,15 @@ fn write_local_offsets(mem: string, row: i64, out: i64, count: i64, i: i64, off:
     let size: RV = rd_u64(mem, row + 8) in
     let m1: string = wr_u32(size.mem, out, off) in
     write_local_offsets(m1, row + 16, out + 4, count, i + 1, off + align8(size.val))
+
+// Build the data-pool offset index: entry i = the absolute image offset of
+// data blob i (length prefixes at `lens`; concatenated bytes from `bytes`).
+fn build_data_index(mem: string, lens: i64, bytes: i64, out: i64, count: i64, i: i64, off: i64) -> string effects[state] =
+  if i >= count then mem
+  else
+    let l: RV = rd_u32(mem, lens + i * 4) in
+    let m1: string = wr_u32(l.mem, out + i * 4, bytes + off) in
+    build_data_index(m1, lens, bytes, out, count, i + 1, off + l.val)
 
 // Build every function's meta blob and the meta index (fns x u32 blob
 // offsets at meta_index). Recursion over the function table.
@@ -478,6 +580,20 @@ fn apply_cast(kind: i64, v: i64) -> i64 =
 // A type-table row's consumer columns: meta kind at row+8, size at row+9.
 fn type_kind(mem: string, fr: Frame, tref: i64) -> RV =
   rd_byte(mem, fr.tb + tref * 17 + 8)
+
+fn type_size(mem: string, fr: Frame, tref: i64) -> RV =
+  rd_u64(mem, fr.tb + tref * 17 + 9)
+
+// An array element's stride: its size rounded up to its alignment. Scalars
+// (no layout row) have stride == size; layout-bearing types read align from
+// their 36-byte layout row (size at +8, align at +16).
+fn elem_stride(mem: string, fr: Frame, tref: i64) -> RV =
+  let lref: RV = rd_u32(mem, fr.tb + tref * 17 + 4) in
+  if lref.val == 0xffffffff then type_size(lref.mem, fr, tref)
+  else
+    let size: RV = rd_u64(lref.mem, fr.lt + lref.val * 36 + 8) in
+    let align: RV = rd_u64(size.mem, fr.lt + lref.val * 36 + 16) in
+    mk_rv(align.mem, ((size.val + align.val - 1) / align.val) * align.val)
 
 fn cell_addr(fr: Frame, vref: i64) -> i64 = fr.vb + vref * 8
 
@@ -697,11 +813,17 @@ fn exec_op(mem: string, vm: Vm, fr: Frame, pc: i64) -> Ex effects[state] =
   let code: RV = rd_byte(mem, pc) in
   let body: i64 = pc + 1 in
   if code.val <= 8 then exec_op_core(code.mem, vm, fr, code.val, body)
+  else if code.val == 9 then exec_case(code.mem, vm, fr, body)
+  else if code.val == 10 then exec_fold(code.mem, vm, fr, body)
+  else if code.val == 11 then exec_loop(code.mem, vm, fr, body)
   else if code.val >= 43 then exec_op_mem(code.mem, vm, fr, code.val, body)
-  else if code.val >= 12 && code.val <= 15 then exec_op_ref(code.mem, vm, fr, code.val, body)
+  else if code.val >= 12 && code.val <= 16 then exec_op_ref(code.mem, vm, fr, code.val, body)
+  else if code.val == 19 || code.val == 20 then exec_op_ref(code.mem, vm, fr, code.val, body)
   else if code.val >= 21 && code.val <= 22 then exec_op_addr(code.mem, vm, fr, code.val, body)
+  else if code.val >= 23 && code.val <= 25 then exec_op_addr_agg(code.mem, fr, code.val, body)
+  else if code.val >= 26 && code.val <= 29 then exec_op_slice(code.mem, vm, fr, code.val, body)
   else
-        mk_ex(code.mem, body, 2, trap_unsupported())
+    mk_ex(code.mem, body, 2, trap_unsupported())
 
 // opcodes 0..8: param, consts, unary, int_cast, binary, call, if - a thin
 // router over the per-op handlers.
@@ -720,7 +842,7 @@ fn exec_op_core(mem: string, vm: Vm, fr: Frame, code: i64, body: i64) -> Ex effe
 fn exec_param(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
   let id: RV = rd_u32(mem, body) in
   let slot: RV = rd_u32(id.mem, body + 4) in
-  let v: RV = rd_u64(slot.mem, fr.fb + slot.val * 8) in
+  let v: RV = rd_u64(slot.mem, fr.fb + (fr.hidden + slot.val) * 8) in
   let m: string = cell_wr(v.mem, fr, id.val, v.val) in
   mk_ex(m, body + 12, 0, 0)
 
@@ -792,22 +914,29 @@ fn exec_call(mem: string, vm: Vm, fr: Frame, body: i64) -> Ex effects[state] =
   let abi: RV = skip_opt(target.mem, body + 8) in
   let argc: RV = rd_u32(abi.mem, abi.val) in
   let retflag: RV = rd_byte(argc.mem, abi.val + 4 + argc.val * 4) in
-  if retflag.val != 0 then
-        mk_ex(retflag.mem, abi.val, 2, trap_unsupported())
+  let shift: i64 = if retflag.val == 0 then 0 else 1 in
+  let end: i64 = abi.val + 4 + argc.val * 4 + 1 + shift * 4 + 4 in
+  // the callee frame sits just past this frame's value cells
+  let vcount: RV = rd_u32(retflag.mem, fr.mb + 12) in
+  let callee_fb: i64 = fr.vb + vcount.val * 8 in
+  // a hidden return slot rides as implicit cell 0 of the callee frame
+  let dest: RV =
+    (if retflag.val == 0 then mk_rv(vcount.mem, 0)
+     else
+       let rref: RV = rd_u32(vcount.mem, abi.val + 4 + argc.val * 4 + 1) in
+       cell_rd(rref.mem, fr, rref.val)) in
+  let seeded: string =
+    (if retflag.val == 0 then dest.mem
+     else wr_u64(dest.mem, callee_fb, dest.val)) in
+  let copied: Ex = copy_args(seeded, fr, abi.val + 4, argc.val, callee_fb + shift * 8, 0) in
+  if copied.status != 0 then copied
   else
-    let end: i64 = abi.val + 4 + argc.val * 4 + 1 + 4 in
-    // callee frame sits just past this frame's value cells
-    let callee_mb: RV = rd_u32(retflag.mem, vm.meta_index + target.val * 4) in
-    let vcount: RV = rd_u32(callee_mb.mem, fr.mb + 8) in
-    let frame_end: i64 = fr.vb + vcount.val * 8 in
-    let copied: Ex = copy_args(vcount.mem, fr, abi.val + 4, argc.val, frame_end, 0) in
-    if copied.status != 0 then copied
+    let run: Ex = call_function(copied.mem, vm, target.val, callee_fb) in
+    if run.status == 2 then run
     else
-      let run: Ex = call_function(copied.mem, vm, target.val, frame_end) in
-      if run.status == 2 then run
-      else
-        let m: string = cell_wr(run.mem, fr, id.val, run.val) in
-                mk_ex(m, end, 0, 0)
+      let result: i64 = if retflag.val == 0 then run.val else dest.val in
+      let m: string = cell_wr(run.mem, fr, id.val, result) in
+      mk_ex(m, end, 0, 0)
 
 // Copy `argc` argument cells (vrefs at `argp`) into the callee's param
 // slots starting at `callee_fb`.
@@ -841,14 +970,21 @@ fn exec_if(mem: string, vm: Vm, fr: Frame, body: i64) -> Ex effects[state] =
        let m: string = cell_wr(e.mem, fr, id.val, e.val) in
               mk_ex(m, e.pc + 4, 0, 0))
 
-// opcodes 12..15: borrows yield their referent's address; derefs are the
-// identity on an address cell (a reference IS an address in this machine).
+// opcodes 12..16, 19..20: borrows yield their referent's address; derefs
+// (shared/mut/box/raw) and ptr_cast are the identity on an address cell (a
+// reference, box, or raw pointer IS an address in this machine; the actual
+// read is the subsequent load through it - backend parity).
 fn exec_op_ref(mem: string, vm: Vm, fr: Frame, code: i64, body: i64) -> Ex effects[state] =
   let id: RV = rd_u32(mem, body) in
   let vref: RV = rd_u32(id.mem, body + 4) in
   let v: RV = cell_rd(vref.mem, fr, vref.val) in
   let m: string = cell_wr(v.mem, fr, id.val, v.val) in
-  let end: i64 = body + (if code <= 13 then 20 else 12) in
+  let end: i64 = body +
+    (if code <= 13 then 20
+     else if code <= 15 then 12
+     else if code == 16 then 16
+     else if code == 19 then 16
+     else 17) in
   mk_ex(m, end, 0, 0)
 
 // opcodes 21..22: addr_of_param / addr_of_local.
@@ -858,20 +994,224 @@ fn exec_op_addr(mem: string, vm: Vm, fr: Frame, code: i64, body: i64) -> Ex effe
   let slot: RV = rd_u32(pk.mem, body + 5) in
   if code == 21 then
     let ind: RV = rd_byte(slot.mem, body + 13) in
-    (if ind.val != 0 then mk_ex(ind.mem, body, 2, trap_unsupported())
+    (if ind.val != 0 then
+       let coff: RV = rd_u32(ind.mem, fr.mb + 40 + slot.val * 8) in
+       let m: string = cell_wr(coff.mem, fr, id.val, fr.cb + coff.val) in
+       mk_ex(m, body + 14, 0, 0)
      else
-       let m: string = cell_wr(ind.mem, fr, id.val, fr.fb + slot.val * 8) in
+       let m: string = cell_wr(ind.mem, fr, id.val, fr.fb + (fr.hidden + slot.val) * 8) in
        mk_ex(m, body + 14, 0, 0))
   else
-    let loff: RV = rd_u32(slot.mem, fr.mb + 28 + slot.val * 4) in
-    let m: string = cell_wr(loff.mem, fr, id.val, fr.fb + fr.pcount * 8 + loff.val) in
+    let loff: RV = rd_u32(slot.mem, fr.mb + 40 + fr.pcount * 8 + slot.val * 4) in
+    let m: string = cell_wr(loff.mem, fr, id.val, fr.lb + loff.val) in
     mk_ex(m, body + 13, 0, 0)
+
+// opcodes 23..25: addresses through aggregate places, all carrying their
+// explicit byte offsets (the CIR consumer design): field/payload = base
+// address + offset; index = base + index * element stride.
+fn exec_op_addr_agg(mem: string, fr: Frame, code: i64, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let base: RV = rd_u32(id.mem, body + 5) in
+  let baddr: RV = cell_rd(base.mem, fr, base.val) in
+  if code == 25 then
+    let iref: RV = rd_u32(baddr.mem, body + 9) in
+    let etref: RV = rd_u32(iref.mem, body + 13) in
+    let stride: RV = elem_stride(etref.mem, fr, etref.val) in
+    let idx: RV = cell_rd(stride.mem, fr, iref.val) in
+    let m: string = cell_wr(idx.mem, fr, id.val, baddr.val + idx.val * stride.val) in
+    mk_ex(m, body + 21, 0, 0)
+  else
+    let flag: RV = rd_byte(baddr.mem, body + 13) in
+    let sym: i64 = if flag.val == 0 then 0 else 4 in
+    if code == 23 then
+      let off: RV = rd_u64(flag.mem, body + 18 + sym) in
+      let m: string = cell_wr(off.mem, fr, id.val, baddr.val + off.val) in
+      mk_ex(m, body + 30 + sym, 0, 0)
+    else
+      let poff: RV = rd_u64(flag.mem, body + 26 + sym) in
+      let m: string = cell_wr(poff.mem, fr, id.val, baddr.val + poff.val) in
+      mk_ex(m, body + 38 + sym, 0, 0)
+
+// opcodes 26..29: static data (pool bytes addressed in the image), slice
+// construction ({data_ptr, len} at the slice place), and the two reads.
+fn exec_op_slice(mem: string, vm: Vm, fr: Frame, code: i64, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  if code == 26 then
+    let didx: RV = rd_u32(id.mem, body + 8) in
+    let blob: RV = rd_u32(didx.mem, vm.data_index + didx.val * 4) in
+    let m: string = cell_wr(blob.mem, fr, id.val, blob.val) in
+    mk_ex(m, body + 24, 0, 0)
+  else if code == 27 then
+    let aref: RV = rd_u32(id.mem, body + 4) in
+    let dref: RV = rd_u32(aref.mem, body + 8) in
+    let lref: RV = rd_u32(dref.mem, body + 12) in
+    let addr: RV = cell_rd(lref.mem, fr, aref.val) in
+    let data: RV = cell_rd(addr.mem, fr, dref.val) in
+    let len: RV = cell_rd(data.mem, fr, lref.val) in
+    let m1: string = wr_u64(len.mem, addr.val, data.val) in
+    let m2: string = wr_u64(m1, addr.val + 8, len.val) in
+    let m3: string = cell_wr(m2, fr, id.val, addr.val) in
+    mk_ex(m3, body + 24, 0, 0)
+  else
+    let sref: RV = rd_u32(id.mem, body + 4) in
+    let saddr: RV = cell_rd(sref.mem, fr, sref.val) in
+    let v: RV = rd_u64(saddr.mem, saddr.val + (if code == 28 then 8 else 0)) in
+    let m: string = cell_wr(v.mem, fr, id.val, v.val) in
+    mk_ex(m, body + 16, 0, 0)
+
+// case: id, scrutinee, enum tref, arm count, arms, tref. Read the 8-byte
+// tag at the enum's address, then try arms in order; the LAST arm runs
+// unconditionally (backend parity: it is the default).
+fn exec_case(mem: string, vm: Vm, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let scr: RV = rd_u32(id.mem, body + 4) in
+  let armc: RV = rd_u32(scr.mem, body + 12) in
+  let saddr: RV = cell_rd(armc.mem, fr, scr.val) in
+  let tag: RV = rd_u64(saddr.mem, saddr.val) in
+  run_case_arms(tag.mem, vm, fr, id.val, tag.val, body + 16, armc.val)
+
+// One case arm: variant str, symbol opt, tag u64, payload tref, payload
+// offset u64, block. On a match (or the last arm) run the block, store its
+// result, and skip the remaining arms to land past the case's tail tref.
+fn run_case_arms(mem: string, vm: Vm, fr: Frame, id: i64, tag: i64, pc: i64, remaining: i64) -> Ex effects[state] =
+  let o: RV = skip_opt(mem, pc + 4) in
+  let atag: RV = rd_u64(o.mem, o.val) in
+  let bpc: i64 = o.val + 20 in
+  if remaining <= 1 || atag.val == tag then
+    let ex: Ex = exec_block(atag.mem, vm, fr, bpc) in
+    (if ex.status != 0 then ex
+     else
+       let rest: RV = skip_case_arms(ex.mem, ex.pc, remaining - 1) in
+       let m: string = cell_wr(rest.mem, fr, id, ex.val) in
+       mk_ex(m, rest.val + 4, 0, 0))
+  else
+    let sk: RV = skip_block(atag.mem, bpc) in
+    run_case_arms(sk.mem, vm, fr, id, tag, sk.val, remaining - 1)
+
+// Store a block result into an accumulator/item local: aggregates memcpy
+// their bytes; scalars write the full 8-byte cell (backend parity).
+fn store_to_local(mem: string, fr: Frame, tref: i64, addr: i64, v: i64) -> string effects[state] =
+  let kind: RV = type_kind(mem, fr, tref) in
+  if kind.val >= 12 then
+    let size: RV = type_size(kind.mem, fr, tref) in
+    mem_copy(size.mem, addr, v, size.val)
+  else wr_u64(kind.mem, addr, v)
+
+// The local-offset read shared by the fold/loop drivers.
+fn local_addr(mem: string, fr: Frame, slot: i64) -> RV =
+  let loff: RV = rd_u32(mem, fr.mb + 40 + fr.pcount * 8 + slot * 4) in
+  mk_rv(loff.mem, fr.lb + loff.val)
+
+// The fold target's element base: an array's address directly, a slice's
+// data pointer (kind 13) through one deref.
+fn fold_base(mem: string, fr: Frame, ttref: i64, tgt: i64) -> RV =
+  let tkind: RV = type_kind(mem, fr, ttref) in
+  let base0: RV = cell_rd(tkind.mem, fr, tgt) in
+  if tkind.val == 13 then rd_u64(base0.mem, base0.val) else mk_rv(base0.mem, base0.val)
+
+// Seed an accumulator local from a value cell.
+fn seed_local(mem: string, fr: Frame, tref: i64, addr: i64, vref: i64) -> string effects[state] =
+  let v: RV = cell_rd(mem, fr, vref) in
+  store_to_local(v.mem, fr, tref, addr, v.val)
+
+// fold: id, target address, target tref, len, init, index/acc/item slots,
+// body block, element tref, acc tref, tref. Drive the body once per index:
+// the item local gets the element's bytes, the acc local the body result.
+fn exec_fold(mem: string, vm: Vm, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let tgt: RV = rd_u32(id.mem, body + 4) in
+  let ttref: RV = rd_u32(tgt.mem, body + 8) in
+  let lref: RV = rd_u32(ttref.mem, body + 12) in
+  let iref: RV = rd_u32(lref.mem, body + 16) in
+  let islot: RV = rd_u32(iref.mem, body + 20) in
+  let aslot: RV = rd_u32(islot.mem, body + 24) in
+  let itslot: RV = rd_u32(aslot.mem, body + 28) in
+  let bpc: i64 = body + 32 in
+  let sk: RV = skip_block(itslot.mem, bpc) in
+  let etref: RV = rd_u32(sk.mem, sk.val) in
+  let atref: RV = rd_u32(etref.mem, sk.val + 4) in
+  let a: FoldArgs = { id: id.val, tgt: tgt.val, ttref: ttref.val, lref: lref.val, iref: iref.val, islot: islot.val, aslot: aslot.val, itslot: itslot.val, bpc: bpc, etref: etref.val, atref: atref.val, end: sk.val + 12 } in
+  fold_drive(atref.mem, vm, fr, a)
+
+// The fold driver proper (split from the header parse for frame size; the
+// decoded header rides in one Copy record - the 8-machine-param cap).
+fn fold_drive(mem: string, vm: Vm, fr: Frame, a: FoldArgs) -> Ex effects[state] =
+  let base: RV = fold_base(mem, fr, a.ttref, a.tgt) in
+  let stride: RV = elem_stride(base.mem, fr, a.etref) in
+  let esize: RV = type_size(stride.mem, fr, a.etref) in
+  let len: RV = cell_rd(esize.mem, fr, a.lref) in
+  let ia: RV = local_addr(len.mem, fr, a.islot) in
+  let aa: RV = local_addr(ia.mem, fr, a.aslot) in
+  let ita: RV = local_addr(aa.mem, fr, a.itslot) in
+  let seeded: string = seed_local(ita.mem, fr, a.atref, aa.val, a.iref) in
+  let done: St4 =
+    loop st = mk_st4(seeded, 0, 0, 0) while st.st == 0 && st.aux < len.val do
+      let cur: St4 = st in
+      let m1: string = wr_u64(cur.mem, ia.val, cur.aux) in
+      let m2: string = mem_copy(m1, ita.val, base.val + cur.aux * stride.val, esize.val) in
+      let ex: Ex = exec_block(m2, vm, fr, a.bpc) in
+      if ex.status != 0 then mk_st4(ex.mem, ex.status, ex.val, cur.aux)
+      else
+        let m3: string = store_to_local(ex.mem, fr, a.atref, aa.val, ex.val) in
+        mk_st4(m3, 0, 0, cur.aux + 1)
+  in
+  if done.st != 0 then mk_ex(done.mem, a.end, done.st, done.val)
+  else fold_finish(done.mem, fr, a.id, a.atref, aa.val, a.end)
+
+// The fold/loop result: an aggregate accumulator yields its local's
+// address; a scalar yields the cell stored there.
+fn fold_finish(mem: string, fr: Frame, id: i64, atref: i64, aa: i64, end: i64) -> Ex effects[state] =
+  let kind: RV = type_kind(mem, fr, atref) in
+  if kind.val >= 12 then
+    let m: string = cell_wr(kind.mem, fr, id, aa) in
+    mk_ex(m, end, 0, 0)
+  else
+    let v: RV = rd_u64(kind.mem, aa) in
+    let m: string = cell_wr(v.mem, fr, id, v.val) in
+    mk_ex(m, end, 0, 0)
+
+// loop: id, acc slot, init, cond block, body block, acc tref, tref. Seed
+// the accumulator local, then: run cond; 0 exits; run body; store the acc.
+fn exec_loop(mem: string, vm: Vm, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let aslot: RV = rd_u32(id.mem, body + 4) in
+  let iref: RV = rd_u32(aslot.mem, body + 8) in
+  let cpc: i64 = body + 12 in
+  let sk1: RV = skip_block(iref.mem, cpc) in
+  let sk2: RV = skip_block(sk1.mem, sk1.val) in
+  let atref: RV = rd_u32(sk2.mem, sk2.val) in
+  let a: LoopArgs = { id: id.val, iref: iref.val, aslot: aslot.val, cpc: cpc, bpc: sk1.val, atref: atref.val, end: sk2.val + 8 } in
+  loop_drive(atref.mem, vm, fr, a)
+
+// The loop driver proper (split from the header parse for frame size; the
+// decoded header rides in one Copy record - the 8-machine-param cap).
+fn loop_drive(mem: string, vm: Vm, fr: Frame, a: LoopArgs) -> Ex effects[state] =
+  let aa: RV = local_addr(mem, fr, a.aslot) in
+  let seeded: string = seed_local(aa.mem, fr, a.atref, aa.val, a.iref) in
+  let done: St4 =
+    loop st = mk_st4(seeded, 0, 0, 1) while st.st == 0 && st.aux == 1 do
+      let cur: St4 = st in
+      let c: Ex = exec_block(cur.mem, vm, fr, a.cpc) in
+      if c.status != 0 then mk_st4(c.mem, c.status, c.val, 0)
+      else if c.val == 0 then mk_st4(c.mem, 0, 0, 0)
+      else
+        let b: Ex = exec_block(c.mem, vm, fr, a.bpc) in
+        if b.status != 0 then mk_st4(b.mem, b.status, b.val, 0)
+        else
+          let m3: string = store_to_local(b.mem, fr, a.atref, aa.val, b.val) in
+          mk_st4(m3, 0, 0, 1)
+  in
+  if done.st != 0 then mk_ex(done.mem, a.end, done.st, done.val)
+  else fold_finish(done.mem, fr, a.id, a.atref, aa.val, a.end)
 
 // opcodes 43..55: bounds check, scalar load/store/copy/move, drop (no-op),
 // borrow_debug (no-op), return, early_return - a thin router; the data ops
 // live in their own functions to keep every frame inside the v0 budget.
 fn exec_op_mem(mem: string, vm: Vm, fr: Frame, code: i64, body: i64) -> Ex effects[state] =
   if code == 43 then exec_bounds(mem, fr, body)
+  else if code == 44 then exec_range_check(mem, fr, body)
+  else if code == 45 then exec_load_enum_tag(mem, fr, body)
+  else if code == 46 then exec_store_enum_tag(mem, fr, body)
   else if code == 47 || code == 50 then exec_load_move(mem, fr, body)
   else if code == 48 then exec_store(mem, fr, body)
   else if code == 49 then exec_copy_cell(mem, fr, body)
@@ -886,7 +1226,12 @@ fn exec_load_move(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
   let aref: RV = rd_u32(id.mem, body + 4) in
   let tref: RV = rd_u32(aref.mem, body + 8) in
   let kind: RV = type_kind(tref.mem, fr, tref.val) in
-  if kind.val >= 11 then mk_ex(kind.mem, body, 2, trap_unsupported())
+  if kind.val == 11 then mk_ex(kind.mem, body, 2, trap_unsupported())
+  else if kind.val >= 12 then
+    // an aggregate value IS its address: alias the cell (backend parity)
+    let addr: RV = cell_rd(kind.mem, fr, aref.val) in
+    let m: string = cell_wr(addr.mem, fr, id.val, addr.val) in
+    mk_ex(m, body + 12, 0, 0)
   else
     let addr: RV = cell_rd(kind.mem, fr, aref.val) in
     let v: RV = load_scalar(addr.mem, kind.val, addr.val) in
@@ -899,7 +1244,14 @@ fn exec_store(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
   let vref: RV = rd_u32(aref.mem, body + 4) in
   let tref: RV = rd_u32(vref.mem, body + 8) in
   let kind: RV = type_kind(tref.mem, fr, tref.val) in
-  if kind.val >= 11 then mk_ex(kind.mem, body, 2, trap_unsupported())
+  if kind.val == 11 then mk_ex(kind.mem, body, 2, trap_unsupported())
+  else if kind.val >= 12 then
+    // aggregate store: memcpy the value's bytes to the destination place
+    let size: RV = type_size(kind.mem, fr, tref.val) in
+    let addr: RV = cell_rd(size.mem, fr, aref.val) in
+    let v: RV = cell_rd(addr.mem, fr, vref.val) in
+    let m: string = mem_copy(v.mem, addr.val, v.val, size.val) in
+    mk_ex(m, body + 12, 0, 0)
   else
     let addr: RV = cell_rd(kind.mem, fr, aref.val) in
     let v: RV = cell_rd(addr.mem, fr, vref.val) in
@@ -920,10 +1272,52 @@ fn exec_bdebug(mem: string, body: i64) -> Ex =
   mk_ex(o.mem, o.val + 4, 0, 0)
 
 // return / early_return: value, tref -> unwind to the function boundary.
-fn exec_return(mem: string, fr: Frame, body: i64) -> Ex =
+// An indirect-returning function copies the value's bytes to the hidden
+// return slot (cell 0) and yields that destination address.
+fn exec_return(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
   let vref: RV = rd_u32(mem, body) in
   let v: RV = cell_rd(vref.mem, fr, vref.val) in
-  mk_ex(v.mem, body + 8, 3, v.val)
+  if fr.hidden == 0 then mk_ex(v.mem, body + 8, 3, v.val)
+  else
+    let rsize: RV = rd_u32(v.mem, fr.mb + 32) in
+    let dest: RV = rd_u64(rsize.mem, fr.fb) in
+    let m: string = mem_copy(dest.mem, dest.val, v.val, rsize.val) in
+    mk_ex(m, body + 8, 3, dest.val)
+
+// slice_range_check: id, start, len, source_len, tref. Unsigned compares
+// (a negative start/len is huge unsigned and traps): start <= source_len and
+// len <= source_len - start, else trap; the result is unit.
+fn exec_range_check(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let sref: RV = rd_u32(id.mem, body + 4) in
+  let lref: RV = rd_u32(sref.mem, body + 8) in
+  let nref: RV = rd_u32(lref.mem, body + 12) in
+  let start: RV = cell_rd(nref.mem, fr, sref.val) in
+  let len: RV = cell_rd(start.mem, fr, lref.val) in
+  let src: RV = cell_rd(len.mem, fr, nref.val) in
+  if to_u64(start.val) > to_u64(src.val) || to_u64(len.val) > to_u64(src.val) - to_u64(start.val) then
+    mk_ex(src.mem, body + 20, 2, trap_bounds())
+  else
+    let m: string = cell_wr(src.mem, fr, id.val, 0) in
+    mk_ex(m, body + 20, 0, 0)
+
+// load_enum_tag: id, address, tref -> the 8-byte tag at the enum's base.
+fn exec_load_enum_tag(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
+  let id: RV = rd_u32(mem, body) in
+  let aref: RV = rd_u32(id.mem, body + 4) in
+  let addr: RV = cell_rd(aref.mem, fr, aref.val) in
+  let tag: RV = rd_u64(addr.mem, addr.val) in
+  let m: string = cell_wr(tag.mem, fr, id.val, tag.val) in
+  mk_ex(m, body + 12, 0, 0)
+
+// store_enum_tag: address, tref, variant str, symbol opt, tag u64.
+fn exec_store_enum_tag(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
+  let aref: RV = rd_u32(mem, body) in
+  let o: RV = skip_opt(aref.mem, body + 12) in
+  let tag: RV = rd_u64(o.mem, o.val) in
+  let addr: RV = cell_rd(tag.mem, fr, aref.val) in
+  let m: string = wr_u64(addr.mem, addr.val, tag.val) in
+  mk_ex(m, o.val + 8, 0, 0)
 
 // bounds_check: id, index, len u64, len_value opt, tref. Out of range traps.
 fn exec_bounds(mem: string, fr: Frame, body: i64) -> Ex effects[state] =
@@ -951,20 +1345,42 @@ fn call_function(mem: string, vm: Vm, fidx: i64, frame_base: i64) -> Ex effects[
   let mb: RV = rd_u32(mem, vm.meta_index + fidx * 4) in
   let ops_base: RV = rd_u32(mb.mem, mb.val) in
   let tb: RV = rd_u32(ops_base.mem, mb.val + 4) in
-  let vcount: RV = rd_u32(tb.mem, mb.val + 8) in
-  let pcount: RV = rd_u32(vcount.mem, mb.val + 12) in
-  let ltotal: RV = rd_u32(pcount.mem, mb.val + 20) in
-  let vb: i64 = frame_base + pcount.val * 8 + ltotal.val in
+  let lt: RV = rd_u32(tb.mem, mb.val + 8) in
+  let vcount: RV = rd_u32(lt.mem, mb.val + 12) in
+  let pcount: RV = rd_u32(vcount.mem, mb.val + 16) in
+  let ltotal: RV = rd_u32(pcount.mem, mb.val + 24) in
+  let rkind: RV = rd_u32(ltotal.mem, mb.val + 28) in
+  let ctotal: RV = rd_u32(rkind.mem, mb.val + 36) in
+  let hidden: i64 = if rkind.val >= 12 then 1 else 0 in
+  let cb: i64 = frame_base + (hidden + pcount.val) * 8 in
+  let lb: i64 = cb + ctotal.val in
+  let vb: i64 = lb + ltotal.val in
   let frame_end: i64 = vb + vcount.val * 8 in
   if frame_end > vm.stack_end then
-        mk_ex(ltotal.mem, 0, 2, trap_stack_overflow())
+    mk_ex(ctotal.mem, 0, 2, trap_stack_overflow())
   else
-    let fr: Frame = { fb: frame_base, vb: vb, pcount: pcount.val, mb: mb.val, tb: tb.val } in
-    let count: RV = rd_u32(ltotal.mem, ops_base.val) in
+    let fr: Frame = { fb: frame_base, vb: vb, pcount: pcount.val, hidden: hidden, cb: cb, lb: lb, mb: mb.val, tb: tb.val, lt: lt.val } in
+    let copied: string = copy_indirect_params(ctotal.mem, fr, 0) in
+    let count: RV = rd_u32(copied, ops_base.val) in
     let run: Ex = exec_ops(count.mem, vm, fr, ops_base.val + 4, count.val) in
     if run.status == 0 then
-            mk_ex(run.mem, run.pc, 2, trap_malformed())
+      mk_ex(run.mem, run.pc, 2, trap_malformed())
     else run
+
+// The callee prologue's ownership copies: each aggregate-indirect param's
+// pointed-to bytes are copied into the frame's copy slot (the param CELL
+// keeps the caller's address; addr_of_param(indirect) yields the copy).
+fn copy_indirect_params(mem: string, fr: Frame, j: i64) -> string effects[state] =
+  if j >= fr.pcount then mem
+  else
+    let entry: i64 = fr.mb + 40 + j * 8 in
+    let coff: RV = rd_u32(mem, entry) in
+    if coff.val == 0xffffffff then copy_indirect_params(coff.mem, fr, j + 1)
+    else
+      let size: RV = rd_u32(coff.mem, entry + 4) in
+      let src: RV = rd_u64(size.mem, fr.fb + (fr.hidden + j) * 8) in
+      let m1: string = mem_copy(src.mem, fr.cb + coff.val, src.val, size.val) in
+      copy_indirect_params(m1, fr, j + 1)
 
 // ---------------------------------------------------------------------------
 // entry
@@ -974,12 +1390,15 @@ fn call_function(mem: string, vm: Vm, fidx: i64, frame_base: i64) -> Ex effects[
 // result (or trap) through the output protocol.
 fn execute_entry<'r>(mem: string, vm: Vm) -> i64 effects[io, alloc, state, ffi, unsafe] =
   let emb: RV = rd_u32(mem, vm.meta_index + vm.entry * 4) in
-  let epcount: RV = rd_u32(emb.mem, emb.val + 12) in
-  if epcount.val > 0 then
+  let epcount: RV = rd_u32(emb.mem, emb.val + 16) in
+  let rkind0: RV = rd_u32(epcount.mem, emb.val + 28) in
+  if epcount.val > 0 || rkind0.val >= 11 then
+    // a param-taking or aggregate-result entry is outside the rung-0
+    // protocol (the corpus is scalar-result programs)
     let t: i64 = print_trap(trap_entry_params()) in
     101
   else
-    let rkind: RV = rd_u32(epcount.mem, emb.val + 24) in
+    let rkind: RV = mk_rv(rkind0.mem, rkind0.val) in
     let result: Ex = call_function(rkind.mem, vm, vm.entry, vm.stack_base) in
     if result.status == 3 then
       let p: i64 = print_ok(rkind.val, result.val) in
@@ -1015,11 +1434,13 @@ fn run(mem: string) -> i64 effects[io, alloc, state, ffi, unsafe] =
       table_base: tail + 12,
       region_base: tail + 12 + fns.val * 12,
       meta_index: meta_base,
+      data_index: meta_base + fns.val * 4,
       stack_base: stack_base,
       stack_end: stack_base + stack_size()
     } in
     let filled: string = zero_fill(fns.mem, vm.stack_end) in
-    let built: string = build_meta(filled, vm, 0, meta_base + fns.val * 4) in
+    let with_data: string = build_data_index(filled, doff + 4, doff + 4 + datas.val * 4, vm.data_index, datas.val, 0, 0) in
+    let built: string = build_meta(with_data, vm, 0, vm.data_index + datas.val * 4) in
     execute_entry(built, vm)
 
 // Sum `count` little-endian u32s starting at `base` (a pool's byte-length

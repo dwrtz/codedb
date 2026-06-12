@@ -524,8 +524,28 @@ fixture fail), with div0/mod0 trapping identically on both sides. The
 authoring tax surfaced one more backend reality, now documented: every op's
 value id costs 8 frame bytes, so big dispatchers must split (`exec_op_*`
 routers + one-literal-site record constructors `mk_rv`/`mk_ex`).
-Case/fold/loop, aggregates, static data, and the heap ops trap
-`unsupported_op` until Stages 3/4 (pinned by the frontier test).
+(6) **Stage 3 — aggregates execute.** Records/enums/arrays/slices/static
+data/case/fold/loop, mirroring the backend's value model exactly: an
+aggregate value IS its address (load/move/copy alias the cell; only `store`
+copies bytes), addr-of ops use the places' explicit offsets (index stride =
+element size rounded to its layout alignment), enum tags are 8 bytes at
+offset 0, `case` treats its last arm as the default, the `fold`/`loop`
+drivers iterate over accumulator/index/item locals with early returns
+propagating out of iteration bodies, and calls implement the hidden-return-
+slot + indirect-param-copy ABI (callee frames carry ownership copies of
+aggregate-indirect params; the param cell keeps the caller's address —
+addr_of_param(indirect) yields the copy). A new CIR consumer kind splits
+slices from other aggregates (the fold target deref). Gate: tokenizer
+(ok:123 / early-exit -1 / empty) and sha256's digest word, plus a
+per-feature aggregate fixture (nested records, enum payloads with a default
+arm, runtime-indexed arrays, fill + array_set, fold with an early return
+from its body, static slices, aggregate params/returns) — all result-equal
+to the Rust evaluator; param-taking and aggregate-result entries stay
+outside the protocol fail-closed. Two more v0 frame realities documented:
+calls cap at 8 machine parameters (driver headers ride in Copy records) and
+the dispatcher/driver split keeps every frame under the 4095-byte budget.
+The heap ops (box/vec/string/argv) trap `unsupported_op` until Stage 4
+(pinned by the frontier test).
 
 Deliverables:
 
