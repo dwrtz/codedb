@@ -38,6 +38,12 @@ const PLATFORM_MALLOC_SYMBOL_HASH: &str = "platform:malloc";
 const PLATFORM_FREE_SYMBOL_HASH: &str = "platform:free";
 const PLATFORM_MALLOC_ABI_SYMBOL: &str = "malloc";
 const PLATFORM_FREE_ABI_SYMBOL: &str = "free";
+const PLATFORM_ARG_COUNT_SYMBOL_HASH: &str = "platform:arg_count";
+const PLATFORM_ARG_COUNT_ABI_SYMBOL: &str = "codedb_arg_count";
+const PLATFORM_ARG_LEN_SYMBOL_HASH: &str = "platform:arg_len";
+const PLATFORM_ARG_LEN_ABI_SYMBOL: &str = "codedb_arg_len";
+const PLATFORM_ARG_BYTE_SYMBOL_HASH: &str = "platform:arg_byte";
+const PLATFORM_ARG_BYTE_ABI_SYMBOL: &str = "codedb_arg_byte";
 
 /// A native object backend target.
 // Consumed by the `op_registry` backend-coverage unit test; kept in all builds
@@ -713,6 +719,9 @@ fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::StringWithCapacity { .. }
             | LoweredOp::StringPush { .. }
             | LoweredOp::StringGet { .. }
+            | LoweredOp::ArgCount { .. }
+            | LoweredOp::ArgLen { .. }
+            | LoweredOp::ArgByte { .. }
             | LoweredOp::BoundsCheck { .. }
             | LoweredOp::SliceRangeCheck { .. }
             | LoweredOp::LoadEnumTag { .. }
@@ -828,7 +837,10 @@ fn validate_native_ops(
             | LoweredOp::StringLen { .. }
             | LoweredOp::StringWithCapacity { .. }
             | LoweredOp::StringPush { .. }
-            | LoweredOp::StringGet { .. } => {}
+            | LoweredOp::StringGet { .. }
+            | LoweredOp::ArgCount { .. }
+            | LoweredOp::ArgLen { .. }
+            | LoweredOp::ArgByte { .. } => {}
             LoweredOp::AddrOfParam { place, .. } => {
                 let LoweredPlace::Param {
                     slot, type_hash, ..
@@ -1727,6 +1739,41 @@ fn validate_native_op_flow(
             }
             native_insert_value(values, id, type_hash)?;
         }
+        LoweredOp::ArgCount { id, type_hash } => {
+            if type_hash != &type_hash_for("I64") {
+                bail!("native object backend saw arg_count non-i64 result");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::ArgLen {
+            id,
+            index,
+            type_hash,
+        } => {
+            if native_value_type(values, index)? != &type_hash_for("I64") {
+                bail!("native object backend saw arg_len non-i64 index");
+            }
+            if type_hash != &type_hash_for("I64") {
+                bail!("native object backend saw arg_len non-i64 result");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
+        LoweredOp::ArgByte {
+            id,
+            index,
+            byte,
+            type_hash,
+        } => {
+            for operand in [index, byte] {
+                if native_value_type(values, operand)? != &type_hash_for("I64") {
+                    bail!("native object backend saw arg_byte non-i64 operand");
+                }
+            }
+            if type_hash != &type_hash_for("U8") {
+                bail!("native object backend saw arg_byte non-u8 result");
+            }
+            native_insert_value(values, id, type_hash)?;
+        }
         LoweredOp::StringWithCapacity {
             id,
             address,
@@ -2558,6 +2605,9 @@ fn collect_value_ids_inner(
             | LoweredOp::StringWithCapacity { id, .. }
             | LoweredOp::StringPush { id, .. }
             | LoweredOp::StringGet { id, .. }
+            | LoweredOp::ArgCount { id, .. }
+            | LoweredOp::ArgLen { id, .. }
+            | LoweredOp::ArgByte { id, .. }
             | LoweredOp::BoundsCheck { id, .. }
             | LoweredOp::SliceRangeCheck { id, .. }
             | LoweredOp::LoadEnumTag { id, .. }
@@ -3095,6 +3145,35 @@ impl FunctionEmitter {
                 ..
             } => {
                 self.emit_buffer_len_x86(id, string_address, string_type_hash, "string")?;
+            }
+            // Process-argument reads (R12): calls into the link harness's argv
+            // runtime, the malloc/free platform-symbol pattern. Bounds aborts
+            // live in the runtime (the native form of eval's range error).
+            LoweredOp::ArgCount { id, .. } => {
+                self.emit_platform_call_x86(
+                    PLATFORM_ARG_COUNT_SYMBOL_HASH,
+                    PLATFORM_ARG_COUNT_ABI_SYMBOL,
+                );
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::ArgLen { id, index, .. } => {
+                self.mov_stack_arg_reg(self.value_offset(index)?, 0)?;
+                self.emit_platform_call_x86(
+                    PLATFORM_ARG_LEN_SYMBOL_HASH,
+                    PLATFORM_ARG_LEN_ABI_SYMBOL,
+                );
+                self.mov_stack_rax(self.value_offset(id)?);
+            }
+            LoweredOp::ArgByte {
+                id, index, byte, ..
+            } => {
+                self.mov_stack_arg_reg(self.value_offset(index)?, 0)?;
+                self.mov_stack_arg_reg(self.value_offset(byte)?, 1)?;
+                self.emit_platform_call_x86(
+                    PLATFORM_ARG_BYTE_SYMBOL_HASH,
+                    PLATFORM_ARG_BYTE_ABI_SYMBOL,
+                );
+                self.mov_stack_rax(self.value_offset(id)?);
             }
             LoweredOp::StringWithCapacity {
                 id,
@@ -5140,6 +5219,34 @@ impl Arm64Emitter {
                 ..
             } => {
                 self.emit_buffer_len_arm64(id, string_address, string_type_hash, "string")?;
+            }
+            // Process-argument reads (R12): calls into the link harness's argv
+            // runtime (see the x86_64 arm for the convention).
+            LoweredOp::ArgCount { id, .. } => {
+                self.emit_platform_call_arm64(
+                    PLATFORM_ARG_COUNT_SYMBOL_HASH,
+                    PLATFORM_ARG_COUNT_ABI_SYMBOL,
+                );
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::ArgLen { id, index, .. } => {
+                self.ldr_stack(0, self.value_offset(index)?)?;
+                self.emit_platform_call_arm64(
+                    PLATFORM_ARG_LEN_SYMBOL_HASH,
+                    PLATFORM_ARG_LEN_ABI_SYMBOL,
+                );
+                self.str_stack(0, self.value_offset(id)?)?;
+            }
+            LoweredOp::ArgByte {
+                id, index, byte, ..
+            } => {
+                self.ldr_stack(0, self.value_offset(index)?)?;
+                self.ldr_stack(1, self.value_offset(byte)?)?;
+                self.emit_platform_call_arm64(
+                    PLATFORM_ARG_BYTE_SYMBOL_HASH,
+                    PLATFORM_ARG_BYTE_ABI_SYMBOL,
+                );
+                self.str_stack(0, self.value_offset(id)?)?;
             }
             LoweredOp::StringWithCapacity {
                 id,

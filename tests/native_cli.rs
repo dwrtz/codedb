@@ -110,7 +110,8 @@ fn hello_invoice_cli_captures_stdout_exit_and_entry_metadata() {
 fn assert_entry_point_metadata(entry_point: &JsonValue) {
     assert_eq!(entry_point["schema"], "codedb/entry-point/v1");
     assert_eq!(entry_point["kind"], "process");
-    assert_eq!(entry_point["args"]["supported"], false);
+    assert_eq!(entry_point["args"]["supported"], true);
+    assert_eq!(entry_point["args"]["source"], "process-argv");
     assert_eq!(entry_point["stdout"]["supported"], true);
     assert_eq!(entry_point["exit_code"]["source"], "entry_return_value");
     assert_eq!(entry_point["runtime"]["semantic_interpreter"], false);

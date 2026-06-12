@@ -1171,6 +1171,51 @@ impl CodeDb {
                     value,
                 )
             }
+            kind @ ("arg_count" | "arg_len" | "arg_byte") => {
+                // Process-argument reads (R12): trace the index operands, then
+                // produce the value from the same seeded argument list the
+                // evaluator reads (`set_process_args`).
+                let mut operands = Vec::new();
+                let keys: &[&str] = match kind {
+                    "arg_count" => &[],
+                    "arg_len" => &["index"],
+                    _ => &["index", "byte"],
+                };
+                let mut failed = None;
+                for key in keys {
+                    let child_hash = payload
+                        .get(*key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("{kind} missing {key}"))?;
+                    match self.trace_expr(
+                        state,
+                        frame,
+                        symbol_hash,
+                        function_def_hash,
+                        child_hash,
+                        args,
+                        locals,
+                    ) {
+                        Ok(value) => operands.push(value),
+                        Err(err) => {
+                            failed = Some(err);
+                            break;
+                        }
+                    }
+                }
+                let value = match failed {
+                    Some(err) => Err(err),
+                    None => crate::expr::trace_process_arg_value(kind, &operands),
+                };
+                self.finish_current_expr(
+                    state,
+                    frame,
+                    symbol_hash,
+                    function_def_hash,
+                    expr_hash,
+                    value,
+                )
+            }
             "borrow_shared" => {
                 let target_hash = payload
                     .get("target")

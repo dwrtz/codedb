@@ -1024,15 +1024,31 @@ the CodeDB front-end lowers the acceptance corpus to IR that is hash-identical t
 
 ## Phase 16 — Process Arguments / argv (R12)
 
-Goal: a richer entry signature so the self-hosted compiler reads a source path.
+Goal: the self-hosted compiler can read a source path from its command line.
 
-Status: planned. Resolves R12.
+Status: implemented. Resolves R12 — as ambient-input BUILTINS rather than an
+entry-signature change: `arg_count() -> i64`, `arg_len(i) -> i64`,
+`arg_byte(i, j) -> u8` (process arguments, program name excluded; `io`
+effect; out-of-range = eval error / native trap). The entry stays
+parameterless, so every existing harness shape is preserved. Natively the cc
+link harness captures argc/argv and the lowered ops call its runtime
+accessors (`codedb_arg_*`, the malloc/free platform-symbol pattern); the
+reference evaluator/tracer read the same list seeded by `--process-arg` on
+`eval`/`trace`/`debug` — eval == native on the same arguments
+(tests/argv_native.rs). `std.io.arg_string(i)` composes the byte reads into
+an owned string with a move-only loop accumulator (loop-carried drop glue) —
+the source-path read the self-hosted front-end needs. envp stays deferred
+until something forces it.
 
-Deliverables:
+Deliverables (delivered):
 
 ```text
-target argv/envp threaded into an entry signature (e.g. main(args: slice<...>))
-capability surfacing of args in build/entry metadata
+arg_count/arg_len/arg_byte builtins: typed nodes, eval/trace parity, lowered
+  ops, both native backends via the cc-harness argv runtime
+capability surfacing: the `args` capability + codedb_arg_* platform externals
+  in the build plan; entry metadata args.supported = true
+std.io.arg_string; --process-arg on eval/trace/debug
+(deferred: envp; argv in an entry signature — the builtin form unblocks rung A)
 ```
 
 Files likely touched:

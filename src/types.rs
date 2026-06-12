@@ -4948,6 +4948,18 @@ impl CodeDb {
                         expected_type,
                     );
                 }
+                if matches!(name.as_str(), "arg_count" | "arg_len" | "arg_byte") {
+                    return self.type_builtin_process_arg(
+                        current_module,
+                        name,
+                        args,
+                        root,
+                        param_names,
+                        param_types,
+                        region_scope,
+                        locals,
+                    );
+                }
                 if name == "array_set" {
                     return self.type_builtin_array_set(
                         current_module,
@@ -7896,6 +7908,71 @@ impl CodeDb {
     /// for a Copy fixed buffer, and the substrate for a worklist that builds an
     /// array by index (e.g. the SHA-256 message schedule).
     #[allow(clippy::too_many_arguments)]
+    /// Type the process-argument builtins (R12): `arg_count() -> i64`,
+    /// `arg_len(i: i64) -> i64`, `arg_byte(i: i64, j: i64) -> u8`. They read
+    /// the process's command-line arguments (the program name excluded), an
+    /// ambient input — so they require the `io` effect. Out-of-range indices
+    /// are a runtime error (eval) / trap (native), like other bounds checks.
+    #[allow(clippy::too_many_arguments)]
+    fn type_builtin_process_arg(
+        &mut self,
+        current_module: &str,
+        name: &str,
+        args: &[RawExpr],
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
+        locals: &mut Vec<LocalTypeBinding>,
+    ) -> Result<TypeCheckResult> {
+        let (arity, keys, result): (usize, &[&str], &str) = match name {
+            "arg_count" => (0, &[], "I64"),
+            "arg_len" => (1, &["index"], "I64"),
+            "arg_byte" => (2, &["index", "byte"], "U8"),
+            other => bail!("unknown process-argument builtin {other}"),
+        };
+        if args.len() != arity {
+            bail!("{name} expects {arity} args, got {}", args.len());
+        }
+        let i64_hash = type_hash_for("I64");
+        let mut payload = serde_json::Map::new();
+        payload.insert("expr_kind".to_string(), json!(name));
+        for (arg, key) in args.iter().zip(keys) {
+            let typed = self.type_expr_with_locals_expecting(
+                current_module,
+                arg,
+                root,
+                param_names,
+                param_types,
+                region_scope,
+                locals,
+                Some(&i64_hash),
+            )?;
+            if typed.type_hash != i64_hash {
+                bail!(
+                    "{name} {key} must be i64, got {}",
+                    self.type_name(&typed.type_hash)?
+                );
+            }
+            payload.insert(key.to_string(), json!(typed.expr_hash));
+        }
+        let type_hash = type_hash_for(result);
+        payload.insert("type".to_string(), json!(type_hash));
+        let expr_hash = self.put_object("Expression", &JsonValue::Object(payload))?;
+        self.write_cache_json(
+            &expr_hash,
+            "typechecker",
+            "typed-dag",
+            ArtifactKind::TypedExpression,
+            &json!({ "type": type_hash }),
+        )?;
+        Ok(TypeCheckResult {
+            expr_hash,
+            type_hash,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn type_builtin_array_set(
         &mut self,
         current_module: &str,
@@ -8306,7 +8383,8 @@ impl CodeDb {
                 self.expr_escapes_local_borrow(root, value, locals_with_local_borrows)
             }
             "vec_new" | "vec_push" | "vec_get" | "vec_len" | "string_new" | "string_len"
-            | "string_with_capacity" | "string_push" | "string_get" => Ok(false),
+            | "string_with_capacity" | "string_push" | "string_get" | "arg_count" | "arg_len"
+            | "arg_byte" => Ok(false),
             "raw_ptr_cast" => {
                 let value = payload
                     .get("value")
@@ -8898,6 +8976,12 @@ impl CodeDb {
                 self.symbol_display(root, &entry.symbol)?
             );
         }
+        if self.expr_requires_io(&body)? && !declared.contains(&Effect::Io) {
+            bail!(
+                "bad_effects: function {} requires undeclared effect io",
+                self.symbol_display(root, &entry.symbol)?
+            );
+        }
         let dependencies = self.dependencies_for_definition(root, &entry.definition)?;
         for dependency in dependencies {
             let Some(callee) = self.root_symbol(root, &dependency) else {
@@ -9245,6 +9329,24 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("string_with_capacity missing capacity"))?;
                 self.verify_expr_borrows(root, capacity, param_types, state, ExprUse::Value)
+            }
+            "arg_count" => Ok(()),
+            "arg_len" => {
+                let index = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("arg_len missing index"))?;
+                self.verify_expr_borrows(root, index, param_types, state, ExprUse::Value)
+            }
+            "arg_byte" => {
+                for key in ["index", "byte"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("arg_byte missing {key}"))?;
+                    self.verify_expr_borrows(root, child, param_types, state, ExprUse::Value)?;
+                }
+                Ok(())
             }
             "string_push" => {
                 let target = payload
@@ -11088,6 +11190,12 @@ impl CodeDb {
             {
                 "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref"
                 | "local_ref" => false,
+                "arg_count" => false,
+                "arg_len" => self.expr_child_requires_state(&payload, "index")?,
+                "arg_byte" => {
+                    self.expr_child_requires_state(&payload, "index")?
+                        || self.expr_child_requires_state(&payload, "byte")?
+                }
                 "assign" => true,
                 "call" => {
                     let mut required = false;
@@ -11229,6 +11337,30 @@ impl CodeDb {
         )
     }
 
+    /// Whether the expression reads the process's command-line arguments (R12)
+    /// — the intrinsic `io` requirement. Unlike the state/alloc/unsafe walkers,
+    /// only the three `arg_*` builtins require `io` intrinsically (extern io
+    /// propagates by callee signature, not by expression kind), so this walk is
+    /// derived from the central child table instead of a per-kind match — a new
+    /// expression kind is covered automatically.
+    pub(crate) fn expr_requires_io(&self, expr_hash: &str) -> Result<bool> {
+        let payload = self.get_payload(expr_hash)?;
+        if matches!(
+            payload.get("expr_kind").and_then(JsonValue::as_str),
+            Some("arg_count" | "arg_len" | "arg_byte")
+        ) {
+            return Ok(true);
+        }
+        let mut requires = false;
+        for_each_child_expr_hash(&payload, &mut |child| {
+            if !requires {
+                requires = self.expr_requires_io(child)?;
+            }
+            Ok(())
+        })?;
+        Ok(requires)
+    }
+
     fn expr_child_requires_state(&self, payload: &JsonValue, key: &str) -> Result<bool> {
         let child = payload
             .get(key)
@@ -11247,6 +11379,12 @@ impl CodeDb {
             {
                 "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref"
                 | "local_ref" => false,
+                "arg_count" => false,
+                "arg_len" => self.expr_child_requires_alloc(&payload, "index")?,
+                "arg_byte" => {
+                    self.expr_child_requires_alloc(&payload, "index")?
+                        || self.expr_child_requires_alloc(&payload, "byte")?
+                }
                 // `unbox` frees the box shell, so it requires `alloc` just like the
                 // allocating builtins (the deallocation is in the alloc effect domain).
                 "box_new" | "unbox" | "vec_new" | "string_new" | "string_with_capacity" => true,
@@ -11408,6 +11546,12 @@ impl CodeDb {
             {
                 "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref"
                 | "local_ref" => false,
+                "arg_count" => false,
+                "arg_len" => self.expr_child_requires_unsafe(&payload, "index")?,
+                "arg_byte" => {
+                    self.expr_child_requires_unsafe(&payload, "index")?
+                        || self.expr_child_requires_unsafe(&payload, "byte")?
+                }
                 "raw_ptr_cast" | "raw_load" | "raw_store" => true,
                 "assign" => {
                     self.expr_child_requires_unsafe(&payload, "target")?
@@ -12547,6 +12691,37 @@ impl CodeDb {
                     bail!("string_len target must be string");
                 }
                 type_hash_for("I64")
+            }
+            "arg_count" => type_hash_for("I64"),
+            kind @ ("arg_len" | "arg_byte") => {
+                // Process-argument reads (R12): every operand is an i64 index.
+                let keys: &[&str] = if kind == "arg_len" {
+                    &["index"]
+                } else {
+                    &["index", "byte"]
+                };
+                for key in keys {
+                    let child = payload
+                        .get(*key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("{kind} missing {key}"))?;
+                    let child_type = self.verify_expr_type_with_locals(
+                        child,
+                        root,
+                        param_types,
+                        allowed_regions,
+                        locals,
+                        fn_return,
+                    )?;
+                    if child_type != type_hash_for("I64") {
+                        bail!("{kind} {key} must be i64");
+                    }
+                }
+                if kind == "arg_len" {
+                    type_hash_for("I64")
+                } else {
+                    type_hash_for("U8")
+                }
             }
             "string_with_capacity" => {
                 let capacity_hash = payload
@@ -15058,8 +15233,10 @@ pub(crate) fn child_expr_hashes(payload: &JsonValue) -> Result<Vec<String>> {
 pub(crate) fn plain_child_expr_keys(kind: &str) -> Result<&'static [&'static str]> {
     Ok(match kind {
         "literal_i64" | "literal_bool" | "literal_unit" | "static_bytes" | "param_ref"
-        | "local_ref" => &[],
+        | "local_ref" | "arg_count" => &[],
         "unary" => &["expr"],
+        "arg_len" => &["index"],
+        "arg_byte" => &["index", "byte"],
         "int_cast" | "box_new" | "unbox" | "raw_ptr_cast" | "array_fill" | "enum_construct"
         | "return" => &["value"],
         "borrow_shared" | "borrow_mut" | "slice_from_array" | "slice_len" | "vec_len"

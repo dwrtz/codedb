@@ -419,7 +419,7 @@ impl CodeDb {
             .ok_or_else(|| anyhow!("link plan missing entry ABI symbol"))?;
         let export_wrappers = export_wrapper_source(&prepared.plan)?;
         let harness = format!(
-            "{export_wrappers}#include <stdio.h>\nlong {entry_abi_symbol}(void);\nint main(void) {{ printf(\"%lld\\n\", (long long){entry_abi_symbol}()); return 0; }}\n"
+            "{export_wrappers}#include <stdio.h>\n{ARGV_RUNTIME_SOURCE}long {entry_abi_symbol}(void);\nint main(void) {{ printf(\"%lld\\n\", (long long){entry_abi_symbol}()); return 0; }}\n"
         );
         let executable = link_with_cc_harness(&prepared, &harness)?;
         let artifact_hash = hash_bytes(BYTES_DOMAIN, &executable);
@@ -686,6 +686,21 @@ impl CodeDb {
                     .entry(format!("alloc:{symbol}"))
                     .or_insert(PlannedCapability {
                         name: "alloc".to_string(),
+                        source,
+                        symbol_hash: symbol.clone(),
+                        effects: effects.clone(),
+                    });
+            }
+            // Process-argument reads (R12) call the harness argv runtime;
+            // surface them as the `args` capability, like the box-allocation
+            // `alloc` tagging above.
+            if compiler_platform_usage.uses_args
+                && let Some(source) = qualified_symbol_display(root, &symbol)
+            {
+                capabilities
+                    .entry(format!("args:{symbol}"))
+                    .or_insert(PlannedCapability {
+                        name: "args".to_string(),
                         source,
                         symbol_hash: symbol.clone(),
                         effects: effects.clone(),
@@ -1039,10 +1054,10 @@ impl CodeDb {
             .ok_or_else(|| anyhow!("native record layout missing return ABI"))?;
         let call = match return_abi {
             "hidden_return_slot" => format!(
-                "void *{entry_abi_symbol}(void *out);\nstruct codedb_result {{ unsigned char bytes[{storage_bytes}]; }} __attribute__((aligned({align_bytes})));\nint main(void) {{\n  struct codedb_result out;\n  memset(&out, 0, sizeof(out));\n  {entry_abi_symbol}(&out);\n"
+                "{ARGV_RUNTIME_SOURCE}void *{entry_abi_symbol}(void *out);\nstruct codedb_result {{ unsigned char bytes[{storage_bytes}]; }} __attribute__((aligned({align_bytes})));\nint main(void) {{\n  struct codedb_result out;\n  memset(&out, 0, sizeof(out));\n  {entry_abi_symbol}(&out);\n"
             ),
             "by_value" => format!(
-                "uint64_t {entry_abi_symbol}(void);\nstruct codedb_result {{ unsigned char bytes[{storage_bytes}]; }} __attribute__((aligned({align_bytes})));\nint main(void) {{\n  struct codedb_result out;\n  memset(&out, 0, sizeof(out));\n  uint64_t result = {entry_abi_symbol}();\n  memcpy(&out, &result, {size_bytes});\n"
+                "{ARGV_RUNTIME_SOURCE}uint64_t {entry_abi_symbol}(void);\nstruct codedb_result {{ unsigned char bytes[{storage_bytes}]; }} __attribute__((aligned({align_bytes})));\nint main(void) {{\n  struct codedb_result out;\n  memset(&out, 0, sizeof(out));\n  uint64_t result = {entry_abi_symbol}();\n  memcpy(&out, &result, {size_bytes});\n"
             ),
             other => bail!("native aggregate harness unsupported return ABI {other}"),
         };
@@ -1233,8 +1248,10 @@ pub(crate) fn native_process_entry_metadata(
             "effects": effects,
         },
         "args": {
-            "supported": false,
-            "reason": "argv lowering is deferred until args support lands",
+            "supported": true,
+            "source": "process-argv",
+            "runtime": "cc-harness-argv-capture",
+            "capability_source": "build_plan.capabilities",
         },
         "stdout": {
             "supported": effects.iter().any(|effect| effect == "io"),
@@ -1371,6 +1388,27 @@ fn collect_compiler_platform_externals(
     if usage.uses_free {
         insert_compiler_platform_external(out, "platform:free", "free", "compiler.drop");
     }
+    if usage.uses_args {
+        // Defined by the cc link harness (ARGV_RUNTIME_SOURCE), not libc.
+        insert_compiler_platform_external(
+            out,
+            "platform:arg_count",
+            "codedb_arg_count",
+            "compiler.process_args",
+        );
+        insert_compiler_platform_external(
+            out,
+            "platform:arg_len",
+            "codedb_arg_len",
+            "compiler.process_args",
+        );
+        insert_compiler_platform_external(
+            out,
+            "platform:arg_byte",
+            "codedb_arg_byte",
+            "compiler.process_args",
+        );
+    }
 }
 
 fn insert_compiler_platform_external(
@@ -1393,6 +1431,7 @@ fn insert_compiler_platform_external(
 struct CompilerPlatformUsage {
     uses_malloc: bool,
     uses_free: bool,
+    uses_args: bool,
 }
 
 fn compiler_platform_usage_for_ir(ir: &LoweredFunctionIr) -> CompilerPlatformUsage {
@@ -1412,6 +1451,9 @@ fn collect_compiler_platform_usage_from_ops(
             | LoweredOp::VecNew { .. }
             | LoweredOp::StringNew { .. } => {
                 usage.uses_malloc = true;
+            }
+            LoweredOp::ArgCount { .. } | LoweredOp::ArgLen { .. } | LoweredOp::ArgByte { .. } => {
+                usage.uses_args = true;
             }
             LoweredOp::Drop { type_hash, .. } => {
                 if lowered_layout_contains_owned_resource(ir, type_hash) {
@@ -1573,6 +1615,30 @@ fn executable_cache_key(prepared: &PreparedLink, linker_identity_hash: &str) -> 
     )
 }
 
+/// The argv runtime every cc harness defines (R12): the process arguments
+/// (program name excluded) captured at startup, plus the accessors the
+/// `arg_count`/`arg_len`/`arg_byte` lowered ops call (the malloc/free
+/// platform-symbol pattern, except these are defined here rather than libc).
+/// Out-of-range indices abort — the native form of the evaluator's range
+/// error. Harnesses that never receive arguments (the test runners) keep the
+/// zero defaults, matching an un-seeded evaluation.
+const ARGV_RUNTIME_SOURCE: &str = "static long long codedb_args_count = 0;\n\
+static char **codedb_args_values = 0;\n\
+long long codedb_arg_count(void) { return codedb_args_count; }\n\
+long long codedb_arg_len(long long i) {\n\
+  if (i < 0 || i >= codedb_args_count) __builtin_trap();\n\
+  long long n = 0;\n\
+  while (codedb_args_values[i][n]) n++;\n\
+  return n;\n\
+}\n\
+long long codedb_arg_byte(long long i, long long j) {\n\
+  if (i < 0 || i >= codedb_args_count) __builtin_trap();\n\
+  long long n = 0;\n\
+  while (codedb_args_values[i][n]) n++;\n\
+  if (j < 0 || j >= n) __builtin_trap();\n\
+  return (long long)(unsigned char)codedb_args_values[i][j];\n\
+}\n";
+
 fn link_with_cc(prepared: &PreparedLink) -> Result<Vec<u8>> {
     let entry = prepared
         .plan
@@ -1581,7 +1647,7 @@ fn link_with_cc(prepared: &PreparedLink) -> Result<Vec<u8>> {
         .ok_or_else(|| anyhow!("link plan missing entry ABI symbol"))?;
     let export_wrappers = export_wrapper_source(&prepared.plan)?;
     let harness_source = format!(
-        "{export_wrappers}long {entry}(void);\nint main(void) {{ return (int){entry}(); }}\n"
+        "{export_wrappers}{ARGV_RUNTIME_SOURCE}long {entry}(void);\nint main(int argc, char **argv) {{\n  codedb_args_count = argc > 0 ? argc - 1 : 0;\n  codedb_args_values = argv + 1;\n  return (int){entry}();\n}}\n"
     );
     link_with_cc_harness(prepared, &harness_source)
 }

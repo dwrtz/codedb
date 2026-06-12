@@ -2,6 +2,14 @@ module std.io {
 fn write_stdout(s: slice<'static, u8>) -> i64 effects[io, ffi, unsafe] =
   std.platform.write(1, raw_ptr(&'static s[0]), len(s))
 
+// Process arguments (R12, program name excluded). The builtins expose count /
+// byte-length / byte reads; this composes them into an owned string, built in
+// a loop with a move-only accumulator (loop-carried drop glue) — the shape the
+// self-hosted front-end uses to read its source-path argument.
+fn arg_string(i: i64) -> string effects[io, alloc, state] =
+  loop buf = string_with_capacity(arg_len(i)) while string_len(buf) < arg_len(i) do
+    let pushed: unit = string_push(buf, arg_byte(i, string_len(buf))) in buf
+
 fn read_file(path: slice<'static, u8>, ptr: raw_mut_ptr<u8>, len: i64) -> std.result.IoResult effects[io, ffi, unsafe] =
   let fd: i64 = std.platform.open(raw_ptr(&'static path[0]), 0) in
   let bytes: i64 =

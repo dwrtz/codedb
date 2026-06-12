@@ -36,6 +36,7 @@ use serde_json::json;
 
 pub use expr::{
     ExternalFunctionSource, FunctionSource, ProgramItem, RawExpr, TypeDefinitionSource, Value,
+    set_process_args,
 };
 pub use op_registry::operator_kinds;
 pub use store::CodeDb;

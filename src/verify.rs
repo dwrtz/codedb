@@ -4473,6 +4473,9 @@ fn collect_lowered_call_targets(
             | LoweredOp::StringWithCapacity { .. }
             | LoweredOp::StringPush { .. }
             | LoweredOp::StringGet { .. }
+            | LoweredOp::ArgCount { .. }
+            | LoweredOp::ArgLen { .. }
+            | LoweredOp::ArgByte { .. }
             | LoweredOp::BoundsCheck { .. }
             | LoweredOp::SliceRangeCheck { .. }
             | LoweredOp::BorrowShared { .. }

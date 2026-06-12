@@ -51,6 +51,10 @@ enum Command {
         db: PathBuf,
         function_name: String,
         args: Vec<String>,
+        /// Process arguments visible to `arg_count`/`arg_len`/`arg_byte` (R12),
+        /// the evaluator's stand-in for native argv. Repeatable.
+        #[arg(long = "process-arg")]
+        process_args: Vec<String>,
     },
     #[command(about = "Run semantic tests stored in the current root")]
     Test {
@@ -129,6 +133,8 @@ enum Command {
         db: PathBuf,
         entry_name: String,
         args: Vec<String>,
+        #[arg(long = "process-arg")]
+        process_args: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -137,6 +143,8 @@ enum Command {
         db: PathBuf,
         entry_name: String,
         args: Vec<String>,
+        #[arg(long = "process-arg")]
+        process_args: Vec<String>,
         #[arg(long = "cmd")]
         commands: Vec<String>,
         #[arg(long)]
@@ -665,8 +673,10 @@ fn main() -> Result<()> {
             db,
             function_name,
             args,
+            process_args,
         } => {
             let codedb = codedb::CodeDb::open(db)?;
+            codedb::set_process_args(process_args);
             let value = codedb.eval_main_branch_text_args(&function_name, &args)?;
             println!("{value}");
         }
@@ -801,12 +811,14 @@ fn main() -> Result<()> {
             db,
             entry_name,
             args,
+            process_args,
             json,
         } => {
             if !json {
                 anyhow::bail!("trace currently requires --json");
             }
             let codedb = codedb::CodeDb::open(db)?;
+            codedb::set_process_args(process_args);
             print!(
                 "{}",
                 codedb.trace_main_branch_text_args_json(&entry_name, &args)?
@@ -816,10 +828,12 @@ fn main() -> Result<()> {
             db,
             entry_name,
             args,
+            process_args,
             commands,
             json,
         } => {
             let codedb = codedb::CodeDb::open(db)?;
+            codedb::set_process_args(process_args);
             if json {
                 print!(
                     "{}",

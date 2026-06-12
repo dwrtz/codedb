@@ -680,6 +680,74 @@ thread_local! {
     static RETURN_UNWIND_VALUE: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
+thread_local! {
+    /// The process's command-line arguments (R12), program name excluded —
+    /// the ambient input the `arg_count`/`arg_len`/`arg_byte` builtins read
+    /// (hence their `io` effect). The CLI front-end seeds it (`--args` on
+    /// `eval`/`trace`/`debug`); empty by default, so an un-seeded evaluation
+    /// deterministically sees zero arguments — matching a native run started
+    /// with none.
+    static PROCESS_ARGS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Seed the evaluator-visible process arguments (R12) for this thread —
+/// called by the CLI before `eval`/`trace`/`debug` runs an entry that reads
+/// them. Native runs read the real argv via the link harness instead.
+pub fn set_process_args<I: IntoIterator<Item = S>, S: Into<String>>(args: I) {
+    PROCESS_ARGS.with(|slot| {
+        *slot.borrow_mut() = args
+            .into_iter()
+            .map(|arg| arg.into().into_bytes())
+            .collect();
+    });
+}
+
+fn with_process_arg<T>(index: i64, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
+    PROCESS_ARGS.with(|slot| {
+        let args = slot.borrow();
+        let count = args.len() as i64;
+        if index < 0 || index >= count {
+            bail!("process argument index {index} out of range ({count} args)");
+        }
+        Ok(f(&args[index as usize]))
+    })
+}
+
+/// Produce a process-argument builtin's value (R12) from already-evaluated
+/// operands — the tracer's path into the same seeded argument list the
+/// evaluator reads.
+pub(crate) fn trace_process_arg_value(kind: &str, operands: &[Value]) -> Result<Value> {
+    let as_i64 = |i: usize, label: &str| -> Result<i64> {
+        match operands.get(i) {
+            Some(Value::I64(value)) => Ok(*value),
+            other => bail!("{kind} {label} evaluated to non-i64 {other:?}"),
+        }
+    };
+    match kind {
+        "arg_count" => Ok(Value::I64(
+            PROCESS_ARGS.with(|slot| slot.borrow().len() as i64),
+        )),
+        "arg_len" => {
+            let index = as_i64(0, "index")?;
+            with_process_arg(index, |bytes| Value::I64(bytes.len() as i64))
+        }
+        "arg_byte" => {
+            let index = as_i64(0, "index")?;
+            let byte = as_i64(1, "byte")?;
+            with_process_arg(index, |bytes| {
+                let len = bytes.len() as i64;
+                if byte < 0 || byte >= len {
+                    bail!(
+                        "process argument byte index {byte} out of range (argument is {len} bytes)"
+                    );
+                }
+                Ok(Value::U8(bytes[byte as usize]))
+            })?
+        }
+        other => bail!("unknown process-argument builtin {other}"),
+    }
+}
+
 /// The unwinding signal an early `return` raises; recognized by `eval_symbol` /
 /// `trace_symbol` via `anyhow::Error::downcast_ref`.
 #[derive(Debug)]
@@ -1334,6 +1402,60 @@ impl CodeDb {
         Ok(Value::Array(cells))
     }
 
+    /// Evaluate the process-argument builtins (R12) against the thread's
+    /// seeded argument list (`set_process_args`). Out-of-range indices are an
+    /// error, the parity of the native runtime's abort. `#[inline(never)]` for
+    /// the same frame reason as `eval_string_builtin`.
+    #[inline(never)]
+    fn eval_process_arg_builtin(
+        &self,
+        root_hash: &str,
+        kind: &str,
+        payload: &JsonValue,
+        args: &mut Vec<ValueCell>,
+        locals: &mut Vec<ValueCell>,
+    ) -> Result<Value> {
+        let child = |key: &str| -> Result<&str> {
+            payload
+                .get(key)
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("{kind} missing {key}"))
+        };
+        let index_of = |this: &Self,
+                        key: &str,
+                        args: &mut Vec<ValueCell>,
+                        locals: &mut Vec<ValueCell>|
+         -> Result<i64> {
+            match this.eval_expr_with_locals(root_hash, child(key)?, args, locals)? {
+                Value::I64(value) => Ok(value),
+                other => bail!("{kind} {key} evaluated to non-i64 {other}"),
+            }
+        };
+        match kind {
+            "arg_count" => Ok(Value::I64(
+                PROCESS_ARGS.with(|slot| slot.borrow().len() as i64),
+            )),
+            "arg_len" => {
+                let index = index_of(self, "index", args, locals)?;
+                with_process_arg(index, |bytes| Value::I64(bytes.len() as i64))
+            }
+            "arg_byte" => {
+                let index = index_of(self, "index", args, locals)?;
+                let byte = index_of(self, "byte", args, locals)?;
+                with_process_arg(index, |bytes| {
+                    let len = bytes.len() as i64;
+                    if byte < 0 || byte >= len {
+                        bail!(
+                            "process argument byte index {byte} out of range (argument is {len} bytes)"
+                        );
+                    }
+                    Ok(Value::U8(bytes[byte as usize]))
+                })?
+            }
+            other => bail!("unknown process-argument builtin {other}"),
+        }
+    }
+
     /// The dynamic-string builtins (`string_with_capacity`, `string_push`,
     /// `string_get`), factored out of `eval_expr_with_locals` and marked
     /// `#[inline(never)]` so their locals never inflate that hot recursive frame
@@ -1721,6 +1843,9 @@ impl CodeDb {
             // (see eval_loop and MAX_EVAL_CALL_DEPTH).
             kind @ ("string_with_capacity" | "string_push" | "string_get") => {
                 self.eval_string_builtin(root_hash, kind, &payload, args, locals)
+            }
+            kind @ ("arg_count" | "arg_len" | "arg_byte") => {
+                self.eval_process_arg_builtin(root_hash, kind, &payload, args, locals)
             }
             "raw_ptr_cast" => {
                 let value_hash = payload
@@ -3208,6 +3333,30 @@ impl CodeDb {
                     )?
                 )
             }
+            kind @ ("arg_count" | "arg_len" | "arg_byte") => {
+                let keys: &[&str] = match kind {
+                    "arg_count" => &[],
+                    "arg_len" => &["index"],
+                    _ => &["index", "byte"],
+                };
+                let mut rendered = Vec::new();
+                for key in keys {
+                    let child = payload
+                        .get(*key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("{kind} missing {key}"))?;
+                    rendered.push(self.expr_to_source_with_locals(
+                        child,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?);
+                }
+                format!("{kind}({})", rendered.join(", "))
+            }
             "string_with_capacity" => {
                 let capacity = payload
                     .get("capacity")
@@ -4638,6 +4787,31 @@ impl CodeDb {
                     )?,
                 ],
             }),
+            kind @ ("arg_count" | "arg_len" | "arg_byte") => {
+                let keys: &[&str] = match kind {
+                    "arg_count" => &[],
+                    "arg_len" => &["index"],
+                    _ => &["index", "byte"],
+                };
+                let mut call_args = Vec::new();
+                for key in keys {
+                    call_args.push(self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get(*key)
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("{kind} missing {key}"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                        hook,
+                    )?);
+                }
+                Ok(RawExpr::Call {
+                    name: kind.to_string(),
+                    args: call_args,
+                })
+            }
             "string_with_capacity" => Ok(RawExpr::Call {
                 name: "string_with_capacity".to_string(),
                 args: vec![
@@ -5744,6 +5918,23 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("string_len missing target"))?;
                 self.collect_expr_deps(root, child, deps)?;
+            }
+            "arg_count" => {}
+            "arg_len" => {
+                let child = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("arg_len missing index"))?;
+                self.collect_expr_deps(root, child, deps)?;
+            }
+            "arg_byte" => {
+                for key in ["index", "byte"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("arg_byte missing {key}"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
             }
             "string_with_capacity" => {
                 let child = payload

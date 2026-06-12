@@ -451,6 +451,29 @@ pub(crate) enum LoweredOp {
         string_type_hash: String,
         type_hash: String,
     },
+    /// `arg_count()` (R12): the number of process command-line arguments
+    /// (program name excluded). Lowers to a call into the link harness's
+    /// argv runtime (`codedb_arg_count`), the platform-symbol pattern of
+    /// malloc/free.
+    ArgCount {
+        id: String,
+        type_hash: String,
+    },
+    /// `arg_len(i)` (R12): byte length of process argument `i`; the runtime
+    /// aborts on an out-of-range index (the native form of eval's error).
+    ArgLen {
+        id: String,
+        index: String,
+        type_hash: String,
+    },
+    /// `arg_byte(i, j)` (R12): byte `j` of process argument `i` as `u8`;
+    /// out-of-range aborts.
+    ArgByte {
+        id: String,
+        index: String,
+        byte: String,
+        type_hash: String,
+    },
     BoundsCheck {
         id: String,
         index: String,
@@ -1662,6 +1685,9 @@ impl CodeDb {
             "string_push" => self.lower_string_push(root, expr_hash, param_types, ctx, locals),
             "string_get" => {
                 self.lower_string_get(root, expr_hash, &type_hash, param_types, ctx, locals)
+            }
+            kind @ ("arg_count" | "arg_len" | "arg_byte") => {
+                self.lower_process_arg(root, expr_hash, kind, &type_hash, param_types, ctx, locals)
             }
             "raw_ptr_cast" => {
                 self.lower_raw_ptr_cast(root, expr_hash, &type_hash, param_types, ctx, locals)
@@ -3516,6 +3542,77 @@ impl CodeDb {
             operations,
             value: id,
             type_hash: type_hash_for("I64"),
+        })
+    }
+
+    /// Lower the process-argument builtins (R12) to their dedicated ops; the
+    /// backends call the link harness's argv runtime (the malloc/free
+    /// platform-symbol pattern), so the runtime owns bounds aborts.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_process_arg(
+        &self,
+        root: &ProgramRootPayload,
+        expr_hash: &str,
+        kind: &str,
+        type_hash: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<LoweredExpr> {
+        let payload = self.get_payload(expr_hash)?;
+        let mut operations = Vec::new();
+        let mut lower_index = |this: &Self, key: &str, ctx: &mut LowerCtx| -> Result<String> {
+            let child = payload
+                .get(key)
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("{kind} missing {key}"))?;
+            let lowered = this.lower_expr(root, child, param_types, ctx, locals)?;
+            if lowered.type_hash != type_hash_for("I64") {
+                bail!("{kind} {key} must lower as i64");
+            }
+            operations.extend(lowered.operations);
+            Ok(lowered.value)
+        };
+        let id = ctx.value();
+        let op = match kind {
+            "arg_count" => LoweredOp::ArgCount {
+                id: id.clone(),
+                type_hash: type_hash_for("I64"),
+            },
+            "arg_len" => {
+                let index = lower_index(self, "index", ctx)?;
+                LoweredOp::ArgLen {
+                    id: id.clone(),
+                    index,
+                    type_hash: type_hash_for("I64"),
+                }
+            }
+            "arg_byte" => {
+                let index = lower_index(self, "index", ctx)?;
+                let byte = lower_index(self, "byte", ctx)?;
+                LoweredOp::ArgByte {
+                    id: id.clone(),
+                    index,
+                    byte,
+                    type_hash: type_hash_for("U8"),
+                }
+            }
+            other => bail!("unknown process-argument builtin {other}"),
+        };
+        ctx.push_debug_op(expr_hash, kind, &id);
+        operations.push(op);
+        let result_type = if kind == "arg_byte" {
+            type_hash_for("U8")
+        } else {
+            type_hash_for("I64")
+        };
+        if type_hash != result_type {
+            bail!("{kind} result type mismatch while lowering");
+        }
+        Ok(LoweredExpr {
+            operations,
+            value: id,
+            type_hash: result_type,
         })
     }
 
@@ -8339,6 +8436,41 @@ impl CodeDb {
                     }
                     insert_value(values, id, type_hash)?;
                 }
+                LoweredOp::ArgCount { id, type_hash } => {
+                    if type_hash != &type_hash_for("I64") {
+                        bail!("lowered arg_count result must be i64");
+                    }
+                    insert_value(values, id, type_hash)?;
+                }
+                LoweredOp::ArgLen {
+                    id,
+                    index,
+                    type_hash,
+                } => {
+                    if value_type(values, index)? != &type_hash_for("I64") {
+                        bail!("lowered arg_len index must be i64");
+                    }
+                    if type_hash != &type_hash_for("I64") {
+                        bail!("lowered arg_len result must be i64");
+                    }
+                    insert_value(values, id, type_hash)?;
+                }
+                LoweredOp::ArgByte {
+                    id,
+                    index,
+                    byte,
+                    type_hash,
+                } => {
+                    for operand in [index, byte] {
+                        if value_type(values, operand)? != &type_hash_for("I64") {
+                            bail!("lowered arg_byte operand must be i64");
+                        }
+                    }
+                    if type_hash != &type_hash_for("U8") {
+                        bail!("lowered arg_byte result must be u8");
+                    }
+                    insert_value(values, id, type_hash)?;
+                }
                 LoweredOp::StringWithCapacity {
                     id,
                     address,
@@ -8885,6 +9017,9 @@ pub(crate) fn lowered_op_value_id(op: &LoweredOp) -> Option<&str> {
         | LoweredOp::StringWithCapacity { id, .. }
         | LoweredOp::StringPush { id, .. }
         | LoweredOp::StringGet { id, .. }
+        | LoweredOp::ArgCount { id, .. }
+        | LoweredOp::ArgLen { id, .. }
+        | LoweredOp::ArgByte { id, .. }
         | LoweredOp::BoundsCheck { id, .. }
         | LoweredOp::SliceRangeCheck { id, .. }
         | LoweredOp::LoadEnumTag { id, .. }
@@ -8944,6 +9079,9 @@ pub(crate) fn lowered_op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::StringWithCapacity { .. } => "string_with_capacity",
         LoweredOp::StringPush { .. } => "string_push",
         LoweredOp::StringGet { .. } => "string_get",
+        LoweredOp::ArgCount { .. } => "arg_count",
+        LoweredOp::ArgLen { .. } => "arg_len",
+        LoweredOp::ArgByte { .. } => "arg_byte",
         LoweredOp::BoundsCheck { .. } => "bounds_check",
         LoweredOp::SliceRangeCheck { .. } => "slice_range_check",
         LoweredOp::LoadEnumTag { .. } => "load_enum_tag",
@@ -9067,6 +9205,9 @@ fn collect_op_type_hashes(operations: &[LoweredOp], out: &mut BTreeSet<String>) 
             | LoweredOp::Drop { type_hash, .. }
             | LoweredOp::BorrowDebug { type_hash, .. }
             | LoweredOp::Return { type_hash, .. }
+            | LoweredOp::ArgCount { type_hash, .. }
+            | LoweredOp::ArgLen { type_hash, .. }
+            | LoweredOp::ArgByte { type_hash, .. }
             | LoweredOp::EarlyReturn { type_hash, .. } => {
                 out.insert(type_hash.clone());
             }
