@@ -667,6 +667,54 @@ impl CodeDb {
         Ok(value)
     }
 
+    /// Trace `array_set(arr, i, v)`: clone the array, overwrite element `i` with `v`,
+    /// yield the new array — mirrors the evaluator so trace stays a faithful oracle.
+    /// Kept out of `trace_expr` (and never inlined) so its locals do not enlarge that
+    /// hot recursive frame (the documented eval/trace-frame gotcha; see `trace_loop`).
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn trace_array_set(
+        &self,
+        state: &mut TraceState,
+        frame: usize,
+        symbol_hash: &str,
+        function_def_hash: &str,
+        expr_hash: &str,
+        payload: &JsonValue,
+        args: &mut Vec<ValueCell>,
+        locals: &mut Vec<ValueCell>,
+    ) -> Result<Value> {
+        let array_hash = payload
+            .get("array")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("array_set missing array"))?;
+        let index_hash = payload
+            .get("index")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("array_set missing index"))?;
+        let value_hash = payload
+            .get("value")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("array_set missing value"))?;
+        let array =
+            self.trace_expr(state, frame, symbol_hash, function_def_hash, array_hash, args, locals)?;
+        let index =
+            self.trace_expr(state, frame, symbol_hash, function_def_hash, index_hash, args, locals)?;
+        let element =
+            self.trace_expr(state, frame, symbol_hash, function_def_hash, value_hash, args, locals)?;
+        let i = trace_index_value(&index)?;
+        let Value::Array(mut cells) = semantic_clone_value(&array) else {
+            bail!("array_set target evaluated to a non-array value");
+        };
+        if i >= cells.len() {
+            bail!("array_set index {i} out of bounds for length {}", cells.len());
+        }
+        cells[i] = value_cell(element);
+        let value = Value::Array(cells);
+        state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
+        Ok(value)
+    }
+
     /// Trace `loop acc = init while cond do body` (R8). Kept out of `trace_expr`
     /// (and never inlined) so its locals do not enlarge that hot recursive frame
     /// (see `CodeDb::eval_loop`). Mirrors the evaluator: acc starts at init; while
@@ -1755,6 +1803,18 @@ impl CodeDb {
                 state.push_value(frame, symbol_hash, function_def_hash, expr_hash, &value);
                 Ok(value)
             }
+            // In an `#[inline(never)]` helper (like `trace_loop`) so its locals do not
+            // enlarge this hot recursive frame (the documented eval/trace-frame gotcha).
+            "array_set" => self.trace_array_set(
+                state,
+                frame,
+                symbol_hash,
+                function_def_hash,
+                expr_hash,
+                &payload,
+                args,
+                locals,
+            ),
             "slice_from_array" => {
                 let target_hash = payload
                     .get("target")

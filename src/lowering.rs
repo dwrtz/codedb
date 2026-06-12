@@ -1384,75 +1384,15 @@ impl CodeDb {
                         type_hash: binding_type.clone(),
                     },
                 }];
-                let value_kind = self
-                    .get_payload(value_hash)?
-                    .get("expr_kind")
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_string);
-                if value_kind.as_deref() == Some("record_literal") {
-                    operations.extend(self.lower_record_init_to_address(
-                        root,
-                        value_hash,
-                        &binding_type,
-                        &address,
-                        param_types,
-                        ctx,
-                        locals,
-                    )?);
-                } else if value_kind.as_deref() == Some("enum_construct") {
-                    operations.extend(self.lower_enum_init_to_address(
-                        root,
-                        value_hash,
-                        &binding_type,
-                        &address,
-                        param_types,
-                        ctx,
-                        locals,
-                    )?);
-                } else if matches!(
-                    value_kind.as_deref(),
-                    Some("array_literal") | Some("array_fill")
-                ) {
-                    operations.extend(self.lower_array_init_to_address(
-                        root,
-                        value_hash,
-                        &binding_type,
-                        &address,
-                        param_types,
-                        ctx,
-                        locals,
-                    )?);
-                } else if self.type_passes_indirect(root, ctx.target_triple(), &binding_type)?
-                    && self.expr_is_place(value_hash)?
-                {
-                    operations.extend(self.lower_aggregate_place_init_to_address(
-                        root,
-                        value_hash,
-                        &binding_type,
-                        &address,
-                        param_types,
-                        ctx,
-                        locals,
-                    )?);
-                } else {
-                    let value = self.lower_expr_as(
-                        root,
-                        value_hash,
-                        &binding_type,
-                        param_types,
-                        ctx,
-                        locals,
-                    )?;
-                    if !self.type_assignable_in_root(root, &value.type_hash, &binding_type)? {
-                        bail!("let binding type mismatch while lowering");
-                    }
-                    operations.extend(value.operations);
-                    operations.push(LoweredOp::Store {
-                        address: address.clone(),
-                        value: value.value,
-                        type_hash: binding_type.clone(),
-                    });
-                }
+                operations.extend(self.lower_value_into_address(
+                    root,
+                    value_hash,
+                    &binding_type,
+                    &address,
+                    param_types,
+                    ctx,
+                    locals,
+                )?);
                 locals.push(LocalLoweredBinding {
                     slot,
                     type_hash: binding_type.clone(),
@@ -1726,7 +1666,7 @@ impl CodeDb {
                 ctx,
                 locals,
             ),
-            "array_literal" | "array_fill" => self.lower_array_literal_into_slot(
+            "array_literal" | "array_fill" | "array_set" => self.lower_array_literal_into_slot(
                 root,
                 expr_hash,
                 &type_hash,
@@ -4343,6 +4283,90 @@ impl CodeDb {
         Ok(operations)
     }
 
+    /// Lower an expression's value into a destination address, picking the
+    /// in-place initializer strategy by the value's kind (record/enum/array
+    /// aggregates initialize their destination field-by-field or slot-by-slot; a
+    /// place-typed aggregate is whole-slot copied/moved; everything else lowers as
+    /// a value and is stored). Shared by the `let`-binding path and `array_set`'s
+    /// source-array copy, so both write a value into a slot identically.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_value_into_address(
+        &self,
+        root: &ProgramRootPayload,
+        value_hash: &str,
+        target_type: &str,
+        target_address: &str,
+        param_types: &[String],
+        ctx: &mut LowerCtx,
+        locals: &mut Vec<LocalLoweredBinding>,
+    ) -> Result<Vec<LoweredOp>> {
+        let value_kind = self
+            .get_payload(value_hash)?
+            .get("expr_kind")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
+        let mut operations = Vec::new();
+        if value_kind.as_deref() == Some("record_literal") {
+            operations.extend(self.lower_record_init_to_address(
+                root,
+                value_hash,
+                target_type,
+                target_address,
+                param_types,
+                ctx,
+                locals,
+            )?);
+        } else if value_kind.as_deref() == Some("enum_construct") {
+            operations.extend(self.lower_enum_init_to_address(
+                root,
+                value_hash,
+                target_type,
+                target_address,
+                param_types,
+                ctx,
+                locals,
+            )?);
+        } else if matches!(
+            value_kind.as_deref(),
+            Some("array_literal") | Some("array_fill") | Some("array_set")
+        ) {
+            operations.extend(self.lower_array_init_to_address(
+                root,
+                value_hash,
+                target_type,
+                target_address,
+                param_types,
+                ctx,
+                locals,
+            )?);
+        } else if self.type_passes_indirect(root, ctx.target_triple(), target_type)?
+            && self.expr_is_place(value_hash)?
+        {
+            operations.extend(self.lower_aggregate_place_init_to_address(
+                root,
+                value_hash,
+                target_type,
+                target_address,
+                param_types,
+                ctx,
+                locals,
+            )?);
+        } else {
+            let value =
+                self.lower_expr_as(root, value_hash, target_type, param_types, ctx, locals)?;
+            if !self.type_assignable_in_root(root, &value.type_hash, target_type)? {
+                bail!("let binding type mismatch while lowering");
+            }
+            operations.extend(value.operations);
+            operations.push(LoweredOp::Store {
+                address: target_address.to_string(),
+                value: value.value,
+                type_hash: target_type.to_string(),
+            });
+        }
+        Ok(operations)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn lower_array_init_to_address(
         &self,
@@ -4357,6 +4381,83 @@ impl CodeDb {
         let payload = self.get_payload(expr_hash)?;
         let array_info = self.lowered_array_info(root, ctx.target_triple(), target_type)?;
         let kind = payload.get("expr_kind").and_then(JsonValue::as_str);
+        // `array_set(arr, i, v)` (R9): a functional array update. Initialize the
+        // destination with a copy of the source array `arr` (the whole Copy slot),
+        // then overwrite element `i` with `v` — a bounds-checked indexed store. The
+        // element type rule (non-reference Copy, trivial drop) makes the source copy
+        // a blind whole-slot copy and the overwrite leak-free.
+        if kind == Some("array_set") {
+            let array_hash = payload
+                .get("array")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("array_set missing array"))?;
+            let index_hash = payload
+                .get("index")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("array_set missing index"))?;
+            let value_hash = payload
+                .get("value")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("array_set missing value"))?;
+            // 1. Copy the source array into the destination slot.
+            let mut operations = self.lower_value_into_address(
+                root,
+                array_hash,
+                target_type,
+                target_address,
+                param_types,
+                ctx,
+                locals,
+            )?;
+            // 2. Lower the index and bounds-check it against the array length.
+            let index = self.lower_expr(root, index_hash, param_types, ctx, locals)?;
+            if index.type_hash != type_hash_for("I64") {
+                bail!("array_set index must lower to i64");
+            }
+            operations.extend(index.operations);
+            if self.literal_i64_value(index_hash)?.is_none() {
+                let check_id = ctx.value();
+                ctx.push_debug_op(expr_hash, "bounds_check", &check_id);
+                operations.push(LoweredOp::BoundsCheck {
+                    id: check_id,
+                    index: index.value.clone(),
+                    len: array_info.len,
+                    len_value: None,
+                    type_hash: type_hash_for("Unit"),
+                });
+            }
+            // 3. Overwrite element `i` with the (Copy) value.
+            let value = self.lower_expr_as(
+                root,
+                value_hash,
+                &array_info.element_type_hash,
+                param_types,
+                ctx,
+                locals,
+            )?;
+            if !self.type_assignable_in_root(root, &value.type_hash, &array_info.element_type_hash)?
+            {
+                bail!("array_set value type mismatch while lowering");
+            }
+            operations.extend(value.operations);
+            let element_address = ctx.value();
+            ctx.push_debug_op(expr_hash, "addr_of_index", &element_address);
+            operations.push(LoweredOp::AddrOfIndex {
+                id: element_address.clone(),
+                place: LoweredPlace::Index {
+                    base: target_address.to_string(),
+                    index: index.value,
+                    element_type_hash: array_info.element_type_hash.clone(),
+                    type_hash: array_info.element_type_hash.clone(),
+                },
+            });
+            operations.push(LoweredOp::Store {
+                address: element_address,
+                value: value.value,
+                type_hash: array_info.element_type_hash.clone(),
+            });
+            return Ok(operations);
+        }
         // `[value; count]` (R9): lower `value` ONCE, then store the (Copy) result into
         // every slot. The single lowered value is reused by all stores — the type
         // rule guarantees a non-reference Copy value, so replicating it is sound.
@@ -5975,7 +6076,7 @@ impl CodeDb {
             self.get_payload(expr_hash)?
                 .get("expr_kind")
                 .and_then(JsonValue::as_str),
-            Some("array_literal") | Some("array_fill")
+            Some("array_literal") | Some("array_fill") | Some("array_set")
         );
         if is_array_literal && self.type_is_fixed_array(root, expected_type)? {
             return self.lower_array_literal_into_slot(

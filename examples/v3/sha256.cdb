@@ -2,14 +2,11 @@
 //
 // Phase 9 forcing function for the bitwise / sized / cast stack (R4/R5/R6): real
 // u32 wrapping arithmetic, bitwise & | ^ ~, shifts, and 32-bit rotates (shift+or),
-// over the layout model. The padded "abc" block is the 16 input words in
-// `schedule`; the 48 derived words and the 64 compression rounds are unrolled
-// (loops are a later milestone) and split into `schedule` (the word array) and
-// `compress` (the working state) so neither exceeds the migration-JSON nesting
-// bound. The reference evaluator is the oracle here: the unrolled hash's per-
-// function stack frame exceeds the v0 native backend's size bound, so this is an
-// eval-verified fixture; the underlying u32 ops are native-checked by
-// tests/oracle_conformance.rs and examples/fnv1a.cdb.
+// over the layout model. The 48 derived message-schedule words and the 64
+// compression rounds are now ROLLED into condition-driven loops (R8) over a Copy
+// `array<u32, 64>` accumulator, updated by index with `array_set` (R9) — so the
+// per-function stack frame is small and the whole hash compiles native. The
+// reference evaluator and the native backend agree on the digest.
 //
 //   reference: sha256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
 
@@ -37,140 +34,48 @@ fn round(s: State, k: u32, w: u32) -> State =
   let t2: u32 = bsig0(s.a) + maj(s.a, s.b, s.c) in
   { a: t1 + t2, b: s.a, c: s.b, d: s.c, e: s.d + t1, f: s.e, g: s.f, h: s.g }
 
+// The loop accumulator carrying the message schedule under construction and the
+// current word index. `w` is a Copy fixed array, so the loop may carry it and
+// `array_set` updates one word per iteration.
+record Schedule {
+  w: array<u32, 64>
+  t: i64
+}
+
+// The padded "abc" block is the 16 input words (w0 = 'abc' + 0x80 padding,
+// w15 = the 24-bit message length); words 16..63 are W[t] = ssig1(W[t-2]) +
+// W[t-7] + ssig0(W[t-15]) + W[t-16] (mod 2^32). The loop fills them by index.
 fn schedule() -> array<u32, 64> =
-  let w0: u32 = 0x61626380 in
-  let w1: u32 = 0x0 in
-  let w2: u32 = 0x0 in
-  let w3: u32 = 0x0 in
-  let w4: u32 = 0x0 in
-  let w5: u32 = 0x0 in
-  let w6: u32 = 0x0 in
-  let w7: u32 = 0x0 in
-  let w8: u32 = 0x0 in
-  let w9: u32 = 0x0 in
-  let w10: u32 = 0x0 in
-  let w11: u32 = 0x0 in
-  let w12: u32 = 0x0 in
-  let w13: u32 = 0x0 in
-  let w14: u32 = 0x0 in
-  let w15: u32 = 0x18 in
-  let w16: u32 = ssig1(w14) + w9 + ssig0(w1) + w0 in
-  let w17: u32 = ssig1(w15) + w10 + ssig0(w2) + w1 in
-  let w18: u32 = ssig1(w16) + w11 + ssig0(w3) + w2 in
-  let w19: u32 = ssig1(w17) + w12 + ssig0(w4) + w3 in
-  let w20: u32 = ssig1(w18) + w13 + ssig0(w5) + w4 in
-  let w21: u32 = ssig1(w19) + w14 + ssig0(w6) + w5 in
-  let w22: u32 = ssig1(w20) + w15 + ssig0(w7) + w6 in
-  let w23: u32 = ssig1(w21) + w16 + ssig0(w8) + w7 in
-  let w24: u32 = ssig1(w22) + w17 + ssig0(w9) + w8 in
-  let w25: u32 = ssig1(w23) + w18 + ssig0(w10) + w9 in
-  let w26: u32 = ssig1(w24) + w19 + ssig0(w11) + w10 in
-  let w27: u32 = ssig1(w25) + w20 + ssig0(w12) + w11 in
-  let w28: u32 = ssig1(w26) + w21 + ssig0(w13) + w12 in
-  let w29: u32 = ssig1(w27) + w22 + ssig0(w14) + w13 in
-  let w30: u32 = ssig1(w28) + w23 + ssig0(w15) + w14 in
-  let w31: u32 = ssig1(w29) + w24 + ssig0(w16) + w15 in
-  let w32: u32 = ssig1(w30) + w25 + ssig0(w17) + w16 in
-  let w33: u32 = ssig1(w31) + w26 + ssig0(w18) + w17 in
-  let w34: u32 = ssig1(w32) + w27 + ssig0(w19) + w18 in
-  let w35: u32 = ssig1(w33) + w28 + ssig0(w20) + w19 in
-  let w36: u32 = ssig1(w34) + w29 + ssig0(w21) + w20 in
-  let w37: u32 = ssig1(w35) + w30 + ssig0(w22) + w21 in
-  let w38: u32 = ssig1(w36) + w31 + ssig0(w23) + w22 in
-  let w39: u32 = ssig1(w37) + w32 + ssig0(w24) + w23 in
-  let w40: u32 = ssig1(w38) + w33 + ssig0(w25) + w24 in
-  let w41: u32 = ssig1(w39) + w34 + ssig0(w26) + w25 in
-  let w42: u32 = ssig1(w40) + w35 + ssig0(w27) + w26 in
-  let w43: u32 = ssig1(w41) + w36 + ssig0(w28) + w27 in
-  let w44: u32 = ssig1(w42) + w37 + ssig0(w29) + w28 in
-  let w45: u32 = ssig1(w43) + w38 + ssig0(w30) + w29 in
-  let w46: u32 = ssig1(w44) + w39 + ssig0(w31) + w30 in
-  let w47: u32 = ssig1(w45) + w40 + ssig0(w32) + w31 in
-  let w48: u32 = ssig1(w46) + w41 + ssig0(w33) + w32 in
-  let w49: u32 = ssig1(w47) + w42 + ssig0(w34) + w33 in
-  let w50: u32 = ssig1(w48) + w43 + ssig0(w35) + w34 in
-  let w51: u32 = ssig1(w49) + w44 + ssig0(w36) + w35 in
-  let w52: u32 = ssig1(w50) + w45 + ssig0(w37) + w36 in
-  let w53: u32 = ssig1(w51) + w46 + ssig0(w38) + w37 in
-  let w54: u32 = ssig1(w52) + w47 + ssig0(w39) + w38 in
-  let w55: u32 = ssig1(w53) + w48 + ssig0(w40) + w39 in
-  let w56: u32 = ssig1(w54) + w49 + ssig0(w41) + w40 in
-  let w57: u32 = ssig1(w55) + w50 + ssig0(w42) + w41 in
-  let w58: u32 = ssig1(w56) + w51 + ssig0(w43) + w42 in
-  let w59: u32 = ssig1(w57) + w52 + ssig0(w44) + w43 in
-  let w60: u32 = ssig1(w58) + w53 + ssig0(w45) + w44 in
-  let w61: u32 = ssig1(w59) + w54 + ssig0(w46) + w45 in
-  let w62: u32 = ssig1(w60) + w55 + ssig0(w47) + w46 in
-  let w63: u32 = ssig1(w61) + w56 + ssig0(w48) + w47 in
-  [w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15, w16, w17, w18, w19, w20, w21, w22, w23, w24, w25, w26, w27, w28, w29, w30, w31, w32, w33, w34, w35, w36, w37, w38, w39, w40, w41, w42, w43, w44, w45, w46, w47, w48, w49, w50, w51, w52, w53, w54, w55, w56, w57, w58, w59, w60, w61, w62, w63]
+  let block: array<u32, 64> = array_set(array_set([0x0; 64], 0, 0x61626380), 15, 0x18) in
+  let done: Schedule =
+    loop s = { w: block, t: 16 } while s.t < 64 do
+      {
+        w: array_set(
+          s.w,
+          s.t,
+          ssig1(s.w[s.t - 2]) + s.w[s.t - 7] + ssig0(s.w[s.t - 15]) + s.w[s.t - 16]
+        ),
+        t: s.t + 1
+      }
+  in done.w
+
+// The 64 SHA-256 round constants, read by the compression loop index.
+fn round_keys() -> array<u32, 64> =
+  [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0xfc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x6ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2]
+
+// The compression accumulator: the working state and the current round index.
+record Working {
+  st: State
+  t: i64
+}
 
 fn compress(w: array<u32, 64>) -> State =
+  let k: array<u32, 64> = round_keys() in
   let s0: State = { a: 0x6a09e667, b: 0xbb67ae85, c: 0x3c6ef372, d: 0xa54ff53a, e: 0x510e527f, f: 0x9b05688c, g: 0x1f83d9ab, h: 0x5be0cd19 } in
-  let s1: State = round(s0, 0x428a2f98, w[0]) in
-  let s2: State = round(s1, 0x71374491, w[1]) in
-  let s3: State = round(s2, 0xb5c0fbcf, w[2]) in
-  let s4: State = round(s3, 0xe9b5dba5, w[3]) in
-  let s5: State = round(s4, 0x3956c25b, w[4]) in
-  let s6: State = round(s5, 0x59f111f1, w[5]) in
-  let s7: State = round(s6, 0x923f82a4, w[6]) in
-  let s8: State = round(s7, 0xab1c5ed5, w[7]) in
-  let s9: State = round(s8, 0xd807aa98, w[8]) in
-  let s10: State = round(s9, 0x12835b01, w[9]) in
-  let s11: State = round(s10, 0x243185be, w[10]) in
-  let s12: State = round(s11, 0x550c7dc3, w[11]) in
-  let s13: State = round(s12, 0x72be5d74, w[12]) in
-  let s14: State = round(s13, 0x80deb1fe, w[13]) in
-  let s15: State = round(s14, 0x9bdc06a7, w[14]) in
-  let s16: State = round(s15, 0xc19bf174, w[15]) in
-  let s17: State = round(s16, 0xe49b69c1, w[16]) in
-  let s18: State = round(s17, 0xefbe4786, w[17]) in
-  let s19: State = round(s18, 0xfc19dc6, w[18]) in
-  let s20: State = round(s19, 0x240ca1cc, w[19]) in
-  let s21: State = round(s20, 0x2de92c6f, w[20]) in
-  let s22: State = round(s21, 0x4a7484aa, w[21]) in
-  let s23: State = round(s22, 0x5cb0a9dc, w[22]) in
-  let s24: State = round(s23, 0x76f988da, w[23]) in
-  let s25: State = round(s24, 0x983e5152, w[24]) in
-  let s26: State = round(s25, 0xa831c66d, w[25]) in
-  let s27: State = round(s26, 0xb00327c8, w[26]) in
-  let s28: State = round(s27, 0xbf597fc7, w[27]) in
-  let s29: State = round(s28, 0xc6e00bf3, w[28]) in
-  let s30: State = round(s29, 0xd5a79147, w[29]) in
-  let s31: State = round(s30, 0x6ca6351, w[30]) in
-  let s32: State = round(s31, 0x14292967, w[31]) in
-  let s33: State = round(s32, 0x27b70a85, w[32]) in
-  let s34: State = round(s33, 0x2e1b2138, w[33]) in
-  let s35: State = round(s34, 0x4d2c6dfc, w[34]) in
-  let s36: State = round(s35, 0x53380d13, w[35]) in
-  let s37: State = round(s36, 0x650a7354, w[36]) in
-  let s38: State = round(s37, 0x766a0abb, w[37]) in
-  let s39: State = round(s38, 0x81c2c92e, w[38]) in
-  let s40: State = round(s39, 0x92722c85, w[39]) in
-  let s41: State = round(s40, 0xa2bfe8a1, w[40]) in
-  let s42: State = round(s41, 0xa81a664b, w[41]) in
-  let s43: State = round(s42, 0xc24b8b70, w[42]) in
-  let s44: State = round(s43, 0xc76c51a3, w[43]) in
-  let s45: State = round(s44, 0xd192e819, w[44]) in
-  let s46: State = round(s45, 0xd6990624, w[45]) in
-  let s47: State = round(s46, 0xf40e3585, w[46]) in
-  let s48: State = round(s47, 0x106aa070, w[47]) in
-  let s49: State = round(s48, 0x19a4c116, w[48]) in
-  let s50: State = round(s49, 0x1e376c08, w[49]) in
-  let s51: State = round(s50, 0x2748774c, w[50]) in
-  let s52: State = round(s51, 0x34b0bcb5, w[51]) in
-  let s53: State = round(s52, 0x391c0cb3, w[52]) in
-  let s54: State = round(s53, 0x4ed8aa4a, w[53]) in
-  let s55: State = round(s54, 0x5b9cca4f, w[54]) in
-  let s56: State = round(s55, 0x682e6ff3, w[55]) in
-  let s57: State = round(s56, 0x748f82ee, w[56]) in
-  let s58: State = round(s57, 0x78a5636f, w[57]) in
-  let s59: State = round(s58, 0x84c87814, w[58]) in
-  let s60: State = round(s59, 0x8cc70208, w[59]) in
-  let s61: State = round(s60, 0x90befffa, w[60]) in
-  let s62: State = round(s61, 0xa4506ceb, w[61]) in
-  let s63: State = round(s62, 0xbef9a3f7, w[62]) in
-  let s64: State = round(s63, 0xc67178f2, w[63]) in
-  s64
+  let done: Working =
+    loop cs = { st: s0, t: 0 } while cs.t < 64 do
+      { st: round(cs.st, k[cs.t], w[cs.t]), t: cs.t + 1 }
+  in done.st
 
 fn digest_0() -> u32 = let s: State = compress(schedule()) in 0x6a09e667 + s.a
 fn digest_1() -> u32 = let s: State = compress(schedule()) in 0xbb67ae85 + s.b

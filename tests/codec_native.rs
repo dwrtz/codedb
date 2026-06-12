@@ -73,10 +73,11 @@ fn fnv1a_hashes_codedb_to_reference_digest_native() {
 fn sha256_hashes_abc_to_reference_digest() {
     // sha256("abc") = ba7816bf 8f01cfea 414140de 5dae2223 b00361a3 96177a9c
     //                 b410ff61 f20015ad — each 32-bit word in decimal below.
-    // The unrolled (loop-free) hash's per-function stack frame exceeds the v0
-    // native backend's size bound, so this is an eval-verified fixture (the
-    // evaluator is the oracle); the underlying u32 / bitwise / rotate ops are
-    // native-checked by oracle_conformance.rs and the fnv1a test above.
+    // The 48 derived message-schedule words and the 64 compression rounds are now
+    // ROLLED into condition-driven loops (R8) over a Copy `array<u32, 64>`
+    // accumulator updated by index with `array_set` (R9), so each function's stack
+    // frame is small and the whole hash compiles native — eval == native on every
+    // word (the Milestone V3.3 acceptance: sha256.cdb compiles native).
     const WORDS: [&str; 8] = [
         "3128432319",
         "2399260650",
@@ -98,5 +99,29 @@ fn sha256_hashes_abc_to_reference_digest() {
             *word,
             "sha256(abc) word {i}"
         );
+    }
+
+    if can_build_default_native_target() {
+        for (i, word) in WORDS.iter().enumerate() {
+            let created = parse_json(&run(&[
+                "create-test",
+                path(&db),
+                &format!("digest_{i}_native"),
+                "--entry",
+                &format!("digest_{i}"),
+                "--expect-int",
+                &format!("u32:{word}"),
+                "--native-required",
+                "--json",
+            ]));
+            assert_eq!(created["status"], "applied", "create-test digest_{i}");
+        }
+        let report = parse_json(&run(&["test", path(&db), "--json"]));
+        assert_eq!(report["status"], "passed", "sha256 native run: {report}");
+        assert_eq!(
+            report["native_mismatches"], 0,
+            "sha256 native digest matches the reference on every word: {report}"
+        );
+        assert_eq!(report["unsupported"], 0);
     }
 }

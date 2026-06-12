@@ -4857,6 +4857,18 @@ impl CodeDb {
                         expected_type,
                     );
                 }
+                if name == "array_set" {
+                    return self.type_builtin_array_set(
+                        current_module,
+                        args,
+                        root,
+                        param_names,
+                        param_types,
+                        region_scope,
+                        locals,
+                        expected_type,
+                    );
+                }
                 if name == "box_new" {
                     return self.type_builtin_box_new(
                         current_module,
@@ -7736,6 +7748,124 @@ impl CodeDb {
         Ok((name.clone(), hash.clone()))
     }
 
+    /// `array_set(arr, i, v)` (R9): functional update of one element of a fixed
+    /// array — yields a NEW `array<T, N>` equal to `arr` with element `i` set to
+    /// `v`. Like `[value; count]`, the element type must be a non-reference Copy
+    /// value with trivial drop: the whole array is Copy (so a `loop` can carry it
+    /// and the update needs no move/loan bookkeeping), and overwriting element `i`
+    /// silently discards the old element (sound only when it needs no drop). `i`
+    /// is bounds-checked at runtime against `N` (a literal out-of-range `i` is
+    /// rejected here). This is the array counterpart of `string_push`/`vec_push`
+    /// for a Copy fixed buffer, and the substrate for a worklist that builds an
+    /// array by index (e.g. the SHA-256 message schedule).
+    #[allow(clippy::too_many_arguments)]
+    fn type_builtin_array_set(
+        &mut self,
+        current_module: &str,
+        args: &[RawExpr],
+        root: &ProgramRootPayload,
+        param_names: &[String],
+        param_types: &[String],
+        region_scope: &BTreeMap<String, String>,
+        locals: &mut Vec<LocalTypeBinding>,
+        expected_type: Option<&str>,
+    ) -> Result<TypeCheckResult> {
+        if args.len() != 3 {
+            bail!("array_set expects 3 args (array, index, value), got {}", args.len());
+        }
+        // `array_set` returns the same array type as its first argument, so an
+        // expected result type (e.g. a `let`-binding annotation `array<u32, N>`)
+        // anchors that argument — letting a bare `array_set([0x0; N], ..)` build a
+        // sized-element array. A nested `array_set` propagates the same expectation.
+        let array = self.type_expr_with_locals_expecting(
+            current_module,
+            &args[0],
+            root,
+            param_names,
+            param_types,
+            region_scope,
+            locals,
+            expected_type,
+        )?;
+        let TypeSpec::FixedArray { element, len } = self.type_spec_in_root(root, &array.type_hash)?
+        else {
+            bail!(
+                "array_set target must be a fixed array, got {}",
+                self.type_name(&array.type_hash)?
+            );
+        };
+        // The result array is Copy and element `i` is overwritten without dropping
+        // the old value, so the element must be a non-reference Copy value with
+        // trivial drop (the array-fill discipline) — keeping the borrow/move
+        // analyses trivial and the overwrite leak-free.
+        let class = self.value_class_in_root(root, &element)?;
+        if class.copy_kind != ValueCopyKind::Copy
+            || class.drop_kind != ValueDropKind::Trivial
+            || class.contains_reference
+        {
+            bail!(
+                "array_set element must be a non-reference Copy value with trivial drop \
+                 (the array is copied and element i overwritten in place), got {}",
+                self.type_name(&element)?
+            );
+        }
+        let index = self.type_expr_with_locals(
+            current_module,
+            &args[1],
+            root,
+            param_names,
+            param_types,
+            region_scope,
+            locals,
+        )?;
+        require_type(&index.type_hash, &type_hash_for("I64"), "array_set index", self)?;
+        if let Some(value) = self.typed_literal_i64_value(&index.expr_hash)?
+            && (value < 0 || value as u64 >= len)
+        {
+            bail!("array_set index {value} out of bounds for length {len}");
+        }
+        let value = self.type_expr_with_locals_expecting(
+            current_module,
+            &args[2],
+            root,
+            param_names,
+            param_types,
+            region_scope,
+            locals,
+            Some(&element),
+        )?;
+        if !self.type_assignable_in_root(root, &value.type_hash, &element)? {
+            bail!(
+                "array_set value type {} does not match element type {}",
+                self.type_name(&value.type_hash)?,
+                self.type_name(&element)?
+            );
+        }
+        let type_hash = array.type_hash.clone();
+        let expr_hash = self.put_object(
+            "Expression",
+            &json!({
+                "expr_kind": "array_set",
+                "array": array.expr_hash,
+                "index": index.expr_hash,
+                "value": value.expr_hash,
+                "element_type": element,
+                "type": type_hash.clone(),
+            }),
+        )?;
+        self.write_cache_json(
+            &expr_hash,
+            "typechecker",
+            "typed-dag",
+            ArtifactKind::TypedExpression,
+            &json!({ "type": type_hash }),
+        )?;
+        Ok(TypeCheckResult {
+            expr_hash,
+            type_hash,
+        })
+    }
+
     fn type_array_index(
         &mut self,
         root: &ProgramRootPayload,
@@ -8110,6 +8240,10 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("array_fill missing value"))?;
                 self.expr_escapes_local_borrow(root, value_hash, locals_with_local_borrows)
             }
+            // `array_set` yields a by-value, non-reference Copy array (the element
+            // type rule forbids references), so it can never be — or hold — a
+            // borrow into local storage.
+            "array_set" => Ok(false),
             "field_access" => {
                 let declared_type = payload
                     .get("type")
@@ -9389,6 +9523,20 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("array_fill missing value"))?;
                 self.verify_expr_borrows(root, value_hash, param_types, state, ExprUse::Value)
+            }
+            "array_set" => {
+                // `array_set(arr, i, v)`: arr/i/v are each read as values (the
+                // element type rule forbids references, so the result Copy array
+                // carries no loan) — so the borrow behaviour is just the children's,
+                // with no per-element loan or move bookkeeping (mirrors `binary`).
+                for key in ["array", "index", "value"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array_set missing {key}"))?;
+                    self.verify_expr_borrows(root, child, param_types, state, ExprUse::Value)?;
+                }
+                Ok(())
             }
             "field_access" => {
                 let target = payload
@@ -10830,6 +10978,11 @@ impl CodeDb {
                     required
                 }
                 "array_fill" => self.expr_child_requires_state(&payload, "value")?,
+                "array_set" => {
+                    self.expr_child_requires_state(&payload, "array")?
+                        || self.expr_child_requires_state(&payload, "index")?
+                        || self.expr_child_requires_state(&payload, "value")?
+                }
                 "array_index" => {
                     self.expr_child_requires_state(&payload, "target")?
                         || self.expr_child_requires_state(&payload, "index")?
@@ -10989,6 +11142,11 @@ impl CodeDb {
                     required
                 }
                 "array_fill" => self.expr_child_requires_alloc(&payload, "value")?,
+                "array_set" => {
+                    self.expr_child_requires_alloc(&payload, "array")?
+                        || self.expr_child_requires_alloc(&payload, "index")?
+                        || self.expr_child_requires_alloc(&payload, "value")?
+                }
                 "array_index" => {
                     self.expr_child_requires_alloc(&payload, "target")?
                         || self.expr_child_requires_alloc(&payload, "index")?
@@ -11145,6 +11303,11 @@ impl CodeDb {
                     required
                 }
                 "array_fill" => self.expr_child_requires_unsafe(&payload, "value")?,
+                "array_set" => {
+                    self.expr_child_requires_unsafe(&payload, "array")?
+                        || self.expr_child_requires_unsafe(&payload, "index")?
+                        || self.expr_child_requires_unsafe(&payload, "value")?
+                }
                 "array_index" => {
                     self.expr_child_requires_unsafe(&payload, "target")?
                         || self.expr_child_requires_unsafe(&payload, "index")?
@@ -12799,6 +12962,74 @@ impl CodeDb {
                     len: count,
                 })?
             }
+            "array_set" => {
+                // Recompute: `array` is `array<T, N>`, `index` is i64, `value` is T
+                // (a non-reference Copy element with trivial drop); the result is the
+                // array type unchanged.
+                let array_hash = payload
+                    .get("array")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_set missing array"))?;
+                let index_hash = payload
+                    .get("index")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_set missing index"))?;
+                let value_hash = payload
+                    .get("value")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("array_set missing value"))?;
+                let array_type = self.verify_expr_type_with_locals(
+                    array_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                let TypeSpec::FixedArray { element, len } =
+                    self.type_spec_in_root(root, &array_type)?
+                else {
+                    bail!("array_set target must be a fixed array");
+                };
+                if payload.get("element_type").and_then(JsonValue::as_str) != Some(element.as_str())
+                {
+                    bail!("array_set element_type mismatch");
+                }
+                let class = self.value_class_in_root(root, &element)?;
+                if class.copy_kind != ValueCopyKind::Copy
+                    || class.drop_kind != ValueDropKind::Trivial
+                    || class.contains_reference
+                {
+                    bail!(
+                        "array_set element must be a non-reference Copy value with trivial drop"
+                    );
+                }
+                let index_type = self.verify_expr_type_with_locals(
+                    index_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if index_type != type_hash_for("I64") {
+                    bail!("array_set index must be i64");
+                }
+                if let Some(value) = self.typed_literal_i64_value(index_hash)?
+                    && (value < 0 || value as u64 >= len)
+                {
+                    bail!("array_set index {value} out of bounds for length {len}");
+                }
+                let value_type = self.verify_expr_type_with_locals(
+                    value_hash,
+                    root,
+                    param_types,
+                    allowed_regions,
+                    locals,
+                )?;
+                if !self.type_assignable_in_root(root, &value_type, &element)? {
+                    bail!("array_set value type does not match element type");
+                }
+                array_type
+            }
             "array_index" => {
                 let target_hash = payload
                     .get("target")
@@ -14435,6 +14666,7 @@ fn plain_child_expr_keys(kind: &str) -> Result<&'static [&'static str]> {
         "vec_push" | "string_push" | "assign" => &["target", "value"],
         "raw_store" => &["pointer", "value"],
         "vec_get" | "string_get" | "array_index" => &["target", "index"],
+        "array_set" => &["array", "index", "value"],
         "let" => &["value", "body"],
         "subslice" => &["target", "start", "len"],
         "if" => &["cond", "then", "else"],

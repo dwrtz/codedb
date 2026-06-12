@@ -2634,6 +2634,9 @@ fn expression_child_hashes(expr_kind: &str, payload: &JsonValue) -> Result<Vec<S
         "array_fill" => {
             push_child_keys(payload, expr_kind, &["value"], &mut children)?;
         }
+        "array_set" => {
+            push_child_keys(payload, expr_kind, &["array", "index", "value"], &mut children)?;
+        }
         "array_index" | "vec_get" => {
             push_child_keys(payload, expr_kind, &["target", "index"], &mut children)?;
         }

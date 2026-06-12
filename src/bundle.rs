@@ -1448,6 +1448,12 @@ fn collect_bundle_object_refs(kind: &str, payload: &JsonValue, refs: &mut Vec<St
                     push_hash_ref(payload.get("value"), refs);
                     push_hash_ref(payload.get("element_type"), refs);
                 }
+                Some("array_set") => {
+                    push_hash_ref(payload.get("array"), refs);
+                    push_hash_ref(payload.get("index"), refs);
+                    push_hash_ref(payload.get("value"), refs);
+                    push_hash_ref(payload.get("element_type"), refs);
+                }
                 Some("array_index") => {
                     push_hash_ref(payload.get("target"), refs);
                     push_hash_ref(payload.get("index"), refs);

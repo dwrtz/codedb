@@ -1246,6 +1246,48 @@ impl CodeDb {
         Ok(accumulator)
     }
 
+    /// `array_set(arr, i, v)`: clone `arr` (a Copy array) and overwrite element `i`
+    /// with `v`, yielding the new array — the functional update the native backend
+    /// lowers to copy-then-store. In an `#[inline(never)]` helper (like
+    /// `eval_string_builtin`) so its locals never inflate the hot `eval_expr_with_locals`
+    /// frame and shrink the depth the evaluator reaches before the host stack overflows.
+    #[inline(never)]
+    fn eval_array_set(
+        &self,
+        root_hash: &str,
+        payload: &JsonValue,
+        args: &mut Vec<ValueCell>,
+        locals: &mut Vec<ValueCell>,
+    ) -> Result<Value> {
+        let array_hash = payload
+            .get("array")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("array_set missing array"))?;
+        let index_hash = payload
+            .get("index")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("array_set missing index"))?;
+        let value_hash = payload
+            .get("value")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("array_set missing value"))?;
+        let array = self.eval_expr_with_locals(root_hash, array_hash, args, locals)?;
+        let index =
+            eval_index_value(self.eval_expr_with_locals(root_hash, index_hash, args, locals)?)?;
+        let value = self.eval_expr_with_locals(root_hash, value_hash, args, locals)?;
+        let Value::Array(mut cells) = semantic_clone_value(&array) else {
+            bail!("array_set target evaluated to a non-array value");
+        };
+        if index >= cells.len() {
+            bail!(
+                "array_set index {index} out of bounds for length {}",
+                cells.len()
+            );
+        }
+        cells[index] = value_cell(value);
+        Ok(Value::Array(cells))
+    }
+
     /// The dynamic-string builtins (`string_with_capacity`, `string_push`,
     /// `string_get`), factored out of `eval_expr_with_locals` and marked
     /// `#[inline(never)]` so their locals never inflate that hot recursive frame
@@ -1835,6 +1877,10 @@ impl CodeDb {
                 }
                 Ok(Value::Array(values))
             }
+            // In an `#[inline(never)]` helper so its locals never inflate this hot
+            // recursive frame (which would lower the depth the evaluator reaches
+            // before the host stack overflows — the documented eval-frame gotcha).
+            "array_set" => self.eval_array_set(root_hash, &payload, args, locals),
             "array_index" => {
                 let target_hash = payload
                     .get("target")
@@ -3627,6 +3673,27 @@ impl CodeDb {
                 )?;
                 format!("[{value}; {count}]")
             }
+            "array_set" => {
+                // Projects as the builtin call `array_set(arr, i, v)`, re-parsed as a
+                // normal call and re-dispatched to the builtin on re-import.
+                let mut rendered = Vec::with_capacity(3);
+                for key in ["array", "index", "value"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array_set missing {key}"))?;
+                    rendered.push(self.expr_to_source_with_locals(
+                        child,
+                        root,
+                        current_module,
+                        local_params,
+                        region_names,
+                        local_names,
+                        0,
+                    )?);
+                }
+                format!("array_set({})", rendered.join(", "))
+            }
             "array_index" => {
                 let target = payload
                     .get("target")
@@ -4840,6 +4907,27 @@ impl CodeDb {
                     .ok_or_else(|| anyhow!("array_fill missing count"))?
                     .to_string(),
             }),
+            "array_set" => {
+                // Reconstructs to the builtin call `array_set(arr, i, v)`, re-typed
+                // back to this node by the type checker.
+                let mut call_args = Vec::with_capacity(3);
+                for key in ["array", "index", "value"] {
+                    call_args.push(self.typed_expr_to_raw_with_locals(
+                        payload
+                            .get(key)
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| anyhow!("array_set missing {key}"))?,
+                        root,
+                        current_module,
+                        region_names,
+                        local_names,
+                    )?);
+                }
+                Ok(RawExpr::Call {
+                    name: "array_set".to_string(),
+                    args: call_args,
+                })
+            }
             "array_index" => Ok(RawExpr::Index {
                 target: Box::new(
                     self.typed_expr_to_raw_with_locals(
@@ -5605,6 +5693,15 @@ impl CodeDb {
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("array_fill missing value"))?;
                 self.collect_expr_deps(root, child, deps)?;
+            }
+            "array_set" => {
+                for key in ["array", "index", "value"] {
+                    let child = payload
+                        .get(key)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| anyhow!("array_set missing {key}"))?;
+                    self.collect_expr_deps(root, child, deps)?;
+                }
             }
             "array_index" => {
                 for key in ["target", "index"] {

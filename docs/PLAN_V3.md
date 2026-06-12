@@ -656,10 +656,32 @@ native): scalar fixpoints (count-up, double-until), a record accumulator (Collat
 step count), a worklist iterating a fixed array by the loop index, a u32 accumulator
 with wrapping arithmetic + a u32 array read (the codec-shaped round loop), the
 zero-iteration edge, the fail-closed move-only-accumulator and body-move rejections,
-projection round-trip, and trace parity. (`examples/v3/sha256.cdb` can roll its 64
-compression rounds into a loop, but its message schedule writes array elements, which
-needs array update / a mutable buffer — a separate feature — so full sha256-native
-remains gated on that, not on loops.)
+projection round-trip, and trace parity. (`examples/v3/sha256.cdb` now rolls BOTH its
+64 compression rounds AND its 48-word message schedule into loops over a Copy
+`array<u32, 64>` accumulator: the compression loop folds a Copy `State` reading the
+round-key and schedule arrays by index, and the schedule loop fills the array by index
+with `array_set` — the array-update primitive that closed the last gap. The whole hash
+compiles native, eval == native on every word — see the array-update note below and
+`tests/codec_native.rs`.)
+
+Array update (`array_set`, the SHA-256 schedule enabler). `array_set(arr, i, v)` is a
+functional update of one element of a fixed Copy array: it yields a NEW `array<T, N>`
+equal to `arr` with element `i` set to `v`. Like `[value; count]` (R9), the element
+must be a non-reference Copy value with trivial drop — so the array is Copy (a `loop`
+can carry it as its accumulator), the source copy is a blind whole-slot copy, and
+overwriting element `i` is leak-free. The index is bounds-checked at runtime (a literal
+out-of-range index is rejected at type-check). It is a recognized builtin call (no new
+grammar): a typed `array_set` node lowers by copying the source array into the
+destination slot, then a bounds-checked indexed `Store` — reusing the array-init +
+`array_index` machinery, so there is NO new lowered op and NO new backend codegen. The
+full native-completion stack supports it (type check + the six analyses, evaluator,
+projection `array_set(..)` + reconstruction, three-child walkers, lowering, native
+x86_64 + arm64, `verify`, `trace`, replay/export/import). It is the array counterpart of
+`string_push`/`vec_push` for a Copy buffer and the substrate for a worklist that builds
+an array by index. `tests/array_set_native.rs` pins it (chained literal-index updates, a
+runtime-index loop building an array, a u32 distinct-layout array, the lowered-IR shape,
+the projection fixpoint, and the fail-closed rejections); `tests/codec_native.rs` pins
+the SHA-256 acceptance (eval == native on all eight words of `sha256("abc")`).
 
 ## Phase 12 — Strings and Integer Formatting (R15, R3)
 
@@ -1190,10 +1212,13 @@ through a generic recursion group (the clique binds its members' `<T>` signature
 before any body is typed; the instances co-materialize at the lowering seam and
 recurse by-symbol). The remaining follow-on is a recursive generic function over a
 *mutually-recursive generic type* clique (a generic `CreateTypeGroup`, D1), which
-fails closed (its `<T>` is not yet threaded through `CreateTypeGroup`).
+fails closed (its `<T>` is not yet threaded through `CreateTypeGroup`). The
+expressiveness acceptance is met: `tokenizer.cdb` and `sha256.cdb` both compile
+native (sha256 rolled into loops over a Copy `array<u32, 64>` updated by `array_set`,
+eval == native on all eight digest words — see Phase 11's array-update note).
 
 ```text
-Success: sha256.cdb and tokenizer.cdb compile native; the language can express a
+Success (met): sha256.cdb and tokenizer.cdb compile native; the language can express a
   compiler front-end.
 ```
 

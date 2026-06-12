@@ -294,7 +294,7 @@ impl CodeDb {
             }
             "borrow_shared" | "borrow_mut" | "slice_from_array" | "slice_len" | "subslice"
             | "assign" | "record_literal" | "field_access" | "enum_construct" | "case" | "fold"
-            | "array_literal" | "array_fill" | "array_index" | "return" => {
+            | "array_literal" | "array_fill" | "array_set" | "array_index" | "return" => {
                 bail!(
                     "C projection v0 does not support {other}",
                     other = payload
