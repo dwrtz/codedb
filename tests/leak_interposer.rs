@@ -544,3 +544,93 @@ fn string_build_frees_every_buffer_at_runtime() {
 fn early_return_drops_live_box_on_the_exit_edge_at_runtime() {
     assert_balanced_across_scale("early_return_drop", EARLY_RETURN_DROP, 4, 64);
 }
+
+// Loop-carried drop glue (SPEC_V3 §7): per-iteration body-local boxes in loop
+// and fold bodies, a move-only accumulator the body REPLACES each iteration
+// (the back-edge drops the old value), one it conditionally consumes (merge
+// compensation keeps the back-edge uniform), and an early `return` that exits
+// while the unconsumed accumulator is live. Each shape's allocation count
+// scales with {K}, so a skipped drop shows up as a scale-dependent net.
+const LOOP_ITERATION_BOX: &str = r#"
+record Node { v: i64 }
+fn drop_it(b: box<Node>) -> i64 effects[alloc] = let n: Node = unbox(b) in n.v
+fn main() -> i64 effects[alloc] =
+  loop acc = 0 while acc < {K} do
+    let b: box<Node> = box_new({ v: 1 }) in acc + drop_it(b)
+"#;
+
+const FOLD_ITERATION_BOX: &str = r#"
+record Node { v: i64 }
+fn drop_it(b: box<Node>) -> i64 effects[alloc] = let n: Node = unbox(b) in n.v
+fn count(n: i64) -> i64 effects[alloc] =
+  let arr: array<i64, 4> = [1; 4] in
+  fold x in arr with acc = 0 do
+    let b: box<Node> = box_new({ v: x }) in acc + drop_it(b)
+fn main() -> i64 effects[alloc] =
+  loop acc = 0 while acc < {K} do acc + count(acc) - 3
+"#;
+
+const LOOP_BACK_EDGE_DROP: &str = r#"
+record Ctr { v: i64 }
+fn fresh(v: i64) -> box<Ctr> effects[alloc] = box_new({ v: v })
+fn main() -> i64 effects[alloc] =
+  let last: box<Ctr> = (loop b = box_new({ v: 0 }) while b.v < {K} do fresh(b.v + 1)) in
+  let n: Ctr = unbox(last) in n.v - n.v
+"#;
+
+const LOOP_CONDITIONAL_CONSUME: &str = r#"
+record Ctr { v: i64 }
+fn fresh(v: i64) -> box<Ctr> effects[alloc] = box_new({ v: v })
+fn main() -> i64 effects[alloc] =
+  let last: box<Ctr> = (loop b = box_new({ v: 0 }) while b.v < {K} do
+    (if b.v - (b.v / 2) * 2 == 0 then fresh(b.v + 1) else
+     let m: Ctr = unbox(b) in fresh(m.v + 1))) in
+  let n: Ctr = unbox(last) in n.v - n.v
+"#;
+
+const LOOP_STRING_ACC: &str = r#"
+fn main() -> i64 effects[alloc, state] =
+  let s: string = (loop buf = string_with_capacity({K}) while string_len(buf) < {K} do
+    let p: unit = string_push(buf, 33) in buf) in
+  string_len(s) - string_len(s)
+"#;
+
+const LOOP_EARLY_RETURN_ACC: &str = r#"
+fn find(limit: i64) -> i64 effects[alloc, state] =
+  let s: string = (loop buf = string_with_capacity(limit) while string_len(buf) < limit do
+    (if string_len(buf) == limit - 1 then return 0 else
+     let p: unit = string_push(buf, 65) in buf)) in
+  string_len(s) - string_len(s)
+fn main() -> i64 effects[alloc, state] =
+  loop acc = 0 while acc < {K} do acc + find(acc + 2) + 1
+"#;
+
+#[test]
+fn loop_iteration_box_frees_every_box_at_runtime() {
+    assert_balanced_across_scale("loop_iteration_box", LOOP_ITERATION_BOX, 4, 64);
+}
+
+#[test]
+fn fold_iteration_box_frees_every_box_at_runtime() {
+    assert_balanced_across_scale("fold_iteration_box", FOLD_ITERATION_BOX, 4, 64);
+}
+
+#[test]
+fn loop_back_edge_drop_frees_every_replaced_accumulator() {
+    assert_balanced_across_scale("loop_back_edge_drop", LOOP_BACK_EDGE_DROP, 4, 64);
+}
+
+#[test]
+fn loop_conditional_consume_stays_exactly_once() {
+    assert_balanced_across_scale("loop_conditional_consume", LOOP_CONDITIONAL_CONSUME, 4, 64);
+}
+
+#[test]
+fn loop_string_accumulator_frees_its_buffer() {
+    assert_balanced_across_scale("loop_string_acc", LOOP_STRING_ACC, 4, 64);
+}
+
+#[test]
+fn loop_early_return_drops_the_live_accumulator() {
+    assert_balanced_across_scale("loop_early_return_acc", LOOP_EARLY_RETURN_ACC, 4, 16);
+}

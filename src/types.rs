@@ -369,17 +369,37 @@ struct ValueClass {
     contains_box: bool,
 }
 
+/// The move constraint active inside a multi-execution region (a `loop`
+/// cond/body or a `fold` body), which runs 0..N times per surrounding
+/// evaluation (#14a → loop-carried drop glue, SPEC_V3 §7). Storage that
+/// OUTLIVES one iteration (a param, a static, or a local bound outside the
+/// region) must not be moved — the move would repeat. Storage minted inside
+/// the region (local ids at or above `floor`) dies with the iteration and may
+/// move freely; its scoped drop glue re-executes per iteration. A `loop`'s
+/// accumulator (`movable_whole`) is the one outer place a BODY may consume:
+/// the back-edge refills it (the body result stores over it), with lowering
+/// dropping the old value when the body did NOT consume it.
+#[derive(Debug, Clone, Copy)]
+struct IterationMoveScope {
+    /// Local ids at or above this are per-iteration storage.
+    floor: usize,
+    /// The loop accumulator's local id: movable, but only as a whole place
+    /// (partial accumulator moves stay fail-closed).
+    movable_whole: Option<usize>,
+    /// "loop body" / "loop condition" / "fold body", for diagnostics.
+    construct: &'static str,
+}
+
 #[derive(Debug, Clone)]
 struct MoveBorrowState {
     locals: Vec<usize>,
     active: Vec<ActiveLoan>,
     moved: Vec<LoanPlace>,
     next_local: usize,
-    /// Monotone count of move events recorded so far. Unlike `moved`, entries
-    /// are never retired when a scope pops, so a multi-execution region (a
-    /// `loop` cond/body) can detect that ANY place was moved during it — the
-    /// typecheck-time mirror of the native-lowering `ctx.moved` snapshot gate.
-    move_events: usize,
+    /// The innermost multi-execution region's move constraint, when inside
+    /// one. Checked at the move-recording site, so scope pops cannot hide a
+    /// per-iteration move the way the retired `moved` set could.
+    iteration_scope: Option<IterationMoveScope>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4534,10 +4554,13 @@ impl CodeDb {
     /// counterpart of `type_fold_expr`. `acc` is bound (to `init`'s type, anchored
     /// to the enclosing destination type like a fold so a record-literal init builds
     /// in declaration-order layout) and is in scope for `cond` (which must be `bool`)
-    /// and `body` (which must produce the next accumulator, same type). Like fold,
-    /// the accumulator must be copyable and carry no references — loop-carried drop
-    /// glue for an owned accumulator is a follow-on (SPEC_V3 §7). The loop's result
-    /// type is the accumulator type (the final accumulator when `cond` is false).
+    /// and `body` (which must produce the next accumulator, same type). The
+    /// accumulator may be move-only (loop-carried drop glue, SPEC_V3 §7): each
+    /// iteration the body either consumes it wholly (producing the next value)
+    /// or lowering drops the old value before the back-edge store — exactly
+    /// once either way. It must not carry references (a loan cannot outlive
+    /// the iteration that minted it). The loop's result type is the
+    /// accumulator type (the final accumulator when `cond` is false).
     #[allow(clippy::too_many_arguments)]
     fn type_loop_expr(
         &mut self,
@@ -4579,11 +4602,6 @@ impl CodeDb {
             _ => init.type_hash.clone(),
         };
         let acc_class = self.value_class_in_root(root, &acc_type)?;
-        if acc_class.copy_kind == ValueCopyKind::MoveOnly {
-            bail!(
-                "loop accumulator type must be copyable (loop-carried drop glue is not yet implemented)"
-            );
-        }
         if acc_class.contains_reference {
             bail!("loop accumulator type must not carry references");
         }
@@ -8911,7 +8929,7 @@ impl CodeDb {
             active: Vec::new(),
             moved: Vec::new(),
             next_local: 0,
-            move_events: 0,
+            iteration_scope: None,
         };
         self.verify_expr_borrows(root, &body, param_types, &mut state, ExprUse::Value)
             .with_context(|| {
@@ -9524,18 +9542,21 @@ impl CodeDb {
                 let acc_local = state.next_local;
                 state.next_local += 1;
                 state.locals.push(acc_local);
-                // The body runs once per element: like `loop` (#14a), any move it
-                // performs would repeat, and lowering rejects it (`ctx.moved`
-                // snapshot) — reject at typecheck too so eval stays a faithful
-                // oracle of the native envelope.
-                let move_events_before = state.move_events;
+                // The body runs once per element (#14a → loop-carried drop
+                // glue): per-iteration locals may move (their scoped drop glue
+                // re-executes each element); the item, the accumulator, and
+                // anything outer may not (the move would repeat). Mirrors the
+                // lowering gate so eval stays a faithful oracle of the native
+                // envelope.
+                let outer_scope = state.iteration_scope;
+                state.iteration_scope = Some(IterationMoveScope {
+                    floor: acc_local + 1,
+                    movable_whole: None,
+                    construct: "fold body",
+                });
                 let body_result =
                     self.verify_expr_borrows(root, body, param_types, state, ExprUse::Value);
-                if body_result.is_ok() && state.move_events != move_events_before {
-                    bail!(
-                        "unsupported_move: fold body cannot move owned values in phase 13; loop-aware drop glue is not yet implemented"
-                    );
-                }
+                state.iteration_scope = outer_scope;
                 let item_owner = LoanPlace {
                     root: LoanRoot::Local(item_local),
                     fields: Vec::new(),
@@ -9582,26 +9603,30 @@ impl CodeDb {
                 let acc_local = state.next_local;
                 state.next_local += 1;
                 state.locals.push(acc_local);
-                // `cond`/`body` run 0..N times: a move of an OUTER place would
-                // repeat (double-free), and even a per-iteration place move is
-                // not lowerable yet (no loop-carried drop glue). Reject ANY move
-                // event here fail-closed (#14a) so import/eval/verify agree with
-                // the native-lowering `ctx.moved` snapshot gate instead of the
-                // evaluator happily running what native rejects. `moved` entries
-                // retire when scopes pop, so this uses the monotone event count.
-                let move_events_before = state.move_events;
+                // `cond`/`body` run 0..N times (#14a → loop-carried drop glue):
+                // per-iteration locals may move (scoped drop glue re-executes
+                // each iteration); outer places may not (the move would
+                // repeat). The BODY may additionally consume the accumulator
+                // wholly — the back-edge refills it, and lowering drops the old
+                // value when the body did not consume it. The CONDITION may
+                // not: it runs once more than the body, and its final
+                // evaluation would leave the loop's result consumed.
+                let outer_scope = state.iteration_scope;
+                state.iteration_scope = Some(IterationMoveScope {
+                    floor: acc_local + 1,
+                    movable_whole: None,
+                    construct: "loop condition",
+                });
                 let cond_result =
                     self.verify_expr_borrows(root, cond, param_types, state, ExprUse::Value);
+                state.iteration_scope = Some(IterationMoveScope {
+                    floor: acc_local + 1,
+                    movable_whole: Some(acc_local),
+                    construct: "loop body",
+                });
                 let body_result =
                     self.verify_expr_borrows(root, body, param_types, state, ExprUse::Value);
-                if cond_result.is_ok()
-                    && body_result.is_ok()
-                    && state.move_events != move_events_before
-                {
-                    bail!(
-                        "unsupported_move: loop body cannot move owned values; loop-carried drop glue is not yet implemented"
-                    );
-                }
+                state.iteration_scope = outer_scope;
                 let acc_owner = LoanPlace {
                     root: LoanRoot::Local(acc_local),
                     fields: Vec::new(),
@@ -10588,8 +10613,39 @@ impl CodeDb {
             // — correct, since the box owns exactly one pointee. (A move out of
             // *borrowed* box content is still rejected by the move-out-of-loan check.)
             self.check_move_conflicts(&place, &state.active)?;
+            // Inside a `loop`/`fold` (#14a → loop-carried drop glue): the move
+            // repeats once per iteration, so it is legal only for per-iteration
+            // storage — or, wholly, for the loop accumulator the back-edge
+            // refills. Checked here at the recording site, because scope pops
+            // retire `moved` entries and would hide a per-iteration move from
+            // any after-the-fact diff.
+            if let Some(scope) = state.iteration_scope {
+                let allowed = match place.root {
+                    LoanRoot::Local(id) if Some(id) == scope.movable_whole => {
+                        if !place.fields.is_empty() {
+                            bail!(
+                                "unsupported_move: {} may consume the loop accumulator only as a whole; a partial accumulator move is not supported",
+                                scope.construct
+                            );
+                        }
+                        true
+                    }
+                    LoanRoot::Local(id) => id >= scope.floor,
+                    LoanRoot::Param(_) | LoanRoot::Static(_) => false,
+                };
+                if !allowed {
+                    bail!(
+                        "unsupported_move: {} cannot move owned values that outlive one iteration (the move would repeat); only per-iteration locals{} may move",
+                        scope.construct,
+                        if scope.movable_whole.is_some() {
+                            " and the whole accumulator"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
             state.moved.push(place);
-            state.move_events += 1;
         } else {
             self.check_shared_read_conflicts(&place, &state.active)?;
         }
@@ -13066,10 +13122,10 @@ impl CodeDb {
                 if !self.type_assignable_in_root(root, &init_type, &acc_type)? {
                     bail!("loop acc_type mismatch");
                 }
+                // The accumulator may be move-only (loop-carried drop glue,
+                // SPEC_V3 §7) but must not carry references — a loan cannot
+                // outlive the iteration that minted it.
                 let acc_class = self.value_class_in_root(root, &acc_type)?;
-                if acc_class.copy_kind == ValueCopyKind::MoveOnly {
-                    bail!("loop accumulator type must be copyable");
-                }
                 if acc_class.contains_reference {
                     bail!("loop accumulator type must not carry references");
                 }
@@ -13728,9 +13784,6 @@ fn merge_branch_state(
 
 fn merged_branch_states(mut left: MoveBorrowState, right: MoveBorrowState) -> MoveBorrowState {
     left.next_local = left.next_local.max(right.next_local);
-    // Either branch may run, so the merged "has anything moved" watermark is
-    // the larger of the two (each already includes the pre-branch count).
-    left.move_events = left.move_events.max(right.move_events);
     for loan in right.active {
         if !left.active.contains(&loan) {
             left.active.push(loan);

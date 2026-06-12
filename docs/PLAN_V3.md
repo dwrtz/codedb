@@ -615,32 +615,46 @@ for a worklist over an array read by the loop index), context-typed/anchored to 
 named accumulator type exactly like a `let acc: T = <init>` (so a `{ acc: 0x0, .. }`
 sized-int field takes its declared width).
 
-Following the SPEC_V3 §7 sequencing, the MVP mirrors `fold`'s soundness envelope:
-the accumulator must be copyable and the body may move no owned values — loop-carried
-drop glue for an owned/move-only accumulator stays fail-closed (the still-open #4
-item), as does `break`/`continue` (the condition is the loop's only exit; `return` is
-rejected in `init`/`cond`/`body`). A new `LoweredOp::Loop` lowers to a real backend
-loop on x86_64 and arm64 (seed the accumulator slot, re-run the `cond` block each
-iteration and exit when it is false, else run the `body` block and store its result
-back) — `lower_loop`/`emit_loop` mirror `lower_fold`/`emit_fold` minus the
-index/item bookkeeping. The borrow checker scopes `acc` as a loop-local and the
-lowering rejects a body move (no loop-carried drop glue); the lowered-IR verifier
-checks the cond is `bool`, the body matches the accumulator, and (since the body
-moves nothing) the shared drop-state is unchanged across the back-edge — so verify
-tolerates non-terminating control. The reference evaluator and tracer iterate the
-loop, guarded by a generous per-loop iteration ceiling (`MAX_EVAL_LOOP_ITERATIONS`)
-that converts a non-terminating loop into a clean error — an oracle-robustness bound,
-not a native limit (the backend runs the loop unbounded), mirroring the recursion
-ceiling. Effects propagate through `init`/`cond`/`body`; round-trips, `verify`,
-`trace`, and replay/export/import all support it.
+The MVP shipped with `fold`'s soundness envelope (copyable accumulator, no body
+moves); LOOP-CARRIED DROP GLUE (the former #4 item) has since landed. The
+accumulator may now be MOVE-ONLY: each iteration the body either consumes it
+wholly (its drop obligation transfers — branch-conditional consumption is made
+uniform by the if/case merge compensation) or lowering appends a drop of the
+old value to the body block, so the back-edge store never overwrites a live
+owned value — exactly-once either way, pinned by tests/leak_interposer.rs.
+Per-iteration body locals (in `loop` AND `fold` bodies) may also move; their
+scoped drop glue re-executes each iteration. Still rejected, permanently:
+moves of storage that OUTLIVES one iteration (params/outer locals — the move
+would repeat), partial accumulator projections, and any accumulator move from
+`cond` (it runs once more than the body, so its final evaluation would consume
+the loop's own result). A conditional `return` inside the body exits the whole
+function, dropping a still-live accumulator on the early-exit edge.
+`break`/`continue` stay deferred (the condition is the loop's only structured
+exit). A new `LoweredOp::Loop` lowers to a real backend loop on x86_64 and
+arm64 (seed the accumulator slot, re-run the `cond` block each iteration and
+exit when it is false, else run the `body` block and store its result back) —
+`lower_loop`/`emit_loop` mirror `lower_fold`/`emit_fold` minus the index/item
+bookkeeping. The borrow checker scopes `acc` as a loop-local and gates
+iteration moves at the move-recording site; the lowered-IR verifier checks the
+cond is `bool`, the body matches the accumulator, and that the blocks consume
+only per-iteration storage (plus the whole accumulator, body-only) — so verify
+tolerates non-terminating control. The reference evaluator and tracer iterate
+the loop, guarded by a generous per-loop iteration ceiling
+(`MAX_EVAL_LOOP_ITERATIONS`) that converts a non-terminating loop into a clean
+error — an oracle-robustness bound, not a native limit (the backend runs the
+loop unbounded), mirroring the recursion ceiling. Effects propagate through
+`init`/`cond`/`body`; round-trips, `verify`, `trace`, and replay/export/import
+all support it.
 
-Deliverables (delivered; the `and/or` alternatives deferred):
+Deliverables (delivered, including the follow-on):
 
 ```text
 `loop acc = init while cond do body` lowering to real backend loops (x86_64 + arm64)
 loop-carried borrow/effect checking; verify tolerates non-terminating control
-(deferred: loop-carried drop glue for an owned accumulator — fail-closed, like fold;
- break/continue — the condition is the exit, and the early-exit machinery is Phase 10)
+loop-carried drop glue: move-only accumulators (consume-or-back-edge-drop) and
+  per-iteration body-local moves in loop AND fold bodies, leak-interposer-pinned
+(deferred: break/continue — the condition is the exit, and the early-exit
+ machinery is Phase 10's `return`, which works inside loop bodies)
 ```
 
 Files likely touched:

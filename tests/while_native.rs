@@ -164,53 +164,87 @@ fn zero_iteration_loop_yields_init_native() {
 }
 
 #[test]
-fn move_only_accumulator_is_rejected_fail_closed() {
-    // The accumulator must be copyable: a loop-carried owned value would need
-    // loop-aware drop glue (a follow-on), so a move-only accumulator fails closed.
-    let source = "record Node { v: i64 }\n\
-                  fn go(n: i64) -> box<Node> effects[alloc] =\n\
-                    loop acc = box_new({ v: 0 }) while n < 1 do acc\n";
-    let temp = tempdir().unwrap();
-    let db = temp.path().join("moveonly.sqlite");
-    let src = temp.path().join("moveonly.cdb");
-    std::fs::write(&src, source).unwrap();
-    run(&["init", path(&db)]);
-    let err = run_fail(&["import", path(&db), path(&src)]);
-    assert!(
-        err.contains("loop accumulator type must be copyable"),
-        "expected a move-only accumulator rejection, got: {err}"
+fn move_only_accumulator_threads_through_the_loop() {
+    // Loop-carried drop glue (SPEC_V3 §7): the accumulator may be MOVE-ONLY.
+    // The load-bearing Phase 8 shape — a string built byte-by-byte in a loop,
+    // the accumulator threaded through the body by move — plus the
+    // fresh-value-per-iteration shape, where the body does NOT consume the old
+    // accumulator and the back-edge drops it before the store-back. Both run
+    // eval == native; the no-leak half is pinned by tests/leak_interposer.rs.
+    check_native(
+        "string_acc_loop",
+        "fn bang_line(n: i64) -> i64 effects[alloc, state] =\n\
+           let s: string = (loop buf = string_with_capacity(8) while string_len(buf) < n do\n\
+             let p: unit = string_push(buf, 33) in buf) in\n\
+           string_len(s)\n\
+         fn main() -> i64 effects[alloc, state] = bang_line(5)\n",
+        "main",
+        5,
+    );
+    check_native(
+        "fresh_box_acc_loop",
+        "record Ctr { v: i64 }\n\
+         fn fresh(v: i64) -> box<Ctr> effects[alloc] = box_new({ v: v })\n\
+         fn main() -> i64 effects[alloc] =\n\
+           let last: box<Ctr> = (loop b = box_new({ v: 0 }) while b.v < 4 do fresh(b.v + 1)) in\n\
+           let n: Ctr = unbox(last) in n.v\n",
+        "main",
+        4,
+    );
+    check_native(
+        "conditional_consume_acc_loop",
+        // One branch consumes the old accumulator (unbox), the other builds a
+        // fresh value without touching it — the if/case merge compensation
+        // makes consumption uniform, so the back-edge stays exactly-once.
+        "record Ctr { v: i64 }\n\
+         fn fresh(v: i64) -> box<Ctr> effects[alloc] = box_new({ v: v })\n\
+         fn main() -> i64 effects[alloc] =\n\
+           let last: box<Ctr> = (loop b = box_new({ v: 0 }) while b.v < 4 do\n\
+             (if b.v == 2 then fresh(3) else\n\
+              let m: Ctr = unbox(b) in fresh(m.v + 1))) in\n\
+           let n: Ctr = unbox(last) in n.v\n",
+        "main",
+        4,
+    );
+    check_native(
+        "early_return_from_move_only_acc_loop",
+        // A conditional `return` exits the function from inside the body while
+        // the (unconsumed) accumulator is live — the early-exit edge drops it.
+        "fn find(limit: i64) -> i64 effects[alloc, state] =\n\
+           let s: string = (loop buf = string_with_capacity(8) while string_len(buf) < limit do\n\
+             (if string_len(buf) == 3 then return 99 else\n\
+              let p: unit = string_push(buf, 65) in buf)) in\n\
+           string_len(s)\n\
+         fn main() -> i64 effects[alloc, state] = find(6)\n",
+        "main",
+        99,
     );
 }
 
 #[test]
-fn loop_body_that_moves_an_owned_value_is_rejected_fail_closed() {
-    // A loop cond/body runs 0..N times, so moving an owned place from it would move
-    // more than once (double-free) — rejected at TYPECHECK (#14a), so import, the
-    // reference evaluator, and verify agree with the native-lowering gate instead of
-    // eval happily re-running the move. Each case must hit the dedicated gate
-    // message, not some incidental earlier rejection.
-    let cases: &[(&str, &str)] = &[
+fn loop_moves_that_outlive_an_iteration_stay_rejected() {
+    // The permanently unsound shapes: consuming the accumulator from the
+    // CONDITION (it runs once more than the body, so the loop's own result
+    // would be consumed), and a partial accumulator projection move.
+    let cases: &[(&str, &str, &str)] = &[
         (
-            // The review repro: moving an outer box param from the body imported
-            // cleanly before the gate (the borrow checker saw only one move).
-            "outer_param_move",
-            "record Node { v: i64 }\n\
-             fn drop_it(b: box<Node>) -> i64 effects[alloc] = let n: Node = unbox(b) in n.v\n\
-             fn go(outer: box<Node>, n: i64) -> i64 effects[alloc] =\n\
-               loop acc = 0 while acc < n do acc + drop_it(outer)\n",
+            "cond_consumes_acc",
+            "fn eat(s: string) -> bool effects[state] = string_len(s) > 2\n\
+             fn main() -> i64 effects[alloc, state] =\n\
+               let s: string = (loop buf = string_with_capacity(2) while eat(buf) do buf) in 0\n",
+            "loop condition cannot move owned values",
         ),
         (
-            // A per-iteration let-bound box move is also unlowerable today (no
-            // loop-carried drop glue); the typecheck gate mirrors lowering exactly.
-            "iteration_local_move",
-            "record Node { v: i64 }\n\
-             fn drop_it(b: box<Node>) -> i64 effects[alloc] = let n: Node = unbox(b) in n.v\n\
-             fn go(n: i64) -> i64 effects[alloc] =\n\
-               loop acc = 0 while acc < n do\n\
-                 let b: box<Node> = box_new({ v: 1 }) in acc + drop_it(b)\n",
+            "partial_acc_move",
+            "record Pair { a: box<i64>, b: box<i64> }\n\
+             fn main() -> i64 effects[alloc] =\n\
+               let p: Pair = (loop acc = { a: box_new(1), b: box_new(2) } while 1 < 0 do\n\
+                 { a: acc.a, b: box_new(4) }) in\n\
+               0\n",
+            "only as a whole",
         ),
     ];
-    for (label, source) in cases {
+    for (label, source, expected) in cases {
         let temp = tempdir().unwrap();
         let db = temp.path().join(format!("{label}.sqlite"));
         let src = temp.path().join(format!("{label}.cdb"));
@@ -218,10 +252,62 @@ fn loop_body_that_moves_an_owned_value_is_rejected_fail_closed() {
         run(&["init", path(&db)]);
         let err = run_fail(&["import", path(&db), path(&src)]);
         assert!(
-            err.contains("loop body cannot move owned values"),
-            "{label}: expected the loop-body move gate, got: {err}"
+            err.contains(expected),
+            "{label}: expected {expected:?}, got: {err}"
         );
     }
+}
+
+#[test]
+fn loop_body_that_moves_an_owned_value_is_rejected_fail_closed() {
+    // A loop cond/body runs 0..N times, so moving an owned place that OUTLIVES
+    // an iteration (a param or outer local) would move more than once
+    // (double-free) — rejected at TYPECHECK (#14a), so import, the reference
+    // evaluator, and verify agree with the native-lowering gate instead of
+    // eval happily re-running the move. (Per-iteration locals and the whole
+    // accumulator may move — loop-carried drop glue; see the positive tests.)
+    let source = "record Node { v: i64 }\n\
+                  fn drop_it(b: box<Node>) -> i64 effects[alloc] = let n: Node = unbox(b) in n.v\n\
+                  fn go(outer: box<Node>, n: i64) -> i64 effects[alloc] =\n\
+                    loop acc = 0 while acc < n do acc + drop_it(outer)\n";
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("outermove.sqlite");
+    let src = temp.path().join("outermove.cdb");
+    std::fs::write(&src, source).unwrap();
+    run(&["init", path(&db)]);
+    let err = run_fail(&["import", path(&db), path(&src)]);
+    assert!(
+        err.contains("loop body cannot move owned values"),
+        "expected the loop-body move gate, got: {err}"
+    );
+}
+
+#[test]
+fn per_iteration_local_moves_run_exactly_once_per_iteration() {
+    // Loop-carried drop glue: a body-local box created and consumed within one
+    // iteration is sound (its scoped drop glue re-executes per iteration) and
+    // now lowers natively; same for a fold body. Previously fail-closed.
+    check_native(
+        "loop_iteration_box",
+        "record Node { v: i64 }\n\
+         fn drop_it(b: box<Node>) -> i64 effects[alloc] = let n: Node = unbox(b) in n.v\n\
+         fn main() -> i64 effects[alloc] =\n\
+           loop acc = 0 while acc < 5 do\n\
+             let b: box<Node> = box_new({ v: 1 }) in acc + drop_it(b)\n",
+        "main",
+        5,
+    );
+    check_native(
+        "fold_iteration_box",
+        "record Node { v: i64 }\n\
+         fn drop_it(b: box<Node>) -> i64 effects[alloc] = let n: Node = unbox(b) in n.v\n\
+         fn main() -> i64 effects[alloc] =\n\
+           let arr: array<i64, 3> = [1, 2, 3] in\n\
+           fold x in arr with acc = 0 do\n\
+             let b: box<Node> = box_new({ v: x }) in acc + drop_it(b)\n",
+        "main",
+        6,
+    );
 }
 
 #[test]

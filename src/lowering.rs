@@ -727,6 +727,83 @@ fn normalize_moved_set(set: BTreeSet<MovedPlace>) -> BTreeSet<MovedPlace> {
 /// The places newly consumed (moved or dropped) by a branch, relative to the
 /// state before it. Used by the verifier to merge per-branch move/drop state at
 /// an `if`/`case` join (SPEC_V3 §7).
+/// Gate the moves recorded while lowering one multi-execution block — a
+/// `loop` cond/body or a `fold` body, which run 0..N times per surrounding
+/// evaluation (loop-carried drop glue, SPEC_V3 §7). `new_moves` are the
+/// `ctx.moved` entries the block added. Per-iteration storage (slots at or
+/// above `iteration_floor`, allocated while lowering the block) may move —
+/// its scoped drop glue re-executes every iteration. A loop BODY may also
+/// consume the accumulator (`movable_whole`), but only as a whole place: the
+/// back-edge refills the slot. Anything else outlives an iteration, so the
+/// move would repeat (double-free) — rejected.
+fn check_iteration_moves<'a>(
+    new_moves: impl Iterator<Item = &'a MovedPlace>,
+    iteration_floor: usize,
+    movable_whole: Option<usize>,
+    construct: &str,
+) -> Result<()> {
+    for place in new_moves {
+        let allowed = match place.root {
+            RootSlot::Local(slot) if Some(slot) == movable_whole => {
+                if !place.path.is_empty() {
+                    bail!(
+                        "unsupported_move: {construct} may consume the loop accumulator only as a whole; a partial accumulator move is not supported"
+                    );
+                }
+                true
+            }
+            RootSlot::Local(slot) => slot >= iteration_floor,
+            RootSlot::Param(_) => false,
+        };
+        if !allowed {
+            bail!(
+                "unsupported_move: {construct} cannot move owned values that outlive one iteration (the move would repeat)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Verifier-side mirror of [`check_iteration_moves`] for STORED lowered IR:
+/// every move/drop/shell-free a `loop` cond/body or `fold` body block performed
+/// must be per-iteration storage (slots above the accumulator's — legitimate
+/// lowering allocates body slots after it) or, for a loop BODY only, the whole
+/// accumulator. A forged block consuming outer storage would repeat that
+/// consumption every iteration.
+fn check_lowered_iteration_consumption(
+    drop_state: &DropTracker,
+    moved_before: &BTreeSet<MovedPlace>,
+    dropped_before: &BTreeSet<MovedPlace>,
+    freed_before: &BTreeSet<MovedPlace>,
+    acc_slot: usize,
+    acc_movable: bool,
+    construct: &str,
+) -> Result<()> {
+    let check = |news: std::collections::btree_set::Difference<'_, MovedPlace>,
+                 allow_whole_acc: bool|
+     -> Result<()> {
+        for place in news {
+            let allowed = match place.root {
+                RootSlot::Local(slot) if slot == acc_slot => {
+                    allow_whole_acc && place.path.is_empty()
+                }
+                RootSlot::Local(slot) => slot > acc_slot,
+                RootSlot::Param(_) => false,
+            };
+            if !allowed {
+                bail!(
+                    "lowered {construct} consumes storage that outlives one iteration ({place:?})"
+                );
+            }
+        }
+        Ok(())
+    };
+    check(drop_state.moved.difference(moved_before), acc_movable)?;
+    check(drop_state.dropped.difference(dropped_before), acc_movable)?;
+    check(drop_state.freed_shells.difference(freed_before), false)?;
+    Ok(())
+}
+
 fn newly_consumed_places(
     drop_state: &DropTracker,
     moved_before: &BTreeSet<MovedPlace>,
@@ -4084,15 +4161,26 @@ impl CodeDb {
             type_hash: acc_type_hash.clone(),
         });
         let moved_before = ctx.moved.clone();
+        // Slots allocated from here on belong to one body iteration: they may
+        // move (their scoped drop glue re-executes per element), while the
+        // item, the accumulator, and anything outer may not — that move would
+        // repeat (loop-carried drop glue, SPEC_V3 §7; the move-only-accumulator
+        // form is `loop`'s, not fold's, for now).
+        let iteration_floor = ctx.next_local;
         let body = self.lower_expr_as(root, body_hash, &acc_type_hash, param_types, ctx, locals);
         locals.pop();
         locals.pop();
         let body = body?;
-        if ctx.moved != moved_before {
-            bail!(
-                "unsupported_move: fold body cannot move owned values in phase 13; loop-aware drop glue is not yet implemented"
-            );
-        }
+        check_iteration_moves(
+            ctx.moved.difference(&moved_before),
+            iteration_floor,
+            None,
+            "fold body",
+        )?;
+        // Per-iteration traces end with the fold (each element refills the
+        // per-iteration slots), so the enclosing scope's moved-set is exactly
+        // the pre-fold one.
+        ctx.moved = moved_before;
         if !self.type_assignable_in_root(root, &body.type_hash, &acc_type_hash)? {
             bail!("fold body type mismatch while lowering");
         }
@@ -4126,9 +4214,22 @@ impl CodeDb {
     /// Lower `loop acc = init while cond do body` (R8): the condition-driven
     /// counterpart of `lower_fold`. `init` lowers and seeds the accumulator slot;
     /// `cond` and `body` lower as blocks that read the accumulator slot (via the
-    /// `acc` local binding). Like fold, the accumulator must be copyable and the
-    /// body may move no owned values (loop-carried drop glue is a follow-on;
-    /// SPEC_V3 §7) — a body move is rejected here.
+    /// `acc` local binding).
+    ///
+    /// Loop-carried drop glue (SPEC_V3 §7): the accumulator may be MOVE-ONLY.
+    /// Each iteration the body either consumes the old accumulator wholly (its
+    /// drop obligation transfers — e.g. it IS the body result, or a callee
+    /// freed it) or it does not, in which case a `Drop` of the old value is
+    /// appended to the body block so the back-edge store does not overwrite a
+    /// live owned value — exactly-once either way (branch-conditional
+    /// consumption inside the body is already made uniform by the if/case
+    /// merge compensation). Per-iteration locals (slots allocated while
+    /// lowering cond/body) may also move; their scoped drop glue re-executes
+    /// every iteration. Moves of anything that OUTLIVES an iteration (params,
+    /// outer locals, partial accumulator projections) would repeat and stay
+    /// rejected, as does any accumulator move from `cond` (which runs once
+    /// more than the body, so its final evaluation would consume the loop's
+    /// result).
     fn lower_loop(
         &self,
         root: &ProgramRootPayload,
@@ -4159,9 +4260,6 @@ impl CodeDb {
         if acc_type_hash != type_hash {
             bail!("loop accumulator/result type mismatch while lowering");
         }
-        if self.type_is_move_only(root, ctx.target_triple(), &acc_type_hash)? {
-            bail!("loop lowering requires a copyable accumulator type");
-        }
         let init = self.lower_expr_as(root, init_hash, &acc_type_hash, param_types, ctx, locals)?;
         if !self.type_assignable_in_root(root, &init.type_hash, &acc_type_hash)? {
             bail!("loop init type mismatch while lowering");
@@ -4178,23 +4276,61 @@ impl CodeDb {
             type_hash: acc_type_hash.clone(),
         });
         let moved_before = ctx.moved.clone();
+        // Slots allocated from here on belong to one cond/body iteration.
+        let iteration_floor = ctx.next_local;
         // `cond` and `body` both read the accumulator slot via the `acc` local.
         let cond = self.lower_expr(root, cond_hash, param_types, ctx, locals);
+        let moved_after_cond = ctx.moved.clone();
         let body = self.lower_expr_as(root, body_hash, &acc_type_hash, param_types, ctx, locals);
         locals.pop();
         let cond = cond?;
         let body = body?;
-        if ctx.moved != moved_before {
-            bail!(
-                "unsupported_move: loop body cannot move owned values; loop-carried drop glue is not yet implemented"
-            );
-        }
+        check_iteration_moves(
+            moved_after_cond.difference(&moved_before),
+            iteration_floor,
+            None,
+            "loop condition",
+        )?;
+        check_iteration_moves(
+            ctx.moved.difference(&moved_after_cond),
+            iteration_floor,
+            Some(acc_slot),
+            "loop body",
+        )?;
         if cond.type_hash != type_hash_for("Bool") {
             bail!("loop condition must lower to bool");
         }
         if !self.type_assignable_in_root(root, &body.type_hash, &acc_type_hash)? {
             bail!("loop body type mismatch while lowering");
         }
+        let mut body_operations = body.operations;
+        if self.type_requires_drop_scaffold(root, ctx.target_triple(), &acc_type_hash)? {
+            let acc_place = MovedPlace::whole(RootSlot::Local(acc_slot));
+            if !place_covered_by(&ctx.moved, &acc_place) {
+                // The body did not consume the old accumulator, so the
+                // back-edge store would overwrite (leak) it: drop the old
+                // value after the body's result is computed. (A partial
+                // accumulator move was rejected above, so this is always the
+                // whole-value drop.)
+                let moved_now = ctx.moved.clone();
+                self.emit_residual_drops(
+                    root,
+                    &acc_place,
+                    &acc_type_hash,
+                    &acc_type_hash,
+                    &moved_now,
+                    expr_hash,
+                    ctx,
+                    &mut body_operations,
+                )?;
+            }
+        }
+        // Per-iteration bookkeeping ends at the back edge: body-internal
+        // places die with their iteration and the accumulator slot is refilled
+        // by the store-back, so the enclosing scope's moved-set is exactly the
+        // pre-loop one (an enclosing if/case merge must not emit compensation
+        // for places that never escaped the loop).
+        ctx.moved = moved_before;
         let id = ctx.value();
         ctx.push_debug_op(expr_hash, "loop", &id);
         operations.push(LoweredOp::Loop {
@@ -4206,7 +4342,7 @@ impl CodeDb {
                 result: cond.value,
             },
             body: LoweredBlock {
-                operations: body.operations,
+                operations: body_operations,
                 result: body.value,
             },
             acc_type_hash: acc_type_hash.clone(),
@@ -7471,6 +7607,13 @@ impl CodeDb {
                         TypeSpec::Slice { element, .. } if element == *element_type_hash => {}
                         _ => bail!("lowered fold target element type mismatch"),
                     }
+                    // The body runs once per element: it may consume only
+                    // per-iteration storage (slots above the accumulator's),
+                    // mirroring the lowering gate for stored IR (loop-carried
+                    // drop glue; the movable-accumulator form is `loop`'s).
+                    let fold_moved_before = drop_state.moved.clone();
+                    let fold_dropped_before = drop_state.dropped.clone();
+                    let fold_freed_before = drop_state.freed_shells.clone();
                     let body_type = self.verify_lowered_block(
                         root,
                         body,
@@ -7485,6 +7628,15 @@ impl CodeDb {
                     if body_type != *acc_type_hash {
                         bail!("lowered fold body result type mismatch");
                     }
+                    check_lowered_iteration_consumption(
+                        drop_state,
+                        &fold_moved_before,
+                        &fold_dropped_before,
+                        &fold_freed_before,
+                        *acc_slot,
+                        false,
+                        "fold body",
+                    )?;
                     insert_value(values, id, type_hash)?;
                     if self.type_passes_indirect(root, target_triple, type_hash)? {
                         insert_address(addresses, id, type_hash)?;
@@ -7513,9 +7665,21 @@ impl CodeDb {
                     if acc_slot_type != *acc_type_hash {
                         bail!("lowered loop accumulator slot type mismatch");
                     }
-                    // `cond` and `body` read the accumulator slot and run 0..N times;
-                    // since the body moves no owned values (enforced at lowering),
-                    // the shared drop-state is unchanged across the back-edge.
+                    // `cond` and `body` read the accumulator slot and run 0..N
+                    // times. They may consume only per-iteration storage (slots
+                    // above the accumulator's — the bump allocator mints body
+                    // slots after it) plus, for the BODY, the whole accumulator
+                    // itself (the back-edge store refills it; lowering appends
+                    // a drop of the old value when the body did not consume
+                    // it). Anything else would repeat the consumption every
+                    // iteration — rejected, mirroring the lowering gate for
+                    // stored IR. The entries stay in the shared tracker
+                    // afterward: legitimate code never touches those slots
+                    // again (slots are never reused), and a forged later read
+                    // of one fails closed against the stale state.
+                    let loop_moved_before = drop_state.moved.clone();
+                    let loop_dropped_before = drop_state.dropped.clone();
+                    let loop_freed_before = drop_state.freed_shells.clone();
                     let cond_type = self.verify_lowered_block(
                         root,
                         cond,
@@ -7530,6 +7694,18 @@ impl CodeDb {
                     if cond_type != type_hash_for("Bool") {
                         bail!("lowered loop condition must be bool");
                     }
+                    check_lowered_iteration_consumption(
+                        drop_state,
+                        &loop_moved_before,
+                        &loop_dropped_before,
+                        &loop_freed_before,
+                        *acc_slot,
+                        false,
+                        "loop condition",
+                    )?;
+                    let body_moved_before = drop_state.moved.clone();
+                    let body_dropped_before = drop_state.dropped.clone();
+                    let body_freed_before = drop_state.freed_shells.clone();
                     let body_type = self.verify_lowered_block(
                         root,
                         body,
@@ -7544,6 +7720,15 @@ impl CodeDb {
                     if body_type != *acc_type_hash {
                         bail!("lowered loop body result type mismatch");
                     }
+                    check_lowered_iteration_consumption(
+                        drop_state,
+                        &body_moved_before,
+                        &body_dropped_before,
+                        &body_freed_before,
+                        *acc_slot,
+                        true,
+                        "loop body",
+                    )?;
                     insert_value(values, id, type_hash)?;
                     if self.type_passes_indirect(root, target_triple, type_hash)? {
                         insert_address(addresses, id, type_hash)?;
