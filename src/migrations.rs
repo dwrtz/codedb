@@ -35,6 +35,13 @@ pub(crate) struct RecursionGroupMemberSpec {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) region_params: Vec<String>,
+    /// Type parameters (R11): a non-empty list makes this member a generic
+    /// function template `fn name<T, ..>` participating in a recursive (or
+    /// mutually-recursive) clique. Skipped when empty so a non-generic
+    /// recursion group's member spec — and therefore the `CreateRecursionGroup`
+    /// op's migration hash — is byte-identical to the pre-generics form.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) type_params: Vec<String>,
     pub(crate) params: Vec<ParamSpec>,
     pub(crate) return_type: String,
     #[serde(default)]
@@ -2259,7 +2266,7 @@ impl CodeDb {
                         module: module.clone(),
                         name: member.name.clone(),
                         region_params: member.region_params.clone(),
-                        type_params: Vec::new(),
+                        type_params: member.type_params.clone(),
                         params: member.params.clone(),
                         return_type: member.return_type.clone(),
                         effects: member.effects.clone(),
@@ -3724,6 +3731,10 @@ impl CodeDb {
             validate_projection_identifier("function name", &member.name)?;
             validate_param_names(&member.params)?;
             validate_region_param_names(&member.region_params)?;
+            // Type parameters (R11): a generic member's `<T, ..>` scopes every
+            // `TypeParam` in its parameter/return types and is checked once with
+            // them opaque, exactly like a non-recursive generic function.
+            validate_type_param_names(&member.type_params)?;
             if !seen_names.insert(member.name.as_str()) {
                 bail!("duplicate function name in recursion group: {}", member.name);
             }
@@ -3760,24 +3771,36 @@ impl CodeDb {
                 &member.region_params,
             )?;
             let region_scope = region_scope_from_params(&region_params);
+            // Resolve member types under both the region scope and the member's
+            // type-parameter scope (R11), so a generic member's `T` binds to a
+            // `TypeParam`. Empty `type_params` reproduces the non-generic path
+            // (byte-identical signatures), preserving every existing clique hash.
             let param_types = member
                 .params
                 .iter()
                 .map(|param| {
-                    self.resolve_type_in_root_with_regions(module, &root, &param.ty, &region_scope)
+                    self.resolve_type_in_root_with_scope(
+                        module,
+                        &root,
+                        &param.ty,
+                        &region_scope,
+                        &member.type_params,
+                    )
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let return_type_hash = self.resolve_type_in_root_with_regions(
+            let return_type_hash = self.resolve_type_in_root_with_scope(
                 module,
                 &root,
                 &member.return_type,
                 &region_scope,
+                &member.type_params,
             )?;
-            let signature = self.put_signature_with_effects_and_regions(
+            let signature = self.put_signature_with_effects_regions_and_type_params(
                 &param_types,
                 &return_type_hash,
                 &member.effects,
                 &region_params,
+                &member.type_params,
             )?;
             let param_name_list = member
                 .params

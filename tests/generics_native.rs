@@ -582,3 +582,196 @@ fn applying_a_type_parameter_is_rejected() {
         "cannot take type or region arguments",
     );
 }
+
+// Recursive and mutually-recursive generic functions (R11, PLAN_V3 Phase 14): the
+// remaining Phase 14 follow-on. A recursive generic function forms a *generic
+// recursion group* — the clique binds its members' generic signatures (`<T>`)
+// before any body is type-checked, so a member may call itself and its peers
+// generically; the concrete instances are monomorphized at the lowering seam, the
+// worklist co-materializing a mutually-recursive instance pair and terminating on
+// the back-edge. The generic templates are never lowered, never projected, and the
+// instances are unnamed derived symbols recursive by-symbol — so lowering, verify,
+// reachability, and the import->export->import fixpoint all carry over unchanged.
+
+const RECURSIVE_GENERIC_PICK: &str = r#"
+fn pick<T>(a: T, b: T, n: i64) -> T =
+  if n <= 0 then a else pick(b, a, n - 1)
+
+fn main() -> i64 =
+  let x: i64 = pick(10, 20, 3) in
+  let f: bool = pick(true, false, 1) in
+  if f then 0 else x
+"#;
+
+#[test]
+fn recursive_generic_function_compiles_at_two_instantiations() {
+    // The acceptance fixture: a SELF-recursive generic function `pick<T>` threading
+    // and returning two `T` values through the recursion, monomorphized natively at
+    // two instantiations (`pick<i64>`, `pick<bool>`), eval == native. The recursion
+    // threads `T` (the args swap each call) and the result depends on BOTH instances
+    // (`pick<bool>` must return `false` for the `i64` branch to be taken), so a
+    // shared/erased instance would miscompute.
+    check_native("recursive_generic_pick", RECURSIVE_GENERIC_PICK, 20);
+}
+
+const MUTUAL_GENERIC_STEPS: &str = r#"
+fn even_steps<T>(x: T, n: i64) -> i64 = if n <= 0 then 100 else odd_steps(x, n - 1)
+fn odd_steps<T>(x: T, n: i64) -> i64 = if n <= 0 then 200 else even_steps(x, n - 1)
+fn main() -> i64 = even_steps(true, 3) + even_steps(7, 2)
+"#;
+
+#[test]
+fn mutually_recursive_generic_functions_compile_natively() {
+    // A mutually-recursive generic clique `{even_steps<T>, odd_steps<T>}` — each
+    // member calls its peer generically. Instantiated at BOTH `bool` and `i64`
+    // (four instances total: even/odd x bool/i64), so the monomorphization worklist
+    // co-materializes each mutually-recursive pair, terminating on the back-edge.
+    // even_steps(true,3) = 200 (3 hops to odd's base), even_steps(7,2) = 100; eval
+    // == native == 300.
+    check_native("mutual_generic_steps", MUTUAL_GENERIC_STEPS, 300);
+}
+
+const RECURSIVE_GENERIC_OVER_GENERIC_TYPE: &str = r#"
+record Wrap<T> {
+  item: T
+  count: i64
+}
+fn bump<T>(w: Wrap<T>, n: i64) -> i64 =
+  if n <= 0 then w.count else 1 + bump(w, n - 1)
+fn main() -> i64 =
+  let a: Wrap<i64> = { item: 5, count: 10 } in
+  let b: Wrap<bool> = { item: true, count: 100 } in
+  bump(a, 3) + bump(b, 2)
+"#;
+
+#[test]
+fn recursive_generic_function_over_a_generic_type_compiles_natively() {
+    // A self-recursive generic function whose parameter is itself a generic type
+    // (`bump<T>(Wrap<T>, i64)`), threading the generic-typed `w: Wrap<T>` through the
+    // recursion. `bump<i64>` (over a 16-byte `Wrap<i64>`) and `bump<bool>` (over a
+    // differently-laid-out `Wrap<bool>`) are distinct monomorphizations reading
+    // `w.count` at instantiation-specific offsets; both run natively (a shared
+    // instance would mis-read one). bump(a,3)=13, bump(b,2)=102; eval == native.
+    check_native(
+        "recursive_generic_over_type",
+        RECURSIVE_GENERIC_OVER_GENERIC_TYPE,
+        115,
+    );
+}
+
+#[test]
+fn recursive_generic_function_blames_to_its_type_params() {
+    // Provenance: a recursive generic function is born by the `create_recursion_group`
+    // migration that binds the clique, and that migration records each member's type
+    // parameters — so blame on the generic identifies the parameters its instances
+    // derive from, even though it is part of a recursion group.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("blamerec.sqlite");
+    let src = temp.path().join("blamerec.cdb");
+    std::fs::write(&src, RECURSIVE_GENERIC_PICK).unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+
+    let blame = parse_json(&run(&["blame-symbol", path(&db), "pick", "--json"]));
+    let birth = &blame["birth_migration"];
+    assert_eq!(
+        birth["operation_kind"], "create_recursion_group",
+        "a recursive generic function is born by create_recursion_group: {blame}"
+    );
+    let member = birth["operation"]["members"]
+        .as_array()
+        .expect("recursion group members")
+        .iter()
+        .find(|member| member["name"] == "pick")
+        .expect("member pick");
+    assert_eq!(
+        member["type_params"],
+        serde_json::json!(["T"]),
+        "the recursion-group member records its type parameters: {blame}"
+    );
+}
+
+#[test]
+fn recursive_generic_function_program_round_trips_to_a_fixpoint() {
+    // import -> export -> import is a fixpoint and the export is byte-stable for a
+    // recursive-generic-function program: the member projects as `fn pick<T>` (a
+    // recursion-group member round-trips as an ordinary generic `fn`), the bare
+    // recursive call re-infers identically, and the unnamed monomorphic instances are
+    // never projected — so re-import reproduces the same instances and root hash.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("rtrec.sqlite");
+    let src = temp.path().join("rtrec.cdb");
+    std::fs::write(&src, RECURSIVE_GENERIC_PICK).unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+
+    let export1 = temp.path().join("rtrec.export1.cdb");
+    run(&["export", path(&db), "--branch", "main", "--out", path(&export1)]);
+
+    let db2 = temp.path().join("rtrec2.sqlite");
+    run(&["init", path(&db2)]);
+    run(&["import", path(&db2), path(&export1)]);
+    run(&["verify", path(&db2)]);
+
+    let export2 = temp.path().join("rtrec.export2.cdb");
+    run(&["export", path(&db2), "--branch", "main", "--out", path(&export2)]);
+
+    assert_eq!(
+        root_hash(&db),
+        root_hash(&db2),
+        "import->export->import is a fixpoint for a recursive-generic-function program"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&export1).unwrap(),
+        std::fs::read_to_string(&export2).unwrap(),
+        "the recursive-generic-function projection is byte-stable"
+    );
+    let projection = std::fs::read_to_string(&export1).unwrap();
+    assert!(projection.contains("fn pick<T>"), "{projection}");
+    assert!(
+        !projection.contains("MonomorphicFunctionInstance"),
+        "instances must not be projected: {projection}"
+    );
+}
+
+#[test]
+fn mutually_recursive_generic_program_round_trips_to_a_fixpoint() {
+    // A mutually-recursive generic clique must round-trip to a fixpoint. The
+    // projection orders a callee before its caller by *named* dependency, and a
+    // generic clique member calls its peers at `TypeParam` arguments (whose unnamed
+    // instance does not exist) — so the projection ordering must follow the named
+    // peer, not the absent instance, or `main` would be emitted between the two
+    // clique members, shift its parse index, and re-identify it (breaking the root
+    // hash even though the projection text is byte-stable). This pins both halves.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("rtmut.sqlite");
+    let src = temp.path().join("rtmut.cdb");
+    std::fs::write(&src, MUTUAL_GENERIC_STEPS).unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+
+    let export1 = temp.path().join("rtmut.export1.cdb");
+    run(&["export", path(&db), "--branch", "main", "--out", path(&export1)]);
+
+    let db2 = temp.path().join("rtmut2.sqlite");
+    run(&["init", path(&db2)]);
+    run(&["import", path(&db2), path(&export1)]);
+    run(&["verify", path(&db2)]);
+
+    let export2 = temp.path().join("rtmut.export2.cdb");
+    run(&["export", path(&db2), "--branch", "main", "--out", path(&export2)]);
+
+    assert_eq!(
+        std::fs::read_to_string(&export1).unwrap(),
+        std::fs::read_to_string(&export2).unwrap(),
+        "the mutually-recursive-generic projection is byte-stable"
+    );
+    assert_eq!(
+        root_hash(&db),
+        root_hash(&db2),
+        "import->export->import is a fixpoint for a mutually-recursive-generic clique"
+    );
+    let projection = std::fs::read_to_string(&export1).unwrap();
+    assert!(projection.contains("fn even_steps<T>"), "{projection}");
+    assert!(projection.contains("fn odd_steps<T>"), "{projection}");
+}

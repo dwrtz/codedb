@@ -2524,7 +2524,7 @@ impl CodeDb {
     /// (R11). Centralizes the per-kind child structure shared by the
     /// monomorphization traversals (mirrors `collect_expr_deps`); the
     /// substitution walker overrides each child in place.
-    fn child_expr_hashes(&self, payload: &JsonValue) -> Result<Vec<String>> {
+    pub(crate) fn child_expr_hashes(&self, payload: &JsonValue) -> Result<Vec<String>> {
         let kind = payload
             .get("expr_kind")
             .and_then(JsonValue::as_str)

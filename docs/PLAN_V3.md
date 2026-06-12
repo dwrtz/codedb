@@ -799,9 +799,10 @@ follow-on).
 Goal: type parameters on fn/record/enum with monomorphization at lowering — the
 one large rock the compiler genuinely needs (`Vec<T>`, `Option<T>`, `Result`).
 
-Status: implemented for records, enums, AND functions. Resolves R11 for
-parametric types and parametric functions. Type parameters on `record`/`enum`
-(`record Pair<T>`, `enum Option<T>`)
+Status: implemented for records, enums, AND functions — including recursive and
+mutually-recursive generic functions (via a generic recursion group; see the final
+paragraph). Resolves R11 for parametric types and parametric functions. Type
+parameters on `record`/`enum` (`record Pair<T>`, `enum Option<T>`)
 are constraint-free and monomorphized by **on-demand substitution** rather than a
 stored-instance pass: a generic instance `Option<i64>` is the content hash of a
 `Named` Type object carrying its type arguments (`{type_symbol: <generic>,
@@ -921,11 +922,32 @@ reproduces it. Reachability and lowering map a generic call to its instance symb
 projection ordering maps the instance back to the named generic (so a callee is
 emitted before its caller). Because instances are unnamed and derived
 deterministically, the projection emits only the generic templates and bare calls —
-never the instances — and import→export→import is a fixpoint. Generic *functions*
-must be non-recursive (a recursive or mutually-recursive generic function needs a
-generic recursion group — monomorphizing a clique that binds its own type
-parameters — which fails closed with a clear message; a non-generic recursive
-function calling a generic helper is supported).
+never the instances — and import→export→import is a fixpoint.
+
+Recursive and mutually-recursive generic functions are supported through a *generic
+recursion group* — the Phase 5 recursion-group object whose members now carry
+`type_params` (skip-if-empty, so a non-generic clique's `CreateRecursionGroup` op
+and every existing clique hash is byte-identical). The clique binds its members'
+generic signatures (`<T>`) before any body is type-checked, so a member may call
+itself and its peers generically (each in-group call infers `[TypeParam{index}]`
+type arguments); the concrete instances are monomorphized at the lowering seam by
+the same worklist, which co-materializes a mutually-recursive instance pair and
+terminates on the back-edge (the instance's recursive call re-enters an
+already-built instance). The instances are ordinary unnamed derived symbols,
+recursive by-symbol, so lowering, the at-most-once verifier, intra-procedural
+effect/borrow checks (satisfied inductively over the clique), and visited-set
+reachability all carry over from non-generic recursion unchanged. One projection
+subtlety the recursion group forces: the source ordering follows a call's *named*
+callee (`collect_named_call_symbols`), not its monomorphic instance, because a
+clique member's in-group calls are at `TypeParam` arguments whose instance does not
+exist — so a non-clique function projected alongside the clique keeps its parse
+position and the import→export→import root hash stays a fixpoint. Blame on a
+recursive generic function reports the `create_recursion_group` migration that
+records each member's type parameters. (A recursive generic function over a
+*mutually-recursive generic type* clique — a generic `CreateTypeGroup`, D1 — remains
+a follow-on (it fails closed: the clique's `<T>` is not yet threaded through
+`CreateTypeGroup`); a self-recursive generic function over a single generic type, and
+a recursive generic threading a generic-typed value, are supported.)
 
 ## Phase 15 — Self-Hosted Front-End to Lowered IR (Ladder Rung A)
 
@@ -1163,8 +1185,12 @@ Includes: Phases 9–14 (ints/bitwise/casts/modulo, early exit, loops, strings/f
 array fill, generics). Generics (Phase 14) is delivered for records, enums, AND
 functions — parametric `record`/`enum`/`fn` monomorphized natively at two-plus
 instantiations (a generic function's instances materialized as derived symbols at
-the lowering seam); recursive generic functions are the remaining follow-on (they
-need a generic recursion group), failing closed with a clear message.
+the lowering seam), now including recursive and mutually-recursive generic functions
+through a generic recursion group (the clique binds its members' `<T>` signatures
+before any body is typed; the instances co-materialize at the lowering seam and
+recurse by-symbol). The remaining follow-on is a recursive generic function over a
+*mutually-recursive generic type* clique (a generic `CreateTypeGroup`, D1), which
+fails closed (its `<T>` is not yet threaded through `CreateTypeGroup`).
 
 ```text
 Success: sha256.cdb and tokenizer.cdb compile native; the language can express a

@@ -5205,39 +5205,54 @@ impl CodeDb {
         Ok(deps)
     }
 
-    /// The *named* function dependencies of a definition (R11): like
-    /// `dependencies_for_definition`, but a generic-function instance is mapped
-    /// back to the named generic it derives from. Build reachability follows the
-    /// (unnamed) instances; source-level concerns — projection ordering — follow
-    /// the named generic a call site mentions, so the projection emits a callee
-    /// before its caller and re-imports to the same program.
+    /// The *named* function dependencies of a definition (R11): the named callee
+    /// each call site mentions (`collect_named_call_symbols`) — the generic itself
+    /// for a generic call. Build reachability (`dependencies_for_definition`) follows
+    /// the unnamed monomorphic instances instead; source-level concerns — projection
+    /// ordering — follow the named generic, so the projection emits a callee before
+    /// its caller and re-imports to the same program. Reading the named callee
+    /// directly (rather than mapping a build-dep instance back to its generic) also
+    /// keeps a generic recursion group's in-clique calls — at `TypeParam` arguments,
+    /// whose instance does not exist — from being dropped.
     pub(crate) fn named_dependencies_for_definition(
         &self,
-        root: &ProgramRootPayload,
+        _root: &ProgramRootPayload,
         definition_hash: &str,
     ) -> Result<BTreeSet<String>> {
-        let mut named = BTreeSet::new();
-        for dep in self.dependencies_for_definition(root, definition_hash)? {
-            match self.generic_function_of_instance(&dep)? {
-                Some(generic) => named.insert(generic),
-                None => named.insert(dep),
-            };
+        if self.definition_is_external(definition_hash)? {
+            return Ok(BTreeSet::new());
         }
+        let body = self.function_body_hash(definition_hash)?;
+        let mut named = BTreeSet::new();
+        self.collect_named_call_symbols(&body, &mut named)?;
         Ok(named)
     }
 
-    /// If `symbol` is a generic function's monomorphic instance (R11), the named
-    /// generic it was derived from; otherwise `None`. The instance's symbol is
-    /// the content hash of its descriptor, which records the generic.
-    pub(crate) fn generic_function_of_instance(&self, symbol: &str) -> Result<Option<String>> {
-        if self.get_kind(symbol).ok().as_deref() != Some(crate::types::MONOMORPHIC_INSTANCE_KIND) {
-            return Ok(None);
+    /// Collect the NAMED callee symbol of every call in a typed body: the symbol a
+    /// call site mentions — a generic function's own (named) symbol for a generic
+    /// call, the function itself otherwise. Unlike `collect_expr_deps` (build
+    /// reachability), this never routes a generic call through its unnamed
+    /// monomorphic instance, so a call whose type arguments are not concrete — a
+    /// recursive or mutually-recursive generic clique calls itself/its peers at
+    /// `TypeParam` arguments, whose instance does not exist — is NOT dropped. That
+    /// keeps the projection's topological order (callee before caller) correct for a
+    /// generic recursion group, so a non-clique function projected alongside it keeps
+    /// its parse position and the import→export→import root hash is a fixpoint (R11).
+    fn collect_named_call_symbols(
+        &self,
+        expr_hash: &str,
+        out: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let payload = self.get_payload(expr_hash)?;
+        if payload.get("expr_kind").and_then(JsonValue::as_str) == Some("call")
+            && let Some(symbol) = payload.get("symbol").and_then(JsonValue::as_str)
+        {
+            out.insert(symbol.to_string());
         }
-        let payload = self.get_payload(symbol)?;
-        Ok(payload
-            .get("generic")
-            .and_then(JsonValue::as_str)
-            .map(str::to_string))
+        for child in self.child_expr_hashes(&payload)? {
+            self.collect_named_call_symbols(&child, out)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn dependencies_for_type_definition(
