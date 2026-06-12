@@ -1,10 +1,11 @@
 # compiler/eval - Reference Evaluator in CodeDB (Ladder Rung 0)
 
-Status: the `.cdb` evaluator EXECUTES (docs/PLAN_V3.md Phase 8; milestone
-V3.2) — stages 1-4 are in: the loader, the scalar core, aggregates, and the
-heap all run natively, result-equal to the Rust evaluator on the staged
-corpora (`tests/selfhost_eval.rs`); the corpus-wide sweep and the §11
-checked-view gate (stage 5) remain.
+Status: COMPLETE (docs/PLAN_V3.md Phase 8; milestone V3.2). The `.cdb`
+evaluator runs natively and is result-equal to the Rust evaluator on the
+operator-conformance sweep, the per-feature scalar/aggregate/heap fixtures,
+and the qualifying example corpus — including the complete sha256 digest —
+and the committed sources pass the §11 checked-view gate
+(`tests/selfhost_eval.rs`).
 
 Re-expresses the reference evaluator — the lowered-IR walker, the Value model,
 and per-op evaluation — as CodeDB objects. This rung is off the compilation path:
@@ -202,6 +203,15 @@ stay out until something forces them.
    like the native runtime (a DOCUMENTED divergence from the growable
    Rust-eval string model, pinned by a test); argv forwards 1:1 — gated by
    box-recursion (cons list), vec/string/fmt, and argv-parity fixtures;
-6. the corpus harness (`tests/selfhost_eval.rs`): manifest-driven
-   Rust-eval-vs-CodeDB-evaluator sweep, plus the §11 checked-view gate for
-   `compiler/eval/*.cdb`.
+6. **(done — Stage 5)** the corpus harness (`tests/selfhost_eval.rs`): the
+   example-corpus manifest sweep (booleans, discount, fnv1a, the tokenizer,
+   and the COMPLETE sha256 digest — all eight words), plus the §11
+   checked-view gate (import the committed sources -> export -> re-import:
+   byte-stable canonical projection, fixpoint root).
+
+Phase 8 / milestone V3.2 is COMPLETE per the corpus definition pinned above:
+CodeDB-eval == Rust-eval on the operator-conformance sweep, the per-feature
+scalar/aggregate/heap fixtures, and the qualifying example corpus, with the
+native backend as the transitive third leg. Extending the manifest with
+further fixtures is mechanical; aggregate-result entries await a canonical
+value serialization if something forces them.

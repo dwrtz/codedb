@@ -472,6 +472,94 @@ fn capacity_traps_mirror_the_native_runtime_not_the_growable_eval_model() {
     );
 }
 
+/// The rung-0 corpus manifest: every committed example whose entries are
+/// extern-free, parameterless, and scalar-result. Each entry must agree
+/// with the Rust evaluator — SPEC_V3 §5's rung-0 acceptance, including the
+/// COMPLETE sha256 digest (all eight words).
+const CORPUS: &[(&str, &str, &[&str])] = &[
+    ("booleans", "examples/booleans.cdb", &["main"]),
+    ("discount", "examples/discount.cdb", &["main"]),
+    (
+        "fnv1a",
+        "examples/fnv1a.cdb",
+        &["fnv_offset", "hash_codedb", "main"],
+    ),
+    (
+        "tokenizer",
+        "examples/v3/tokenizer.cdb",
+        &["tokenize_ok", "tokenize_bad", "tokenize_empty"],
+    ),
+    (
+        "sha256",
+        "examples/v3/sha256.cdb",
+        &[
+            "digest_0", "digest_1", "digest_2", "digest_3", "digest_4", "digest_5", "digest_6",
+            "digest_7",
+        ],
+    ),
+];
+
+#[test]
+fn the_example_corpus_matches_the_rust_evaluator() {
+    if !can_build_default_native_target() {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let exe = evaluator();
+    for (name, source, entries) in CORPUS {
+        let db = temp.path().join(format!("{name}.sqlite"));
+        run(&["init", path(&db)]);
+        run(&["import", path(&db), source]);
+        for entry in *entries {
+            assert_three_way(temp.path(), exe, &db, entry);
+        }
+    }
+}
+
+#[test]
+fn the_committed_evaluator_view_passes_the_checked_view_gate() {
+    // SPEC_V3 §11: the committed .cdb is a checked view. The evaluator's
+    // build is a two-import bootstrap (std/fmt.cdb + compiler/eval/eval.cdb),
+    // so the gate goes through one consolidation: import the committed
+    // sources, export the canonical projection, re-import it — the
+    // re-exported projection must be byte-stable and the root a fixpoint.
+    let temp = tempdir().unwrap();
+    let db1 = temp.path().join("view1.sqlite");
+    run(&["init", path(&db1)]);
+    run(&["import", path(&db1), "std/fmt.cdb"]);
+    run(&["import", path(&db1), "compiler/eval/eval.cdb"]);
+    run(&["verify", path(&db1)]);
+    let export1 = temp.path().join("view1.cdb");
+    run(&["export", path(&db1), "--branch", "main", "--out", path(&export1)]);
+
+    let db2 = temp.path().join("view2.sqlite");
+    run(&["init", path(&db2)]);
+    run(&["import", path(&db2), path(&export1)]);
+    run(&["verify", path(&db2)]);
+    let export2 = temp.path().join("view2.cdb");
+    run(&["export", path(&db2), "--branch", "main", "--out", path(&export2)]);
+
+    let db3 = temp.path().join("view3.sqlite");
+    run(&["init", path(&db3)]);
+    run(&["import", path(&db3), path(&export2)]);
+    let export3 = temp.path().join("view3.cdb");
+    run(&["export", path(&db3), "--branch", "main", "--out", path(&export3)]);
+
+    // One consolidation reaches the canonical fixpoint: byte-stable
+    // projection and a reproduced root hash.
+    let text2 = std::fs::read(&export2).unwrap();
+    let text3 = std::fs::read(&export3).unwrap();
+    assert_eq!(text2, text3, "canonical projection is byte-stable");
+    let root = |db: &Path| {
+        let history = run(&["history", path(db), "--json"]);
+        serde_json::from_str::<serde_json::Value>(&history).unwrap()["root_hash"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(root(&db2), root(&db3), "root hash is a fixpoint");
+}
+
 #[test]
 fn non_cir_input_fails_closed() {
     if !can_build_default_native_target() {

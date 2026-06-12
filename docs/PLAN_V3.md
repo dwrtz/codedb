@@ -461,10 +461,15 @@ a native program dispatches on integer literals with a `_` default and a nested
 Goal: re-express the reference evaluator as CodeDB objects — the first
 self-hosting completion and the Pillar-1 warm-up.
 
-Status: substrate landed; the `.cdb` evaluator's loader stage is in (see the
-staging note at the end of this phase); the executing stages are next.
-Self-hosts rung 0. Depends on Phases 6 (recursion) and 7 (patterns). Two
-design pins, settled:
+Status: COMPLETE — the first self-hosting completion (milestone V3.2). The
+CodeDB-hosted evaluator (compiler/eval/eval.cdb, ~1100 lines of .cdb built
+through the staged plan below) compiles natively and is result-equal to the
+Rust evaluator on the operator-conformance sweep (one fixture per registry
+kind), the per-feature scalar/aggregate/heap fixtures, and the qualifying
+example corpus — including the COMPLETE sha256 digest, all eight words —
+with the native backend as the transitive third leg; the committed sources
+pass the §11 checked-view gate (tests/selfhost_eval.rs). Self-hosts rung 0.
+Depends on Phases 6 (recursion) and 7 (patterns). Two design pins, settled:
 the CodeDB-hosted evaluator walks the **lowered IR** (SPEC_V3 §5's "smallest
 recursive IR-walker"), not typed expressions — the IR is layout-resolved
 (explicit offsets/slot sizes, desugared patterns, monomorphized generics,
@@ -562,7 +567,17 @@ negative-domain round-trip over the bump heap, and argv parity against
 --process-arg — all result-equal to the Rust evaluator. With Stage 4 every
 one of the 56 CIR opcodes is routed; what remains for V3.2 is Stage 5: the
 corpus-wide manifest sweep and the §11 checked-view gate for
-compiler/eval/*.cdb.
+compiler/eval/*.cdb. (8) **Stage 5 — the corpus sweep + checked-view gate.**
+The manifest covers every committed example whose entries are extern-free,
+parameterless, and scalar-result (booleans, discount, fnv1a, the tokenizer,
+and the complete sha256 digest), each three-way result-equal; and the §11
+gate holds — the evaluator's two-import bootstrap (std/fmt.cdb +
+compiler/eval/eval.cdb) consolidates in one import→export→import pass to a
+byte-stable canonical projection and a fixpoint root. Phase 8 is COMPLETE.
+Known cost: the selfhost_eval suite is the heaviest native suite (~20 min;
+dominated by the evaluator import+verify per test process and the per-entry
+CLI rounds) — caching the built evaluator across runs keyed on the source
+hash is the obvious follow-on if it grows.
 
 Deliverables:
 
@@ -1345,10 +1360,13 @@ Success: recursion compiles native; drops occur exactly once across conditional
 
 ### Milestone V3.2 — Self-Hosted Oracle
 
-Includes: Phase 8 (reference evaluator in CodeDB, rung 0).
+Includes: Phase 8 (reference evaluator in CodeDB, rung 0). Status: COMPLETE
+(see Phase 8 — the .cdb evaluator runs natively, result-equal to the Rust
+evaluator across the conformance sweep, the per-feature fixtures, and the
+example corpus incl. the full sha256 digest; §11 checked-view gate green).
 
 ```text
-Success: CodeDB-eval == Rust-eval on the corpus — a three-way oracle.
+Success (met): CodeDB-eval == Rust-eval on the corpus — a three-way oracle.
 ```
 
 ### Milestone V3.3 — Expressiveness for a Front-End
