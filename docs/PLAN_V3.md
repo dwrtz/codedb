@@ -1124,6 +1124,21 @@ each ladder rung is gated by the determinism oracle
 the committed .cdb is a checked view; CI gates import -> verify -> re-export and a root_hash pin
 ```
 
+The checked-view gate rests on `import -> export -> import` being a root-hash
+fixpoint (SPEC_V3 §11). That holds because the importer processes parsed items in a
+deterministic, **source-order-independent canonical order** (all type definitions
+first, then functions/externals; each Kahn-toposorted by dependencies with an
+alphabetical tie-break, mutually-recursive cliques as single units), so a program's
+migration sequence — and therefore every deterministic birth identity (§10) and the
+root hash — is a function of the item SET, not of how the source happens to be
+ordered. Without it, a hand-written source in any order other than the projection's
+canonical order would re-import (from the name-sorted projection) with a different
+migration history and a different root, even though the projection text is
+byte-stable. The source is always already a valid topological order (the importer
+fails to resolve a forward reference otherwise), so canonicalizing it never violates
+a dependency. `tests/import_order.rs` pins order-independence (two source orderings of
+one program reach the same root) and the non-canonical-source round-trip fixpoint.
+
 ## Suggested milestone cuts
 
 ### Milestone V3.0 — Foundations

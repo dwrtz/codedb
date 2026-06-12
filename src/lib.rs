@@ -209,11 +209,20 @@ impl CodeDb {
         let type_recursion = Self::analyze_type_recursion_groups(&items);
         let mut emitted_type_group = vec![false; type_recursion.groups.len()];
 
-        for (idx, item) in items.iter().enumerate() {
+        // Process items in a canonical, source-order-independent order (types before
+        // functions, each toposorted with an alphabetical tie-break), so the migration
+        // sequence — and thus every birth identity and the root hash — is a function of
+        // the item set, making import→export→import a fixpoint for ANY source ordering
+        // (SPEC_V3 §11). `idx` is the item's position in THIS canonical order, used in
+        // the non-clique birth seeds (clique members derive theirs from the in-group
+        // ordinal). `item_idx` indexes back into `items` / the clique analyses.
+        let canonical_order = canonical_item_order(&items, &recursion, &type_recursion);
+        for (idx, &item_idx) in canonical_order.iter().enumerate() {
+            let item = &items[item_idx];
             let branch = self.branch(MAIN_BRANCH)?;
             let op = match item {
                 ProgramItem::TypeDefinition(definition) => {
-                    if let Some(&group_id) = type_recursion.group_of.get(&idx) {
+                    if let Some(&group_id) = type_recursion.group_of.get(&item_idx) {
                         // A mutually-recursive type clique is created once, at its
                         // first member, with every member's name bound before any
                         // definition is resolved.
@@ -279,7 +288,7 @@ impl CodeDb {
                     }
                 }
                 ProgramItem::Function(function) => {
-                    if let Some(&group_id) = recursion.group_of.get(&idx) {
+                    if let Some(&group_id) = recursion.group_of.get(&item_idx) {
                         // A recursive clique is created once, at its first member,
                         // with every member bound before any body is typed.
                         if emitted_group[group_id] {
@@ -1743,6 +1752,163 @@ fn canonical_clique_order(
         best.expect("individualization-refinement yields at least one labeling")
             .2
     }
+}
+
+/// The (module, name) of a parsed program item — its key for canonical ordering.
+fn item_module_name(item: &ProgramItem) -> (String, String) {
+    match item {
+        ProgramItem::TypeDefinition(d) => (d.module.clone(), d.name.clone()),
+        ProgramItem::Function(f) => (f.module.clone(), f.name.clone()),
+        ProgramItem::ExternalFunction(f) => (f.module.clone(), f.name.clone()),
+    }
+}
+
+/// A deterministic, dependency-respecting canonical order of the parsed program
+/// items, so the migration sequence — and therefore every deterministic birth
+/// identity (SPEC_V3 §10) and the root hash — is a function of the item SET, not of
+/// its source ordering. Without it `import → export → import` is not a fixpoint
+/// (SPEC_V3 §11): the projection emits symbols in a canonical (name-sorted) order, so
+/// a source written in any other order re-imports with a different migration history
+/// and a different root, even though the projection text is byte-stable.
+///
+/// All type definitions come first (a function's parameter/return types — and another
+/// type's fields — must already exist), then all functions/externals. Within each, a
+/// Kahn topological sort with an alphabetical (module, name) tie-break, treating each
+/// mutually-recursive clique as a single unit (it is created by one atomic migration,
+/// so its members are emitted contiguously). The source is already a valid topological
+/// order — the importer would otherwise fail to resolve a forward reference — so
+/// re-sorting it canonically never violates a dependency; and because the order is a
+/// pure function of the dependency graph and the names, re-importing the projection
+/// reproduces it exactly.
+fn canonical_item_order(
+    items: &[ProgramItem],
+    recursion: &RecursionAnalysis,
+    type_recursion: &RecursionAnalysis,
+) -> Vec<usize> {
+    let mut order = Vec::with_capacity(items.len());
+    order.extend(canonical_unit_order(
+        items,
+        type_recursion,
+        |item| matches!(item, ProgramItem::TypeDefinition(_)),
+        |item| match item {
+            ProgramItem::TypeDefinition(d) => {
+                collect_named_type_refs(&d.definition).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        },
+    ));
+    order.extend(canonical_unit_order(
+        items,
+        recursion,
+        |item| matches!(item, ProgramItem::Function(_) | ProgramItem::ExternalFunction(_)),
+        |item| match item {
+            ProgramItem::Function(f) => {
+                let mut names = Vec::new();
+                collect_call_names(&f.body, &mut names);
+                names
+            }
+            _ => Vec::new(),
+        },
+    ));
+    order
+}
+
+/// Canonically order the items of ONE kind (`is_kind`): mutually-recursive cliques
+/// (from `recursion`, which was analysed over exactly this kind's items) plus
+/// singletons, Kahn-toposorted by the references `refs_of` reports, with an
+/// alphabetical (module, name) tie-break (see `canonical_item_order`).
+fn canonical_unit_order(
+    items: &[ProgramItem],
+    recursion: &RecursionAnalysis,
+    is_kind: impl Fn(&ProgramItem) -> bool,
+    refs_of: impl Fn(&ProgramItem) -> Vec<String>,
+) -> Vec<usize> {
+    use std::collections::{BTreeSet, HashMap};
+    let member_items: Vec<usize> = (0..items.len()).filter(|&i| is_kind(&items[i])).collect();
+    if member_items.is_empty() {
+        return Vec::new();
+    }
+    let key = |i: usize| item_module_name(&items[i]);
+    let name_to_item: HashMap<(String, String), usize> =
+        member_items.iter().map(|&i| (key(i), i)).collect();
+
+    // Assign each item to a unit: clique units (preserving canonical member order)
+    // first, then a singleton unit per ungrouped item.
+    let mut unit_of: HashMap<usize, usize> = HashMap::new();
+    let mut units: Vec<Vec<usize>> = Vec::new();
+    for members in &recursion.groups {
+        let uid = units.len();
+        for &m in members {
+            unit_of.insert(m, uid);
+        }
+        units.push(members.clone());
+    }
+    for &i in &member_items {
+        unit_of.entry(i).or_insert_with(|| {
+            let uid = units.len();
+            units.push(vec![i]);
+            uid
+        });
+    }
+    let num_units = units.len();
+
+    // Unit dependency edges: U depends on V (V emitted first) if a member of U
+    // references a name resolving to a member of a different unit V.
+    let mut deps: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); num_units];
+    let mut dependents: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); num_units];
+    for (uid, members) in units.iter().enumerate() {
+        for &item in members {
+            let module = key(item).0;
+            for name in refs_of(&items[item]) {
+                if let Some(target) = resolve_call_node(&name, &module, &name_to_item) {
+                    let vid = unit_of[&target];
+                    if vid != uid {
+                        deps[uid].insert(vid);
+                    }
+                }
+            }
+        }
+    }
+    for (uid, dset) in deps.iter().enumerate() {
+        for &vid in dset {
+            dependents[vid].insert(uid);
+        }
+    }
+
+    // Kahn's algorithm: emit the alphabetically-smallest unit whose dependencies are
+    // all emitted. The unit's key is its alphabetically-smallest member, unique across
+    // the program, so ties are broken deterministically and order-independently.
+    let unit_key = |uid: usize| -> (String, String) {
+        units[uid]
+            .iter()
+            .map(|&i| key(i))
+            .min()
+            .expect("unit has at least one member")
+    };
+    let mut remaining: Vec<usize> = deps.iter().map(BTreeSet::len).collect();
+    let mut available: BTreeSet<(String, String, usize)> = BTreeSet::new();
+    for (uid, &deps_count) in remaining.iter().enumerate() {
+        if deps_count == 0 {
+            let (m, n) = unit_key(uid);
+            available.insert((m, n, uid));
+        }
+    }
+    let mut order = Vec::with_capacity(member_items.len());
+    while let Some(entry) = available.iter().next().cloned() {
+        available.remove(&entry);
+        let uid = entry.2;
+        order.extend(units[uid].iter().copied());
+        for &dep in &dependents[uid] {
+            remaining[dep] -= 1;
+            if remaining[dep] == 0 {
+                let (m, n) = unit_key(dep);
+                available.insert((m, n, dep));
+            }
+        }
+    }
+    // The unit graph is a DAG (each clique is a maximal SCC), so every unit is emitted.
+    debug_assert_eq!(order.len(), member_items.len());
+    order
 }
 
 /// Canonical, name-independent ordering of a recursion (function) clique's members,
