@@ -65,17 +65,121 @@ count-prefixed and nested (`if`/`case`/`fold`/`loop` carry their sub-blocks
 inline), so the walker recurses exactly the way the spec's "smallest recursive
 IR-walker" suggests.
 
-## Evaluator staging (next)
+CIR additionally carries **consumer columns** — derived metadata pre-classified
+at encode time so the `.cdb` walker never interprets hash strings or operator
+names:
 
-1. loader/decoder in `.cdb` (argv path -> byte reads -> pools/tables),
-   simulated memory over `string_with_capacity`/`string_set`/`string_get`;
-2. scalar core (consts, all binary/unary widths with wrap+trap semantics,
+- each type-table row carries `meta_kind u8` + `meta_size u64` (unit/bool/
+  i8..u64/pointer/aggregate-by-value/aggregate-indirect and the byte size),
+  derived from the well-known scalar type hashes and the layout rows;
+- each `binary`/`unary` op carries `verb u8` + `width u8` (bytes) + `signed u8`,
+  derived from the operator-registry kind string.
+
+Like the call-target indices, these are *renamings* of facts already explicit
+in the IR (type names, layout rows, registry kinds) — never new semantics —
+and the decode half of the honesty gate recomputes each column and fails on
+any mismatch, so a CIR file provably carries the same classification the
+registry and layout engine would produce.
+
+## Execution design (pinned)
+
+**Input protocol.** `eval-bin <cir-path> [program-args...]`: the first process
+argument is the CIR file path; the remaining arguments belong to the evaluated
+program (its `arg_count`/`arg_len`/`arg_byte` see the host argument list
+shifted by one). The path is copied into a NUL-terminated stack buffer and the
+file is read with the platform capsule's `open`/`read`/`close` through a small
+stack bounce buffer (the `todo_cli` idiom) — the shell is the only
+extern-touching part of the evaluator; everything after "bytes are in memory"
+is pure compute.
+
+**Memory.** One `string` is the machine memory: a fixed generous capacity
+(`string_with_capacity`), grown to its watermark with `string_push`, then
+random-accessed with `string_get`/`string_set`. Addresses are byte offsets
+into this buffer. The map:
+
+```text
+[0, image_len)            the CIR file image, verbatim
+[meta, stack)             loader-built per-function metadata (see below)
+[stack, heap)             call frames: a bump-up stack, popped on return
+[heap, capacity)          heap: bump-up allocations, never freed
+```
+
+A single address space means static-data addresses point directly into the
+image's data pool and raw-pointer corpus ops need no tagging. Exceeding a
+region or the capacity traps (fail-loud), never silently grows.
+
+**Per-function metadata (load-time prepass).** The image's tables are
+fixed-width and indexed in place (type rows, layout rows, param/local rows,
+the function table); only frame offsets need computing. At load, one pass per
+function writes into the meta region: section/op-stream/type-table/layout-table
+base offsets, param/local/value counts, the frame size, and per-param /
+per-local frame offsets (params first, then locals by their declared
+`size_bytes`, then one 8-byte cell per value id, each region 8-aligned).
+Stage 3 extends the prepass with fixed temp offsets for aggregate-result
+value ids (loops re-execute ops, so temps are slots, not a bump).
+
+**Value model.** Mirrors the native backend, not the Rust evaluator: one
+8-byte cell per dense value id. Scalar cells hold the value in canonical
+extended form (sign-extended for i8/i16/i32, zero-extended for unsigned
+widths); pointer-like cells (box/ref/raw pointer) hold an address; aggregate
+cells hold the address of the value's bytes (`by_indirect` ABI). `int_cast`
+truncates to the target width and re-extends by the target's signedness.
+Comparisons pick signed/unsigned forms from the consumer columns; arithmetic
+wraps at its width; `div`/`mod` trap on a zero right operand per the op's
+trap field.
+
+**Calls.** A call bumps the stack by the callee's frame size, copies argument
+cells into param slots (aggregates pass as addresses), recurses into the
+callee's op stream, and pops. An aggregate return uses the caller-provided
+`return_address`. `early_return` unwinds the current function only (its
+drops are already explicit ops on the early-exit edge).
+
+**Drops and the heap.** `heap_alloc` bumps; `drop` and `free_box_shell` are
+validated no-ops. The oracle is *result equality* and the Rust evaluator's
+domain excludes externs, so drop execution is unobservable in the rung-0
+corpus; the bump heap makes "use after free" impossible by construction.
+Capacity traps on vec/string ops are enforced exactly like the native
+runtime's.
+
+**Output protocol.** On success the evaluator prints `ok:<value>` — the entry
+result rendered from its return-type consumer column (signed widths as signed
+decimal, unsigned as unsigned decimal, bool as `0`/`1`, unit as `unit`) — and
+exits 0. On a trap it prints `trap:<code>` (the trap-code pool string, e.g.
+`trap:division_by_zero`, or the checker's code for bounds/capacity traps) and
+exits nonzero. The Stage-1 probe instead prints five numbers, one per line —
+function count, entry index, entry op count, entry param count, entry local
+count — cross-checked against `emit-cir`'s summary JSON.
+
+**State threading.** The memory string is move-only: helpers take it and
+return it inside a small record (`{ mem: string, val: i64 }`); scalar loop
+state rides in Copy records; byte pumps either use the `arg_string` loop shape
+(the accumulator IS the string, the index derived from `string_len`) or
+chunk-bounded recursion. This verbosity is deliberate dogfood: rung 0 is the
+first big program written the way agents will have to write the compiler.
+
+**Corpus.** A CIR-encodable program is extern-free by construction; the
+rung-0 corpus is every such entry with a scalar result: the generated
+operator-conformance fixtures (`tests/oracle_conformance.rs`) extended
+three-way, the pure examples (`fnv1a`, `sha256`, `tokenizer`, recursion /
+pattern / string / fmt / argv fixtures), and targeted aggregate + heap
+programs. Aggregate-result entries need a canonical value serialization and
+stay out until something forces them.
+
+## Evaluator staging
+
+1. **(done — substrate)** `string_set` + the CIR artifact + consumer columns;
+2. loader in `.cdb` (path argv -> bounce-buffer reads -> image in memory ->
+   per-function metadata prepass), gated by the five-line probe vs
+   `emit-cir`'s summary;
+3. scalar core (consts, all binary/unary widths with wrap+trap semantics,
    `int_cast`, `if`, load/store/copy/move, call/return/early-return) — gated
    by the three-way operator-conformance corpus;
-3. aggregates (records/enums/arrays: addr-of ops, sized load/store, enum tags,
-   `case`, bounds checks, slices, static data, `fold`, `loop`);
-4. heap (box ops with a bump allocator, vec/string ops with capacity traps,
-   argv forwarding shifted past the CIR path argument);
-5. the corpus harness (`tests/selfhost_eval.rs`): manifest-driven
+4. aggregates (records/enums/arrays: addr-of ops, sized load/store, enum tags,
+   `case`, bounds checks, slices, static data, `fold`, `loop`) — gated by the
+   sha256 digest and the aggregate corpora;
+5. heap (box ops over the bump allocator, vec/string ops with capacity traps,
+   argv forwarding shifted past the CIR path argument) — gated by the
+   box-recursion, string/fmt, and tokenizer corpora;
+6. the corpus harness (`tests/selfhost_eval.rs`): manifest-driven
    Rust-eval-vs-CodeDB-evaluator sweep, plus the §11 checked-view gate for
    `compiler/eval/*.cdb`.
