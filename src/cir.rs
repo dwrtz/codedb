@@ -38,13 +38,28 @@
 //! layout table: count u32, then per layout:
 //!   type_hash str, kind str, size_bytes u64, align_bytes u64,
 //!   abi_pass str, abi_return str, metadata canonical-JSON str
-//! type table: count u32, then per type: type_hash str, layout_index u32
+//! type table: count u32, then per type:
+//!   type_hash str, layout_index u32, meta_kind u8, meta_size u64
 //!   (layout_index = u32::MAX when the type has no layout entry; scalar types)
 //! value table: count u32, then per value: value_id str
 //! return_type tref | params count u32 x (slot u32, tref)
 //! locals count u32 x (slot u32, tref, size_bytes u64)
 //! ops count u32 x op | debug map
 //! ```
+//!
+//! ## Consumer columns
+//!
+//! The type-table `meta_kind`/`meta_size` pair and the `verb`/`width`/`signed`
+//! triple on `binary`/`unary` ops are **consumer columns**: derived metadata
+//! pre-classified at encode time so the `.cdb` walker never compares hash
+//! strings or operator-kind names. They are renamings of facts already
+//! explicit in the IR — the well-known scalar type hashes (`typemeta`), the
+//! layout rows' size/ABI, and the operator registry's `SemOp` (`opverb`) —
+//! never new semantics, exactly like the pre-resolved call-target indices.
+//! The decode half of the round-trip honesty gate recomputes every consumer
+//! column from the same inputs and fails on any mismatch. Param and local
+//! slots are validated dense (`slot == row index`) at encode AND decode so a
+//! consumer may index frame tables by slot.
 //!
 //! `tref` and `vref` are u32 indices into the function's type and value tables.
 //! Optional fields are a u8 presence flag followed by the payload when 1.
@@ -56,6 +71,7 @@
 //! the reference evaluator's domain, which cannot execute externs either.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value as JsonValue};
@@ -65,9 +81,10 @@ use crate::lowering::{
     LoweredFunctionIr, LoweredLocalSlot, LoweredOp, LoweredParamSlot, LoweredPlace, LoweredTrap,
     LoweredTypeAbi, LoweredTypeLayout,
 };
+use crate::op_registry::{sem_for_kind, ArithOp, BitOp, Cmp, SemOp, ShiftOp};
 use crate::oracle::bytes_oracle_hash;
 use crate::store::canonical_json;
-use crate::types::{bytes_to_hex, hex_to_bytes};
+use crate::types::{bytes_to_hex, hex_to_bytes, type_hash_for};
 use crate::{CodeDb, MAIN_BRANCH};
 
 pub const CIR_SCHEMA: &str = "codedb/cir/v0";
@@ -144,6 +161,152 @@ mod placekind {
     pub const FIELD: u8 = 2;
     pub const ENUM_PAYLOAD: u8 = 3;
     pub const INDEX: u8 = 4;
+}
+
+/// Type-table consumer column: how a value of this type lives in a cell/slot.
+/// 0-9 are the scalar kinds (cells hold the canonically extended value), 10 is
+/// pointer-like (box / reference / raw pointer — an 8-byte address cell), 11/12
+/// are layout-bearing aggregates split by ABI pass mode (cells hold the address
+/// of the value's bytes; `meta_size` is the byte size of the bytes themselves).
+mod typemeta {
+    pub const UNIT: u8 = 0;
+    pub const BOOL: u8 = 1;
+    pub const I8: u8 = 2;
+    pub const I16: u8 = 3;
+    pub const I32: u8 = 4;
+    pub const I64: u8 = 5;
+    pub const U8: u8 = 6;
+    pub const U16: u8 = 7;
+    pub const U32: u8 = 8;
+    pub const U64: u8 = 9;
+    pub const POINTER: u8 = 10;
+    pub const AGG_BY_VALUE: u8 = 11;
+    pub const AGG_INDIRECT: u8 = 12;
+}
+
+/// Binary/unary consumer column: the registry kind's verb, decoupled from its
+/// width (the `width`/`signed` columns carry the [`crate::op_registry::IntKind`];
+/// the boolean verbs are width-free and encode width 0).
+mod opverb {
+    pub const ADD: u8 = 1;
+    pub const SUB: u8 = 2;
+    pub const MUL: u8 = 3;
+    pub const DIV: u8 = 4;
+    pub const REM: u8 = 5;
+    pub const BIT_AND: u8 = 6;
+    pub const BIT_OR: u8 = 7;
+    pub const BIT_XOR: u8 = 8;
+    pub const SHL: u8 = 9;
+    pub const SHR: u8 = 10;
+    pub const EQ: u8 = 11;
+    pub const NE: u8 = 12;
+    pub const LT: u8 = 13;
+    pub const LE: u8 = 14;
+    pub const GT: u8 = 15;
+    pub const GE: u8 = 16;
+    pub const NEG: u8 = 17;
+    pub const BIT_NOT: u8 = 18;
+    pub const AND_BOOL: u8 = 19;
+    pub const OR_BOOL: u8 = 20;
+    pub const NOT_BOOL: u8 = 21;
+}
+
+/// The well-known scalar type hashes -> their type-meta columns. Computed once;
+/// these are the exact hashes the registry and backend special-case, so the
+/// classification cannot drift from the type system's hashing.
+fn scalar_type_meta(type_hash: &str) -> Option<(u8, u64)> {
+    static SCALARS: OnceLock<BTreeMap<String, (u8, u64)>> = OnceLock::new();
+    let map = SCALARS.get_or_init(|| {
+        BTreeMap::from([
+            (type_hash_for("Unit"), (typemeta::UNIT, 0)),
+            (type_hash_for("Bool"), (typemeta::BOOL, 1)),
+            (type_hash_for("I8"), (typemeta::I8, 1)),
+            (type_hash_for("I16"), (typemeta::I16, 2)),
+            (type_hash_for("I32"), (typemeta::I32, 4)),
+            (type_hash_for("I64"), (typemeta::I64, 8)),
+            (type_hash_for("U8"), (typemeta::U8, 1)),
+            (type_hash_for("U16"), (typemeta::U16, 2)),
+            (type_hash_for("U32"), (typemeta::U32, 4)),
+            (type_hash_for("U64"), (typemeta::U64, 8)),
+        ])
+    });
+    map.get(type_hash).copied()
+}
+
+/// Derive a type-table row's consumer columns from facts already in the IR:
+/// the well-known scalar hashes, or the row's layout (kind + size + ABI pass).
+/// A layout-less non-scalar type is pointer-like (references and raw pointers
+/// live in 8-byte cells), as is a `box` layout (its value IS the pointer).
+fn type_meta_columns(type_hash: &str, layout: Option<&LoweredTypeLayout>) -> (u8, u64) {
+    if let Some(meta) = scalar_type_meta(type_hash) {
+        return meta;
+    }
+    match layout {
+        Some(layout) if layout.kind == "box" => (typemeta::POINTER, 8),
+        Some(layout) if layout.abi.pass == "by_indirect" => {
+            (typemeta::AGG_INDIRECT, layout.size_bytes)
+        }
+        Some(layout) => (typemeta::AGG_BY_VALUE, layout.size_bytes),
+        None => (typemeta::POINTER, 8),
+    }
+}
+
+/// Derive a binary/unary op's consumer columns (verb, width-in-bytes, signed)
+/// from the registry's semantic for its kind string. Unknown kinds fail closed.
+fn sem_columns(kind: &str) -> Result<(u8, u8, u8)> {
+    let sem = sem_for_kind(kind)
+        .ok_or_else(|| anyhow!("CIR operator kind {kind} is not in the registry"))?;
+    let (verb, int) = match sem {
+        SemOp::Arith(op, k) => (
+            match op {
+                ArithOp::Add => opverb::ADD,
+                ArithOp::Sub => opverb::SUB,
+                ArithOp::Mul => opverb::MUL,
+                ArithOp::Div => opverb::DIV,
+                ArithOp::Rem => opverb::REM,
+            },
+            Some(k),
+        ),
+        SemOp::Bit(op, k) => (
+            match op {
+                BitOp::And => opverb::BIT_AND,
+                BitOp::Or => opverb::BIT_OR,
+                BitOp::Xor => opverb::BIT_XOR,
+            },
+            Some(k),
+        ),
+        SemOp::Shift(op, k) => (
+            match op {
+                ShiftOp::Shl => opverb::SHL,
+                ShiftOp::Shr => opverb::SHR,
+            },
+            Some(k),
+        ),
+        SemOp::Cmp(op, k) => (
+            match op {
+                Cmp::Eq => opverb::EQ,
+                Cmp::Ne => opverb::NE,
+                Cmp::Lt => opverb::LT,
+                Cmp::Le => opverb::LE,
+                Cmp::Gt => opverb::GT,
+                Cmp::Ge => opverb::GE,
+            },
+            Some(k),
+        ),
+        SemOp::Neg(k) => (opverb::NEG, Some(k)),
+        SemOp::BitNot(k) => (opverb::BIT_NOT, Some(k)),
+        SemOp::AndBool => (opverb::AND_BOOL, None),
+        SemOp::OrBool => (opverb::OR_BOOL, None),
+        SemOp::NotBool => (opverb::NOT_BOOL, None),
+    };
+    match int {
+        Some(k) => {
+            let width = u8::try_from(k.width)
+                .map_err(|_| anyhow!("CIR operator kind {kind} has an unencodable width"))?;
+            Ok((verb, width, u8::from(k.signed)))
+        }
+        None => Ok((verb, 0, 0)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +620,10 @@ impl FnEncoder<'_, '_> {
                 write_u8(out, opcode::UNARY);
                 write_u32(out, self.tables.vref(id));
                 write_u32(out, self.pools.istr(kind));
+                let (verb, width, signed) = sem_columns(kind)?;
+                write_u8(out, verb);
+                write_u8(out, width);
+                write_u8(out, signed);
                 write_u32(out, self.tables.vref(value));
                 write_u32(out, self.tables.tref(type_hash));
             }
@@ -481,6 +648,10 @@ impl FnEncoder<'_, '_> {
                 write_u8(out, opcode::BINARY);
                 write_u32(out, self.tables.vref(id));
                 write_u32(out, self.pools.istr(kind));
+                let (verb, width, signed) = sem_columns(kind)?;
+                write_u8(out, verb);
+                write_u8(out, width);
+                write_u8(out, signed);
                 write_u32(out, self.tables.vref(left));
                 write_u32(out, self.tables.vref(right));
                 write_u32(out, self.tables.tref(type_hash));
@@ -1115,6 +1286,26 @@ fn encode_function(
         fn_index,
     };
 
+    // The `.cdb` consumer indexes its frame tables by slot, so slots must be
+    // dense and in row order (lowering allocates them that way; fail closed if
+    // that ever changes rather than emit an unconsumable file).
+    for (index, param) in ir.params.iter().enumerate() {
+        if param.slot != index {
+            bail!(
+                "CIR param slots must be dense and in order (row {index} has slot {})",
+                param.slot
+            );
+        }
+    }
+    for (index, local) in ir.locals.iter().enumerate() {
+        if local.slot != index {
+            bail!(
+                "CIR local slots must be dense and in order (row {index} has slot {})",
+                local.slot
+            );
+        }
+    }
+
     // Encode the table-referencing tail first so the type/value tables are
     // complete, then assemble the section with the tables ahead of the tail.
     let mut tail = Vec::new();
@@ -1165,13 +1356,15 @@ fn encode_function(
     write_usize_u32(&mut out, tables.types.len(), "type table count")?;
     for type_hash in &tables.types {
         write_u32(&mut out, pools.istr(type_hash));
-        write_u32(
-            &mut out,
-            layout_index
-                .get(type_hash.as_str())
-                .copied()
-                .unwrap_or(NO_LAYOUT),
-        );
+        let layout_ref = layout_index
+            .get(type_hash.as_str())
+            .copied()
+            .unwrap_or(NO_LAYOUT);
+        write_u32(&mut out, layout_ref);
+        let layout = (layout_ref != NO_LAYOUT).then(|| &ir.type_layouts[layout_ref as usize]);
+        let (meta_kind, meta_size) = type_meta_columns(type_hash, layout);
+        write_u8(&mut out, meta_kind);
+        write_u64(&mut out, meta_size);
     }
     write_usize_u32(&mut out, tables.values.len(), "value table count")?;
     for id in &tables.values {
@@ -1336,6 +1529,17 @@ impl FnDecoder<'_> {
         Ok(reader.u32()? as usize)
     }
 
+    /// Read a binary/unary op's consumer columns and fail unless they equal
+    /// what the registry reproduces for `kind` (the honesty half of the
+    /// consumer columns; see the module doc).
+    fn rcheck_sem_columns(&self, reader: &mut Reader, kind: &str) -> Result<()> {
+        let stored = (reader.u8()?, reader.u8()?, reader.u8()?);
+        if stored != sem_columns(kind)? {
+            bail!("CIR operator consumer columns are inconsistent for kind {kind}");
+        }
+        Ok(())
+    }
+
     fn rblock(&self, reader: &mut Reader) -> Result<LoweredBlock> {
         let count = self.rusize(reader)?;
         let mut operations = Vec::with_capacity(count);
@@ -1407,25 +1611,35 @@ impl FnDecoder<'_> {
                 id: self.rvalue(reader)?,
                 type_hash: self.rtype(reader)?,
             },
-            opcode::UNARY => LoweredOp::Unary {
-                id: self.rvalue(reader)?,
-                kind: self.rstr(reader)?,
-                value: self.rvalue(reader)?,
-                type_hash: self.rtype(reader)?,
-            },
+            opcode::UNARY => {
+                let id = self.rvalue(reader)?;
+                let kind = self.rstr(reader)?;
+                self.rcheck_sem_columns(reader, &kind)?;
+                LoweredOp::Unary {
+                    id,
+                    kind,
+                    value: self.rvalue(reader)?,
+                    type_hash: self.rtype(reader)?,
+                }
+            }
             opcode::INT_CAST => LoweredOp::IntCast {
                 id: self.rvalue(reader)?,
                 value: self.rvalue(reader)?,
                 type_hash: self.rtype(reader)?,
             },
-            opcode::BINARY => LoweredOp::Binary {
-                id: self.rvalue(reader)?,
-                kind: self.rstr(reader)?,
-                left: self.rvalue(reader)?,
-                right: self.rvalue(reader)?,
-                type_hash: self.rtype(reader)?,
-                trap: self.rtrap(reader)?,
-            },
+            opcode::BINARY => {
+                let id = self.rvalue(reader)?;
+                let kind = self.rstr(reader)?;
+                self.rcheck_sem_columns(reader, &kind)?;
+                LoweredOp::Binary {
+                    id,
+                    kind,
+                    left: self.rvalue(reader)?,
+                    right: self.rvalue(reader)?,
+                    type_hash: self.rtype(reader)?,
+                    trap: self.rtrap(reader)?,
+                }
+            }
             opcode::CALL => {
                 let id = self.rvalue(reader)?;
                 let target = reader.u32()?;
@@ -1857,13 +2071,22 @@ fn decode_function(
     for _ in 0..type_count {
         let type_hash = decoder.rstr(&mut reader)?;
         let layout_ref = reader.u32()?;
+        let mut layout = None;
         if layout_ref != NO_LAYOUT {
-            let layout = type_layouts.get(layout_ref as usize).ok_or_else(|| {
+            let linked = type_layouts.get(layout_ref as usize).ok_or_else(|| {
                 anyhow!("CIR type-table layout index {layout_ref} out of range")
             })?;
-            if layout.type_hash != type_hash {
+            if linked.type_hash != type_hash {
                 bail!("CIR type-table layout link mismatch for {type_hash}");
             }
+            layout = Some(linked);
+        }
+        // Consumer-column honesty: the stored classification must equal what
+        // the same inputs reproduce.
+        let meta_kind = reader.u8()?;
+        let meta_size = reader.u64()?;
+        if (meta_kind, meta_size) != type_meta_columns(&type_hash, layout) {
+            bail!("CIR type-meta consumer columns are inconsistent for {type_hash}");
         }
         types.push(type_hash);
     }
@@ -1878,17 +2101,25 @@ fn decode_function(
     let return_type_hash = decoder.rtype(&mut reader)?;
     let param_count = decoder.rusize(&mut reader)?;
     let mut params = Vec::with_capacity(param_count);
-    for _ in 0..param_count {
+    for index in 0..param_count {
+        let slot = decoder.rusize(&mut reader)?;
+        if slot != index {
+            bail!("CIR param slots must be dense and in order (row {index} has slot {slot})");
+        }
         params.push(LoweredParamSlot {
-            slot: decoder.rusize(&mut reader)?,
+            slot,
             type_hash: decoder.rtype(&mut reader)?,
         });
     }
     let local_count = decoder.rusize(&mut reader)?;
     let mut locals = Vec::with_capacity(local_count);
-    for _ in 0..local_count {
+    for index in 0..local_count {
+        let slot = decoder.rusize(&mut reader)?;
+        if slot != index {
+            bail!("CIR local slots must be dense and in order (row {index} has slot {slot})");
+        }
         locals.push(LoweredLocalSlot {
-            slot: decoder.rusize(&mut reader)?,
+            slot,
             type_hash: decoder.rtype(&mut reader)?,
             size_bytes: reader.u64()?,
         });
@@ -2068,12 +2299,16 @@ impl CodeDb {
             bail!("CIR round-trip mismatch: decoded IR differs from the lowered IR (encoder bug)");
         }
 
+        let entry_ir = &functions[entry_index as usize];
         let summary = json!({
             "schema": CIR_SCHEMA,
             "target": target,
             "entry": entry_name,
             "entry_symbol": entry_symbol,
             "entry_index": entry_index,
+            "entry_op_count": entry_ir.operations.len(),
+            "entry_param_count": entry_ir.params.len(),
+            "entry_local_count": entry_ir.locals.len(),
             "function_count": functions.len(),
             "byte_len": bytes.len(),
             "cir_hash": bytes_oracle_hash(&bytes),
@@ -2099,7 +2334,7 @@ mod tests {
                 type_hash: "sha256:i64".to_string(),
             }],
             locals: vec![LoweredLocalSlot {
-                slot: 1,
+                slot: 0,
                 type_hash: "sha256:i64".to_string(),
                 size_bytes: 8,
             }],
@@ -2113,7 +2348,7 @@ mod tests {
                 },
                 LoweredOp::Binary {
                     id: "v1".to_string(),
-                    kind: "add".to_string(),
+                    kind: "add_i64".to_string(),
                     left: "v0".to_string(),
                     right: "v0".to_string(),
                     type_hash: "sha256:i64".to_string(),
