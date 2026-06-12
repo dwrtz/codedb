@@ -83,14 +83,16 @@ registry and layout engine would produce.
 
 ## Execution design (pinned)
 
-**Input protocol.** `eval-bin <cir-path> [program-args...]`: the first process
-argument is the CIR file path; the remaining arguments belong to the evaluated
-program (its `arg_count`/`arg_len`/`arg_byte` see the host argument list
-shifted by one). The path is copied into a NUL-terminated stack buffer and the
-file is read with the platform capsule's `open`/`read`/`close` through a small
-stack bounce buffer (the `todo_cli` idiom) — the shell is the only
-extern-touching part of the evaluator; everything after "bytes are in memory"
-is pure compute.
+**Input protocol.** `eval-bin < program.cir [program-args...]`: the CIR
+arrives on stdin and every process argument belongs to the evaluated program
+(its `arg_count`/`arg_len`/`arg_byte` see the host list 1:1). A path argument
+was the original sketch, but the v0 backend gives every op's value id an
+8-byte frame slot, so the `[0x0; N]` path/chunk buffers cost ~24N frame bytes
+(fill stores plus their address/bounds ids) and any N >= ~150 busts the
+4095-byte arm64 frame budget; stdin needs only a 1-byte bounce buffer read in
+a loop (`read(0, ptr, 1)` per byte — at rung-0 corpus sizes the syscall cost
+is noise). The shell is the only extern-touching part of the evaluator;
+everything after "bytes are in memory" is pure compute.
 
 **Memory.** One `string` is the machine memory: a fixed generous capacity
 (`string_with_capacity`), grown to its watermark with `string_push`, then
@@ -168,9 +170,11 @@ stay out until something forces them.
 ## Evaluator staging
 
 1. **(done — substrate)** `string_set` + the CIR artifact + consumer columns;
-2. loader in `.cdb` (path argv -> bounce-buffer reads -> image in memory ->
-   per-function metadata prepass), gated by the five-line probe vs
-   `emit-cir`'s summary;
+2. **(done — Stage 1)** loader in `.cdb` (stdin -> 1-byte bounce reads ->
+   image in the memory string -> header/pool/function-table/section walk),
+   gated by the five-line probe vs `emit-cir`'s summary on real examples
+   (`tests/selfhost_eval.rs`); the per-function frame prepass lands with the
+   first executing stage;
 3. scalar core (consts, all binary/unary widths with wrap+trap semantics,
    `int_cast`, `if`, load/store/copy/move, call/return/early-return) — gated
    by the three-way operator-conformance corpus;
@@ -178,8 +182,8 @@ stay out until something forces them.
    `case`, bounds checks, slices, static data, `fold`, `loop`) — gated by the
    sha256 digest and the aggregate corpora;
 5. heap (box ops over the bump allocator, vec/string ops with capacity traps,
-   argv forwarding shifted past the CIR path argument) — gated by the
-   box-recursion, string/fmt, and tokenizer corpora;
+   argv forwarded 1:1 to the evaluated program) — gated by the box-recursion,
+   string/fmt, and tokenizer corpora;
 6. the corpus harness (`tests/selfhost_eval.rs`): manifest-driven
    Rust-eval-vs-CodeDB-evaluator sweep, plus the §11 checked-view gate for
    `compiler/eval/*.cdb`.

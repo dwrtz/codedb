@@ -461,8 +461,10 @@ a native program dispatches on integer literals with a `_` default and a nested
 Goal: re-express the reference evaluator as CodeDB objects — the first
 self-hosting completion and the Pillar-1 warm-up.
 
-Status: substrate landed; the `.cdb` evaluator itself is next. Self-hosts rung
-0. Depends on Phases 6 (recursion) and 7 (patterns). Two design pins, settled:
+Status: substrate landed; the `.cdb` evaluator's loader stage is in (see the
+staging note at the end of this phase); the executing stages are next.
+Self-hosts rung 0. Depends on Phases 6 (recursion) and 7 (patterns). Two
+design pins, settled:
 the CodeDB-hosted evaluator walks the **lowered IR** (SPEC_V3 §5's "smallest
 recursive IR-walker"), not typed expressions — the IR is layout-resolved
 (explicit offsets/slot sizes, desugared patterns, monomorphized generics,
@@ -485,6 +487,24 @@ source; extern-reachable closures are rejected fail-closed (the rung-0 corpus
 is the Rust evaluator's domain, which cannot execute externs either);
 monomorphic instances appear as ordinary functions, templates never do.
 `tests/cir_artifact.rs`; format doc in `src/cir.rs` + `compiler/eval/README.md`.
+
+Landed since: (3) CIR **consumer columns** — decoder-verified derived metadata
+(per-type `meta_kind`/`meta_size` classified from the well-known scalar hashes
+and layout rows; per-binary/unary `verb`/`width`/`signed` from the operator
+registry) plus dense-slot validation, so the `.cdb` walker never interprets
+hash strings or kind names. (4) **Stage 1 of the `.cdb` evaluator itself**
+(`compiler/eval/eval.cdb`): the execution design is pinned in
+`compiler/eval/README.md` (single-string memory map, backend-mirroring 8-byte
+value cells, frame model, bump heap with no-op drops, `ok:`/`trap:` output
+protocol, move-threading discipline), and the loader walks a real CIR — stdin
+through a 1-byte bounce buffer (a path argument loses to the v0 frame budget:
+every value id costs 8 frame bytes, so `[0x0; N]` buffers cost ~24N), then
+magic/version, both pools, the function table, and the entry's fixed-width
+section tables — all NATIVE, gated by a five-number probe (function count,
+entry index, entry op/param/local counts) that must match `emit-cir`'s summary
+on the tokenizer and sha256 examples (`tests/selfhost_eval.rs`). The walk also
+exercised real `.cdb` authoring: the structural-literal-in-let anchoring
+gotcha and the value-id frame tax are both documented in the source.
 
 Deliverables:
 

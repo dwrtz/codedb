@@ -1,0 +1,172 @@
+// compiler/eval/eval.cdb - the CodeDB-hosted reference evaluator (ladder rung 0).
+//
+// Stage 1 (loader + probe): read a CIR file (docs/PLAN_V3.md Phase 8;
+// format doc in src/cir.rs) from STDIN into the memory string and walk its
+// header, pools, function table, and the entry's function section. The probe
+// prints five numbers, one per line - function count, entry index, entry op
+// count, entry param count, entry local count - cross-checked by
+// tests/selfhost_eval.rs against `emit-cir`'s summary JSON. Exit codes:
+// 0 ok, 65 not a CIR file.
+//
+// The CIR arrives on stdin (`eval-bin < program.cir [args...]`) rather than
+// as a path argument: the shell then needs no path buffer, no open/close,
+// and every process argument belongs to the evaluated program (forwarded
+// 1:1, from Stage 4 on). A path argument was the original sketch, but the
+// v0 backend gives every op's value id an 8-byte frame slot, so a
+// `[0x0; N]` stack buffer costs ~24N frame bytes (fill stores + their
+// address/bounds ids) and any N >= ~150 busts the 4095-byte arm64 frame
+// budget. Stdin needs only a 1-byte bounce buffer: the read loop costs one
+// syscall per byte, which at rung-0 corpus sizes (CIR files of tens of KB)
+// is well under suite noise.
+//
+// The shell (stdin -> read through the bounce byte) is the only
+// extern-touching part; everything after "bytes are in memory" is pure
+// compute over `string_get` place reads, with the memory string threaded by
+// move through helpers that return it inside a record (see the execution
+// design in compiler/eval/README.md).
+
+module std.platform {
+extern fn write(fd: i64, ptr: raw_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "write" library "c"
+extern fn read(fd: i64, ptr: raw_mut_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "read" library "c"
+}
+
+// The memory string plus one scalar result: the return shape of every reader
+// that consumes the memory by move and hands it back.
+record RV {
+  mem: string
+  val: i64
+}
+
+// A Copy loop accumulator for summing pool byte-lengths in place.
+record Sum {
+  i: i64
+  total: i64
+}
+
+// A Copy loop accumulator carrying a small output buffer under construction.
+record OutBuf {
+  b: array<u8, 32>
+  i: i64
+}
+
+// The stdin pump's move-only loop accumulator: the memory string under
+// construction plus the "keep reading" flag.
+record Pump {
+  mem: string
+  more: bool
+}
+
+// Little-endian u32 read at `off` (the CIR's only multi-byte header integer).
+fn rd_u32(mem: string, off: i64) -> RV =
+  let b0: i64 = to_i64(string_get(mem, off)) in
+  let b1: i64 = to_i64(string_get(mem, off + 1)) in
+  let b2: i64 = to_i64(string_get(mem, off + 2)) in
+  let b3: i64 = to_i64(string_get(mem, off + 3)) in
+  let v: i64 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) in
+  { mem: mem, val: v }
+
+// Sum `count` little-endian u32s starting at `base` (a pool's byte-length
+// prefix -> the pool's total byte size). The u32 assembly is inlined because a
+// loop body may only read outer storage, never move it into a call; the final
+// record is anchored by a typed let (the structural-literal propagation gap).
+fn sum_lens(mem: string, base: i64, count: i64) -> RV =
+  let done: Sum =
+    loop s = { i: 0, total: 0 } while s.i < count do
+      let off: i64 = base + s.i * 4 in
+      let b0: i64 = to_i64(string_get(mem, off)) in
+      let b1: i64 = to_i64(string_get(mem, off + 1)) in
+      let b2: i64 = to_i64(string_get(mem, off + 2)) in
+      let b3: i64 = to_i64(string_get(mem, off + 3)) in
+      let next: Sum = { i: s.i + 1, total: s.total + (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) } in
+      next
+  in
+  { mem: mem, val: done.total }
+
+// Append everything stdin yields onto `mem`, one byte per read() through a
+// 1-byte stack bounce buffer (the todo_cli idiom, minimized so the frame
+// stays small). A loop, not recursion, so the input size is bounded by the
+// memory capacity alone; the move-only accumulator is consumed wholly each
+// iteration (a loop body may read outer storage - the bounce byte - but
+// never move it, and may not project fields out of the accumulator itself).
+fn read_all<'r>(mem: string) -> string effects[io, state, ffi, unsafe] =
+  let bounce: array<u8, 1> = [0x0; 1] in
+  let done: Pump =
+    loop s = { mem: mem, more: true } while s.more do
+      let cur: Pump = s in
+      let m: string = cur.mem in
+      let p: raw_mut_ptr<u8> = raw_mut_ptr(&'r mut bounce[0]) in
+      let n: i64 = std.platform.read(0, p, 1) in
+      if n <= 0 then
+        let fin: Pump = { mem: m, more: false } in
+        fin
+      else
+        let pushed: unit = string_push(m, bounce[0]) in
+        let nxt: Pump = { mem: m, more: true } in
+        nxt
+  in
+  done.mem
+
+// Print `n` as decimal plus a newline: format into a heap string, copy it to
+// a stack buffer, and write(1) once.
+fn print_num<'r>(n: i64) -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let s: string = std.fmt.i64_to_string(n) in
+  let ln: i64 = string_len(s) in
+  let done: OutBuf =
+    loop st = { b: [0x0; 32], i: 0 } while st.i < ln do
+      { b: array_set(st.b, st.i, string_get(s, st.i)), i: st.i + 1 }
+  in
+  let out: array<u8, 32> = array_set(done.b, ln, 0xa) in
+  std.platform.write(1, raw_ptr(&'r out[0]), ln + 1)
+
+// The five probe lines. Consumes (and thereby frees) the memory string.
+fn print_probe(mem: string, fns: i64, entry: i64, ops: i64, params: i64, locals: i64) -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let p1: i64 = print_num(fns) in
+  let p2: i64 = print_num(entry) in
+  let p3: i64 = print_num(ops) in
+  let p4: i64 = print_num(params) in
+  let p5: i64 = print_num(locals) in
+  0
+
+// Walk the image: magic/version, the two pools (count + lens + bytes), the
+// header tail (target str, entry index, function count), the function table
+// (12-byte rows), then the entry's section up to its op count. Table rows are
+// fixed-width, so every hop is offset arithmetic over `string_get` reads:
+// layout rows 36 bytes, type rows 17 (with the consumer columns), value rows
+// 4, param rows 8, local rows 16 (src/cir.rs has the authoritative layout).
+fn probe(mem: string) -> i64 effects[io, alloc, state, ffi, unsafe] =
+  if string_len(mem) < 32 then 65
+  else
+    let magic: RV = rd_u32(mem, 0) in
+    let g1: i64 = (if magic.val == 0x52494443 then 0 else return 65) in
+    let version: RV = rd_u32(magic.mem, 4) in
+    let g2: i64 = (if version.val == 0 then 0 else return 65) in
+    let strs: RV = rd_u32(version.mem, 8) in
+    let strbytes: RV = sum_lens(strs.mem, 12, strs.val) in
+    let doff: i64 = 12 + strs.val * 4 + strbytes.val in
+    let datas: RV = rd_u32(strbytes.mem, doff) in
+    let databytes: RV = sum_lens(datas.mem, doff + 4, datas.val) in
+    let tail: i64 = doff + 4 + datas.val * 4 + databytes.val in
+    let entry: RV = rd_u32(databytes.mem, tail + 4) in
+    let fns: RV = rd_u32(entry.mem, tail + 8) in
+    let table_base: i64 = tail + 12 in
+    let region_base: i64 = table_base + fns.val * 12 in
+    let secoff: RV = rd_u32(fns.mem, table_base + entry.val * 12 + 4) in
+    let sec: i64 = region_base + secoff.val in
+    let layouts: RV = rd_u32(secoff.mem, sec + 20) in
+    let tco: i64 = sec + 24 + layouts.val * 36 in
+    let types: RV = rd_u32(layouts.mem, tco) in
+    let vco: i64 = tco + 4 + types.val * 17 in
+    let vals: RV = rd_u32(types.mem, vco) in
+    let pco: i64 = vco + 4 + vals.val * 4 + 4 in
+    let params: RV = rd_u32(vals.mem, pco) in
+    let lco: i64 = pco + 4 + params.val * 8 in
+    let locals: RV = rd_u32(params.mem, lco) in
+    let oco: i64 = lco + 4 + locals.val * 16 in
+    let ops: RV = rd_u32(locals.mem, oco) in
+    print_probe(ops.mem, fns.val, entry.val, ops.val, params.val, locals.val)
+
+// eval-bin < program.cir [program-args...]: the CIR arrives on stdin; every
+// process argument belongs to the evaluated program (forwarded from Stage 4).
+fn main<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let mem: string = read_all(string_with_capacity(4194304)) in
+  probe(mem)
