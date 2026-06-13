@@ -1170,16 +1170,31 @@ domain-prefixed preimage (rewriting the two newlines to `\0` and prepending
 itself: every dump line is a real `(kind, schema, canonical payload → hash)` case,
 so the `.cdb` provably computes the SAME object hashes CodeDB does, across a
 record, an enum, and several functions (short and long payloads). The
-content-addressing core — raw SHA-256 and the object framing — now fully
-self-hosts; only the object BUILDER (source → the right canonical payloads) plus
-migration/birth identity remain between here and root-hash equality.
+content-addressing core — raw SHA-256 and the object framing — fully self-hosts.
 
-`tests/selfhost_frontend.rs` is the gate (6 tests: lexer × full corpus, the §11
-checked-view gate, emit-objects determinism, SHA-256 × lengths/blocks, and
-obj_hash × real objects). Still planned for 15a.3: the object builder (parsed
-items → canonical-JSON object payloads in the importer's deterministic order) +
-migration/birth identity → root-hash equality; the parser (15a.2, tokens → AST);
-then 15b–15e.
+Landed milestone (15a.3, minimal grammar): **root-hash equality**.
+`compiler/front/import.cdb` reads `fn main() -> i64 = <int>` from stdin, builds the
+six content-addressed objects (Type i64, Expression, FunctionSignature,
+SymbolBirth, FunctionDef, ProgramRoot) with their EXACT canonical-JSON payloads in
+dependency order, chains `hash_object` over them (reusing the SHA-256 core; reused
+hashes — the i64 Type, the Signature, the SymbolBirth — are threaded back from the
+build helpers, since a `.cdb` helper taking a `string` by value drops it and
+`string_get` rejects `&string`), and emits the ProgramRoot hash. That root EQUALS
+the Rust importer's (`codedb import → root …`) for every value tested (0, 1, 42,
+1000000, i64::MAX) — the `.cdb` computes the same program identity CodeDB does, with
+the deterministic birth identity reproduced exactly (the SymbolBirth `local_nonce`
+is the literal `import:main:main:0` = `import:<module>:<name>:<ordinal>`). The
+committed source passes the §11 checked-view gate. The "parser" here is minimal (it
+extracts the decimal int after `=`); the real tokenize+parse and the other object
+kinds are what GROWING the grammar adds.
+
+`tests/selfhost_frontend.rs` is the gate (7 tests: lexer × full corpus, the §11
+checked-view gate, emit-objects determinism, SHA-256 × lengths/blocks, obj_hash ×
+real objects, and importer root-hash equality × int values). Next: grow the importer
+grammar (params, more types, body expressions, multiple functions, records/enums —
+each adding object kinds plus the real recursive-descent parser, 15a.2), widening
+root-hash equality toward the full corpus; then 15b–15e (typecheck → … → lowering →
+CIR) for IR-hash equality, the mixed compiler.
 
 Sub-stages (each independently oracle-checked at its artifact):
 

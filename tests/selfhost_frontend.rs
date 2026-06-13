@@ -8,11 +8,15 @@
 //                              == codedb::token_probe on the full committed corpus
 //                              (incl. string/byte-string literals).
 //   compiler/front/sha256.cdb  general multi-block SHA-256 of stdin -> hex digest,
-//                              == codedb::sha256_hex — the content-addressing
-//                              keystone the importer's object/root hashing needs.
+//                              == codedb::sha256_hex; its obj_hash entry frames the
+//                              object preimage and reproduces hash_object_canonical
+//                              (gated against emit-objects dumps).
+//   compiler/front/import.cdb  reads `fn main() -> i64 = <int>`, builds the six
+//                              canonical objects + chains their hashes, and emits a
+//                              ProgramRoot hash == the Rust importer's root for the
+//                              same source (rung-A importer milestone, minimal grammar).
 //
-// The 15a.0 substrate (`emit-objects`, the importer oracle the object-builder
-// sub-stage will check the .cdb importer's objects + root hash against) is also
+// The 15a.0 substrate (`emit-objects`, the importer's object/root oracle) is also
 // pinned here for determinism across an independent rebuild.
 
 use std::io::Write;
@@ -303,6 +307,60 @@ fn obj_hash_reproduces_hash_object_canonical_for_real_objects() {
         checked >= 10,
         "the dump should carry several objects; only checked {checked}"
     );
+}
+
+/// Import + verify + build the self-hosted importer (the minimal-grammar
+/// source -> root-hash program) — once per test process.
+fn importer() -> &'static Path {
+    static IMPORTER: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    IMPORTER
+        .get_or_init(|| {
+            let temp = tempdir().unwrap();
+            let db = temp.path().join("selfhost-import.sqlite");
+            run(&["init", path(&db)]);
+            run(&["import", path(&db), "compiler/front/import.cdb"]);
+            run(&["verify", path(&db)]);
+            let exe = temp.path().join("import-bin");
+            run(&["build", path(&db), "main", "--out", path(&exe)]);
+            (temp, exe)
+        })
+        .1
+        .as_path()
+}
+
+#[test]
+fn importer_reproduces_the_root_hash_for_the_minimal_grammar() {
+    // The rung-A importer milestone (15a.3) on its smallest input: the .cdb
+    // importer reads `fn main() -> i64 = <int>`, builds the six content-addressed
+    // objects with their exact canonical payloads, chains hash_object over them,
+    // and emits a ProgramRoot hash that EQUALS the Rust importer's root for the
+    // same source — proving the .cdb computes the same program identity CodeDB does.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    for value in ["0", "1", "2", "42", "1000000", "9223372036854775807"] {
+        let source = format!("fn main() -> i64 = {value}\n");
+        // The Rust importer's root for this source.
+        let db = temp.path().join(format!("ref-{value}.sqlite"));
+        let src = temp.path().join(format!("ref-{value}.cdb"));
+        std::fs::write(&src, &source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        // The self-hosted importer's root from the same source on stdin.
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer root mismatch for `{}`",
+            source.trim()
+        );
+    }
 }
 
 #[test]

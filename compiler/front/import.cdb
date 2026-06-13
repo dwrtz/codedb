@@ -1,0 +1,365 @@
+// compiler/front/import.cdb - the self-hosted importer toward root-hash equality
+// (ladder rung A, stage 15a.3, minimal grammar).
+//
+// Reads a source `fn main() -> i64 = <int>` from stdin and prints the program
+// ROOT HASH the Rust importer would compute for it (`codedb import` -> `root ...`).
+// This is the rung-A importer milestone on its smallest input: parse the source,
+// build the content-addressed objects with their EXACT canonical-JSON payloads in
+// dependency order, chain hash_object (= src/store.rs::hash_object_canonical) over
+// them, and emit the ProgramRoot's hash. Gate: that root equals the Rust
+// importer's for the same source (tests/selfhost_frontend.rs).
+//
+// For `fn main() -> i64 = V` the six objects are, in order:
+//   Type              {"type_kind":"I64"}                                  -> T
+//   Expression        {"expr_kind":"literal_i64","type":T,"value":V}       -> E
+//   FunctionSignature {"abi":"codedb-v0-internal","effects":[],
+//                      "params":[],"return":T}                             -> SIG
+//   SymbolBirth       {"birth_history_hash":"genesis",
+//                      "local_nonce":"import:main:main:0",
+//                      "symbol_kind":"function"}                           -> SYM
+//   FunctionDef       {"function_sig_hash":SIG,"symbol":SYM,
+//                      "typed_body_expr_hash":E}                           -> DEF
+//   ProgramRoot       {... names/param_names/symbols referencing SYM,DEF,SIG}-> ROOT
+// Reused hashes (T, SIG, SYM) are THREADED back from the build helpers (a .cdb
+// helper taking a `string` by value would drop it, and string_get rejects a
+// &string), so each survives its multiple uses.
+//
+// Minimal grammar: name=main, module=main, return type i64, body a decimal int
+// literal. The "parser" here only extracts the int (the digits after `=`); the
+// real tokenize+parse and the rest of the object kinds are the next increments.
+// The SHA-256 core is copied from sha256.cdb verbatim (it will move to a shared
+// library when the front-end is composed).
+
+module std.platform {
+extern fn write(fd: i64, ptr: raw_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "write" library "c"
+extern fn read(fd: i64, ptr: raw_mut_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "read" library "c"
+}
+
+// ---------------------------------------------------------------------------
+// SHA-256 compression core (verbatim from examples/v3/sha256.cdb)
+// ---------------------------------------------------------------------------
+
+fn rotr(x: u32, n: u32) -> u32 = (x >> n) | (x << (32 - n))
+fn ssig0(x: u32) -> u32 = rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3)
+fn ssig1(x: u32) -> u32 = rotr(x, 17) ^ rotr(x, 19) ^ (x >> 10)
+fn bsig0(x: u32) -> u32 = rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22)
+fn bsig1(x: u32) -> u32 = rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25)
+fn ch(x: u32, y: u32, z: u32) -> u32 = (x & y) ^ (~x & z)
+fn maj(x: u32, y: u32, z: u32) -> u32 = (x & y) ^ (x & z) ^ (y & z)
+
+record State {
+  a: u32
+  b: u32
+  c: u32
+  d: u32
+  e: u32
+  f: u32
+  g: u32
+  h: u32
+}
+
+fn round(s: State, k: u32, w: u32) -> State =
+  let t1: u32 = s.h + bsig1(s.e) + ch(s.e, s.f, s.g) + k + w in
+  let t2: u32 = bsig0(s.a) + maj(s.a, s.b, s.c) in
+  { a: t1 + t2, b: s.a, c: s.b, d: s.c, e: s.d + t1, f: s.e, g: s.f, h: s.g }
+
+fn round_keys() -> array<u32, 64> =
+  [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0xfc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x6ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2]
+
+record Sched { w: array<u32, 64>  t: i64 }
+record SchedR { mem: string  w: array<u32, 64> }
+record Working { st: State  t: i64 }
+record BlkAcc { mem: string  h: State  b: i64 }
+record Pump { mem: string  more: bool }
+
+fn read_all<'r>(mem: string) -> string effects[io, state, ffi, unsafe] =
+  let bounce: array<u8, 1> = [0x0; 1] in
+  let done: Pump =
+    loop s = { mem: mem, more: true } while s.more do
+      let cur: Pump = s in
+      let m: string = cur.mem in
+      let p: raw_mut_ptr<u8> = raw_mut_ptr(&'r mut bounce[0]) in
+      let n: i64 = std.platform.read(0, p, 1) in
+      if n <= 0 then
+        let fin: Pump = { mem: m, more: false } in
+        fin
+      else
+        let pushed: unit = string_push(m, bounce[0]) in
+        let nxt: Pump = { mem: m, more: true } in
+        nxt
+  in
+  done.mem
+
+fn pad(mem: string, msglen: i64) -> string effects[state] =
+  let p80: unit = string_push(mem, to_u8(0x80)) in
+  let zeroed: string =
+    loop m = mem while (string_len(m) % 64) != 56 do
+      let z: unit = string_push(m, to_u8(0)) in
+      m
+  in
+  let bits: i64 = msglen * 8 in
+  let b0: unit = string_push(zeroed, to_u8((bits >> 56) & 0xff)) in
+  let b1: unit = string_push(zeroed, to_u8((bits >> 48) & 0xff)) in
+  let b2: unit = string_push(zeroed, to_u8((bits >> 40) & 0xff)) in
+  let b3: unit = string_push(zeroed, to_u8((bits >> 32) & 0xff)) in
+  let b4: unit = string_push(zeroed, to_u8((bits >> 24) & 0xff)) in
+  let b5: unit = string_push(zeroed, to_u8((bits >> 16) & 0xff)) in
+  let b6: unit = string_push(zeroed, to_u8((bits >> 8) & 0xff)) in
+  let b7: unit = string_push(zeroed, to_u8(bits & 0xff)) in
+  zeroed
+
+fn schedule_at(mem: string, base: i64) -> SchedR =
+  let seed: Sched = { w: [0x0; 64], t: 0 } in
+  let done: Sched =
+    loop s = seed while s.t < 64 do
+      let word: u32 =
+        if s.t < 16 then
+          let o: i64 = base + s.t * 4 in
+          to_u32(
+            (to_i64(string_get(mem, o)) << 24) |
+            (to_i64(string_get(mem, o + 1)) << 16) |
+            (to_i64(string_get(mem, o + 2)) << 8) |
+            to_i64(string_get(mem, o + 3))
+          )
+        else ssig1(s.w[s.t - 2]) + s.w[s.t - 7] + ssig0(s.w[s.t - 15]) + s.w[s.t - 16]
+      in
+      let nx: Sched = { w: array_set(s.w, s.t, word), t: s.t + 1 } in nx
+  in
+  let res: SchedR = { mem: mem, w: done.w } in res
+
+fn compress_from(h: State, w: array<u32, 64>) -> State =
+  let k: array<u32, 64> = round_keys() in
+  let done: Working =
+    loop cs = { st: h, t: 0 } while cs.t < 64 do
+      let nx: Working = { st: round(cs.st, k[cs.t], w[cs.t]), t: cs.t + 1 } in nx
+  in
+  let s: State = done.st in
+  let out: State = {
+    a: h.a + s.a, b: h.b + s.b, c: h.c + s.c, d: h.d + s.d,
+    e: h.e + s.e, f: h.f + s.f, g: h.g + s.g, h: h.h + s.h
+  } in out
+
+fn hash_blocks(mem: string, nblocks: i64) -> State =
+  let h0: State = { a: 0x6a09e667, b: 0xbb67ae85, c: 0x3c6ef372, d: 0xa54ff53a, e: 0x510e527f, f: 0x9b05688c, g: 0x1f83d9ab, h: 0x5be0cd19 } in
+  let seed: BlkAcc = { mem: mem, h: h0, b: 0 } in
+  let done: BlkAcc =
+    loop s = seed while s.b < nblocks do
+      let cur: BlkAcc = s in
+      let bb: i64 = cur.b in
+      let hh: State = cur.h in
+      let sr: SchedR = schedule_at(cur.mem, bb * 64) in
+      let nh: State = compress_from(hh, sr.w) in
+      let r: BlkAcc = { mem: sr.mem, h: nh, b: bb + 1 } in r
+  in
+  done.h
+
+fn hex_nibble(v: i64) -> i64 = if v < 10 then 48 + v else 97 + v - 10
+
+fn push_word_hex(out: string, w: u32) -> string effects[state] =
+  let wi: i64 = to_i64(w) in
+  let p0: unit = string_push(out, to_u8(hex_nibble((wi >> 28) & 0xf))) in
+  let p1: unit = string_push(out, to_u8(hex_nibble((wi >> 24) & 0xf))) in
+  let p2: unit = string_push(out, to_u8(hex_nibble((wi >> 20) & 0xf))) in
+  let p3: unit = string_push(out, to_u8(hex_nibble((wi >> 16) & 0xf))) in
+  let p4: unit = string_push(out, to_u8(hex_nibble((wi >> 12) & 0xf))) in
+  let p5: unit = string_push(out, to_u8(hex_nibble((wi >> 8) & 0xf))) in
+  let p6: unit = string_push(out, to_u8(hex_nibble((wi >> 4) & 0xf))) in
+  let p7: unit = string_push(out, to_u8(hex_nibble(wi & 0xf))) in
+  out
+
+// ---------------------------------------------------------------------------
+// string building + object hashing
+// ---------------------------------------------------------------------------
+
+record PBi { p: string  i: i64 }
+record OS { out: string  s: string }
+record EH { h: string  t: string }
+record DH { h: string  sig: string  sym: string }
+record Ext { out: string  p: i64  eq: bool }
+record OB { b: array<u8, 96>  i: i64 }
+
+// Append a static byte slice to `out`.
+fn push_lit(out: string, s: slice<'static, u8>) -> string effects[state] =
+  let n: i64 = len(s) in
+  let seed: PBi = { p: out, i: 0 } in
+  let done: PBi =
+    loop a = seed while a.i < n do
+      let cur: PBi = a in
+      let pp: string = cur.p in
+      let pushed: unit = string_push(pp, s[cur.i]) in
+      let r: PBi = { p: pp, i: cur.i + 1 } in r
+  in done.p
+
+fn push_byte(out: string, b: u8) -> string effects[state] =
+  let pushed: unit = string_push(out, b) in
+  out
+
+// Append `s` to `out`, CONSUMING s (for a value used exactly once).
+fn push_str(out: string, s: string) -> string effects[state] =
+  let n: i64 = string_len(s) in
+  let seed: PBi = { p: out, i: 0 } in
+  let done: PBi =
+    loop a = seed while a.i < n do
+      let cur: PBi = a in
+      let pp: string = cur.p in
+      let pushed: unit = string_push(pp, string_get(s, cur.i)) in
+      let r: PBi = { p: pp, i: cur.i + 1 } in r
+  in done.p
+
+// Append `s` to `out`, THREADING s back (for a hash reused across objects).
+fn push_kept(out: string, s: string) -> OS effects[state] =
+  let n: i64 = string_len(s) in
+  let seed: PBi = { p: out, i: 0 } in
+  let done: PBi =
+    loop a = seed while a.i < n do
+      let cur: PBi = a in
+      let pp: string = cur.p in
+      let pushed: unit = string_push(pp, string_get(s, cur.i)) in
+      let r: PBi = { p: pp, i: cur.i + 1 } in r
+  in
+  let res: OS = { out: done.p, s: s } in res
+
+// Render the 8-word state as "sha256:" + 64 lowercase hex chars (a string).
+fn state_to_hash(st: State) -> string effects[alloc, state] =
+  let h0: string = push_lit(string_with_capacity(80), b"sha256:") in
+  let h1: string = push_word_hex(h0, st.a) in
+  let h2: string = push_word_hex(h1, st.b) in
+  let h3: string = push_word_hex(h2, st.c) in
+  let h4: string = push_word_hex(h3, st.d) in
+  let h5: string = push_word_hex(h4, st.e) in
+  let h6: string = push_word_hex(h5, st.f) in
+  let h7: string = push_word_hex(h6, st.g) in
+  let h8: string = push_word_hex(h7, st.h) in
+  h8
+
+// hash_object_canonical: "sha256:" + hex(SHA-256(OBJECT_DOMAIN || kind || \0 ||
+// schema || \0 || payload)). schema is a single decimal digit (always 1 here).
+// `payload` is consumed.
+fn hash_object(kind: slice<'static, u8>, schema: i64, payload: string) -> string effects[alloc, state] =
+  let p0: string = string_with_capacity(2048) in
+  let p1: string = push_lit(p0, b"codedb/object/v1\0") in
+  let p2: string = push_lit(p1, kind) in
+  let p3: string = push_byte(p2, to_u8(0)) in
+  let p4: string = push_byte(p3, to_u8(48 + schema)) in
+  let p5: string = push_byte(p4, to_u8(0)) in
+  let p6: string = push_str(p5, payload) in
+  let msglen: i64 = string_len(p6) in
+  let padded: string = pad(p6, msglen) in
+  let nblocks: i64 = string_len(padded) / 64 in
+  let st: State = hash_blocks(padded, nblocks) in
+  state_to_hash(st)
+
+// ---------------------------------------------------------------------------
+// the object builders (canonical payloads in dependency order)
+// ---------------------------------------------------------------------------
+
+fn build_type() -> string effects[alloc, state] =
+  let p: string = push_lit(string_with_capacity(64), b"{\"type_kind\":\"I64\"}") in
+  hash_object(b"Type", 1, p)
+
+fn build_expr(t: string, val: string) -> EH effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(256), b"{\"expr_kind\":\"literal_i64\",\"type\":\"") in
+  let k: OS = push_kept(p0, t) in
+  let p1: string = k.out in
+  let t2: string = k.s in
+  let p2: string = push_lit(p1, b"\",\"value\":\"") in
+  let p3: string = push_str(p2, val) in
+  let p4: string = push_lit(p3, b"\"}") in
+  let e: string = hash_object(b"Expression", 1, p4) in
+  let res: EH = { h: e, t: t2 } in res
+
+fn build_sig(t: string) -> string effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(192), b"{\"abi\":\"codedb-v0-internal\",\"effects\":[],\"params\":[],\"return\":\"") in
+  let p1: string = push_str(p0, t) in
+  let p2: string = push_lit(p1, b"\"}") in
+  hash_object(b"FunctionSignature", 1, p2)
+
+fn build_sym() -> string effects[alloc, state] =
+  let p: string = push_lit(string_with_capacity(160), b"{\"birth_history_hash\":\"genesis\",\"local_nonce\":\"import:main:main:0\",\"symbol_kind\":\"function\"}") in
+  hash_object(b"SymbolBirth", 1, p)
+
+fn build_def(sig: string, sym: string, e: string) -> DH effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(320), b"{\"function_sig_hash\":\"") in
+  let k1: OS = push_kept(p0, sig) in
+  let p1: string = k1.out in
+  let sig2: string = k1.s in
+  let p2: string = push_lit(p1, b"\",\"symbol\":\"") in
+  let k2: OS = push_kept(p2, sym) in
+  let p3: string = k2.out in
+  let sym2: string = k2.s in
+  let p4: string = push_lit(p3, b"\",\"typed_body_expr_hash\":\"") in
+  let p5: string = push_str(p4, e) in
+  let p6: string = push_lit(p5, b"\"}") in
+  let d: string = hash_object(b"FunctionDef", 1, p6) in
+  let res: DH = { h: d, sig: sig2, sym: sym2 } in res
+
+fn build_root_obj(sym: string, def: string, sig: string) -> string effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(1024), b"{\"metadata\":{},\"names\":[{\"display_name\":\"main\",\"is_preferred\":true,\"module\":\"main\",\"symbol\":\"") in
+  let k1: OS = push_kept(p0, sym) in
+  let p1: string = k1.out in
+  let sym1: string = k1.s in
+  let p2: string = push_lit(p1, b"\"}],\"param_names\":[{\"names\":[],\"symbol\":\"") in
+  let k2: OS = push_kept(p2, sym1) in
+  let p3: string = k2.out in
+  let sym2: string = k2.s in
+  let p4: string = push_lit(p3, b"\"}],\"symbols\":[{\"definition\":\"") in
+  let p5: string = push_str(p4, def) in
+  let p6: string = push_lit(p5, b"\",\"signature\":\"") in
+  let p7: string = push_str(p6, sig) in
+  let p8: string = push_lit(p7, b"\",\"symbol\":\"") in
+  let p9: string = push_str(p8, sym2) in
+  let p10: string = push_lit(p9, b"\"}]}") in
+  hash_object(b"ProgramRoot", 1, p10)
+
+fn import_root(val: string) -> string effects[alloc, state] =
+  let t: string = build_type() in
+  let re: EH = build_expr(t, val) in
+  let e: string = re.h in
+  let t2: string = re.t in
+  let sig: string = build_sig(t2) in
+  let sym: string = build_sym() in
+  let rd: DH = build_def(sig, sym, e) in
+  let def: string = rd.h in
+  let sig2: string = rd.sig in
+  let sym2: string = rd.sym in
+  build_root_obj(sym2, def, sig2)
+
+// ---------------------------------------------------------------------------
+// minimal "parser": the decimal int literal is the digits after `=`
+// ---------------------------------------------------------------------------
+
+fn extract_int(src: string) -> string effects[alloc, state] =
+  let n: i64 = string_len(src) in
+  let seed: Ext = { out: string_with_capacity(32), p: 0, eq: false } in
+  let done: Ext =
+    loop a = seed while a.p < n do
+      let cur: Ext = a in
+      let oo: string = cur.out in
+      let b: i64 = to_i64(string_get(src, cur.p)) in
+      if cur.eq then
+        (if b >= 48 && b <= 57 then
+           let pushed: unit = string_push(oo, to_u8(b)) in
+           (let r: Ext = { out: oo, p: cur.p + 1, eq: true } in r)
+         else (let r: Ext = { out: oo, p: cur.p + 1, eq: true } in r))
+      else
+        (let r: Ext = { out: oo, p: cur.p + 1, eq: b == 61 } in r)
+  in done.out
+
+fn print_str<'r>(s: string) -> i64 effects[io, state, ffi, unsafe] =
+  let n: i64 = string_len(s) in
+  let seed: OB = { b: [0x0; 96], i: 0 } in
+  let done: OB =
+    loop st = seed while st.i < n do
+      let nx: OB = { b: array_set(st.b, st.i, string_get(s, st.i)), i: st.i + 1 } in nx
+  in
+  let out: array<u8, 96> = array_set(done.b, n, 0xa) in
+  std.platform.write(1, raw_ptr(&'r out[0]), n + 1)
+
+fn mem_cap() -> i64 = 1048576
+
+fn main<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let src: string = read_all(string_with_capacity(mem_cap())) in
+  let val: string = extract_int(src) in
+  let root: string = import_root(val) in
+  let printed: i64 = print_str(root) in
+  0

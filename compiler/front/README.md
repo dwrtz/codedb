@@ -26,9 +26,18 @@ The object-hash wrapper is landed on top of it: the `obj_hash` entry of
 `src/store.rs::hash_object_canonical` (`sha256:`+hex) exactly. Its oracle is
 `emit-objects` itself — every dump line is a real `(kind, schema, payload → hash)`
 case — so the `.cdb` provably computes the same object hashes CodeDB does. The
-content-addressing core now fully self-hosts. Remaining increments: the object
-builder (parsed items → canonical-JSON payloads) + birth identity → root-hash
-oracle (15a.3), and the parser (15a.2, tokens → AST).
+content-addressing core now fully self-hosts.
+
+Root-hash equality is reached on the minimal grammar: `import.cdb` reads
+`fn main() -> i64 = <int>`, builds the six content-addressed objects with their
+exact canonical payloads in dependency order, chains `hash_object`, and emits a
+ProgramRoot hash that equals the Rust importer's root (`codedb import → root …`)
+for every int tested — so the `.cdb` computes the same program identity CodeDB
+does, deterministic birth identity included. The committed source passes the §11
+gate. Next: grow the importer grammar (params, more types, body expressions,
+multiple functions, records/enums) plus the real recursive-descent parser (15a.2),
+widening root-hash equality toward the full corpus; then the back half of rung A
+(typecheck → … → lowering → CIR) for IR-hash equality.
 
 The front half of the compiler as CodeDB objects, meeting the Rust native backend
 at the lowered-IR seam (the mixed compiler). Sub-stages, each oracle-checked at
