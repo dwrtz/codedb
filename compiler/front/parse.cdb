@@ -166,6 +166,22 @@ record DefS {
   go: bool
 }
 
+// The effect-list loop accumulator: memory, cursor, the present-effect bitmask
+// (bit `ord` set), keep-going.
+record EffS {
+  mem: string
+  p: i64
+  mask: i64
+  go: bool
+}
+
+// An effect-ordinal lookup result: memory threaded back and the ordinal (0 for
+// pure/unknown, 1..7 for trap/io/state/alloc/ffi/unsafe/concurrent).
+record SOrd {
+  mem: string
+  ord: i64
+}
+
 // A stack output buffer for writing a rendered number (Copy).
 record OutBuf64 {
   b: array<u8, 64>
@@ -450,6 +466,95 @@ fn parse_def_params(mem: string, h: u32, p: i64, len: i64) -> PS =
     in
     let r: PS = { mem: done.mem, h: done.h, p: done.p } in r
   else (let r: PS = { mem: m0, h: fnv_step(fnv_step(h, 0), 0), p: p } in r)
+
+// Map an effect name [ts, te) to its ordinal (the BTreeSet declaration order:
+// trap=1, io=2, state=3, alloc=4, ffi=5, unsafe=6, concurrent=7; pure/unknown=0),
+// memory threaded back.
+fn eff_ord(mem: string, ts: i64, te: i64) -> SOrd =
+  let r1: SBool = tok_eq(mem, ts, te, "trap") in
+  if r1.yes then (let r: SOrd = { mem: r1.mem, ord: 1 } in r)
+  else
+    let r2: SBool = tok_eq(r1.mem, ts, te, "io") in
+    if r2.yes then (let r: SOrd = { mem: r2.mem, ord: 2 } in r)
+    else
+      let r3: SBool = tok_eq(r2.mem, ts, te, "state") in
+      if r3.yes then (let r: SOrd = { mem: r3.mem, ord: 3 } in r)
+      else
+        let r4: SBool = tok_eq(r3.mem, ts, te, "alloc") in
+        if r4.yes then (let r: SOrd = { mem: r4.mem, ord: 4 } in r)
+        else
+          let r5: SBool = tok_eq(r4.mem, ts, te, "ffi") in
+          if r5.yes then (let r: SOrd = { mem: r5.mem, ord: 5 } in r)
+          else
+            let r6: SBool = tok_eq(r5.mem, ts, te, "unsafe") in
+            if r6.yes then (let r: SOrd = { mem: r6.mem, ord: 6 } in r)
+            else
+              let r7: SBool = tok_eq(r6.mem, ts, te, "concurrent") in
+              if r7.yes then (let r: SOrd = { mem: r7.mem, ord: 7 } in r)
+              else (let r: SOrd = { mem: r7.mem, ord: 0 } in r)
+
+// Parse an `effects[ ... ]` list at `p` (just after the `effects` keyword) and
+// fold the AstProbe effect text-list: the present effects deduped and sorted by
+// ordinal (`normalize_effects`: a BTreeSet with pure removed), each as
+// `1`+text(name), then a `0`. Returns the cursor past `]`.
+fn parse_effects(mem: string, h: u32, p: i64, len: i64) -> PS =
+  let tlb: Tok = lex1(mem, p, len) in
+  let done: EffS =
+    loop a = { mem: tlb.mem, p: tlb.nxt, mask: 0, go: true } while a.go do
+      let cur: EffS = a in
+      let t: Tok = lex1(cur.mem, cur.p, len) in
+      let rrb: SBool = is_sym1(t.mem, t.ts, t.te, t.kind, 93) in
+      let m1: string = rrb.mem in
+      if rrb.yes then
+        (let s: EffS = { mem: m1, p: t.nxt, mask: cur.mask, go: false } in s)
+      else
+        let rcomma: SBool = is_sym1(m1, t.ts, t.te, t.kind, 44) in
+        let m2: string = rcomma.mem in
+        if rcomma.yes then
+          (let s: EffS = { mem: m2, p: t.nxt, mask: cur.mask, go: true } in s)
+        else
+          let eo: SOrd = eff_ord(m2, t.ts, t.te) in
+          let nm: i64 = if eo.ord > 0 then cur.mask | (1 << eo.ord) else cur.mask in
+          (let s: EffS = { mem: eo.mem, p: t.nxt, mask: nm, go: true } in s)
+  in
+  let mask: i64 = done.mask in
+  let h1: u32 = if ((mask >> 1) & 1) == 1 then fblob_static("trap", fnv_step(h, 1)) else h in
+  let h2: u32 = if ((mask >> 2) & 1) == 1 then fblob_static("io", fnv_step(h1, 1)) else h1 in
+  let h3: u32 = if ((mask >> 3) & 1) == 1 then fblob_static("state", fnv_step(h2, 1)) else h2 in
+  let h4: u32 = if ((mask >> 4) & 1) == 1 then fblob_static("alloc", fnv_step(h3, 1)) else h3 in
+  let h5: u32 = if ((mask >> 5) & 1) == 1 then fblob_static("ffi", fnv_step(h4, 1)) else h4 in
+  let h6: u32 = if ((mask >> 6) & 1) == 1 then fblob_static("unsafe", fnv_step(h5, 1)) else h5 in
+  let h7: u32 = if ((mask >> 7) & 1) == 1 then fblob_static("concurrent", fnv_step(h6, 1)) else h6 in
+  let r: PS = { mem: done.mem, h: fnv_step(h7, 0), p: done.p } in r
+
+// `fold item in target with acc = init do body`. Folds byte(17), text(item),
+// expr(target), text(acc), expr(init), expr(body).
+fn parse_fold_tail(mem: string, h: u32, p: i64, len: i64) -> PS =
+  let h1: u32 = fnv_step(h, 17) in
+  let titem: Tok = lex1(mem, p, len) in
+  let hi: HF = fblob_range(titem.mem, titem.ts, titem.te, h1) in
+  let tin: Tok = lex1(hi.mem, titem.nxt, len) in
+  let tgt: PS = parse_expr(tin.mem, hi.hash, tin.nxt, len) in
+  let twith: Tok = lex1(tgt.mem, tgt.p, len) in
+  let tacc: Tok = lex1(twith.mem, twith.nxt, len) in
+  let ha: HF = fblob_range(tacc.mem, tacc.ts, tacc.te, tgt.h) in
+  let teq: Tok = lex1(ha.mem, tacc.nxt, len) in
+  let init: PS = parse_expr(teq.mem, ha.hash, teq.nxt, len) in
+  let tdo: Tok = lex1(init.mem, init.p, len) in
+  parse_expr(tdo.mem, init.h, tdo.nxt, len)
+
+// `loop acc = init while cond do body`. Folds byte(18), text(acc), expr(init),
+// expr(cond), expr(body).
+fn parse_loop_tail(mem: string, h: u32, p: i64, len: i64) -> PS =
+  let h1: u32 = fnv_step(h, 18) in
+  let tacc: Tok = lex1(mem, p, len) in
+  let ha: HF = fblob_range(tacc.mem, tacc.ts, tacc.te, h1) in
+  let teq: Tok = lex1(ha.mem, tacc.nxt, len) in
+  let init: PS = parse_expr(teq.mem, ha.hash, teq.nxt, len) in
+  let twhile: Tok = lex1(init.mem, init.p, len) in
+  let cond: PS = parse_expr(twhile.mem, init.h, twhile.nxt, len) in
+  let tdo: Tok = lex1(cond.mem, cond.p, len) in
+  parse_expr(tdo.mem, cond.h, tdo.nxt, len)
 
 // Parse the comma-separated call arguments at `p` (just after `(`), through the
 // closing `)`. Folds [1, arg]* then 0 (the AstProbe Call argument list).
@@ -742,7 +847,15 @@ fn parse_expr(mem: string, h: u32, p: i64, len: i64) -> PS =
       let ri: SBool = tok_eq(m2, t.ts, t.te, "if") in
       let m3: string = ri.mem in
       if t.kind == 1 && ri.yes then parse_if_tail(m3, h, t.nxt, len)
-      else parse_binary(m3, h, p, len, 0)
+      else
+        let rfo: SBool = tok_eq(m3, t.ts, t.te, "fold") in
+        let m4: string = rfo.mem in
+        if t.kind == 1 && rfo.yes then parse_fold_tail(m4, h, t.nxt, len)
+        else
+          let rlo: SBool = tok_eq(m4, t.ts, t.te, "loop") in
+          let m5: string = rlo.mem in
+          if t.kind == 1 && rlo.yes then parse_loop_tail(m5, h, t.nxt, len)
+          else parse_binary(m5, h, p, len, 0)
 
 // Parse the `name: type` parameter list at `p` (just after `(`), through `)`.
 // Folds [1, text(name), text(type)]* then 0 (the AstProbe param pair list).
@@ -798,9 +911,17 @@ fn parse_item(mem: string, h: u32, p: i64, len: i64, modts: i64) -> PS =
   let tarrow: Tok = lex1(pr.mem, pr.p, len) in
   let tyr: TyR = scan_type(tarrow.mem, tarrow.nxt, len) in
   let hrt: HF = fblob_range(tyr.mem, tyr.ts0, tyr.end, pr.h) in
-  let heff: u32 = fnv_step(hrt.hash, 0) in
-  let teq: Tok = lex1(hrt.mem, tyr.end, len) in
-  parse_expr(teq.mem, heff, teq.nxt, len)
+  // optional `effects[...]` (else the empty effect list), then `=` and the body
+  let teff: Tok = lex1(hrt.mem, tyr.end, len) in
+  let reff: SBool = tok_eq(teff.mem, teff.ts, teff.te, "effects") in
+  let meff: string = reff.mem in
+  if teff.kind == 1 && reff.yes then
+    let ef: PS = parse_effects(meff, hrt.hash, teff.nxt, len) in
+    let teq: Tok = lex1(ef.mem, ef.p, len) in
+    parse_expr(teq.mem, ef.h, teq.nxt, len)
+  else
+    let heff: u32 = fnv_step(hrt.hash, 0) in
+    parse_expr(meff, heff, teff.nxt, len)
 
 // Parse a `module path { items }` block, folding every item with the module's
 // name and returning the running digest, cursor, and item count.

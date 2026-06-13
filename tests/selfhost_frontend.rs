@@ -375,6 +375,33 @@ fn parser_probe_matches_rust_on_generics_types_and_modules() {
 }
 
 #[test]
+fn parser_probe_matches_rust_on_effects_loops_and_folds() {
+    // Phase 15a.2 (cont.): `effects[...]` on the function header (deduped and
+    // sorted by ordinal like normalize_effects), and the `loop`/`fold` keyword
+    // forms. With these, std/alloc.cdb (effects + dotted calls) and std/io.cdb
+    // (effects + loop + borrows + slice types) parse byte-for-byte.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = parser();
+    // Effect lists: canonical order preserved, and reordered input normalizes the
+    // same (io before unsafe regardless of how they are written).
+    assert_ast_probe(exe, "fn e(x: i64) -> i64 effects[io, alloc, ffi, unsafe] = x");
+    assert_ast_probe(exe, "fn e2(x: i64) -> i64 effects[unsafe, io] = x");
+    // Loop and fold.
+    assert_ast_probe(exe, "fn lp(n: i64) -> i64 = loop a = 0 while a < n do a + 1");
+    assert_ast_probe(
+        exe,
+        "fn fo(n: i64) -> i64 = fold x in items with acc = 0 do acc + x",
+    );
+    // Two more committed corpus files.
+    for file in ["std/alloc.cdb", "std/io.cdb"] {
+        let source = std::fs::read_to_string(file).unwrap_or_else(|_| panic!("read {file}"));
+        assert_ast_probe(exe, &source);
+    }
+}
+
+#[test]
 fn sha256_matches_reference_across_lengths_and_blocks() {
     // The content-addressing keystone (SPEC_V3 §5): the self-hosted hasher must
     // compute SHA-256 of arbitrary bytes byte-for-byte like the reference, or the
