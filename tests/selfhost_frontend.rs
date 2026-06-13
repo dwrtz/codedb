@@ -426,6 +426,52 @@ fn parser_probe_matches_rust_on_definitions_and_aggregates() {
 }
 
 #[test]
+fn parser_probe_matches_rust_on_strings_externs_and_the_committed_corpus() {
+    // Phase 15a.2 (cont.): string/byte-string literals (lex1 scans them honoring
+    // `\` escapes; the probe folds the decoded value for a string and the hex of
+    // the decoded bytes for a byte string) and external functions (`extern fn ...
+    // abi[..] effects[..] link_name ".." library ".."`, with effects folded before
+    // abi per AstProbe). With these, the self-hosted parser matches ast_probe on
+    // most of the committed corpus — everything except the `case`-using files
+    // (std/result.cdb, compiler/eval/eval.cdb), which await case-pattern support.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = parser();
+    // String and byte-string literals, with escapes.
+    assert_ast_probe(exe, r#"fn s() -> i64 = "hello""#);
+    assert_ast_probe(exe, r#"fn e() -> i64 = "a\nb\t\"q\"\\z""#);
+    assert_ast_probe(exe, r#"fn bs() -> i64 = b"bytes \x1f \x00 \0 \n end""#);
+    // External functions, in and out of a module.
+    assert_ast_probe(
+        exe,
+        r#"extern fn write(fd: i64, ptr: raw_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "write" library "c""#,
+    );
+    assert_ast_probe(
+        exe,
+        r#"extern fn malloc(size: i64) -> raw_mut_ptr<u8> abi[c] link_name "malloc""#,
+    );
+    // The committed corpus files the parser now reproduces byte-for-byte
+    // (everything that does not use `case`), including the parser parsing itself.
+    for file in [
+        "std/core.cdb",
+        "std/mem.cdb",
+        "std/alloc.cdb",
+        "std/string.cdb",
+        "std/fmt.cdb",
+        "std/io.cdb",
+        "examples/v3/tokenizer.cdb",
+        "examples/v3/sha256.cdb",
+        "compiler/front/lex.cdb",
+        "compiler/front/sha256.cdb",
+        "compiler/front/parse.cdb",
+    ] {
+        let source = std::fs::read_to_string(file).unwrap_or_else(|_| panic!("read {file}"));
+        assert_ast_probe(exe, &source);
+    }
+}
+
+#[test]
 fn sha256_matches_reference_across_lengths_and_blocks() {
     // The content-addressing keystone (SPEC_V3 §5): the self-hosted hasher must
     // compute SHA-256 of arbitrary bytes byte-for-byte like the reference, or the

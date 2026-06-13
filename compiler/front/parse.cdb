@@ -182,6 +182,15 @@ record SOrd {
   ord: i64
 }
 
+// The string-literal decode loop accumulator (Copy): the running digest, the
+// cursor, the decoded-byte count, keep-going.
+record DecA {
+  h: u32
+  p: i64
+  n: i64
+  go: bool
+}
+
 // A stack output buffer for writing a rendered number (Copy).
 record OutBuf64 {
   b: array<u8, 64>
@@ -340,7 +349,15 @@ fn lex1(mem: string, p0: i64, len: i64) -> Tok =
   else
     let b: i64 = to_i64(string_get(mem, q)) in
     let b1: i64 = if q + 1 < len then to_i64(string_get(mem, q + 1)) else 0 in
-    if is_ident_start(b) then
+    if b == 98 && b1 == 34 then
+      // byte-string literal `b"..."` (checked before the identifier rule)
+      let se: SE = scan_str(mem, q + 2, len) in
+      let t: Tok = { mem: se.mem, kind: 4, ts: q, te: se.end, nxt: se.end } in t
+    else if b == 34 then
+      // string literal `"..."`
+      let se: SE = scan_str(mem, q + 1, len) in
+      let t: Tok = { mem: se.mem, kind: 3, ts: q, te: se.end, nxt: se.end } in t
+    else if is_ident_start(b) then
       let se: SE = scan_end(mem, q + 1, len, 0) in
       let t: Tok = { mem: se.mem, kind: 1, ts: q, te: se.end, nxt: se.end } in t
     else if is_digit(b) then
@@ -466,6 +483,103 @@ fn parse_def_params(mem: string, h: u32, p: i64, len: i64) -> PS =
     in
     let r: PS = { mem: done.mem, h: done.h, p: done.p } in r
   else (let r: PS = { mem: m0, h: fnv_step(fnv_step(h, 0), 0), p: p } in r)
+
+// A hex digit's value (0..15); 0 for a non-hex byte (only valid `\xHH` reaches
+// this). Mirrors lex.cdb::hexv.
+fn hexv(b: i64) -> i64 =
+  if b >= 48 && b <= 57 then b - 48
+  else if b >= 97 && b <= 102 then b - 97 + 10
+  else if b >= 65 && b <= 70 then b - 65 + 10
+  else 0
+
+// The lowercase hex character for a nibble 0..15 (matches bytes_to_hex).
+fn hexchar(v: i64) -> i64 = if v < 10 then 48 + v else 97 + (v - 10)
+
+// Decode a one-char escape `\<e>` to its byte (matches lex_string/lex_byte_string):
+// n -> 0x0a, t -> 0x09, 0 -> 0x00; anything else (incl. `"` and `\`) maps to itself.
+fn decode_escape(e: i64) -> i64 =
+  if e == 110 then 10 else if e == 116 then 9 else if e == 48 then 0 else e
+
+// Count the decoded bytes of a string/byte-string body [bs, be) (between the
+// quotes). `\xHH` (byte strings only) and one-char escapes decode to a single
+// byte. Memory threaded back (end carries the count).
+fn str_declen(mem: string, bs: i64, be: i64, isbyte: bool) -> SE =
+  let done: DecA =
+    loop a = { h: fnv_seed(), p: bs, n: 0, go: true } while a.go do
+      let cur: DecA = a in
+      if cur.p >= be then (let s: DecA = { h: cur.h, p: cur.p, n: cur.n, go: false } in s)
+      else
+        let c: i64 = to_i64(string_get(mem, cur.p)) in
+        if c == 92 && cur.p + 1 < be then
+          let e: i64 = to_i64(string_get(mem, cur.p + 1)) in
+          if isbyte && e == 120 && cur.p + 3 < be then
+            (let s: DecA = { h: cur.h, p: cur.p + 4, n: cur.n + 1, go: true } in s)
+          else (let s: DecA = { h: cur.h, p: cur.p + 2, n: cur.n + 1, go: true } in s)
+        else (let s: DecA = { h: cur.h, p: cur.p + 1, n: cur.n + 1, go: true } in s)
+  in
+  let r: SE = { mem: mem, end: done.n } in r
+
+// Fold the DECODED bytes of a string body [bs, be) into the digest (LiteralString
+// value). Mirrors str_declen's decode walk.
+fn fold_str_bytes(mem: string, h0: u32, bs: i64, be: i64, isbyte: bool) -> HF =
+  let done: DecA =
+    loop a = { h: h0, p: bs, n: 0, go: true } while a.go do
+      let cur: DecA = a in
+      if cur.p >= be then (let s: DecA = { h: cur.h, p: cur.p, n: cur.n, go: false } in s)
+      else
+        let c: i64 = to_i64(string_get(mem, cur.p)) in
+        if c == 92 && cur.p + 1 < be then
+          let e: i64 = to_i64(string_get(mem, cur.p + 1)) in
+          if isbyte && e == 120 && cur.p + 3 < be then
+            let byte: i64 = (hexv(to_i64(string_get(mem, cur.p + 2))) << 4) | hexv(to_i64(string_get(mem, cur.p + 3))) in
+            (let s: DecA = { h: fnv_step(cur.h, byte), p: cur.p + 4, n: cur.n, go: true } in s)
+          else (let s: DecA = { h: fnv_step(cur.h, decode_escape(e)), p: cur.p + 2, n: cur.n, go: true } in s)
+        else (let s: DecA = { h: fnv_step(cur.h, c), p: cur.p + 1, n: cur.n, go: true } in s)
+  in
+  let r: HF = { mem: mem, hash: done.h } in r
+
+// Fold the DECODED bytes of a byte-string body [bs, be) as a HEX string (the
+// LiteralBytes `bytes_hex`): two lowercase hex chars per decoded byte.
+fn fold_hex_bytes(mem: string, h0: u32, bs: i64, be: i64) -> HF =
+  let done: DecA =
+    loop a = { h: h0, p: bs, n: 0, go: true } while a.go do
+      let cur: DecA = a in
+      if cur.p >= be then (let s: DecA = { h: cur.h, p: cur.p, n: cur.n, go: false } in s)
+      else
+        let c: i64 = to_i64(string_get(mem, cur.p)) in
+        let byte: i64 =
+          if c == 92 && cur.p + 1 < be then
+            (let e: i64 = to_i64(string_get(mem, cur.p + 1)) in
+             if e == 120 && cur.p + 3 < be then
+               (hexv(to_i64(string_get(mem, cur.p + 2))) << 4) | hexv(to_i64(string_get(mem, cur.p + 3)))
+             else decode_escape(e))
+          else c in
+        let adv: i64 =
+          if c == 92 && cur.p + 1 < be then
+            (let e: i64 = to_i64(string_get(mem, cur.p + 1)) in if e == 120 && cur.p + 3 < be then 4 else 2)
+          else 1 in
+        let h1: u32 = fnv_step(cur.h, hexchar((byte >> 4) & 15)) in
+        let h2: u32 = fnv_step(h1, hexchar(byte & 15)) in
+        (let s: DecA = { h: h2, p: cur.p + adv, n: cur.n, go: true } in s)
+  in
+  let r: HF = { mem: mem, hash: done.h } in r
+
+// Scan a string/byte-string body from `p0` (just after the opening quote) to just
+// past the closing quote, honoring `\` escapes (an escaped quote does not close).
+fn scan_str(mem: string, p0: i64, len: i64) -> SE =
+  let done: TrivAcc =
+    loop a = { p: p0, go: true, incmt: false } while a.go do
+      let cur: TrivAcc = a in
+      if cur.p >= len then (let s: TrivAcc = { p: cur.p, go: false, incmt: false } in s)
+      else
+        let c: i64 = to_i64(string_get(mem, cur.p)) in
+        if c == 92 then
+          (if cur.p + 1 < len then (let s: TrivAcc = { p: cur.p + 2, go: true, incmt: false } in s)
+           else (let s: TrivAcc = { p: cur.p + 1, go: false, incmt: false } in s))
+        else if c == 34 then (let s: TrivAcc = { p: cur.p + 1, go: false, incmt: false } in s)
+        else (let s: TrivAcc = { p: cur.p + 1, go: true, incmt: false } in s)
+  in
+  let r: SE = { mem: mem, end: done.p } in r
 
 // Map an effect name [ts, te) to its ordinal (the BTreeSet declaration order:
 // trap=1, io=2, state=3, alloc=4, ffi=5, unsafe=6, concurrent=7; pure/unknown=0),
@@ -704,6 +818,20 @@ fn parse_primary(mem: string, h: u32, p: i64, len: i64) -> PS =
     let h1: u32 = fnv_step(h, 1) in
     let hb: HF = fblob_range(m, t.ts, t.te, h1) in
     let r: PS = { mem: hb.mem, h: hb.hash, p: t.nxt } in r
+  else if t.kind == 3 then
+    // string literal: byte(3) + blob(decoded value bytes)
+    let h1: u32 = fnv_step(h, 3) in
+    let cl: SE = str_declen(m, t.ts + 1, t.te - 1, false) in
+    let h2: u32 = fu32(h1, cl.end) in
+    let hf: HF = fold_str_bytes(cl.mem, h2, t.ts + 1, t.te - 1, false) in
+    let r: PS = { mem: hf.mem, h: hf.hash, p: t.nxt } in r
+  else if t.kind == 4 then
+    // byte-string literal: byte(4) + blob(hex of decoded bytes)
+    let h1: u32 = fnv_step(h, 4) in
+    let cl: SE = str_declen(m, t.ts + 2, t.te - 1, true) in
+    let h2: u32 = fu32(h1, cl.end * 2) in
+    let hf: HF = fold_hex_bytes(cl.mem, h2, t.ts + 2, t.te - 1) in
+    let r: PS = { mem: hf.mem, h: hf.hash, p: t.nxt } in r
   else if t.kind == 1 then
     let rt: SBool = tok_eq(m, t.ts, t.te, "true") in
     let m1: string = rt.mem in
@@ -1009,11 +1137,95 @@ fn parse_typedef(mem: string, h: u32, p: i64, len: i64, modts: i64) -> PS =
   let tlb: Tok = lex1(dp.mem, dp.p, len) in
   parse_members(tlb.mem, hk, tlb.nxt, len)
 
-// Dispatch one top-level/module item: a record/enum definition or a function.
-// (Externs await string-literal support.) `modts` selects the module.
+// Parse an optional region-only parameter list `<'r, ...>` (externs carry no
+// type params), folding the AstProbe region-param text-list (`0` when absent).
+fn parse_region_params(mem: string, h: u32, p: i64, len: i64) -> PS =
+  let t0: Tok = lex1(mem, p, len) in
+  let rlt: SBool = is_sym1(t0.mem, t0.ts, t0.te, t0.kind, 60) in
+  let m0: string = rlt.mem in
+  if rlt.yes then
+    let done: LpS =
+      loop a = { mem: m0, h: h, p: t0.nxt, go: true } while a.go do
+        let cur: LpS = a in
+        let t: Tok = lex1(cur.mem, cur.p, len) in
+        let rgt: SBool = is_sym1(t.mem, t.ts, t.te, t.kind, 62) in
+        let m1: string = rgt.mem in
+        if rgt.yes then
+          (let s: LpS = { mem: m1, h: cur.h, p: t.nxt, go: false } in s)
+        else
+          let rcomma: SBool = is_sym1(m1, t.ts, t.te, t.kind, 44) in
+          let m2: string = rcomma.mem in
+          if rcomma.yes then
+            (let s: LpS = { mem: m2, h: cur.h, p: t.nxt, go: true } in s)
+          else
+            let ti: Tok = lex1(m2, t.nxt, len) in
+            let h1: u32 = fnv_step(cur.h, 1) in
+            let hb: HF = fblob_range(ti.mem, ti.ts, ti.te, h1) in
+            (let s: LpS = { mem: hb.mem, h: hb.hash, p: ti.nxt, go: true } in s)
+    in
+    let r: PS = { mem: done.mem, h: fnv_step(done.h, 0), p: done.p } in r
+  else (let r: PS = { mem: m0, h: fnv_step(h, 0), p: p } in r)
+
+// An external function `extern fn name<'r>(params) -> type abi[t] [effects[...]]
+// link_name "..." [library "..."]` at `p` (the `extern` keyword). Folds the
+// AstProbe ExternalFunction: byte(3), module, name, region list, pair_list(params),
+// text(return), effect list, text(abi), text(link_name), opt_text(library). Note
+// the fold puts effects BEFORE abi, though the source writes `abi[..]` first.
+fn parse_extern(mem: string, h: u32, p: i64, len: i64, modts: i64) -> PS =
+  let tex: Tok = lex1(mem, p, len) in
+  let tfn: Tok = lex1(tex.mem, tex.nxt, len) in
+  let tname: Tok = lex1(tfn.mem, tfn.nxt, len) in
+  let h1: u32 = fnv_step(h, 3) in
+  let hmod: HF = fold_module(tname.mem, h1, modts, len) in
+  let hnm: HF = fblob_range(hmod.mem, tname.ts, tname.te, hmod.hash) in
+  let rp: PS = parse_region_params(hnm.mem, hnm.hash, tname.nxt, len) in
+  let tlp: Tok = lex1(rp.mem, rp.p, len) in
+  let pp: PS = parse_params(tlp.mem, rp.h, tlp.nxt, len) in
+  let tarrow: Tok = lex1(pp.mem, pp.p, len) in
+  let tyr: TyR = scan_type(tarrow.mem, tarrow.nxt, len) in
+  let hrt: HF = fblob_range(tyr.mem, tyr.ts0, tyr.end, pp.h) in
+  // abi[ident] — parsed now, folded after the effects (AstProbe order)
+  let tabi: Tok = lex1(hrt.mem, tyr.end, len) in
+  let tlb: Tok = lex1(tabi.mem, tabi.nxt, len) in
+  let tid: Tok = lex1(tlb.mem, tlb.nxt, len) in
+  let trb: Tok = lex1(tid.mem, tid.nxt, len) in
+  // optional effects
+  let teff: Tok = lex1(trb.mem, trb.nxt, len) in
+  let reff: SBool = tok_eq(teff.mem, teff.ts, teff.te, "effects") in
+  let meff: string = reff.mem in
+  let ef: PS =
+    if teff.kind == 1 && reff.yes then parse_effects(meff, hrt.hash, teff.nxt, len)
+    else (let r: PS = { mem: meff, h: fnv_step(hrt.hash, 0), p: trb.nxt } in r) in
+  // text(abi), then link_name "..."
+  let habi: HF = fblob_range(ef.mem, tid.ts, tid.te, ef.h) in
+  let tln: Tok = lex1(habi.mem, ef.p, len) in
+  let tls: Tok = lex1(tln.mem, tln.nxt, len) in
+  let cl: SE = str_declen(tls.mem, tls.ts + 1, tls.te - 1, false) in
+  let h2: u32 = fu32(habi.hash, cl.end) in
+  let hln: HF = fold_str_bytes(cl.mem, h2, tls.ts + 1, tls.te - 1, false) in
+  // optional library "..."
+  let tlib: Tok = lex1(hln.mem, tls.nxt, len) in
+  let rlib: SBool = tok_eq(tlib.mem, tlib.ts, tlib.te, "library") in
+  let mlib: string = rlib.mem in
+  if tlib.kind == 1 && rlib.yes then
+    let tlibs: Tok = lex1(mlib, tlib.nxt, len) in
+    let h3: u32 = fnv_step(hln.hash, 1) in
+    let cl2: SE = str_declen(tlibs.mem, tlibs.ts + 1, tlibs.te - 1, false) in
+    let h4: u32 = fu32(h3, cl2.end) in
+    let hlib: HF = fold_str_bytes(cl2.mem, h4, tlibs.ts + 1, tlibs.te - 1, false) in
+    let r: PS = { mem: hlib.mem, h: hlib.hash, p: tlibs.nxt } in r
+  else
+    let r: PS = { mem: mlib, h: fnv_step(hln.hash, 0), p: tls.nxt } in r
+
+// Dispatch one top-level/module item: an external function, a record/enum
+// definition, or a function. `modts` selects the module.
 fn parse_item(mem: string, h: u32, p: i64, len: i64, modts: i64) -> PS =
   let t0: Tok = lex1(mem, p, len) in
-  let rrec: SBool = tok_eq(t0.mem, t0.ts, t0.te, "record") in
+  let rext: SBool = tok_eq(t0.mem, t0.ts, t0.te, "extern") in
+  let mx: string = rext.mem in
+  if t0.kind == 1 && rext.yes then parse_extern(mx, h, p, len, modts)
+  else
+  let rrec: SBool = tok_eq(mx, t0.ts, t0.te, "record") in
   let m1: string = rrec.mem in
   if t0.kind == 1 && rrec.yes then parse_typedef(m1, h, p, len, modts)
   else
