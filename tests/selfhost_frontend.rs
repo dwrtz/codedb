@@ -111,6 +111,25 @@ fn hasher() -> &'static Path {
         .as_path()
 }
 
+/// Import + verify + build the `obj_hash` entry of the hasher (the object-hash
+/// wrapper, hash_object_canonical) — once per test process.
+fn obj_hasher() -> &'static Path {
+    static OBJ_HASHER: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    OBJ_HASHER
+        .get_or_init(|| {
+            let temp = tempdir().unwrap();
+            let db = temp.path().join("selfhost-objhash.sqlite");
+            run(&["init", path(&db)]);
+            run(&["import", path(&db), "compiler/front/sha256.cdb"]);
+            run(&["verify", path(&db)]);
+            let exe = temp.path().join("obj-bin");
+            run(&["build", path(&db), "obj_hash", "--out", path(&exe)]);
+            (temp, exe)
+        })
+        .1
+        .as_path()
+}
+
 /// Run the native hasher with `bytes` on stdin; return its trimmed hex digest.
 fn run_hasher(exe: &Path, bytes: &[u8]) -> String {
     let mut child = StdCommand::new(exe)
@@ -230,6 +249,59 @@ fn sha256_matches_reference_across_lengths_and_blocks() {
     assert_sha(
         exe,
         br#"{"expr_kind":"binary","left":"sha256:a","op":"+","right":"sha256:b","type":"sha256:i64"}"#,
+    );
+}
+
+#[test]
+fn obj_hash_reproduces_hash_object_canonical_for_real_objects() {
+    // The content-addressing core, end to end: the .cdb obj_hash wrapper frames
+    // OBJECT_DOMAIN || kind || \0 || schema || \0 || payload and SHA-256s it, so it
+    // must reproduce src/store.rs::hash_object_canonical. Every line of an
+    // `emit-objects` dump is a real (kind, schema, canonical payload -> hash) case,
+    // so this proves the .cdb computes the SAME object hashes CodeDB does.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = obj_hasher();
+    // A program with varied object kinds (a record, an enum, several functions)
+    // so the dump spans short and long canonical payloads.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("prog.sqlite");
+    let src = temp.path().join("prog.cdb");
+    std::fs::write(
+        &src,
+        "record Point { x: i64  y: i64 }\n\
+         enum Opt { none: unit  some: i64 }\n\
+         fn add(a: i64, b: i64) -> i64 = a + b\n\
+         fn main() -> i64 = add(40, 2)\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+    let dump_path = temp.path().join("dump.txt");
+    run(&["emit-objects", path(&db), "--out", path(&dump_path)]);
+    let dump = std::fs::read_to_string(&dump_path).unwrap();
+
+    let mut checked = 0usize;
+    for line in dump.lines() {
+        // `<hash>\t<kind>\t<schema>\t<payload>`; the trailing `root <hash>` line
+        // has no tabs and is skipped.
+        let cols: Vec<&str> = line.splitn(4, '\t').collect();
+        if cols.len() != 4 {
+            continue;
+        }
+        let (hash, kind, schema, payload) = (cols[0], cols[1], cols[2], cols[3]);
+        let input = format!("{kind}\n{schema}\n{payload}");
+        let got = run_hasher(exe, input.as_bytes());
+        assert_eq!(
+            got, hash,
+            "obj_hash mismatch for a {kind} object (schema {schema})"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 10,
+        "the dump should carry several objects; only checked {checked}"
     );
 }
 

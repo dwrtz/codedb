@@ -242,3 +242,84 @@ fn main<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
   let final: State = hash_blocks(padded, nblocks) in
   let printed: i64 = print_hex(final) in
   0
+
+// ---------------------------------------------------------------------------
+// object hashing: hash_object_canonical over the SHA-256 core
+//
+// The `obj_hash` entry reproduces src/store.rs::hash_object_canonical:
+//   "sha256:" + hex(SHA-256(OBJECT_DOMAIN || kind || \0 || schema || \0 || payload))
+// with OBJECT_DOMAIN = "codedb/object/v1\0" (src/lib.rs). Input on stdin is
+// `kind\nschema\npayload` (kind line, decimal schema line, then the canonical
+// JSON payload — which has no newlines), so the preimage body is exactly stdin
+// with its two newlines rewritten to \0. Gate: its output equals the `hash`
+// column of an `emit-objects` dump for every object (tests/selfhost_frontend.rs).
+// ---------------------------------------------------------------------------
+
+record Pos { p: i64  go: bool }
+record NlR { raw: string  idx: i64 }
+record PB { p: string  i: i64 }
+record PR { out: string  raw: string }
+record PRi { out: string  raw: string  i: i64 }
+
+fn print_static(s: slice<'static, u8>) -> i64 effects[io, ffi, unsafe] =
+  std.platform.write(1, raw_ptr(&'static s[0]), len(s))
+
+// Index of the first newline at or after `start` (or `len` if none).
+fn scan_nl(raw: string, start: i64, len: i64) -> NlR =
+  let seed: Pos = { p: start, go: true } in
+  let done: Pos =
+    loop a = seed while a.go do
+      if a.p >= len then (let s: Pos = { p: a.p, go: false } in s)
+      else if string_get(raw, a.p) == to_u8(10) then (let s: Pos = { p: a.p, go: false } in s)
+      else (let s: Pos = { p: a.p + 1, go: true } in s)
+  in
+  let res: NlR = { raw: raw, idx: done.p } in res
+
+// Append the 17 bytes of OBJECT_DOMAIN ("codedb/object/v1\0") to `out`.
+fn push_domain(out: string) -> string effects[state] =
+  let dom: slice<'static, u8> = b"codedb/object/v1\0" in
+  let n: i64 = len(dom) in
+  let seed: PB = { p: out, i: 0 } in
+  let done: PB =
+    loop a = seed while a.i < n do
+      let cur: PB = a in
+      let pp: string = cur.p in
+      let pushed: unit = string_push(pp, dom[cur.i]) in
+      let r: PB = { p: pp, i: cur.i + 1 } in r
+  in done.p
+
+// Append `raw`[0, n) to `out`, threading both move-only buffers back.
+fn append_all(out: string, raw: string, n: i64) -> PR effects[state] =
+  let seed: PRi = { out: out, raw: raw, i: 0 } in
+  let done: PRi =
+    loop a = seed while a.i < n do
+      let cur: PRi = a in
+      let oo: string = cur.out in
+      let rr: string = cur.raw in
+      let b: u8 = string_get(rr, cur.i) in
+      let pushed: unit = string_push(oo, b) in
+      let r: PRi = { out: oo, raw: rr, i: cur.i + 1 } in r
+  in
+  let res: PR = { out: done.out, raw: done.raw } in res
+
+fn obj_hash<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let rawlen: i64 = string_len(raw) in
+  let n1: NlR = scan_nl(raw, 0, rawlen) in
+  let i1: i64 = n1.idx in
+  let n2: NlR = scan_nl(n1.raw, i1 + 1, rawlen) in
+  let r2: string = n2.raw in
+  let i2: i64 = n2.idx in
+  let s1: unit = string_set(r2, i1, to_u8(0)) in
+  let s2: unit = string_set(r2, i2, to_u8(0)) in
+  let pre0: string = string_with_capacity(mem_cap()) in
+  let pre1: string = push_domain(pre0) in
+  let app: PR = append_all(pre1, r2, rawlen) in
+  let preimage: string = app.out in
+  let msglen: i64 = string_len(preimage) in
+  let padded: string = pad(preimage, msglen) in
+  let nblocks: i64 = string_len(padded) / 64 in
+  let st: State = hash_blocks(padded, nblocks) in
+  let pfx: i64 = print_static("sha256:") in
+  let printed: i64 = print_hex(st) in
+  0

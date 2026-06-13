@@ -1162,12 +1162,24 @@ reuses its compression core verbatim and adds arbitrary ingestion, spec padding
 (inlined so `string_get` borrows the owned buffer rather than a helper consuming
 it), and hex output. `hash_object_canonical` is exactly this over the
 domain-framed object preimage (`OBJECT_DOMAIN || kind || \0 || schema || \0 ||
-payload`), so the object-hash wrapper is now a thin, mechanical next step.
+payload`). The object-hash wrapper is now landed too: the `obj_hash` entry of
+`compiler/front/sha256.cdb` reads `kind\nschema\npayload` from stdin, frames the
+domain-prefixed preimage (rewriting the two newlines to `\0` and prepending
+`OBJECT_DOMAIN`), SHA-256s it, and prints `sha256:`+hex — reproducing
+`src/store.rs::hash_object_canonical` exactly. Its oracle is `emit-objects`
+itself: every dump line is a real `(kind, schema, canonical payload → hash)` case,
+so the `.cdb` provably computes the SAME object hashes CodeDB does, across a
+record, an enum, and several functions (short and long payloads). The
+content-addressing core — raw SHA-256 and the object framing — now fully
+self-hosts; only the object BUILDER (source → the right canonical payloads) plus
+migration/birth identity remain between here and root-hash equality.
 
-`tests/selfhost_frontend.rs` is the gate (5 tests: lexer × full corpus, the §11
-checked-view gate, emit-objects determinism, and SHA-256 × lengths/blocks). Still
-planned: the object-hash wrapper + canonical JSON + migration/birth identity →
-root-hash equality (15a.3), the parser (15a.2, tokens → AST), then 15b–15e.
+`tests/selfhost_frontend.rs` is the gate (6 tests: lexer × full corpus, the §11
+checked-view gate, emit-objects determinism, SHA-256 × lengths/blocks, and
+obj_hash × real objects). Still planned for 15a.3: the object builder (parsed
+items → canonical-JSON object payloads in the importer's deterministic order) +
+migration/birth identity → root-hash equality; the parser (15a.2, tokens → AST);
+then 15b–15e.
 
 Sub-stages (each independently oracle-checked at its artifact):
 
