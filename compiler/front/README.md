@@ -20,6 +20,22 @@ importer cannot self-host until the language computes SHA-256); the example
 `examples/v3/sha256.cdb` proved only the fixed "abc" block, so this generalizes it
 (ingestion, padding, multi-block chaining, hex).
 
+The self-hosted parser has started landing too (15a.2). `parse.cdb` reads source
+from stdin, parses it with recursive descent (lex-on-demand: `lex1` returns the
+next token's geometry without a separate token buffer), and prints the AST-shape
+probe `items <count> ast32 <digest>`, byte-equal to the Rust reference
+`codedb::ast_probe` (`emit-ast <file>`). The probe folds an FNV-1a-32 over a
+STREAMING traversal of the AST — keyword-led forms pre-order, infix `Binary`
+post-order via precedence climbing, lists sentinel-encoded, blobs
+length-prefixed — so a streaming parser reproduces it without buffering. This
+increment covers the EXPRESSION CORE over scalar pure functions: i64/bool
+literals, parameter names, calls, the full operator set with precedence (incl.
+`<<`/`>>` as two `<`/`>` tokens), prefix unary, parentheses/unit, and
+`let`/`if`/`return`, plus multi-item programs and comments. Staged follow-on:
+strings/records/arrays/enums/field-index/fold-loop-case/borrows, the type
+normalizer (non-scalar types), modules, generics, and effects — then the object
+builder (15a.3).
+
 The object-hash wrapper is landed on top of it: the `obj_hash` entry of
 `sha256.cdb` reads `kind\nschema\npayload` and frames `OBJECT_DOMAIN || kind || \0
 || schema || \0 || payload` before hashing, reproducing

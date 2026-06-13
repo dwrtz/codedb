@@ -62,6 +62,36 @@ fn lexer() -> &'static Path {
         .as_path()
 }
 
+/// Import std/fmt.cdb + the parser, verify, and build the native parser binary —
+/// once per test process.
+fn parser() -> &'static Path {
+    static PARSER: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    PARSER
+        .get_or_init(|| {
+            let temp = tempdir().unwrap();
+            let db = temp.path().join("selfhost-parser.sqlite");
+            run(&["init", path(&db)]);
+            run(&["import", path(&db), "std/fmt.cdb"]);
+            run(&["import", path(&db), "compiler/front/parse.cdb"]);
+            run(&["verify", path(&db)]);
+            let exe = temp.path().join("parse-bin");
+            run(&["build", path(&db), "main", "--out", path(&exe)]);
+            (temp, exe)
+        })
+        .1
+        .as_path()
+}
+
+/// Assert the .cdb parser's probe equals the Rust `ast_probe` for `source`.
+fn assert_ast_probe(exe: &Path, source: &str) {
+    let got = run_lexer(exe, source);
+    let want = codedb::ast_probe(source)
+        .expect("ast_probe")
+        .trim()
+        .to_string();
+    assert_eq!(got, want, "parser probe mismatch for source: {source:?}");
+}
+
 /// Run the native lexer with `source` on stdin; return its trimmed stdout.
 fn run_lexer(exe: &Path, source: &str) -> String {
     let mut child = StdCommand::new(exe)
@@ -222,6 +252,55 @@ fn lexer_probe_matches_rust_on_the_committed_corpus() {
         let source = std::fs::read_to_string(file).unwrap_or_else(|_| panic!("read {file}"));
         assert_probe(exe, &source);
     }
+}
+
+#[test]
+fn parser_probe_matches_rust_on_the_expression_core() {
+    // Phase 15a.2: the self-hosted parser (compiler/front/parse.cdb) parses with
+    // recursive descent and prints the AST-shape probe `items <count> ast32
+    // <digest>`, byte-equal to the Rust `ast_probe` (the determinism oracle one
+    // stage downstream of the lexer probe). This increment covers the EXPRESSION
+    // CORE over scalar pure functions: literals, parameter names, calls, the full
+    // operator set with precedence (incl. `<<`/`>>` as two tokens), prefix unary,
+    // parentheses/unit, and let/if/return — plus multi-item programs and comments.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = parser();
+    // Single leaves and a parameter, then operators and precedence.
+    assert_ast_probe(exe, "fn main() -> i64 = 1");
+    assert_ast_probe(exe, "fn id(n: i64) -> i64 = n");
+    assert_ast_probe(exe, "fn main() -> i64 = 1 + 2 * 3");
+    assert_ast_probe(exe, "fn main() -> i64 = 1 * 2 + 3");
+    assert_ast_probe(exe, "fn main() -> i64 = (1 + 2) * 3");
+    // Every binary operator class and both bool operators.
+    assert_ast_probe(exe, "fn ops(a: i64, b: i64) -> i64 = a + b - a * b / 2 % 3");
+    assert_ast_probe(
+        exe,
+        "fn cmp(a: i64, b: i64) -> bool = a < b || a > b || a <= b || a >= b && a == b || a != b",
+    );
+    assert_ast_probe(exe, "fn bits(a: u8, b: u8) -> u8 = a & b ^ a | b");
+    // `<<`/`>>` are two `<`/`>` tokens the parser must pair.
+    assert_ast_probe(exe, "fn sh(x: u32) -> u32 = (x << 3) | (x >> 5)");
+    // Prefix unary chains and complement.
+    assert_ast_probe(exe, "fn neg(a: i64) -> i64 = - - a");
+    assert_ast_probe(exe, "fn cm(x: u8) -> u8 = ~x");
+    // let / if / return, recursion, calls, unit.
+    assert_ast_probe(exe, "fn main() -> i64 = let x: i64 = 3 in x * x");
+    assert_ast_probe(exe, "fn f(n: i64) -> i64 = if n <= 1 then 1 else n * f(n - 1)");
+    assert_ast_probe(exe, "fn r(n: i64) -> i64 = if n == 0 then return 1 else n");
+    assert_ast_probe(exe, "fn u() -> unit = ()");
+    // A multi-item program with calls between items and comments.
+    assert_ast_probe(
+        exe,
+        "fn a() -> i64 = 1 // trailing comment\n\
+         // a full-line comment\n\
+         fn b() -> i64 = 2\n\
+         fn c(x: i64) -> i64 = a() + b() * x\n",
+    );
+    // A handful of widths, to exercise the scalar return/param type folding.
+    assert_ast_probe(exe, "fn w(a: i32, b: i16) -> i8 = 0");
+    assert_ast_probe(exe, "fn w(a: u64, b: u16) -> u32 = 0");
 }
 
 #[test]
