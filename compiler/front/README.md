@@ -10,8 +10,18 @@ including `"`/`b"` string and byte-string literals (folded over their decoded
 bytes). The committed source passes the §11 checked-view gate. The 15a.0 oracle
 substrate (`emit-objects` for the importer's object/root-hash equality;
 `emit-tokens` for the lexer) is in place. The only assumption is ASCII outside
-string/comment content (every committed source satisfies it). Next increments: the
-parser (15a.2, tokens → AST) and the object builder → root-hash oracle (15a.3).
+string/comment content (every committed source satisfies it).
+
+The content-addressing keystone is also landed: `sha256.cdb` is general
+multi-block SHA-256 of arbitrary stdin bytes → hex, byte-equal to
+`codedb::sha256_hex` across empty input, every padding edge, multi-block messages,
+and all 256 byte values. SPEC_V3 §5 makes this the rung-A prerequisite (the
+importer cannot self-host until the language computes SHA-256); the example
+`examples/v3/sha256.cdb` proved only the fixed "abc" block, so this generalizes it
+(ingestion, padding, multi-block chaining, hex). `hash_object_canonical` is this
+over the domain-framed object preimage, so the object-hash wrapper is the next
+mechanical step. Remaining increments: the object-hash wrapper + object builder →
+root-hash oracle (15a.3) and the parser (15a.2, tokens → AST).
 
 The front half of the compiler as CodeDB objects, meeting the Rust native backend
 at the lowered-IR seam (the mixed compiler). Sub-stages, each oracle-checked at

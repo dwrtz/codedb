@@ -1,17 +1,17 @@
-// Phase 15 (ladder rung A): the self-hosted front-end, stage 15a.1.
+// Phase 15 (ladder rung A): the self-hosted front-end (docs/PLAN_V3.md Phase 15a).
 //
-// `compiler/front/lex.cdb` is imported, verified, built to a NATIVE binary,
-// and fed source bytes on stdin. It tokenizes the source exactly like the Rust
-// lexer (src/expr.rs `lex`) and prints the token-stream PROBE
-// `tokens <count> fnv32 <digest>`. That probe must equal the Rust reference
-// `codedb::token_probe` on the same source — the determinism oracle for this
-// first front-end increment (docs/PLAN_V3.md Phase 15a; the lexer counterpart
-// of the Phase 8 loader probe).
+// Each .cdb stage object is imported, verified, built to a NATIVE binary, fed
+// bytes on stdin, and gated against a Rust determinism-oracle reference:
 //
-// This stage's corpus is ASCII and free of string / byte-string literals (a
-// token's text is then a direct source slice, so the byte machine matches the
-// Rust lexer's `char` walk exactly); string-literal lexing is a documented
-// follow-on. The 15a.0 substrate (`emit-objects`, the importer oracle the next
+//   compiler/front/lex.cdb     tokenizes like src/expr.rs::lex and prints the
+//                              token-stream probe `tokens <count> fnv32 <digest>`,
+//                              == codedb::token_probe on the full committed corpus
+//                              (incl. string/byte-string literals).
+//   compiler/front/sha256.cdb  general multi-block SHA-256 of stdin -> hex digest,
+//                              == codedb::sha256_hex — the content-addressing
+//                              keystone the importer's object/root hashing needs.
+//
+// The 15a.0 substrate (`emit-objects`, the importer oracle the object-builder
 // sub-stage will check the .cdb importer's objects + root hash against) is also
 // pinned here for determinism across an independent rebuild.
 
@@ -93,6 +93,52 @@ fn assert_probe(exe: &Path, source: &str) {
     assert_eq!(got, want, "lexer probe mismatch for source: {source:?}");
 }
 
+/// Import + verify + build the native SHA-256 hasher — once per test process.
+fn hasher() -> &'static Path {
+    static HASHER: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    HASHER
+        .get_or_init(|| {
+            let temp = tempdir().unwrap();
+            let db = temp.path().join("selfhost-sha256.sqlite");
+            run(&["init", path(&db)]);
+            run(&["import", path(&db), "compiler/front/sha256.cdb"]);
+            run(&["verify", path(&db)]);
+            let exe = temp.path().join("sha-bin");
+            run(&["build", path(&db), "main", "--out", path(&exe)]);
+            (temp, exe)
+        })
+        .1
+        .as_path()
+}
+
+/// Run the native hasher with `bytes` on stdin; return its trimmed hex digest.
+fn run_hasher(exe: &Path, bytes: &[u8]) -> String {
+    let mut child = StdCommand::new(exe)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn hasher");
+    child
+        .stdin
+        .take()
+        .expect("hasher stdin")
+        .write_all(bytes)
+        .expect("write hasher stdin");
+    let output = child.wait_with_output().expect("wait hasher");
+    assert!(output.status.success(), "hasher exited non-zero: {output:?}");
+    String::from_utf8(output.stdout)
+        .expect("utf8 hasher stdout")
+        .trim()
+        .to_string()
+}
+
+/// Assert the .cdb hasher's digest equals the Rust `sha256_hex` reference.
+fn assert_sha(exe: &Path, bytes: &[u8]) {
+    let got = run_hasher(exe, bytes);
+    let want = codedb::sha256_hex(bytes);
+    assert_eq!(got, want, "sha256 mismatch for a {}-byte input", bytes.len());
+}
+
 #[test]
 fn lexer_probe_matches_rust_on_minimal_corpus() {
     if !can_build_default_native_target() {
@@ -157,6 +203,34 @@ fn lexer_probe_matches_rust_on_the_committed_corpus() {
         let source = std::fs::read_to_string(file).unwrap_or_else(|_| panic!("read {file}"));
         assert_probe(exe, &source);
     }
+}
+
+#[test]
+fn sha256_matches_reference_across_lengths_and_blocks() {
+    // The content-addressing keystone (SPEC_V3 §5): the self-hosted hasher must
+    // compute SHA-256 of arbitrary bytes byte-for-byte like the reference, or the
+    // importer can never reproduce object/root hashes. Covers empty input, the
+    // padding edges (55 bytes fits one block with its length; 56 forces a second),
+    // multi-block messages, and all 256 byte values.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = hasher();
+    assert_sha(exe, b"");
+    assert_sha(exe, b"abc");
+    assert_sha(exe, b"The quick brown fox jumps over the lazy dog");
+    for len in [1usize, 54, 55, 56, 57, 63, 64, 65, 119, 127, 128, 129, 200, 1000] {
+        assert_sha(exe, &vec![b'a'; len]);
+    }
+    // Every byte value, incl. 0x00 and 0xff, spanning blocks — canonical object
+    // payloads are arbitrary bytes, so the hasher must be byte-exact.
+    let all_bytes: Vec<u8> = (0..=255u8).collect();
+    assert_sha(exe, &all_bytes);
+    // A canonical-JSON-payload-shaped input (the shape object hashing will feed it).
+    assert_sha(
+        exe,
+        br#"{"expr_kind":"binary","left":"sha256:a","op":"+","right":"sha256:b","type":"sha256:i64"}"#,
+    );
 }
 
 #[test]

@@ -1147,9 +1147,27 @@ and are pinned in the source: record literals in `if`/`case` branch and
 function-return position must be bound to a typed `let` (else they take a
 structural, field-sorted layout that mismatches the nominal record — the Phase 8
 gotcha), and the per-token work is split into `classify`/`step` routers so each
-frame stays under the v0 4095-byte budget. `tests/selfhost_frontend.rs` is the gate.
-Still planned: 15a.2 parser (tokens → AST), 15a.3 object builder + canonical JSON +
-SHA-256 + migration/birth identity → root-hash equality, then 15b–15e.
+frame stays under the v0 4095-byte budget.
+
+Landed keystone (15a.3, the content-addressing core): `compiler/front/sha256.cdb`
+is **general multi-block SHA-256** of arbitrary stdin bytes → lowercase hex,
+byte-equal to `codedb::sha256_hex` on empty input, every SHA-256 padding edge
+(55/56/63/64/65/127/128…), multi-block messages, all 256 byte values, and a
+canonical-JSON-payload-shaped input. SPEC_V3 §5 names this the rung-A gate ("the
+importer cannot self-host until the language can compute SHA-256"): the existing
+`examples/v3/sha256.cdb` proved only the single fixed "abc" block, so this file
+reuses its compression core verbatim and adds arbitrary ingestion, spec padding
+(0x80 + zero-fill to 56 mod 64 + 64-bit BE length), multi-block state chaining
+(`compress_from` threads the running eight-word state), big-endian word reads
+(inlined so `string_get` borrows the owned buffer rather than a helper consuming
+it), and hex output. `hash_object_canonical` is exactly this over the
+domain-framed object preimage (`OBJECT_DOMAIN || kind || \0 || schema || \0 ||
+payload`), so the object-hash wrapper is now a thin, mechanical next step.
+
+`tests/selfhost_frontend.rs` is the gate (5 tests: lexer × full corpus, the §11
+checked-view gate, emit-objects determinism, and SHA-256 × lengths/blocks). Still
+planned: the object-hash wrapper + canonical JSON + migration/birth identity →
+root-hash equality (15a.3), the parser (15a.2, tokens → AST), then 15b–15e.
 
 Sub-stages (each independently oracle-checked at its artifact):
 

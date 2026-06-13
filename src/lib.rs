@@ -60,6 +60,17 @@ pub(crate) const SCHEMA_VERSION: i64 = 1;
 pub(crate) const MAIN_BRANCH: &str = "main";
 pub const LINUX_X86_64_TARGET: &str = "x86_64-unknown-linux-gnu";
 pub const APPLE_ARM64_TARGET: &str = "aarch64-apple-darwin";
+
+/// SHA-256 of `bytes` as lowercase hex — the determinism-oracle reference for the
+/// self-hosted hasher (`compiler/front/sha256.cdb`, docs/PLAN_V3.md Phase 15a). The
+/// content-addressing core (`hash_object_canonical`) is this over the domain-framed
+/// object preimage, so reproducing it in `.cdb` is the rung-A importer prerequisite.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub const DEFAULT_NATIVE_TARGET: &str = APPLE_ARM64_TARGET;
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
