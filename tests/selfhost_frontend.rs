@@ -304,6 +304,39 @@ fn parser_probe_matches_rust_on_the_expression_core() {
 }
 
 #[test]
+fn parser_probe_matches_rust_on_postfix_paths_and_borrows() {
+    // Phase 15a.2 (cont.): the parser now also handles dotted name paths (a call
+    // name, an enum type, or a `field_access_from_path` chain), postfix `[index]`
+    // and `.field`, enum construction (`Type::variant` with/without a payload),
+    // and borrows (`&`, `&mut`). Signatures stay scalar (the type normalizer and
+    // region/type params on the item header are the next increment).
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = parser();
+    // Dotted paths: a field-access chain, a postfix field on a non-path primary,
+    // and a module-qualified call name folded as one blob.
+    assert_ast_probe(exe, "fn fa(r: i64) -> i64 = a.b.c");
+    assert_ast_probe(exe, "fn pf(x: i64) -> i64 = (x + 2).foo");
+    assert_ast_probe(
+        exe,
+        "fn dc(a: i64, b: i64, c: i64) -> i64 = std.platform.write(a, b, c)",
+    );
+    // Enum construction with and without a payload.
+    assert_ast_probe(exe, "fn ec(n: i64) -> i64 = Option::some(n)");
+    assert_ast_probe(exe, "fn en() -> i64 = Option::none");
+    // Postfix index and chains mixing index and field.
+    assert_ast_probe(exe, "fn cm(a: i64) -> i64 = a[0]");
+    assert_ast_probe(exe, "fn idx(a: i64, b: i64) -> i64 = a[b + 1]");
+    assert_ast_probe(exe, "fn ch(a: i64) -> i64 = a[0].b[1]");
+    assert_ast_probe(exe, "fn fc(a: i64) -> i64 = f(a).g");
+    // Borrows (shared and mutable, no region — region borrows await region params
+    // on the item header).
+    assert_ast_probe(exe, "fn b1(x: i64) -> i64 = foo(&x)");
+    assert_ast_probe(exe, "fn b2(x: i64) -> i64 = foo(&mut x)");
+}
+
+#[test]
 fn sha256_matches_reference_across_lengths_and_blocks() {
     // The content-addressing keystone (SPEC_V3 §5): the self-hosted hasher must
     // compute SHA-256 of arbitrary bytes byte-for-byte like the reference, or the

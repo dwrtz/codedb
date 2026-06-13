@@ -111,6 +111,24 @@ record LpS {
   go: bool
 }
 
+// The dotted-path scan loop accumulator: memory, the end of the last name, the
+// cursor after it, keep-going.
+record PathS {
+  mem: string
+  pathend: i64
+  cur: i64
+  go: bool
+}
+
+// A dotted-path scan result: memory, the first name's start, the path end (the
+// last name's end), and the cursor just past the path.
+record PathR {
+  mem: string
+  ts0: i64
+  pathend: i64
+  cur: i64
+}
+
 // The top item loop accumulator: memory, digest, cursor, item count, keep-going.
 record RunS {
   mem: string
@@ -329,8 +347,63 @@ fn parse_args(mem: string, h: u32, p: i64, len: i64) -> PS =
     in
     let r: PS = { mem: done.mem, h: fnv_step(done.h, 0), p: done.p } in r
 
-// A primary: literal, true/false, parameter name, call, parenthesized expr, or
-// the unit `()`.
+// Whether token `t` is the two symbol bytes packed as `c01 = c0*256 + c1` (e.g.
+// `::` = 58*256+58), memory threaded back (the two bytes are combined into one
+// parameter to stay within the v0 backend's machine-parameter budget). Length is
+// pure, so the byte reads are bounds-guarded.
+fn is_sym2(mem: string, ts: i64, te: i64, kind: i64, c01: i64) -> SBool =
+  if kind == 6 && (te - ts) == 2 then
+    (let got: i64 = to_i64(string_get(mem, ts)) * 256 + to_i64(string_get(mem, ts + 1)) in
+     let r: SBool = { mem: mem, yes: got == c01 } in r)
+  else (let r: SBool = { mem: mem, yes: false } in r)
+
+// Consume a dotted name path `ident(.ident)*` from `p` (greedy, mirroring
+// finish_name_path), returning the first name's start, the path end, and the
+// cursor past it. A trailing `.` not followed by an identifier is left unconsumed.
+fn scan_path(mem: string, p: i64, len: i64) -> PathR =
+  let t0: Tok = lex1(mem, p, len) in
+  let done: PathS =
+    loop a = { mem: t0.mem, pathend: t0.te, cur: t0.nxt, go: true } while a.go do
+      let curp: PathS = a in
+      let td: Tok = lex1(curp.mem, curp.cur, len) in
+      let rdot: SBool = is_sym1(td.mem, td.ts, td.te, td.kind, 46) in
+      let m1: string = rdot.mem in
+      if rdot.yes then
+        let ti: Tok = lex1(m1, td.nxt, len) in
+        if ti.kind == 1 then
+          (let s: PathS = { mem: ti.mem, pathend: ti.te, cur: ti.nxt, go: true } in s)
+        else (let s: PathS = { mem: ti.mem, pathend: curp.pathend, cur: curp.cur, go: false } in s)
+      else (let s: PathS = { mem: m1, pathend: curp.pathend, cur: curp.cur, go: false } in s)
+  in
+  let r: PathR = { mem: done.mem, ts0: t0.ts, pathend: done.pathend, cur: done.cur } in r
+
+// Fold a dotted path used as a value as `field_access_from_path` builds it: the
+// first name as a ParamName (byte 7 + text), then each subsequent name as a
+// FieldAccess (byte 24 + text). Re-walks the path from `p`; returns the cursor
+// past it.
+fn fold_path_fields(mem: string, h: u32, p: i64, len: i64) -> PS =
+  let t0: Tok = lex1(mem, p, len) in
+  let h1: u32 = fnv_step(h, 7) in
+  let hf: HF = fblob_range(t0.mem, t0.ts, t0.te, h1) in
+  let done: LpS =
+    loop a = { mem: hf.mem, h: hf.hash, p: t0.nxt, go: true } while a.go do
+      let cur: LpS = a in
+      let td: Tok = lex1(cur.mem, cur.p, len) in
+      let rdot: SBool = is_sym1(td.mem, td.ts, td.te, td.kind, 46) in
+      let m1: string = rdot.mem in
+      if rdot.yes then
+        let ti: Tok = lex1(m1, td.nxt, len) in
+        if ti.kind == 1 then
+          let h2: u32 = fnv_step(cur.h, 24) in
+          let hb: HF = fblob_range(ti.mem, ti.ts, ti.te, h2) in
+          (let s: LpS = { mem: hb.mem, h: hb.hash, p: ti.nxt, go: true } in s)
+        else (let s: LpS = { mem: ti.mem, h: cur.h, p: cur.p, go: false } in s)
+      else (let s: LpS = { mem: m1, h: cur.h, p: cur.p, go: false } in s)
+  in
+  let r: PS = { mem: done.mem, h: done.h, p: done.p } in r
+
+// A primary: literal, true/false, a dotted path (parameter/field chain, call, or
+// enum construction), a parenthesized expression, or the unit `()`.
 fn parse_primary(mem: string, h: u32, p: i64, len: i64) -> PS =
   let t: Tok = lex1(mem, p, len) in
   let m: string = t.mem in
@@ -349,17 +422,37 @@ fn parse_primary(mem: string, h: u32, p: i64, len: i64) -> PS =
       if rf.yes then
         (let r: PS = { mem: m2, h: fnv_step(fnv_step(h, 2), 0), p: t.nxt } in r)
       else
-        let t2: Tok = lex1(m2, t.nxt, len) in
-        let rlp: SBool = is_sym1(t2.mem, t2.ts, t2.te, t2.kind, 40) in
-        let m3: string = rlp.mem in
-        if rlp.yes then
-          let h1: u32 = fnv_step(h, 8) in
-          let hb: HF = fblob_range(m3, t.ts, t.te, h1) in
-          parse_args(hb.mem, hb.hash, t2.nxt, len)
+        // a dotted name path: call, enum construction, or a field-access chain
+        let pr: PathR = scan_path(m2, p, len) in
+        let tn: Tok = lex1(pr.mem, pr.cur, len) in
+        let rcc: SBool = is_sym2(tn.mem, tn.ts, tn.te, tn.kind, 58 * 256 + 58) in
+        let mc: string = rcc.mem in
+        if rcc.yes then
+          // `Path::variant` [ `(` value `)` ] — enum construction
+          let h1: u32 = fnv_step(h, 23) in
+          let hp: HF = fblob_range(mc, pr.ts0, pr.pathend, h1) in
+          let tv: Tok = lex1(hp.mem, tn.nxt, len) in
+          let hv: HF = fblob_range(tv.mem, tv.ts, tv.te, hp.hash) in
+          let tlp: Tok = lex1(hv.mem, tv.nxt, len) in
+          let rlp: SBool = is_sym1(tlp.mem, tlp.ts, tlp.te, tlp.kind, 40) in
+          let ml: string = rlp.mem in
+          if rlp.yes then
+            let val: PS = parse_expr(ml, hv.hash, tlp.nxt, len) in
+            let trp: Tok = lex1(val.mem, val.p, len) in
+            let r: PS = { mem: trp.mem, h: val.h, p: trp.nxt } in r
+          else
+            (let r: PS = { mem: ml, h: fnv_step(hv.hash, 5), p: tv.nxt } in r)
         else
-          let h1: u32 = fnv_step(h, 7) in
-          let hb: HF = fblob_range(m3, t.ts, t.te, h1) in
-          let r: PS = { mem: hb.mem, h: hb.hash, p: t.nxt } in r
+          let rlp: SBool = is_sym1(mc, tn.ts, tn.te, tn.kind, 40) in
+          let mp: string = rlp.mem in
+          if rlp.yes then
+            // `Path(args)` — a call
+            let h1: u32 = fnv_step(h, 8) in
+            let hp: HF = fblob_range(mp, pr.ts0, pr.pathend, h1) in
+            parse_args(hp.mem, hp.hash, tn.nxt, len)
+          else
+            // a parameter name or a field-access chain (re-walk the path)
+            fold_path_fields(mp, h, p, len)
   else
     // a symbol primary: `(` for unit or a parenthesized expression
     let rlp: SBool = is_sym1(m, t.ts, t.te, t.kind, 40) in
@@ -378,7 +471,34 @@ fn parse_primary(mem: string, h: u32, p: i64, len: i64) -> PS =
       // unsupported primary at this rung; consume one token to make progress
       (let r: PS = { mem: m0, h: h, p: t.nxt } in r)
 
-// A prefix unary chain: `-`/`!`/`~` then a unary; else a primary.
+// A postfix chain over a primary: `[index]` (Index) and `.field` (FieldAccess).
+fn parse_postfix(mem: string, h: u32, p: i64, len: i64) -> PS =
+  let base: PS = parse_primary(mem, h, p, len) in
+  let done: LpS =
+    loop a = { mem: base.mem, h: base.h, p: base.p, go: true } while a.go do
+      let cur: LpS = a in
+      let t: Tok = lex1(cur.mem, cur.p, len) in
+      let rlb: SBool = is_sym1(t.mem, t.ts, t.te, t.kind, 91) in
+      let m1: string = rlb.mem in
+      if rlb.yes then
+        let h1: u32 = fnv_step(cur.h, 21) in
+        let idx: PS = parse_expr(m1, h1, t.nxt, len) in
+        let tr: Tok = lex1(idx.mem, idx.p, len) in
+        (let s: LpS = { mem: tr.mem, h: idx.h, p: tr.nxt, go: true } in s)
+      else
+        let rdot: SBool = is_sym1(m1, t.ts, t.te, t.kind, 46) in
+        let m2: string = rdot.mem in
+        if rdot.yes then
+          let h1: u32 = fnv_step(cur.h, 24) in
+          let tf: Tok = lex1(m2, t.nxt, len) in
+          let hb: HF = fblob_range(tf.mem, tf.ts, tf.te, h1) in
+          (let s: LpS = { mem: hb.mem, h: hb.hash, p: tf.nxt, go: true } in s)
+        else (let s: LpS = { mem: m2, h: cur.h, p: cur.p, go: false } in s)
+  in
+  let r: PS = { mem: done.mem, h: done.h, p: done.p } in r
+
+// A prefix unary chain: `-`/`!`/`~` (Unary), `&`/`&'r`/`&'r mut`/`&mut` (Borrow),
+// else a postfix expression.
 fn parse_unary(mem: string, h: u32, p: i64, len: i64) -> PS =
   let t: Tok = lex1(mem, p, len) in
   let m: string = t.mem in
@@ -388,7 +508,32 @@ fn parse_unary(mem: string, h: u32, p: i64, len: i64) -> PS =
     let h1: u32 = fnv_step(h, 10) in
     let hb: HF = fblob_range(m, t.ts, t.te, h1) in
     parse_unary(hb.mem, hb.hash, t.nxt, len)
-  else parse_primary(m, h, p, len)
+  else if issym1 && c == 38 then
+    let t2: Tok = lex1(m, t.nxt, len) in
+    let rq: SBool = is_sym1(t2.mem, t2.ts, t2.te, t2.kind, 39) in
+    let mq: string = rq.mem in
+    if rq.yes then
+      // `& ' region [mut] target`
+      let tr: Tok = lex1(mq, t2.nxt, len) in
+      let tmut: Tok = lex1(tr.mem, tr.nxt, len) in
+      let rm: SBool = tok_eq(tmut.mem, tmut.ts, tmut.te, "mut") in
+      let mm: string = rm.mem in
+      let ismut: bool = (tmut.kind == 1) && rm.yes in
+      let h1: u32 = fnv_step(h, if ismut then 12 else 11) in
+      let h2: u32 = fnv_step(h1, 1) in
+      let hb: HF = fblob_range(mm, tr.ts, tr.te, h2) in
+      let nextp: i64 = if ismut then tmut.nxt else tr.nxt in
+      parse_unary(hb.mem, hb.hash, nextp, len)
+    else
+      // `& [mut] target` (no region)
+      let rm: SBool = tok_eq(mq, t2.ts, t2.te, "mut") in
+      let mm: string = rm.mem in
+      let ismut: bool = (t2.kind == 1) && rm.yes in
+      let h1: u32 = fnv_step(h, if ismut then 12 else 11) in
+      let h2: u32 = fnv_step(h1, 0) in
+      let nextp: i64 = if ismut then t2.nxt else t.nxt in
+      parse_unary(mm, h2, nextp, len)
+  else parse_postfix(m, h, p, len)
 
 // Precedence climbing (left-associative; right operand parsed at prec+1). Detects
 // `<<`/`>>` as two adjacent `<`/`>` tokens, folding the synthesized two-byte op.
