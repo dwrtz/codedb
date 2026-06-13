@@ -1110,10 +1110,23 @@ a recursive generic threading a generic-typed value, are supported.)
 Goal: express the front half of the compiler as CodeDB objects and meet the Rust
 native backend at the lowered-IR seam — the mixed compiler.
 
-Status: in progress — sub-stage 15a.1 (the lexer probe) is landed; 15a.2–15e are
-planned. Self-hosts rung A. Depends on Phases 6, 7, 9–14 (all complete) and the
-Phase 8 CIR artifact (rung A produces the CIR that rung 0 consumes — the two meet
-at the same flat binary).
+Status: in progress — sub-stages 15a.0 (oracle substrate), 15a.1 (lexer), and the
+15a.3 SHA-256 keystone are landed; 15a.2 (parser) is partly landed (the oracle +
+the expression core) with the rest of the grammar plus the object builder still
+to come; 15b–15e are planned. Self-hosts rung A. Depends on Phases 6, 7, 9–14
+(all complete) and the Phase 8 CIR artifact (rung A produces the CIR that rung 0
+consumes — the two meet at the same flat binary).
+
+Scope note on the importer's object-hash/root oracle (15a.3): the importer's
+stored objects are TYPED — an `Expression` object carries its resolved `type`
+hash, a name resolves to a `param_ref` index or a callee `symbol` hash, and a
+`FunctionDef` points at the type-checked body — and `SymbolBirth` objects chain
+on the migration history. So full object-hash and root-hash equality is coupled
+to type-checking (15b), not parsing alone: the type-check-INDEPENDENT objects
+(SymbolBirth/birth-identity chain, FunctionSignature, TypeDef/RecordDef/EnumDef,
+the ProgramRoot name/param tables) are reproducible at 15a.3, while the typed
+`Expression` bodies and therefore the FunctionDef/ProgramRoot definition hashes
+and the root pin land with 15b. The object builder is staged accordingly.
 
 Landed substrate (15a.0): two determinism-oracle references for the front-end.
 `emit-objects <db> --out` (`CodeDb::export_objects_branch`) dumps the object
@@ -1174,12 +1187,33 @@ content-addressing core — raw SHA-256 and the object framing — now fully
 self-hosts; only the object BUILDER (source → the right canonical payloads) plus
 migration/birth identity remain between here and root-hash equality.
 
-`tests/selfhost_frontend.rs` is the gate (6 tests: lexer × full corpus, the §11
-checked-view gate, emit-objects determinism, SHA-256 × lengths/blocks, and
-obj_hash × real objects). Still planned for 15a.3: the object builder (parsed
-items → canonical-JSON object payloads in the importer's deterministic order) +
-migration/birth identity → root-hash equality; the parser (15a.2, tokens → AST);
-then 15b–15e.
+Landed 15a.2 (the parser, started): `codedb::ast_probe` / `emit-ast <file>` is
+the parser-stage determinism oracle — it parses a program and folds an
+FNV-1a-32 over a STREAMING recursive-descent traversal of the AST, reporting
+`items <count> ast32 <digest>`, the same probe shape as `token_probe` one stage
+downstream. The fold order is the stream order of a recursive-descent parse
+(keyword-led forms pre-order; infix `Binary`, postfix `Index`/`FieldAccess`, and
+the `[...]` array/fill split post-order, with precedence climbing reproducing
+the canonical `Binary` nesting), lists sentinel-encoded and blobs
+length-prefixed, so a self-hosted parser reproduces it without buffering; the
+oracle covers the full RawExpr/ProgramItem grammar. `compiler/front/parse.cdb`
+is the self-hosted parser: lex-on-demand (`lex1` returns the next token's
+geometry with no separate token buffer), recursive descent threading the
+move-only memory by move, precedence climbing matching op_registry (incl.
+`<<`/`>>` as two `<`/`>` tokens). Its probe is byte-equal to `ast_probe` on the
+EXPRESSION CORE — scalar pure functions: literals, parameter names, calls, the
+full operator set with precedence, prefix unary, parentheses/unit, and
+`let`/`if`/`return`, plus multi-item programs and comments. Still to come on the
+parser: strings/records/arrays/enums/field-index/fold-loop-case/borrows, the
+type normalizer (non-scalar types), modules, generics, and effects.
+
+`tests/selfhost_frontend.rs` is the gate (9 tests: lexer × full corpus, the §11
+checked-view gate, emit-objects determinism, SHA-256 × lengths/blocks, obj_hash
+× real objects, ast_probe corpus coverage + discrimination, and the .cdb parser
+× the expression core). Still planned: the rest of the parser grammar (15a.2
+cont.); the object builder (parsed items → canonical-JSON object payloads in the
+importer's deterministic order) + migration/birth identity → object-hash and (with
+15b) root-hash equality (15a.3); then 15b–15e.
 
 Sub-stages (each independently oracle-checked at its artifact):
 
