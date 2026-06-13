@@ -138,6 +138,34 @@ record RunS {
   go: bool
 }
 
+// A type-extent scan result: memory, the type's source start, and the cursor
+// just past it. The corpus writes types in canonical normalized form, so the
+// source slice [ts0, end) IS the normalized type the probe folds.
+record TyR {
+  mem: string
+  ts0: i64
+  end: i64
+}
+
+// The balanced-bracket scan loop accumulator: memory, cursor, nesting depth,
+// keep-going.
+record BalS {
+  mem: string
+  p: i64
+  depth: i64
+  go: bool
+}
+
+// The definition-parameter loop accumulator: memory, digest, cursor, phase
+// (0 = region params, 1 = type params), keep-going.
+record DefS {
+  mem: string
+  h: u32
+  p: i64
+  phase: i64
+  go: bool
+}
+
 // A stack output buffer for writing a rendered number (Copy).
 record OutBuf64 {
   b: array<u8, 64>
@@ -323,6 +351,105 @@ fn is_sym1(mem: string, ts: i64, te: i64, kind: i64, c: i64) -> SBool =
 // ---------------------------------------------------------------------------
 // the parser (expression core)
 // ---------------------------------------------------------------------------
+
+// Consume a balanced bracket run starting just after an opening `open` byte
+// (depth already 1), returning the cursor just past the matching `close`. In
+// type position the lexer emits `>>` as two `>` tokens, so counting single
+// `<`/`>` (or `{`/`}`) tokens balances correctly for nested generics.
+fn scan_balanced(mem: string, p: i64, len: i64, open: i64, close: i64) -> SE =
+  let done: BalS =
+    loop a = { mem: mem, p: p, depth: 1, go: true } while a.go do
+      let cur: BalS = a in
+      let t: Tok = lex1(cur.mem, cur.p, len) in
+      if t.kind == 7 then
+        (let s: BalS = { mem: t.mem, p: t.nxt, depth: cur.depth, go: false } in s)
+      else
+        let c: i64 = if (t.kind == 6) && ((t.te - t.ts) == 1) then to_i64(string_get(t.mem, t.ts)) else 0 in
+        let nd: i64 = if c == open then cur.depth + 1 else if c == close then cur.depth - 1 else cur.depth in
+        if nd == 0 then (let s: BalS = { mem: t.mem, p: t.nxt, depth: 0, go: false } in s)
+        else (let s: BalS = { mem: t.mem, p: t.nxt, depth: nd, go: true } in s)
+  in
+  let r: SE = { mem: done.mem, end: done.p } in r
+
+// Consume a type's tokens, returning its source extent [ts0, end). A leading `&`
+// reference recurses over its referent; `(` `)` is unit; otherwise a (possibly
+// dotted) name optionally followed by a balanced `<...>` (generics/box/vec/slice/
+// array/ptr) or `{...}` (inline record/enum). The caller folds the source slice
+// as the normalized type (the corpus is written canonically).
+fn scan_type(mem: string, p: i64, len: i64) -> TyR =
+  let t: Tok = lex1(mem, p, len) in
+  let ramp: SBool = is_sym1(t.mem, t.ts, t.te, t.kind, 38) in
+  let m0: string = ramp.mem in
+  if ramp.yes then
+    let tq: Tok = lex1(m0, t.nxt, len) in
+    let tr: Tok = lex1(tq.mem, tq.nxt, len) in
+    let tmaybe: Tok = lex1(tr.mem, tr.nxt, len) in
+    let rmut: SBool = tok_eq(tmaybe.mem, tmaybe.ts, tmaybe.te, "mut") in
+    let mm: string = rmut.mem in
+    let ismut: bool = (tmaybe.kind == 1) && rmut.yes in
+    let innerp: i64 = if ismut then tmaybe.nxt else tr.nxt in
+    let inner: TyR = scan_type(mm, innerp, len) in
+    let r: TyR = { mem: inner.mem, ts0: t.ts, end: inner.end } in r
+  else
+    let rlp: SBool = is_sym1(m0, t.ts, t.te, t.kind, 40) in
+    let m1: string = rlp.mem in
+    if rlp.yes then
+      let t2: Tok = lex1(m1, t.nxt, len) in
+      let r: TyR = { mem: t2.mem, ts0: t.ts, end: t2.nxt } in r
+    else
+      let pr: PathR = scan_path(m1, p, len) in
+      let tn: Tok = lex1(pr.mem, pr.cur, len) in
+      let rlt: SBool = is_sym1(tn.mem, tn.ts, tn.te, tn.kind, 60) in
+      let m2: string = rlt.mem in
+      if rlt.yes then
+        let be: SE = scan_balanced(m2, tn.nxt, len, 60, 62) in
+        let r: TyR = { mem: be.mem, ts0: t.ts, end: be.end } in r
+      else
+        let rlb: SBool = is_sym1(m2, tn.ts, tn.te, tn.kind, 123) in
+        let m3: string = rlb.mem in
+        if rlb.yes then
+          let be: SE = scan_balanced(m3, tn.nxt, len, 123, 125) in
+          let r: TyR = { mem: be.mem, ts0: t.ts, end: be.end } in r
+        else (let r: TyR = { mem: m3, ts0: t.ts, end: pr.cur } in r)
+
+// Parse an optional definition parameter list `<'r, ..., T, ...>`, folding the
+// AstProbe region-param text-list then type-param text-list (regions strictly
+// before types). Folds `0` `0` (both empty) when there is no `<...>`.
+fn parse_def_params(mem: string, h: u32, p: i64, len: i64) -> PS =
+  let t0: Tok = lex1(mem, p, len) in
+  let rlt: SBool = is_sym1(t0.mem, t0.ts, t0.te, t0.kind, 60) in
+  let m0: string = rlt.mem in
+  if rlt.yes then
+    let done: DefS =
+      loop a = { mem: m0, h: h, p: t0.nxt, phase: 0, go: true } while a.go do
+        let cur: DefS = a in
+        let t: Tok = lex1(cur.mem, cur.p, len) in
+        let rgt: SBool = is_sym1(t.mem, t.ts, t.te, t.kind, 62) in
+        let m1: string = rgt.mem in
+        if rgt.yes then
+          let hend: u32 = if cur.phase == 0 then fnv_step(fnv_step(cur.h, 0), 0) else fnv_step(cur.h, 0) in
+          (let s: DefS = { mem: m1, h: hend, p: t.nxt, phase: cur.phase, go: false } in s)
+        else
+          let rcomma: SBool = is_sym1(m1, t.ts, t.te, t.kind, 44) in
+          let m2: string = rcomma.mem in
+          if rcomma.yes then
+            (let s: DefS = { mem: m2, h: cur.h, p: t.nxt, phase: cur.phase, go: true } in s)
+          else
+            let rq: SBool = is_sym1(m2, t.ts, t.te, t.kind, 39) in
+            let m3: string = rq.mem in
+            if rq.yes then
+              let ti: Tok = lex1(m3, t.nxt, len) in
+              let h1: u32 = fnv_step(cur.h, 1) in
+              let hb: HF = fblob_range(ti.mem, ti.ts, ti.te, h1) in
+              (let s: DefS = { mem: hb.mem, h: hb.hash, p: ti.nxt, phase: 0, go: true } in s)
+            else
+              let ht0: u32 = if cur.phase == 0 then fnv_step(cur.h, 0) else cur.h in
+              let h1: u32 = fnv_step(ht0, 1) in
+              let hb: HF = fblob_range(m3, t.ts, t.te, h1) in
+              (let s: DefS = { mem: hb.mem, h: hb.hash, p: t.nxt, phase: 1, go: true } in s)
+    in
+    let r: PS = { mem: done.mem, h: done.h, p: done.p } in r
+  else (let r: PS = { mem: m0, h: fnv_step(fnv_step(h, 0), 0), p: p } in r)
 
 // Parse the comma-separated call arguments at `p` (just after `(`), through the
 // closing `)`. Folds [1, arg]* then 0 (the AstProbe Call argument list).
@@ -575,18 +702,17 @@ fn parse_binary(mem: string, h: u32, p: i64, len: i64, min: i64) -> PS =
   in
   let r: PS = { mem: done.mem, h: done.h, p: done.p } in r
 
-// `let name: type = value in body` (scalar `type` at this rung). Folds
-// byte(14), text(name), text(type), expr(value), expr(body).
+// `let name: type = value in body`. Folds byte(14), text(name), text(type),
+// expr(value), expr(body). The type is a full type (via `scan_type`).
 fn parse_let_tail(mem: string, h: u32, p: i64, len: i64) -> PS =
   let tn: Tok = lex1(mem, p, len) in
   let m: string = tn.mem in
   let h1: u32 = fnv_step(h, 14) in
   let hn: HF = fblob_range(m, tn.ts, tn.te, h1) in
   let tc: Tok = lex1(hn.mem, tn.nxt, len) in
-  let tt: Tok = lex1(tc.mem, tc.nxt, len) in
-  let mt: string = tt.mem in
-  let ht: HF = fblob_range(mt, tt.ts, tt.te, hn.hash) in
-  let teq: Tok = lex1(ht.mem, tt.nxt, len) in
+  let tyr: TyR = scan_type(tc.mem, tc.nxt, len) in
+  let ht: HF = fblob_range(tyr.mem, tyr.ts0, tyr.end, hn.hash) in
+  let teq: Tok = lex1(ht.mem, tyr.end, len) in
   let val: PS = parse_expr(teq.mem, ht.hash, teq.nxt, len) in
   let ti: Tok = lex1(val.mem, val.p, len) in
   parse_expr(ti.mem, val.h, ti.nxt, len)
@@ -635,10 +761,9 @@ fn parse_params(mem: string, h: u32, p: i64, len: i64) -> PS =
         let h1: u32 = fnv_step(cur.h, 1) in
         let hn: HF = fblob_range(m1, tn.ts, tn.te, h1) in
         let tc: Tok = lex1(hn.mem, tn.nxt, len) in
-        let tt: Tok = lex1(tc.mem, tc.nxt, len) in
-        let mt: string = tt.mem in
-        let ht: HF = fblob_range(mt, tt.ts, tt.te, hn.hash) in
-        let ts2: Tok = lex1(ht.mem, tt.nxt, len) in
+        let tyr: TyR = scan_type(tc.mem, tc.nxt, len) in
+        let ht: HF = fblob_range(tyr.mem, tyr.ts0, tyr.end, hn.hash) in
+        let ts2: Tok = lex1(ht.mem, tyr.end, len) in
         let rp2: SBool = is_sym1(ts2.mem, ts2.ts, ts2.te, ts2.kind, 41) in
         let m4: string = rp2.mem in
         if rp2.yes then
@@ -647,27 +772,55 @@ fn parse_params(mem: string, h: u32, p: i64, len: i64) -> PS =
     in
     let r: PS = { mem: done.mem, h: fnv_step(done.h, 0), p: done.p } in r
 
-// One top-level function item: `fn name(params) -> scalar = body`. Folds the
-// AstProbe Function item: byte(2), text("main"), text(name), 0 (region params),
-// 0 (type params), pair_list(params), text(return), 0 (effects), expr(body).
-fn parse_item(mem: string, h: u32, p: i64, len: i64) -> PS =
+// Fold an item's module name: the static "main" for a top-level item (`modts`
+// < 0), else the dotted module path whose first name starts at `modts` (re-scanned
+// to find its end). Returns the threaded memory and digest.
+fn fold_module(mem: string, h: u32, modts: i64, len: i64) -> HF =
+  if modts < 0 then (let r: HF = { mem: mem, hash: fblob_static("main", h) } in r)
+  else
+    let pr: PathR = scan_path(mem, modts, len) in
+    fblob_range(pr.mem, modts, pr.pathend, h)
+
+// One function item `fn name<params>(params) -> type [effects] = body`. Folds the
+// AstProbe Function item: byte(2), text(module), text(name), region-param list,
+// type-param list, pair_list(params), text(return), effect list, expr(body).
+// `modts` selects the module (see `fold_module`). Effects are not yet parsed at
+// this rung (folded as the empty list); pure functions match exactly.
+fn parse_item(mem: string, h: u32, p: i64, len: i64, modts: i64) -> PS =
   let tfn: Tok = lex1(mem, p, len) in
   let tname: Tok = lex1(tfn.mem, tfn.nxt, len) in
-  let m: string = tname.mem in
   let h1: u32 = fnv_step(h, 2) in
-  let hmod: u32 = fblob_static("main", h1) in
-  let hnm: HF = fblob_range(m, tname.ts, tname.te, hmod) in
-  let hreg: u32 = fnv_step(hnm.hash, 0) in
-  let htp: u32 = fnv_step(hreg, 0) in
-  let tlp: Tok = lex1(hnm.mem, tname.nxt, len) in
-  let pr: PS = parse_params(tlp.mem, htp, tlp.nxt, len) in
+  let hmod: HF = fold_module(tname.mem, h1, modts, len) in
+  let hnm: HF = fblob_range(hmod.mem, tname.ts, tname.te, hmod.hash) in
+  let dp: PS = parse_def_params(hnm.mem, hnm.hash, tname.nxt, len) in
+  let tlp: Tok = lex1(dp.mem, dp.p, len) in
+  let pr: PS = parse_params(tlp.mem, dp.h, tlp.nxt, len) in
   let tarrow: Tok = lex1(pr.mem, pr.p, len) in
-  let trt: Tok = lex1(tarrow.mem, tarrow.nxt, len) in
-  let mrt: string = trt.mem in
-  let hrt: HF = fblob_range(mrt, trt.ts, trt.te, pr.h) in
+  let tyr: TyR = scan_type(tarrow.mem, tarrow.nxt, len) in
+  let hrt: HF = fblob_range(tyr.mem, tyr.ts0, tyr.end, pr.h) in
   let heff: u32 = fnv_step(hrt.hash, 0) in
-  let teq: Tok = lex1(hrt.mem, trt.nxt, len) in
+  let teq: Tok = lex1(hrt.mem, tyr.end, len) in
   parse_expr(teq.mem, heff, teq.nxt, len)
+
+// Parse a `module path { items }` block, folding every item with the module's
+// name and returning the running digest, cursor, and item count.
+fn parse_mod(mem: string, h: u32, p: i64, len: i64) -> RunS =
+  let tm: Tok = lex1(mem, p, len) in
+  let pr: PathR = scan_path(tm.mem, tm.nxt, len) in
+  let tlb: Tok = lex1(pr.mem, pr.cur, len) in
+  let done: RunS =
+    loop a = { mem: tlb.mem, h: h, p: tlb.nxt, count: 0, go: true } while a.go do
+      let cur: RunS = a in
+      let t: Tok = lex1(cur.mem, cur.p, len) in
+      let rrb: SBool = is_sym1(t.mem, t.ts, t.te, t.kind, 125) in
+      let m1: string = rrb.mem in
+      if rrb.yes then
+        (let s: RunS = { mem: m1, h: cur.h, p: t.nxt, count: cur.count, go: false } in s)
+      else
+        let it: PS = parse_item(m1, cur.h, cur.p, len, pr.ts0) in
+        (let s: RunS = { mem: it.mem, h: it.h, p: it.p, count: cur.count + 1, go: true } in s)
+  in
+  done
 
 // ---------------------------------------------------------------------------
 // the stdin shell (the Phase 8 read_all, verbatim) + output
@@ -712,20 +865,26 @@ fn print_probe(count: i64, hashv: i64) -> i64 effects[io, alloc, state, ffi, uns
   let d: i64 = print_num(hashv) in
   print_static("\n")
 
-// Parse every top-level item, folding each into the program digest, and print the
-// probe. The item count and the FNV-1a-32 over the AST match `ast_probe`.
+// Parse every top-level unit — a `module path { ... }` block or a single item —
+// folding each item (modules flattened, source order) into the program digest,
+// and print the probe. The item count and the FNV-1a-32 over the AST match
+// `ast_probe`.
 fn run(mem: string) -> i64 effects[io, alloc, state, ffi, unsafe] =
   let len: i64 = string_len(mem) in
   let done: RunS =
     loop s = { mem: mem, h: fnv_seed(), p: 0, count: 0, go: true } while s.go do
       let cur: RunS = s in
       let t: Tok = lex1(cur.mem, cur.p, len) in
-      let m: string = t.mem in
+      let rmod: SBool = tok_eq(t.mem, t.ts, t.te, "module") in
+      let m: string = rmod.mem in
       if t.kind == 7 then
         (let fin: RunS = { mem: m, h: cur.h, p: cur.p, count: cur.count, go: false } in fin)
+      else if t.kind == 1 && rmod.yes then
+        let md: RunS = parse_mod(m, cur.h, cur.p, len) in
+        (let nxt: RunS = { mem: md.mem, h: md.h, p: md.p, count: cur.count + md.count, go: true } in nxt)
       else
-        let it: PS = parse_item(m, cur.h, cur.p, len) in
-        let nxt: RunS = { mem: it.mem, h: it.h, p: it.p, count: cur.count + 1, go: true } in nxt
+        let it: PS = parse_item(m, cur.h, cur.p, len, 0 - 1) in
+        (let nxt: RunS = { mem: it.mem, h: it.h, p: it.p, count: cur.count + 1, go: true } in nxt)
   in
   print_probe(done.count, to_i64(done.h))
 

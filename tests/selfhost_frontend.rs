@@ -337,6 +337,44 @@ fn parser_probe_matches_rust_on_postfix_paths_and_borrows() {
 }
 
 #[test]
+fn parser_probe_matches_rust_on_generics_types_and_modules() {
+    // Phase 15a.2 (cont.): the parser now handles `module path { ... }` blocks,
+    // region/type parameters on the function header (`<'a, T>`), and the type
+    // normalizer for parameter/return/let types — `scan_type` consumes a type's
+    // tokens (references, `box`/`vec`/`slice`/`array`/`raw_ptr` and generic
+    // `<...>`, balanced including nested `>>`) and the canonical source slice is
+    // folded as the normalized type. This lands the first committed corpus files
+    // (std/core.cdb, std/mem.cdb) byte-for-byte. (Effects, externs, record/enum
+    // definitions, strings, and fold/loop/case are the next increments.)
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = parser();
+    // Generic and region parameters on the header.
+    assert_ast_probe(exe, "fn id<T>(x: T) -> T = x");
+    assert_ast_probe(exe, "fn pick<'a, T>(x: T) -> T = x");
+    assert_ast_probe(exe, "fn reg<'a>(x: i64) -> i64 = x");
+    // The type normalizer over the parameter/return/let positions.
+    assert_ast_probe(exe, "fn b(n: box<i64>) -> i64 = 0");
+    assert_ast_probe(exe, "fn nest(o: Option<box<i64>>) -> i64 = 0");
+    assert_ast_probe(exe, "fn arr(a: array<u8, 4>) -> u8 = a[0]");
+    assert_ast_probe(exe, "fn lt(x: i64) -> i64 = let b: array<u8, 4> = z in x");
+    // A module block, with the module name folded per item.
+    assert_ast_probe(
+        exe,
+        "module std.demo {\n\
+         fn one(x: i64) -> i64 = x\n\
+         fn two<'a>(s: slice<'a, u8>) -> i64 = len(s)\n\
+         }\n",
+    );
+    // The first committed corpus files, parsed byte-for-byte.
+    for file in ["std/core.cdb", "std/mem.cdb"] {
+        let source = std::fs::read_to_string(file).unwrap_or_else(|_| panic!("read {file}"));
+        assert_ast_probe(exe, &source);
+    }
+}
+
+#[test]
 fn sha256_matches_reference_across_lengths_and_blocks() {
     // The content-addressing keystone (SPEC_V3 §5): the self-hosted hasher must
     // compute SHA-256 of arbitrary bytes byte-for-byte like the reference, or the
