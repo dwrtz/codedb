@@ -1130,22 +1130,26 @@ reads source bytes from stdin (the Phase 8 1-byte-bounce-buffer pump), tokenizes
 them exactly like `src/expr.rs::lex` over a move-only memory string (the Phase 8
 threading discipline; every byte read guarded by `if p < len` because the
 language's `&&` is strict, evaluating both operands), and prints the same probe.
-It compiles native and its probe is byte-equal to `token_probe` on a varied ASCII
-corpus (idents with underscores/digits, decimal + `0x` hex, `//` comments, all ten
-two-char symbols, whitespace, a recursive multi-line program) AND on four real
-committed string-free sources (std/core, std/mem, std/result, std/alloc) — the
-rung-A lexer dogfood. The committed source passes the §11 checked-view gate
-(import→export→import fixpoint, byte-stable projection). Two .cdb-authoring
-realities resurfaced and are pinned in the source: record literals in `if`/`case`
-branch and function-return position must be bound to a typed `let` (else they take
-a structural, field-sorted layout that mismatches the nominal record — the Phase 8
+It compiles native and its probe is byte-equal to `token_probe` on a varied corpus
+(idents with underscores/digits, decimal + `0x` hex, `//` comments, all ten
+two-char symbols, whitespace, a recursive multi-line program, and `"`/`b"` string +
+byte-string literals folded over their DECODED bytes — `\n`/`\t`/`\"`/`\\` and the
+byte-string `\0`/`\xHH`) AND on the **entire committed corpus** token-for-token:
+all of `std/*`, `examples/v3/{tokenizer,sha256}.cdb`, the 1700-line
+`compiler/eval/eval.cdb`, and the lexer tokenizing itself. The committed source
+passes the §11 checked-view gate (import→export→import fixpoint, byte-stable
+projection). String literals fold the decoded value, not the raw slice (mirroring
+`lex_string`/`lex_byte_string`); the only assumption is ASCII outside string/comment
+content (every committed source satisfies it — `\`/`"` never occur as UTF-8
+continuation bytes, so byte-level escape/quote detection and the re-encoded decoded
+bytes match the Rust `char` walk exactly). Two .cdb-authoring realities resurfaced
+and are pinned in the source: record literals in `if`/`case` branch and
+function-return position must be bound to a typed `let` (else they take a
+structural, field-sorted layout that mismatches the nominal record — the Phase 8
 gotcha), and the per-token work is split into `classify`/`step` routers so each
-frame stays under the v0 4095-byte budget. Corpus constraint: ASCII and free of
-string/byte-string literals (a token's text is then a direct source slice, so the
-byte machine matches the Rust `char` walk); string-literal lexing is the next
-follow-on. `tests/selfhost_frontend.rs` is the gate. Still planned: 15a.2 parser
-(tokens → AST), 15a.3 object builder + canonical JSON + SHA-256 + migration/birth
-identity → root-hash equality, then 15b–15e.
+frame stays under the v0 4095-byte budget. `tests/selfhost_frontend.rs` is the gate.
+Still planned: 15a.2 parser (tokens → AST), 15a.3 object builder + canonical JSON +
+SHA-256 + migration/birth identity → root-hash equality, then 15b–15e.
 
 Sub-stages (each independently oracle-checked at its artifact):
 

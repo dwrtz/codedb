@@ -15,13 +15,18 @@
 // (tests/selfhost_frontend.rs). This mirrors the Phase 8 loader's five-number
 // probe: a small digest that is wrong unless the whole walk is right.
 //
-// Scope of THIS increment: the minimal lexer corpus is ASCII and carries no
-// string/byte-string literals, so a token's text is always a direct source
-// slice and the byte machine (which works over bytes, not Unicode scalars)
-// matches the Rust lexer (which works over `char`s) exactly. Whitespace,
-// identifiers (incl. `_`), decimal + `0x` hex numbers, `//` comments, the
-// ten two-char symbols (`-> == != <= >= && || :: => ..`), and one-char symbols
-// are all handled. String/byte-string lexing is a documented follow-on.
+// Scope: the full lexical grammar of the committed .cdb corpus. Whitespace,
+// identifiers (incl. `_`), decimal + `0x` hex numbers, `//` comments, the ten
+// two-char symbols (`-> == != <= >= && || :: => ..`), one-char symbols, `"`
+// string literals (folded over their DECODED bytes — `\n`/`\t`/`\"`/`\\`), and
+// `b"` byte-string literals (also `\0` and `\xHH`) are all handled, matching the
+// Rust lexer token-for-token on every committed source (std/*, examples/v3/*,
+// compiler/eval/eval.cdb, and this file itself). The one assumption is that
+// source is ASCII OUTSIDE string/comment content: the byte machine indexes bytes
+// where the Rust lexer indexes `char`s, and `\` (0x5c) / `"` (0x22) never occur
+// as UTF-8 continuation bytes, so escape and quote detection — and the decoded
+// content bytes, which re-encode to the same UTF-8 — agree byte-for-byte. Every
+// committed source is ASCII, so this is exact for the whole corpus.
 //
 // The memory string is move-only (the Phase 8 discipline): it threads by MOVE
 // through the scan accumulator and the scan/fold helpers, each returning it
@@ -75,6 +80,22 @@ record HF {
   hash: u32
 }
 
+// A fold_strlit result: the threaded memory, the digest folded over the DECODED
+// bytes, and the cursor just past the closing quote.
+record SF {
+  mem: string
+  hash: u32
+  next: i64
+}
+
+// The string-literal decode accumulator (Copy): the digest, the cursor, and a
+// keep-going flag (cleared at the closing quote or end of input).
+record StrAcc {
+  h: u32
+  p: i64
+  go: bool
+}
+
 // The inner position scan accumulator (Copy): a cursor and a keep-going flag.
 record P2 {
   p: i64
@@ -118,6 +139,23 @@ fn is_two_char(a: i64, b: i64) -> bool =
   (a == 60 && b == 61) || (a == 62 && b == 61) || (a == 38 && b == 38) ||
   (a == 124 && b == 124) || (a == 58 && b == 58) || (a == 61 && b == 62) ||
   (a == 46 && b == 46)
+
+// A hex digit's value (0..15); 0 for a non-hex byte (unreachable for valid input,
+// which only feeds `\xHH` two real hex digits).
+fn hexv(b: i64) -> i64 =
+  if b >= 48 && b <= 57 then b - 48
+  else if b >= 97 && b <= 102 then b - 97 + 10
+  else if b >= 65 && b <= 70 then b - 65 + 10
+  else 0
+
+// Decode a one-char escape `\<e>` to its byte (matches lex_string /
+// lex_byte_string): n -> 0x0a, t -> 0x09, 0 -> 0x00; `"` and `\` (and any other)
+// map to themselves. `\x` two-digit byte escapes are handled inline in fold_strlit.
+fn decode_escape(e: i64) -> i64 =
+  if e == 110 then 10
+  else if e == 116 then 9
+  else if e == 48 then 0
+  else e
 
 // ---------------------------------------------------------------------------
 // the stdin shell (the Phase 8 read_all, verbatim)
@@ -203,6 +241,34 @@ fn fold_bytes(mem: string, ts: i64, te: i64, h0: u32) -> HF =
   in
   let res: HF = { mem: mem, hash: done.h } in res
 
+// Decode a string / byte-string literal body starting at `p0` (the byte after
+// the opening quote) and fold its DECODED bytes into the digest, returning the
+// cursor just past the closing quote. This mirrors lex_string / lex_byte_string:
+// the token's folded text is the decoded value, not the raw source slice — so
+// `\n`/`\t`/`\"`/`\\` (and, for a byte string, `\0` and `\xHH`) fold the decoded
+// byte. `is_byte` enables the byte-string-only `\0` / `\xHH` forms. Every byte
+// read is guarded by `a.p < len` (and the escape look-ahead by `a.p + 1 < len`).
+fn fold_strlit(mem: string, p0: i64, len: i64, h0: u32, is_byte: bool) -> SF =
+  let seed: StrAcc = { h: h0, p: p0, go: true } in
+  let done: StrAcc =
+    loop a = seed while a.go do
+      if a.p >= len then (let stop: StrAcc = { h: a.h, p: a.p, go: false } in stop)
+      else
+        let c: i64 = to_i64(string_get(mem, a.p)) in
+        if c == 34 then (let stop: StrAcc = { h: a.h, p: a.p + 1, go: false } in stop)
+        else if c == 92 && a.p + 1 < len then
+          let e: i64 = to_i64(string_get(mem, a.p + 1)) in
+          if e == 120 && is_byte && a.p + 3 < len then
+            let hi: i64 = to_i64(string_get(mem, a.p + 2)) in
+            let lo: i64 = to_i64(string_get(mem, a.p + 3)) in
+            let byte: i64 = (hexv(hi) << 4) | hexv(lo) in
+            (let nx: StrAcc = { h: fnv_step(a.h, byte), p: a.p + 4, go: true } in nx)
+          else
+            (let nx: StrAcc = { h: fnv_step(a.h, decode_escape(e)), p: a.p + 2, go: true } in nx)
+        else (let nx: StrAcc = { h: fnv_step(a.h, c), p: a.p + 1, go: true } in nx)
+  in
+  let res: SF = { mem: mem, hash: done.h, next: done.p } in res
+
 // Decide the geometry of the token starting at `i` (with the next byte `b1`),
 // threading the memory back. A separate function so its value ids (the per-arm
 // scan_end / Geo temporaries) stay off the loop frame (the v0 4095-byte budget).
@@ -227,12 +293,23 @@ fn classify(mem: string, i: i64, b: i64, b1: i64, len: i64) -> Geo =
 
 // One scan step: skip a whitespace byte, or emit one token (folding its kind +
 // text into the digest) and advance past it. Returns the next accumulator.
+// String (`"`, kind 3) and byte-string (`b"`, kind 4) literals are matched first
+// — like the Rust lexer's `b"` check ahead of the identifier rule — and folded
+// over their DECODED bytes (fold_strlit); everything else goes through classify.
 fn step(mem: string, i: i64, count: i64, h: u32, len: i64) -> ScanS =
   let b: i64 = to_i64(string_get(mem, i)) in
+  let b1: i64 = if i + 1 < len then to_i64(string_get(mem, i + 1)) else 0 in
   if is_ws(b) then
     let r: ScanS = { mem: mem, i: i + 1, count: count, hash: h } in r
+  else if b == 98 && b1 == 34 then
+    let h1: u32 = fnv_step(h, 4) in
+    let sf: SF = fold_strlit(mem, i + 2, len, h1, true) in
+    let r: ScanS = { mem: sf.mem, i: sf.next, count: count + 1, hash: sf.hash } in r
+  else if b == 34 then
+    let h1: u32 = fnv_step(h, 3) in
+    let sf: SF = fold_strlit(mem, i + 1, len, h1, false) in
+    let r: ScanS = { mem: sf.mem, i: sf.next, count: count + 1, hash: sf.hash } in r
   else
-    let b1: i64 = if i + 1 < len then to_i64(string_get(mem, i + 1)) else 0 in
     let g: Geo = classify(mem, i, b, b1, len) in
     let h1: u32 = fnv_step(h, g.kind) in
     let hf: HF = fold_bytes(g.mem, g.ts, g.te, h1) in

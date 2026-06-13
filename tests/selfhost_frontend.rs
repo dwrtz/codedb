@@ -121,21 +121,38 @@ fn lexer_probe_matches_rust_on_minimal_corpus() {
         "fn f(n: i64) -> i64 = if n <= 1 then 1 else n * f(n - 1)\n\
          fn g(n: i64) -> bool = true && false || n != 0\n",
     );
+    // String literals, folded over their DECODED bytes (escapes resolved).
+    assert_probe(exe, r#""hello world""#);
+    assert_probe(exe, r#""escapes: \n \t \" \\ done""#);
+    assert_probe(exe, r#"fn greet() -> string = "hi, there""#);
+    // Byte-string literals, incl. the \0 and \xHH byte escapes.
+    assert_probe(exe, r#"b"0""#);
+    assert_probe(exe, r#"b"bytes \x1f \x00 \0 \n \t end""#);
+    // A string adjacent to other tokens and a comment containing quotes/backslash.
+    assert_probe(exe, r#"let s: string = "a" in print(s) // a "quoted" \ note"#);
 }
 
 #[test]
-fn lexer_probe_matches_rust_on_real_string_free_sources() {
+fn lexer_probe_matches_rust_on_the_committed_corpus() {
     if !can_build_default_native_target() {
         return;
     }
     let exe = lexer();
-    // Real committed CodeDB sources (no string/byte-string literals): the
-    // self-hosted lexer tokenizes them identically to the Rust lexer — dogfood.
+    // The self-hosted lexer tokenizes every committed .cdb source identically to
+    // the Rust lexer — including string/byte-string literals, the full std and
+    // examples corpus, the 1700-line evaluator, and the lexer itself (dogfood).
     for file in [
         "std/core.cdb",
         "std/mem.cdb",
         "std/result.cdb",
         "std/alloc.cdb",
+        "std/string.cdb",
+        "std/fmt.cdb",
+        "std/io.cdb",
+        "examples/v3/tokenizer.cdb",
+        "examples/v3/sha256.cdb",
+        "compiler/eval/eval.cdb",
+        "compiler/front/lex.cdb",
     ] {
         let source = std::fs::read_to_string(file).unwrap_or_else(|_| panic!("read {file}"));
         assert_probe(exe, &source);
