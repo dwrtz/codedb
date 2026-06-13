@@ -402,6 +402,30 @@ fn parser_probe_matches_rust_on_effects_loops_and_folds() {
 }
 
 #[test]
+fn parser_probe_matches_rust_on_definitions_and_aggregates() {
+    // Phase 15a.2 (cont.): record/enum definitions and record/array/array-fill
+    // literal expressions. With these, examples/v3/sha256.cdb — records, arrays,
+    // `array_set`, `[v; n]` fills, loops, bitwise, generics — parses byte-for-byte.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = parser();
+    // Record and enum definitions (members in source order; generic params).
+    assert_ast_probe(exe, "record Point { x: i64  y: i64 }");
+    assert_ast_probe(exe, "record Pair<T> { a: T  b: T }");
+    assert_ast_probe(exe, "enum Opt { none: unit  some: i64 }");
+    // Record / array / array-fill literal expressions, including nesting.
+    assert_ast_probe(exe, "fn mk() -> i64 = { a: 1, b: 2 }");
+    assert_ast_probe(exe, "fn arr() -> i64 = [1, 2, 3]");
+    assert_ast_probe(exe, "fn one() -> i64 = [42]");
+    assert_ast_probe(exe, "fn fill() -> i64 = [0x0; 64]");
+    assert_ast_probe(exe, "fn nested() -> i64 = { a: [1, 2], b: { c: 3 } }");
+    // The SHA-256 example, parsed byte-for-byte.
+    let source = std::fs::read_to_string("examples/v3/sha256.cdb").unwrap();
+    assert_ast_probe(exe, &source);
+}
+
+#[test]
 fn sha256_matches_reference_across_lengths_and_blocks() {
     // The content-addressing keystone (SPEC_V3 §5): the self-hosted hasher must
     // compute SHA-256 of arbitrary bytes byte-for-byte like the reference, or the

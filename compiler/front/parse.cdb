@@ -556,6 +556,67 @@ fn parse_loop_tail(mem: string, h: u32, p: i64, len: i64) -> PS =
   let tdo: Tok = lex1(cond.mem, cond.p, len) in
   parse_expr(tdo.mem, cond.h, tdo.nxt, len)
 
+// A record literal `{ name: value, ... }` at `p` (just after `{`), through `}`.
+// Folds byte(22) then [1, text(name), expr(value)]* then 0 (the AstProbe Record).
+fn parse_record_lit(mem: string, h: u32, p: i64, len: i64) -> PS =
+  let h0: u32 = fnv_step(h, 22) in
+  let done: LpS =
+    loop a = { mem: mem, h: h0, p: p, go: true } while a.go do
+      let cur: LpS = a in
+      let t: Tok = lex1(cur.mem, cur.p, len) in
+      let rrb: SBool = is_sym1(t.mem, t.ts, t.te, t.kind, 125) in
+      let m1: string = rrb.mem in
+      if rrb.yes then
+        (let s: LpS = { mem: m1, h: cur.h, p: t.nxt, go: false } in s)
+      else
+        let h1: u32 = fnv_step(cur.h, 1) in
+        let hn: HF = fblob_range(m1, t.ts, t.te, h1) in
+        let tc: Tok = lex1(hn.mem, t.nxt, len) in
+        let v: PS = parse_expr(tc.mem, hn.hash, tc.nxt, len) in
+        let tnext: Tok = lex1(v.mem, v.p, len) in
+        let rcomma: SBool = is_sym1(tnext.mem, tnext.ts, tnext.te, tnext.kind, 44) in
+        let m2: string = rcomma.mem in
+        if rcomma.yes then
+          (let s: LpS = { mem: m2, h: v.h, p: tnext.nxt, go: true } in s)
+        else (let s: LpS = { mem: m2, h: v.h, p: tnext.nxt, go: false } in s)
+  in
+  let r: PS = { mem: done.mem, h: fnv_step(done.h, 0), p: done.p } in r
+
+// An array literal `[e, ...]` or repeat `[value; count]` at `p` (just after `[`),
+// through `]`. Array folds expr(elem0), byte(19), [1, expr]* (the rest), 0; fill
+// folds expr(value), byte(20), text(count) (the AstProbe Array / ArrayFill).
+fn parse_array_lit(mem: string, h: u32, p: i64, len: i64) -> PS =
+  let first: PS = parse_expr(mem, h, p, len) in
+  let t: Tok = lex1(first.mem, first.p, len) in
+  let rsemi: SBool = is_sym1(t.mem, t.ts, t.te, t.kind, 59) in
+  let m1: string = rsemi.mem in
+  if rsemi.yes then
+    let h1: u32 = fnv_step(first.h, 20) in
+    let tc: Tok = lex1(m1, t.nxt, len) in
+    let hc: HF = fblob_range(tc.mem, tc.ts, tc.te, h1) in
+    let trb: Tok = lex1(hc.mem, tc.nxt, len) in
+    let r: PS = { mem: trb.mem, h: hc.hash, p: trb.nxt } in r
+  else
+    let h1: u32 = fnv_step(first.h, 19) in
+    let rrb: SBool = is_sym1(m1, t.ts, t.te, t.kind, 93) in
+    let m2: string = rrb.mem in
+    if rrb.yes then
+      (let r: PS = { mem: m2, h: fnv_step(h1, 0), p: t.nxt } in r)
+    else
+      let done: LpS =
+        loop a = { mem: m2, h: h1, p: t.nxt, go: true } while a.go do
+          let cur: LpS = a in
+          let h2: u32 = fnv_step(cur.h, 1) in
+          let e: PS = parse_expr(cur.mem, h2, cur.p, len) in
+          let tn: Tok = lex1(e.mem, e.p, len) in
+          let rrb2: SBool = is_sym1(tn.mem, tn.ts, tn.te, tn.kind, 93) in
+          let m3: string = rrb2.mem in
+          if rrb2.yes then
+            (let s: LpS = { mem: m3, h: e.h, p: tn.nxt, go: false } in s)
+          else (let s: LpS = { mem: m3, h: e.h, p: tn.nxt, go: true } in s)
+      in
+      let r: PS = { mem: done.mem, h: fnv_step(done.h, 0), p: done.p } in r
+
 // Parse the comma-separated call arguments at `p` (just after `(`), through the
 // closing `)`. Folds [1, arg]* then 0 (the AstProbe Call argument list).
 fn parse_args(mem: string, h: u32, p: i64, len: i64) -> PS =
@@ -686,22 +747,30 @@ fn parse_primary(mem: string, h: u32, p: i64, len: i64) -> PS =
             // a parameter name or a field-access chain (re-walk the path)
             fold_path_fields(mp, h, p, len)
   else
-    // a symbol primary: `(` for unit or a parenthesized expression
-    let rlp: SBool = is_sym1(m, t.ts, t.te, t.kind, 40) in
-    let m0: string = rlp.mem in
-    if rlp.yes then
-      let t2: Tok = lex1(m0, t.nxt, len) in
-      let rrp: SBool = is_sym1(t2.mem, t2.ts, t2.te, t2.kind, 41) in
-      let m2: string = rrp.mem in
-      if rrp.yes then
-        (let r: PS = { mem: m2, h: fnv_step(h, 5), p: t2.nxt } in r)
-      else
-        let inner: PS = parse_expr(m2, h, t.nxt, len) in
-        let t3: Tok = lex1(inner.mem, inner.p, len) in
-        let r: PS = { mem: t3.mem, h: inner.h, p: t3.nxt } in r
+    // a symbol primary: record literal `{`, array/fill `[`, or `(` unit/paren
+    let rlc: SBool = is_sym1(m, t.ts, t.te, t.kind, 123) in
+    let mc: string = rlc.mem in
+    if rlc.yes then parse_record_lit(mc, h, t.nxt, len)
     else
-      // unsupported primary at this rung; consume one token to make progress
-      (let r: PS = { mem: m0, h: h, p: t.nxt } in r)
+      let rlbk: SBool = is_sym1(mc, t.ts, t.te, t.kind, 91) in
+      let mb: string = rlbk.mem in
+      if rlbk.yes then parse_array_lit(mb, h, t.nxt, len)
+      else
+        let rlp: SBool = is_sym1(mb, t.ts, t.te, t.kind, 40) in
+        let m0: string = rlp.mem in
+        if rlp.yes then
+          let t2: Tok = lex1(m0, t.nxt, len) in
+          let rrp: SBool = is_sym1(t2.mem, t2.ts, t2.te, t2.kind, 41) in
+          let m2: string = rrp.mem in
+          if rrp.yes then
+            (let r: PS = { mem: m2, h: fnv_step(h, 5), p: t2.nxt } in r)
+          else
+            let inner: PS = parse_expr(m2, h, t.nxt, len) in
+            let t3: Tok = lex1(inner.mem, inner.p, len) in
+            let r: PS = { mem: t3.mem, h: inner.h, p: t3.nxt } in r
+        else
+          // unsupported primary at this rung; consume one token to make progress
+          (let r: PS = { mem: m0, h: h, p: t.nxt } in r)
 
 // A postfix chain over a primary: `[index]` (Index) and `.field` (FieldAccess).
 fn parse_postfix(mem: string, h: u32, p: i64, len: i64) -> PS =
@@ -894,12 +963,71 @@ fn fold_module(mem: string, h: u32, modts: i64, len: i64) -> HF =
     let pr: PathR = scan_path(mem, modts, len) in
     fblob_range(pr.mem, modts, pr.pathend, h)
 
+// Parse a record/enum definition's members `{ name: type ... }` at `p` (just
+// after `{`), through `}`. Folds the AstProbe member pair-list: [1, text(name),
+// text(type)]* then 0. Members are separated by an optional `,` (source order;
+// definitions are not sorted, unlike inline record/enum types).
+fn parse_members(mem: string, h: u32, p: i64, len: i64) -> PS =
+  let done: LpS =
+    loop a = { mem: mem, h: h, p: p, go: true } while a.go do
+      let cur: LpS = a in
+      let t: Tok = lex1(cur.mem, cur.p, len) in
+      let rrb: SBool = is_sym1(t.mem, t.ts, t.te, t.kind, 125) in
+      let m1: string = rrb.mem in
+      if rrb.yes then
+        (let s: LpS = { mem: m1, h: cur.h, p: t.nxt, go: false } in s)
+      else
+        let h1: u32 = fnv_step(cur.h, 1) in
+        let hn: HF = fblob_range(m1, t.ts, t.te, h1) in
+        let tc: Tok = lex1(hn.mem, t.nxt, len) in
+        let tyr: TyR = scan_type(tc.mem, tc.nxt, len) in
+        let ht: HF = fblob_range(tyr.mem, tyr.ts0, tyr.end, hn.hash) in
+        let tcm: Tok = lex1(ht.mem, tyr.end, len) in
+        let rcomma: SBool = is_sym1(tcm.mem, tcm.ts, tcm.te, tcm.kind, 44) in
+        let m2: string = rcomma.mem in
+        if rcomma.yes then
+          (let s: LpS = { mem: m2, h: ht.hash, p: tcm.nxt, go: true } in s)
+        else (let s: LpS = { mem: m2, h: ht.hash, p: tyr.end, go: true } in s)
+  in
+  let r: PS = { mem: done.mem, h: fnv_step(done.h, 0), p: done.p } in r
+
+// A record or enum definition `record|enum Name<params> { members }` at `p` (the
+// keyword). Folds the AstProbe TypeDefinition item: byte(1), text(module),
+// text(name), region/type-param lists, kind byte (record=1/enum=2), member
+// pair-list.
+fn parse_typedef(mem: string, h: u32, p: i64, len: i64, modts: i64) -> PS =
+  let tk: Tok = lex1(mem, p, len) in
+  let rrec: SBool = tok_eq(tk.mem, tk.ts, tk.te, "record") in
+  let mk: string = rrec.mem in
+  let kindbyte: i64 = if rrec.yes then 1 else 2 in
+  let tname: Tok = lex1(mk, tk.nxt, len) in
+  let h1: u32 = fnv_step(h, 1) in
+  let hmod: HF = fold_module(tname.mem, h1, modts, len) in
+  let hnm: HF = fblob_range(hmod.mem, tname.ts, tname.te, hmod.hash) in
+  let dp: PS = parse_def_params(hnm.mem, hnm.hash, tname.nxt, len) in
+  let hk: u32 = fnv_step(dp.h, kindbyte) in
+  let tlb: Tok = lex1(dp.mem, dp.p, len) in
+  parse_members(tlb.mem, hk, tlb.nxt, len)
+
+// Dispatch one top-level/module item: a record/enum definition or a function.
+// (Externs await string-literal support.) `modts` selects the module.
+fn parse_item(mem: string, h: u32, p: i64, len: i64, modts: i64) -> PS =
+  let t0: Tok = lex1(mem, p, len) in
+  let rrec: SBool = tok_eq(t0.mem, t0.ts, t0.te, "record") in
+  let m1: string = rrec.mem in
+  if t0.kind == 1 && rrec.yes then parse_typedef(m1, h, p, len, modts)
+  else
+    let renum: SBool = tok_eq(m1, t0.ts, t0.te, "enum") in
+    let m2: string = renum.mem in
+    if t0.kind == 1 && renum.yes then parse_typedef(m2, h, p, len, modts)
+    else parse_fn_item(m2, h, p, len, modts)
+
 // One function item `fn name<params>(params) -> type [effects] = body`. Folds the
 // AstProbe Function item: byte(2), text(module), text(name), region-param list,
 // type-param list, pair_list(params), text(return), effect list, expr(body).
-// `modts` selects the module (see `fold_module`). Effects are not yet parsed at
-// this rung (folded as the empty list); pure functions match exactly.
-fn parse_item(mem: string, h: u32, p: i64, len: i64, modts: i64) -> PS =
+// `modts` selects the module (see `fold_module`). Pure functions fold the empty
+// effect list.
+fn parse_fn_item(mem: string, h: u32, p: i64, len: i64, modts: i64) -> PS =
   let tfn: Tok = lex1(mem, p, len) in
   let tname: Tok = lex1(tfn.mem, tfn.nxt, len) in
   let h1: u32 = fnv_step(h, 2) in
