@@ -451,24 +451,102 @@ fn parser_probe_matches_rust_on_strings_externs_and_the_committed_corpus() {
         exe,
         r#"extern fn malloc(size: i64) -> raw_mut_ptr<u8> abi[c] link_name "malloc""#,
     );
-    // The committed corpus files the parser now reproduces byte-for-byte
-    // (everything that does not use `case`), including the parser parsing itself.
-    for file in [
-        "std/core.cdb",
-        "std/mem.cdb",
-        "std/alloc.cdb",
-        "std/string.cdb",
-        "std/fmt.cdb",
-        "std/io.cdb",
-        "examples/v3/tokenizer.cdb",
-        "examples/v3/sha256.cdb",
-        "compiler/front/lex.cdb",
-        "compiler/front/sha256.cdb",
-        "compiler/front/parse.cdb",
-    ] {
+    // (Full committed-corpus parity is asserted by
+    // parser_probe_matches_rust_on_case_and_the_full_corpus.)
+}
+
+/// Every committed .cdb the self-hosted parser must reproduce — the full corpus.
+const PARSER_CORPUS: &[&str] = &[
+    "std/core.cdb",
+    "std/mem.cdb",
+    "std/result.cdb",
+    "std/alloc.cdb",
+    "std/string.cdb",
+    "std/fmt.cdb",
+    "std/io.cdb",
+    "examples/v3/tokenizer.cdb",
+    "examples/v3/sha256.cdb",
+    "compiler/front/lex.cdb",
+    "compiler/front/sha256.cdb",
+    "compiler/front/parse.cdb",
+    "compiler/eval/eval.cdb",
+];
+
+#[test]
+fn parser_probe_matches_rust_on_case_and_the_full_corpus() {
+    // Phase 15a.2 COMPLETE: `case` pattern matching with the bitor-terminates
+    // discipline (a top-level `|` in an arm body is the arm separator, not
+    // bitwise-OR — threaded through the expression chain as the `bt` flag). This
+    // is the last grammar piece, and with it the self-hosted parser reproduces
+    // `ast_probe` on the ENTIRE committed corpus byte-for-byte — including the
+    // 1700-line evaluator and the parser parsing itself (dogfood).
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = parser();
+    // Variant arms with bindings, integer-literal + default arms, ranges, bool
+    // arms, and a parenthesized bitwise-OR inside an arm body (which must NOT be
+    // taken as the arm separator).
+    assert_ast_probe(
+        exe,
+        "fn uw(r: IoResult) -> i64 = case r of ok(value) => value | err(code) => code",
+    );
+    assert_ast_probe(exe, "fn d(n: i64) -> i64 = case n of 1 => 10 | 2 => 20 | _ => 0");
+    assert_ast_probe(
+        exe,
+        "fn rg(n: i64) -> i64 = case n of 0..10 => 1 | 10..=20 => 2 | _ => 3",
+    );
+    assert_ast_probe(exe, "fn bl(b: bool) -> i64 = case b of true => 1 | false => 0");
+    assert_ast_probe(
+        exe,
+        "fn bor(x: u32, y: u32) -> u32 = case x of 7 => (x | y) | _ => 0",
+    );
+    // The whole committed corpus, parsed byte-for-byte.
+    for file in PARSER_CORPUS {
         let source = std::fs::read_to_string(file).unwrap_or_else(|_| panic!("read {file}"));
         assert_ast_probe(exe, &source);
     }
+}
+
+#[test]
+fn the_committed_parser_view_passes_the_checked_view_gate() {
+    // SPEC_V3 §11: the committed compiler/front/parse.cdb is a checked view. Like
+    // the lexer's gate, the parser's build is a two-import bootstrap (std/fmt.cdb +
+    // parse.cdb); one consolidation must reach a byte-stable canonical projection
+    // and a reproduced root hash.
+    let temp = tempdir().unwrap();
+    let db1 = temp.path().join("pv1.sqlite");
+    run(&["init", path(&db1)]);
+    run(&["import", path(&db1), "std/fmt.cdb"]);
+    run(&["import", path(&db1), "compiler/front/parse.cdb"]);
+    run(&["verify", path(&db1)]);
+    let export1 = temp.path().join("pv1.cdb");
+    run(&["export", path(&db1), "--branch", "main", "--out", path(&export1)]);
+
+    let db2 = temp.path().join("pv2.sqlite");
+    run(&["init", path(&db2)]);
+    run(&["import", path(&db2), path(&export1)]);
+    run(&["verify", path(&db2)]);
+    let export2 = temp.path().join("pv2.cdb");
+    run(&["export", path(&db2), "--branch", "main", "--out", path(&export2)]);
+
+    let db3 = temp.path().join("pv3.sqlite");
+    run(&["init", path(&db3)]);
+    run(&["import", path(&db3), path(&export2)]);
+    let export3 = temp.path().join("pv3.cdb");
+    run(&["export", path(&db3), "--branch", "main", "--out", path(&export3)]);
+
+    let text2 = std::fs::read(&export2).unwrap();
+    let text3 = std::fs::read(&export3).unwrap();
+    assert_eq!(text2, text3, "canonical projection is byte-stable");
+    let root = |db: &Path| {
+        let history = run(&["history", path(db), "--json"]);
+        serde_json::from_str::<serde_json::Value>(&history).unwrap()["root_hash"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(root(&db2), root(&db3), "root hash is a fixpoint");
 }
 
 #[test]

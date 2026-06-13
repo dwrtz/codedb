@@ -643,32 +643,148 @@ fn parse_effects(mem: string, h: u32, p: i64, len: i64) -> PS =
 
 // `fold item in target with acc = init do body`. Folds byte(17), text(item),
 // expr(target), text(acc), expr(init), expr(body).
-fn parse_fold_tail(mem: string, h: u32, p: i64, len: i64) -> PS =
+fn parse_fold_tail(mem: string, h: u32, p: i64, len: i64, bt: i64) -> PS =
   let h1: u32 = fnv_step(h, 17) in
   let titem: Tok = lex1(mem, p, len) in
   let hi: HF = fblob_range(titem.mem, titem.ts, titem.te, h1) in
   let tin: Tok = lex1(hi.mem, titem.nxt, len) in
-  let tgt: PS = parse_expr(tin.mem, hi.hash, tin.nxt, len) in
+  let tgt: PS = parse_expr(tin.mem, hi.hash, tin.nxt, len, bt) in
   let twith: Tok = lex1(tgt.mem, tgt.p, len) in
   let tacc: Tok = lex1(twith.mem, twith.nxt, len) in
   let ha: HF = fblob_range(tacc.mem, tacc.ts, tacc.te, tgt.h) in
   let teq: Tok = lex1(ha.mem, tacc.nxt, len) in
-  let init: PS = parse_expr(teq.mem, ha.hash, teq.nxt, len) in
+  let init: PS = parse_expr(teq.mem, ha.hash, teq.nxt, len, bt) in
   let tdo: Tok = lex1(init.mem, init.p, len) in
-  parse_expr(tdo.mem, init.h, tdo.nxt, len)
+  parse_expr(tdo.mem, init.h, tdo.nxt, len, bt)
 
 // `loop acc = init while cond do body`. Folds byte(18), text(acc), expr(init),
 // expr(cond), expr(body).
-fn parse_loop_tail(mem: string, h: u32, p: i64, len: i64) -> PS =
+fn parse_loop_tail(mem: string, h: u32, p: i64, len: i64, bt: i64) -> PS =
   let h1: u32 = fnv_step(h, 18) in
   let tacc: Tok = lex1(mem, p, len) in
   let ha: HF = fblob_range(tacc.mem, tacc.ts, tacc.te, h1) in
   let teq: Tok = lex1(ha.mem, tacc.nxt, len) in
-  let init: PS = parse_expr(teq.mem, ha.hash, teq.nxt, len) in
+  let init: PS = parse_expr(teq.mem, ha.hash, teq.nxt, len, bt) in
   let twhile: Tok = lex1(init.mem, init.p, len) in
-  let cond: PS = parse_expr(twhile.mem, init.h, twhile.nxt, len) in
+  let cond: PS = parse_expr(twhile.mem, init.h, twhile.nxt, len, bt) in
   let tdo: Tok = lex1(cond.mem, cond.p, len) in
-  parse_expr(tdo.mem, cond.h, tdo.nxt, len)
+  parse_expr(tdo.mem, cond.h, tdo.nxt, len, bt)
+
+// Fold a case arm's optional `if <guard>` (R14): byte(1)+expr(guard) when present,
+// else byte(0) with the cursor unchanged. The guard is in arm context (bt=1).
+fn parse_guard(mem: string, h: u32, p: i64, len: i64) -> PS =
+  let t: Tok = lex1(mem, p, len) in
+  let rif: SBool = tok_eq(t.mem, t.ts, t.te, "if") in
+  let m: string = rif.mem in
+  if t.kind == 1 && rif.yes then
+    (let h1: u32 = fnv_step(h, 1) in parse_expr(m, h1, t.nxt, len, 1))
+  else (let r: PS = { mem: m, h: fnv_step(h, 0), p: p } in r)
+
+// The shared tail of every case arm: the optional guard, the (absent at this
+// rung) nested payload-pattern, `=>`, and the body. The body always parses in
+// arm context (bt=1) so a top-level `|` ends it as the arm separator.
+fn arm_tail(mem: string, h: u32, p: i64, len: i64) -> PS =
+  let g: PS = parse_guard(mem, h, p, len) in
+  let h1: u32 = fnv_step(g.h, 0) in
+  let tarrow: Tok = lex1(g.mem, g.p, len) in
+  parse_expr(tarrow.mem, h1, tarrow.nxt, len, 1)
+
+// Parse and fold one case arm (the AstProbe RawCaseArm: opt variant, opt literal,
+// opt range, default flag, opt binding, guard, opt payload pattern, body). Handles
+// default (`_`/`else`/`default`), scalar literal (int + range, bool), and variant
+// arms (with an optional `(binding)` or `(_)`). Nested payload patterns and
+// negative-bound ranges are not used by the committed corpus and are not handled.
+fn parse_arm(mem: string, h: u32, p: i64, len: i64) -> PS =
+  let t: Tok = lex1(mem, p, len) in
+  let r1: SBool = tok_eq(t.mem, t.ts, t.te, "_") in
+  let m1: string = r1.mem in
+  let r2: SBool = tok_eq(m1, t.ts, t.te, "else") in
+  let m2: string = r2.mem in
+  let r3: SBool = tok_eq(m2, t.ts, t.te, "default") in
+  let m3: string = r3.mem in
+  if t.kind == 1 && (r1.yes || r2.yes || r3.yes) then
+    // default/wildcard arm
+    let h1: u32 = fnv_step(fnv_step(fnv_step(h, 0), 0), 0) in
+    let h4: u32 = fnv_step(h1, 1) in
+    let h5: u32 = fnv_step(h4, 0) in
+    arm_tail(m3, h5, t.nxt, len)
+  else if t.kind == 2 then
+    let tdots: Tok = lex1(m3, t.nxt, len) in
+    let rdots: SBool = is_sym2(tdots.mem, tdots.ts, tdots.te, tdots.kind, 46 * 256 + 46) in
+    let md: string = rdots.mem in
+    if rdots.yes then
+      // range pattern `lo..hi` / `lo..=hi`
+      let teqi: Tok = lex1(md, tdots.nxt, len) in
+      let riq: SBool = is_sym1(teqi.mem, teqi.ts, teqi.te, teqi.kind, 61) in
+      let mi: string = riq.mem in
+      let incl: i64 = if riq.yes then 1 else 0 in
+      let hipos: i64 = if riq.yes then teqi.nxt else tdots.nxt in
+      let h3: u32 = fnv_step(fnv_step(fnv_step(h, 0), 0), 1) in
+      let hlo: HF = fblob_range(mi, t.ts, t.te, fnv_step(h3, 1)) in
+      let thi: Tok = lex1(hlo.mem, hipos, len) in
+      let hhi: HF = fblob_range(thi.mem, thi.ts, thi.te, fnv_step(hlo.hash, 1)) in
+      let h6: u32 = fnv_step(fnv_step(fnv_step(hhi.hash, incl), 0), 0) in
+      arm_tail(hhi.mem, h6, thi.nxt, len)
+    else
+      // plain integer literal pattern
+      let h2: u32 = fnv_step(fnv_step(h, 0), 1) in
+      let hlit: HF = fblob_range(md, t.ts, t.te, fnv_step(h2, 1)) in
+      let h5: u32 = fnv_step(fnv_step(fnv_step(hlit.hash, 0), 0), 0) in
+      arm_tail(hlit.mem, h5, t.nxt, len)
+  else if t.kind == 1 then
+    let rtrue: SBool = tok_eq(m3, t.ts, t.te, "true") in
+    let mt: string = rtrue.mem in
+    let rfalse: SBool = tok_eq(mt, t.ts, t.te, "false") in
+    let mf: string = rfalse.mem in
+    if rtrue.yes || rfalse.yes then
+      // bool literal pattern
+      let bit: i64 = if rtrue.yes then 1 else 0 in
+      let h2: u32 = fnv_step(fnv_step(h, 0), 1) in
+      let h2b: u32 = fnv_step(fnv_step(h2, 2), bit) in
+      let h5: u32 = fnv_step(fnv_step(fnv_step(h2b, 0), 0), 0) in
+      arm_tail(mf, h5, t.nxt, len)
+    else
+      // variant arm
+      let h1: u32 = fnv_step(h, 1) in
+      let hv: HF = fblob_range(mf, t.ts, t.te, h1) in
+      let h4: u32 = fnv_step(fnv_step(fnv_step(hv.hash, 0), 0), 0) in
+      let tp: Tok = lex1(hv.mem, t.nxt, len) in
+      let rlp: SBool = is_sym1(tp.mem, tp.ts, tp.te, tp.kind, 40) in
+      let mp: string = rlp.mem in
+      if rlp.yes then
+        let ti: Tok = lex1(mp, tp.nxt, len) in
+        let rus: SBool = tok_eq(ti.mem, ti.ts, ti.te, "_") in
+        let mi: string = rus.mem in
+        let trp: Tok = lex1(mi, ti.nxt, len) in
+        if ti.kind == 1 && rus.yes then
+          (let h5: u32 = fnv_step(h4, 0) in arm_tail(trp.mem, h5, trp.nxt, len))
+        else
+          let h5: u32 = fnv_step(h4, 1) in
+          let hb: HF = fblob_range(trp.mem, ti.ts, ti.te, h5) in
+          arm_tail(hb.mem, hb.hash, trp.nxt, len)
+      else (let h5: u32 = fnv_step(h4, 0) in arm_tail(mp, h5, t.nxt, len))
+  else (let r: PS = { mem: m3, h: h, p: t.nxt } in r)
+
+// `case scrutinee of arm | arm | ...`. Folds byte(25), expr(scrutinee), then
+// [1, arm]* and a trailing 0 (the AstProbe Case). The scrutinee carries the
+// incoming bt; each arm body parses with bt=1 so a top-level `|` is the separator.
+fn parse_case_tail(mem: string, h: u32, p: i64, len: i64, bt: i64) -> PS =
+  let h1: u32 = fnv_step(h, 25) in
+  let scrut: PS = parse_expr(mem, h1, p, len, bt) in
+  let tof: Tok = lex1(scrut.mem, scrut.p, len) in
+  let done: LpS =
+    loop a = { mem: tof.mem, h: scrut.h, p: tof.nxt, go: true } while a.go do
+      let cur: LpS = a in
+      let ha: u32 = fnv_step(cur.h, 1) in
+      let arm: PS = parse_arm(cur.mem, ha, cur.p, len) in
+      let tb: Tok = lex1(arm.mem, arm.p, len) in
+      let rbar: SBool = is_sym1(tb.mem, tb.ts, tb.te, tb.kind, 124) in
+      let mb: string = rbar.mem in
+      if rbar.yes then
+        (let s: LpS = { mem: mb, h: arm.h, p: tb.nxt, go: true } in s)
+      else (let s: LpS = { mem: mb, h: arm.h, p: arm.p, go: false } in s)
+  in
+  let r: PS = { mem: done.mem, h: fnv_step(done.h, 0), p: done.p } in r
 
 // A record literal `{ name: value, ... }` at `p` (just after `{`), through `}`.
 // Folds byte(22) then [1, text(name), expr(value)]* then 0 (the AstProbe Record).
@@ -686,7 +802,7 @@ fn parse_record_lit(mem: string, h: u32, p: i64, len: i64) -> PS =
         let h1: u32 = fnv_step(cur.h, 1) in
         let hn: HF = fblob_range(m1, t.ts, t.te, h1) in
         let tc: Tok = lex1(hn.mem, t.nxt, len) in
-        let v: PS = parse_expr(tc.mem, hn.hash, tc.nxt, len) in
+        let v: PS = parse_expr(tc.mem, hn.hash, tc.nxt, len, 0) in
         let tnext: Tok = lex1(v.mem, v.p, len) in
         let rcomma: SBool = is_sym1(tnext.mem, tnext.ts, tnext.te, tnext.kind, 44) in
         let m2: string = rcomma.mem in
@@ -700,7 +816,7 @@ fn parse_record_lit(mem: string, h: u32, p: i64, len: i64) -> PS =
 // through `]`. Array folds expr(elem0), byte(19), [1, expr]* (the rest), 0; fill
 // folds expr(value), byte(20), text(count) (the AstProbe Array / ArrayFill).
 fn parse_array_lit(mem: string, h: u32, p: i64, len: i64) -> PS =
-  let first: PS = parse_expr(mem, h, p, len) in
+  let first: PS = parse_expr(mem, h, p, len, 0) in
   let t: Tok = lex1(first.mem, first.p, len) in
   let rsemi: SBool = is_sym1(t.mem, t.ts, t.te, t.kind, 59) in
   let m1: string = rsemi.mem in
@@ -721,7 +837,7 @@ fn parse_array_lit(mem: string, h: u32, p: i64, len: i64) -> PS =
         loop a = { mem: m2, h: h1, p: t.nxt, go: true } while a.go do
           let cur: LpS = a in
           let h2: u32 = fnv_step(cur.h, 1) in
-          let e: PS = parse_expr(cur.mem, h2, cur.p, len) in
+          let e: PS = parse_expr(cur.mem, h2, cur.p, len, 0) in
           let tn: Tok = lex1(e.mem, e.p, len) in
           let rrb2: SBool = is_sym1(tn.mem, tn.ts, tn.te, tn.kind, 93) in
           let m3: string = rrb2.mem in
@@ -744,7 +860,7 @@ fn parse_args(mem: string, h: u32, p: i64, len: i64) -> PS =
       loop a = { mem: m, h: h, p: p, go: true } while a.go do
         let cur: LpS = a in
         let h1: u32 = fnv_step(cur.h, 1) in
-        let e: PS = parse_expr(cur.mem, h1, cur.p, len) in
+        let e: PS = parse_expr(cur.mem, h1, cur.p, len, 0) in
         let tt: Tok = lex1(e.mem, e.p, len) in
         let rp2: SBool = is_sym1(tt.mem, tt.ts, tt.te, tt.kind, 41) in
         let m2: string = rp2.mem in
@@ -858,7 +974,7 @@ fn parse_primary(mem: string, h: u32, p: i64, len: i64) -> PS =
           let rlp: SBool = is_sym1(tlp.mem, tlp.ts, tlp.te, tlp.kind, 40) in
           let ml: string = rlp.mem in
           if rlp.yes then
-            let val: PS = parse_expr(ml, hv.hash, tlp.nxt, len) in
+            let val: PS = parse_expr(ml, hv.hash, tlp.nxt, len, 0) in
             let trp: Tok = lex1(val.mem, val.p, len) in
             let r: PS = { mem: trp.mem, h: val.h, p: trp.nxt } in r
           else
@@ -893,7 +1009,7 @@ fn parse_primary(mem: string, h: u32, p: i64, len: i64) -> PS =
           if rrp.yes then
             (let r: PS = { mem: m2, h: fnv_step(h, 5), p: t2.nxt } in r)
           else
-            let inner: PS = parse_expr(m2, h, t.nxt, len) in
+            let inner: PS = parse_expr(m2, h, t.nxt, len, 0) in
             let t3: Tok = lex1(inner.mem, inner.p, len) in
             let r: PS = { mem: t3.mem, h: inner.h, p: t3.nxt } in r
         else
@@ -911,7 +1027,7 @@ fn parse_postfix(mem: string, h: u32, p: i64, len: i64) -> PS =
       let m1: string = rlb.mem in
       if rlb.yes then
         let h1: u32 = fnv_step(cur.h, 21) in
-        let idx: PS = parse_expr(m1, h1, t.nxt, len) in
+        let idx: PS = parse_expr(m1, h1, t.nxt, len, 0) in
         let tr: Tok = lex1(idx.mem, idx.p, len) in
         (let s: LpS = { mem: tr.mem, h: idx.h, p: tr.nxt, go: true } in s)
       else
@@ -966,7 +1082,14 @@ fn parse_unary(mem: string, h: u32, p: i64, len: i64) -> PS =
 
 // Precedence climbing (left-associative; right operand parsed at prec+1). Detects
 // `<<`/`>>` as two adjacent `<`/`>` tokens, folding the synthesized two-byte op.
-fn parse_binary(mem: string, h: u32, p: i64, len: i64, min: i64) -> PS =
+// `mode` packs the minimum precedence (low byte) and the bitor-terminates flag
+// (bit 8): inside a `case`-arm body (bt set) a top-level `|` (prec 1) ends the
+// expression instead of parsing as bitwise-OR — the arm separator (matching the
+// Rust parser's `bitor_terminates`). The flag is preserved across the right
+// operand and reset to 0 only inside delimited primaries (parens, args, …).
+fn parse_binary(mem: string, h: u32, p: i64, len: i64, mode: i64) -> PS =
+  let realmin: i64 = mode & 255 in
+  let bt: i64 = (mode >> 8) & 1 in
   let left: PS = parse_unary(mem, h, p, len) in
   let done: LpS =
     loop a = { mem: left.mem, h: left.h, p: left.p, go: true } while a.go do
@@ -987,26 +1110,27 @@ fn parse_binary(mem: string, h: u32, p: i64, len: i64, min: i64) -> PS =
       let isShr: bool = issym && l1 == 1 && c0 == 62 && c2 == 62 in
       let prec0: i64 = op_prec_bytes(l1, c0, c1) in
       let prec: i64 = if isShl || isShr then 45 else prec0 in
-      if prec == 0 || prec < min then
+      if prec == 0 || prec < realmin || (bt == 1 && prec == 1) then
         (let s: LpS = { mem: m2, h: cur.h, p: cur.p, go: false } in s)
       else if isShl || isShr then
         let h1: u32 = fnv_step(cur.h, 9) in
         let ha: u32 = fu32(h1, 2) in
         let hb2: u32 = fnv_step(ha, c0) in
         let hop: u32 = fnv_step(hb2, c0) in
-        let right: PS = parse_binary(m2, hop, t2.nxt, len, prec + 1) in
+        let right: PS = parse_binary(m2, hop, t2.nxt, len, (prec + 1) | (bt << 8)) in
         let s: LpS = { mem: right.mem, h: right.h, p: right.p, go: true } in s
       else
         let h1: u32 = fnv_step(cur.h, 9) in
         let hb: HF = fblob_range(m2, t.ts, t.te, h1) in
-        let right: PS = parse_binary(hb.mem, hb.hash, t.nxt, len, prec + 1) in
+        let right: PS = parse_binary(hb.mem, hb.hash, t.nxt, len, (prec + 1) | (bt << 8)) in
         let s: LpS = { mem: right.mem, h: right.h, p: right.p, go: true } in s
   in
   let r: PS = { mem: done.mem, h: done.h, p: done.p } in r
 
 // `let name: type = value in body`. Folds byte(14), text(name), text(type),
-// expr(value), expr(body). The type is a full type (via `scan_type`).
-fn parse_let_tail(mem: string, h: u32, p: i64, len: i64) -> PS =
+// expr(value), expr(body). The type is a full type (via `scan_type`). `bt`
+// propagates the bitor-terminates flag (the value/body are not delimited).
+fn parse_let_tail(mem: string, h: u32, p: i64, len: i64, bt: i64) -> PS =
   let tn: Tok = lex1(mem, p, len) in
   let m: string = tn.mem in
   let h1: u32 = fnv_step(h, 14) in
@@ -1015,44 +1139,49 @@ fn parse_let_tail(mem: string, h: u32, p: i64, len: i64) -> PS =
   let tyr: TyR = scan_type(tc.mem, tc.nxt, len) in
   let ht: HF = fblob_range(tyr.mem, tyr.ts0, tyr.end, hn.hash) in
   let teq: Tok = lex1(ht.mem, tyr.end, len) in
-  let val: PS = parse_expr(teq.mem, ht.hash, teq.nxt, len) in
+  let val: PS = parse_expr(teq.mem, ht.hash, teq.nxt, len, bt) in
   let ti: Tok = lex1(val.mem, val.p, len) in
-  parse_expr(ti.mem, val.h, ti.nxt, len)
+  parse_expr(ti.mem, val.h, ti.nxt, len, bt)
 
 // `if cond then a else b`. Folds byte(15), expr(cond), expr(then), expr(else).
-fn parse_if_tail(mem: string, h: u32, p: i64, len: i64) -> PS =
+fn parse_if_tail(mem: string, h: u32, p: i64, len: i64, bt: i64) -> PS =
   let h1: u32 = fnv_step(h, 15) in
-  let cnd: PS = parse_expr(mem, h1, p, len) in
+  let cnd: PS = parse_expr(mem, h1, p, len, bt) in
   let tthen: Tok = lex1(cnd.mem, cnd.p, len) in
-  let thn: PS = parse_expr(tthen.mem, cnd.h, tthen.nxt, len) in
+  let thn: PS = parse_expr(tthen.mem, cnd.h, tthen.nxt, len, bt) in
   let telse: Tok = lex1(thn.mem, thn.p, len) in
-  parse_expr(telse.mem, thn.h, telse.nxt, len)
+  parse_expr(telse.mem, thn.h, telse.nxt, len, bt)
 
-// A full expression: `let`, `return`, `if`, or a binary/operator expression.
-fn parse_expr(mem: string, h: u32, p: i64, len: i64) -> PS =
+// A full expression: `let`, `return`, `if`, `fold`, `loop`, `case`, or a
+// binary/operator expression. `bt` is the bitor-terminates flag (see parse_binary).
+fn parse_expr(mem: string, h: u32, p: i64, len: i64, bt: i64) -> PS =
   let t: Tok = lex1(mem, p, len) in
   let m: string = t.mem in
   let rl: SBool = tok_eq(m, t.ts, t.te, "let") in
   let m1: string = rl.mem in
-  if t.kind == 1 && rl.yes then parse_let_tail(m1, h, t.nxt, len)
+  if t.kind == 1 && rl.yes then parse_let_tail(m1, h, t.nxt, len, bt)
   else
     let rr: SBool = tok_eq(m1, t.ts, t.te, "return") in
     let m2: string = rr.mem in
     if t.kind == 1 && rr.yes then
-      (let h1: u32 = fnv_step(h, 16) in parse_expr(m2, h1, t.nxt, len))
+      (let h1: u32 = fnv_step(h, 16) in parse_expr(m2, h1, t.nxt, len, bt))
     else
       let ri: SBool = tok_eq(m2, t.ts, t.te, "if") in
       let m3: string = ri.mem in
-      if t.kind == 1 && ri.yes then parse_if_tail(m3, h, t.nxt, len)
+      if t.kind == 1 && ri.yes then parse_if_tail(m3, h, t.nxt, len, bt)
       else
         let rfo: SBool = tok_eq(m3, t.ts, t.te, "fold") in
         let m4: string = rfo.mem in
-        if t.kind == 1 && rfo.yes then parse_fold_tail(m4, h, t.nxt, len)
+        if t.kind == 1 && rfo.yes then parse_fold_tail(m4, h, t.nxt, len, bt)
         else
           let rlo: SBool = tok_eq(m4, t.ts, t.te, "loop") in
           let m5: string = rlo.mem in
-          if t.kind == 1 && rlo.yes then parse_loop_tail(m5, h, t.nxt, len)
-          else parse_binary(m5, h, p, len, 0)
+          if t.kind == 1 && rlo.yes then parse_loop_tail(m5, h, t.nxt, len, bt)
+          else
+            let rca: SBool = tok_eq(m5, t.ts, t.te, "case") in
+            let m6: string = rca.mem in
+            if t.kind == 1 && rca.yes then parse_case_tail(m6, h, t.nxt, len, bt)
+            else parse_binary(m6, h, p, len, bt << 8)
 
 // Parse the `name: type` parameter list at `p` (just after `(`), through `)`.
 // Folds [1, text(name), text(type)]* then 0 (the AstProbe param pair list).
@@ -1258,10 +1387,10 @@ fn parse_fn_item(mem: string, h: u32, p: i64, len: i64, modts: i64) -> PS =
   if teff.kind == 1 && reff.yes then
     let ef: PS = parse_effects(meff, hrt.hash, teff.nxt, len) in
     let teq: Tok = lex1(ef.mem, ef.p, len) in
-    parse_expr(teq.mem, ef.h, teq.nxt, len)
+    parse_expr(teq.mem, ef.h, teq.nxt, len, 0)
   else
     let heff: u32 = fnv_step(hrt.hash, 0) in
-    parse_expr(meff, heff, teff.nxt, len)
+    parse_expr(meff, heff, teff.nxt, len, 0)
 
 // Parse a `module path { items }` block, folding every item with the module's
 // name and returning the running digest, cursor, and item count.

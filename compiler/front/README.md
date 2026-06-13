@@ -20,21 +20,27 @@ importer cannot self-host until the language computes SHA-256); the example
 `examples/v3/sha256.cdb` proved only the fixed "abc" block, so this generalizes it
 (ingestion, padding, multi-block chaining, hex).
 
-The self-hosted parser has started landing too (15a.2). `parse.cdb` reads source
-from stdin, parses it with recursive descent (lex-on-demand: `lex1` returns the
-next token's geometry without a separate token buffer), and prints the AST-shape
+The self-hosted parser is now complete (15a.2). `parse.cdb` reads source from
+stdin, parses it with recursive descent (lex-on-demand: `lex1` returns the next
+token's geometry without a separate token buffer), and prints the AST-shape
 probe `items <count> ast32 <digest>`, byte-equal to the Rust reference
-`codedb::ast_probe` (`emit-ast <file>`). The probe folds an FNV-1a-32 over a
-STREAMING traversal of the AST — keyword-led forms pre-order, infix `Binary`
-post-order via precedence climbing, lists sentinel-encoded, blobs
-length-prefixed — so a streaming parser reproduces it without buffering. This
-increment covers the EXPRESSION CORE over scalar pure functions: i64/bool
-literals, parameter names, calls, the full operator set with precedence (incl.
-`<<`/`>>` as two `<`/`>` tokens), prefix unary, parentheses/unit, and
-`let`/`if`/`return`, plus multi-item programs and comments. Staged follow-on:
-strings/records/arrays/enums/field-index/fold-loop-case/borrows, the type
-normalizer (non-scalar types), modules, generics, and effects — then the object
-builder (15a.3).
+`codedb::ast_probe` (`emit-ast <file>`) on the ENTIRE committed corpus — all of
+`std/*`, both `examples/v3/*`, the 1700-line `compiler/eval/eval.cdb`, and the
+parser parsing itself. The committed source passes the §11 checked-view gate.
+The probe folds an FNV-1a-32 over a STREAMING traversal of the AST — keyword-led
+forms pre-order, infix `Binary`/postfix `Index`/`FieldAccess` post-order via
+precedence climbing, lists sentinel-encoded, blobs length-prefixed — so a
+streaming parser reproduces it without buffering. The full grammar is covered:
+the expression core (literals incl. strings/byte-strings, parameter names, calls,
+all operators with precedence incl. `<<`/`>>`, prefix unary, parens/unit),
+dotted paths (call/enum/field-access), postfix index/field, borrows, records,
+arrays + `[v; n]` fills, enum construction, `let`/`if`/`return`/`fold`/`loop`,
+`case` patterns (variant/literal/range/bool/default, with the bitor-terminates
+discipline), the type normalizer (references, box/vec/slice/array/raw_ptr and
+generics, written canonically), modules, region/type parameters, effects (deduped
+and ordinal-sorted), record/enum definitions, and external functions. Next:
+15a.3, the object builder (parsed items → canonical-JSON object payloads + birth
+identity → object-hash equality, with root-hash equality alongside 15b).
 
 The object-hash wrapper is landed on top of it: the `obj_hash` entry of
 `sha256.cdb` reads `kind\nschema\npayload` and frames `OBJECT_DOMAIN || kind || \0

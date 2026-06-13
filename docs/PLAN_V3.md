@@ -1110,12 +1110,15 @@ a recursive generic threading a generic-typed value, are supported.)
 Goal: express the front half of the compiler as CodeDB objects and meet the Rust
 native backend at the lowered-IR seam — the mixed compiler.
 
-Status: in progress — sub-stages 15a.0 (oracle substrate), 15a.1 (lexer), and the
-15a.3 SHA-256 keystone are landed; 15a.2 (parser) is partly landed (the oracle +
-the expression core) with the rest of the grammar plus the object builder still
-to come; 15b–15e are planned. Self-hosts rung A. Depends on Phases 6, 7, 9–14
-(all complete) and the Phase 8 CIR artifact (rung A produces the CIR that rung 0
-consumes — the two meet at the same flat binary).
+Status: in progress — sub-stages 15a.0 (oracle substrate), 15a.1 (lexer), 15a.2
+(parser), and the 15a.3 SHA-256 keystone are landed; the 15a.3 object builder
+plus 15b–15e are planned. The self-hosted parser (`compiler/front/parse.cdb`)
+now reproduces `ast_probe` on the ENTIRE committed corpus byte-for-byte — all of
+`std/*`, both `examples/v3/*`, the 1700-line `compiler/eval/eval.cdb`, and the
+parser parsing itself — and the committed source passes the §11 checked-view
+gate, so source → AST self-hosts. Self-hosts rung A. Depends on Phases 6, 7,
+9–14 (all complete) and the Phase 8 CIR artifact (rung A produces the CIR that
+rung 0 consumes — the two meet at the same flat binary).
 
 Scope note on the importer's object-hash/root oracle (15a.3): the importer's
 stored objects are TYPED — an `Expression` object carries its resolved `type`
@@ -1201,19 +1204,31 @@ is the self-hosted parser: lex-on-demand (`lex1` returns the next token's
 geometry with no separate token buffer), recursive descent threading the
 move-only memory by move, precedence climbing matching op_registry (incl.
 `<<`/`>>` as two `<`/`>` tokens). Its probe is byte-equal to `ast_probe` on the
-EXPRESSION CORE — scalar pure functions: literals, parameter names, calls, the
-full operator set with precedence, prefix unary, parentheses/unit, and
-`let`/`if`/`return`, plus multi-item programs and comments. Still to come on the
-parser: strings/records/arrays/enums/field-index/fold-loop-case/borrows, the
-type normalizer (non-scalar types), modules, generics, and effects.
+ENTIRE committed corpus. The full grammar self-hosts: the expression core
+(literals incl. string/byte-string, parameter names, calls, all operators with
+precedence, prefix unary, parens/unit), dotted paths (call/enum/field-access
+chains), postfix index/field, borrows, records, arrays + `[v; n]` fills, enum
+construction, `let`/`if`/`return`/`fold`/`loop`, `case` patterns
+(variant/literal/range/bool/default with the bitor-terminates discipline — a
+top-level `|` in an arm body is the arm separator, threaded as the `bt` flag),
+the type normalizer (references, box/vec/slice/array/raw_ptr, generics — folding
+the canonical source extent, since the corpus is written canonically), modules,
+region/type parameters, effects (deduped + ordinal-sorted), record/enum
+definitions, and externals. A few v0-backend realities were handled: helpers that
+read the move-only string thread it back through a record (`is_sym1`/`is_sym2`/
+`tok_eq`) rather than consuming it; `is_sym2` packs its two target bytes into one
+parameter to stay within the 6-machine-parameter budget; and `parse_binary`'s
+`min` parameter was widened to a `mode` packing the bitor-terminates flag (so no
+new parameter is added).
 
-`tests/selfhost_frontend.rs` is the gate (9 tests: lexer × full corpus, the §11
-checked-view gate, emit-objects determinism, SHA-256 × lengths/blocks, obj_hash
-× real objects, ast_probe corpus coverage + discrimination, and the .cdb parser
-× the expression core). Still planned: the rest of the parser grammar (15a.2
-cont.); the object builder (parsed items → canonical-JSON object payloads in the
-importer's deterministic order) + migration/birth identity → object-hash and (with
-15b) root-hash equality (15a.3); then 15b–15e.
+`tests/selfhost_frontend.rs` is the gate (16 tests: lexer × full corpus, the
+lexer §11 checked-view gate, emit-objects determinism, SHA-256 × lengths/blocks,
+obj_hash × real objects, ast_probe corpus coverage + discrimination, the .cdb
+parser across seven feature increments AND the full committed corpus, and the
+parser §11 checked-view gate). Still planned: the object builder (parsed items →
+canonical-JSON object payloads in the importer's deterministic order) +
+migration/birth identity → object-hash and (with 15b) root-hash equality
+(15a.3); then 15b–15e.
 
 Sub-stages (each independently oracle-checked at its artifact):
 
