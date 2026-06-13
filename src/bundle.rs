@@ -101,6 +101,33 @@ struct BundleArtifact {
 }
 
 impl CodeDb {
+    /// Dump the object closure reachable from `root_hash` as a deterministic,
+    /// `.cdb`-comparable text artifact: one tab-separated
+    /// `<hash>\t<kind>\t<schema_version>\t<canonical_payload>` line per object,
+    /// sorted by hash, then a trailing `root <root_hash>` line. This is the
+    /// determinism-oracle reference the self-hosted importer's objects and root
+    /// hash are checked against (docs/PLAN_V3.md Phase 15a). `bundle_object_closure`
+    /// already proves every payload is canonical and rehashes to its hash, so the
+    /// dump carries exactly the canonical bytes the `.cdb` importer must reproduce.
+    pub fn export_objects_root(&self, root_hash: &str) -> Result<String> {
+        self.load_root(root_hash)
+            .with_context(|| format!("object dump root is not a valid program root: {root_hash}"))?;
+        let mut objects = self.bundle_object_closure(&BTreeSet::from([root_hash.to_string()]))?;
+        objects.sort_by(|a, b| a.hash.cmp(&b.hash));
+        let mut out = String::new();
+        for object in &objects {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\n",
+                object.hash,
+                object.kind,
+                object.schema_version,
+                canonical_json(&object.payload),
+            ));
+        }
+        out.push_str(&format!("root {root_hash}\n"));
+        Ok(out)
+    }
+
     pub fn export_bundle_root(
         &self,
         root_hash: &str,

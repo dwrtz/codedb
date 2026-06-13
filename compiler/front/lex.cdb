@@ -1,0 +1,258 @@
+// compiler/front/lex.cdb - the self-hosted lexer probe (ladder rung A, stage 15a.1).
+//
+// The first .cdb increment of the self-hosted front-end (docs/PLAN_V3.md Phase 15).
+// It reads a source file from STDIN, tokenizes it exactly like the Rust lexer
+// (src/expr.rs `lex`), and prints the determinism-oracle PROBE of the token
+// stream:
+//
+//   tokens <count> fnv32 <digest>
+//
+// `digest` is the FNV-1a-32 over, for each token in stream order, its KIND byte
+// (Ident=1, Number=2, String=3, ByteString=4, Comment=5, Symbol=6, Eof=7)
+// followed by its TEXT bytes (the raw source slice for ident/number/symbol/
+// comment; nothing for Eof). The Rust reference `codedb::token_probe` folds the
+// identical sequence, so the two agree byte-for-byte and the probe is the gate
+// (tests/selfhost_frontend.rs). This mirrors the Phase 8 loader's five-number
+// probe: a small digest that is wrong unless the whole walk is right.
+//
+// Scope of THIS increment: the minimal lexer corpus is ASCII and carries no
+// string/byte-string literals, so a token's text is always a direct source
+// slice and the byte machine (which works over bytes, not Unicode scalars)
+// matches the Rust lexer (which works over `char`s) exactly. Whitespace,
+// identifiers (incl. `_`), decimal + `0x` hex numbers, `//` comments, the
+// ten two-char symbols (`-> == != <= >= && || :: => ..`), and one-char symbols
+// are all handled. String/byte-string lexing is a documented follow-on.
+//
+// The memory string is move-only (the Phase 8 discipline): it threads by MOVE
+// through the scan accumulator and the scan/fold helpers, each returning it
+// inside a small record. Every byte read is guarded by an explicit `if p < len`
+// (the language's `&&` is strict — it evaluates both operands — so a compound
+// `p < len && get(p)` loop condition would bounds-trap at the end).
+
+module std.platform {
+extern fn write(fd: i64, ptr: raw_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "write" library "c"
+extern fn read(fd: i64, ptr: raw_mut_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "read" library "c"
+}
+
+// ---------------------------------------------------------------------------
+// records
+// ---------------------------------------------------------------------------
+
+// The stdin pump's move-only loop accumulator (the Phase 8 idiom).
+record Pump {
+  mem: string
+  more: bool
+}
+
+// The top scan loop's move-only accumulator: the memory, the cursor, the
+// running non-Eof token count, and the running FNV-1a-32 digest.
+record ScanS {
+  mem: string
+  i: i64
+  count: i64
+  hash: u32
+}
+
+// The decided geometry of one token, with the memory threaded back: the text
+// range [ts, te) to fold, the kind byte, and the next cursor position.
+record Geo {
+  mem: string
+  ts: i64
+  te: i64
+  kind: i64
+  next: i64
+}
+
+// A scan_end result: the threaded memory and the end index it walked to.
+record SE {
+  mem: string
+  end: i64
+}
+
+// A fold_bytes result: the threaded memory and the updated digest.
+record HF {
+  mem: string
+  hash: u32
+}
+
+// The inner position scan accumulator (Copy): a cursor and a keep-going flag.
+record P2 {
+  p: i64
+  go: bool
+}
+
+// The inner hash-fold accumulator (Copy): the digest and the cursor.
+record P2h {
+  h: u32
+  j: i64
+}
+
+// A stack output buffer for writing a rendered number (Copy).
+record OutBuf64 {
+  b: array<u8, 64>
+  i: i64
+}
+
+// ---------------------------------------------------------------------------
+// FNV-1a-32 (matches src/expr.rs::fnv1a32_step exactly)
+// ---------------------------------------------------------------------------
+
+fn fnv_seed() -> u32 = to_u32(0x811c9dc5)
+fn fnv_prime() -> u32 = to_u32(0x01000193)
+fn fnv_step(h: u32, b: i64) -> u32 = (h ^ to_u32(b)) * fnv_prime()
+
+// ---------------------------------------------------------------------------
+// pure byte classifiers (ASCII; mirror the Rust lexer's char classes)
+// ---------------------------------------------------------------------------
+
+fn is_ws(b: i64) -> bool = b == 32 || b == 9 || b == 10 || b == 13 || b == 11 || b == 12
+fn is_alpha(b: i64) -> bool = (b >= 97 && b <= 122) || (b >= 65 && b <= 90)
+fn is_ident_start(b: i64) -> bool = is_alpha(b) || b == 95
+fn is_alnum_us(b: i64) -> bool = is_alpha(b) || (b >= 48 && b <= 57) || b == 95
+fn is_digit(b: i64) -> bool = b >= 48 && b <= 57
+fn is_hex(b: i64) -> bool = is_digit(b) || (b >= 97 && b <= 102) || (b >= 65 && b <= 70)
+
+// The ten two-char symbols, by their byte pairs.
+fn is_two_char(a: i64, b: i64) -> bool =
+  (a == 45 && b == 62) || (a == 61 && b == 61) || (a == 33 && b == 61) ||
+  (a == 60 && b == 61) || (a == 62 && b == 61) || (a == 38 && b == 38) ||
+  (a == 124 && b == 124) || (a == 58 && b == 58) || (a == 61 && b == 62) ||
+  (a == 46 && b == 46)
+
+// ---------------------------------------------------------------------------
+// the stdin shell (the Phase 8 read_all, verbatim)
+// ---------------------------------------------------------------------------
+
+fn read_all<'r>(mem: string) -> string effects[io, state, ffi, unsafe] =
+  let bounce: array<u8, 1> = [0x0; 1] in
+  let done: Pump =
+    loop s = { mem: mem, more: true } while s.more do
+      let cur: Pump = s in
+      let m: string = cur.mem in
+      let p: raw_mut_ptr<u8> = raw_mut_ptr(&'r mut bounce[0]) in
+      let n: i64 = std.platform.read(0, p, 1) in
+      if n <= 0 then
+        let fin: Pump = { mem: m, more: false } in
+        fin
+      else
+        let pushed: unit = string_push(m, bounce[0]) in
+        let nxt: Pump = { mem: m, more: true } in
+        nxt
+  in
+  done.mem
+
+// ---------------------------------------------------------------------------
+// output: `tokens <count> fnv32 <digest>` over write(1)
+// ---------------------------------------------------------------------------
+
+fn print_static(s: slice<'static, u8>) -> i64 effects[io, ffi, unsafe] =
+  std.platform.write(1, raw_ptr(&'static s[0]), len(s))
+
+// Render a non-negative i64 as decimal (no newline) by copying its digits into
+// a stack buffer and writing them. count and the u32 digest both fit easily.
+fn print_num<'r>(n: i64) -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let s: string = std.fmt.i64_to_string(n) in
+  let ln: i64 = string_len(s) in
+  let seed: OutBuf64 = { b: [0x0; 64], i: 0 } in
+  let done: OutBuf64 =
+    loop st = seed while st.i < ln do
+      { b: array_set(st.b, st.i, string_get(s, st.i)), i: st.i + 1 }
+  in
+  let out: array<u8, 64> = done.b in
+  std.platform.write(1, raw_ptr(&'r out[0]), ln)
+
+fn print_probe(count: i64, hashv: i64) -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let a: i64 = print_static("tokens ") in
+  let b: i64 = print_num(count) in
+  let c: i64 = print_static(" fnv32 ") in
+  let d: i64 = print_num(hashv) in
+  print_static("\n")
+
+// ---------------------------------------------------------------------------
+// the lexer
+// ---------------------------------------------------------------------------
+
+// Walk [p0, len) advancing while the byte matches `mode`, then return the end
+// index (memory threaded back). mode: 0 ident-continue, 1 decimal digit,
+// 2 hex digit, 3 comment body (until a newline). The `if a.p >= len` guard
+// reads a byte only when in bounds.
+fn scan_end(mem: string, p0: i64, len: i64, mode: i64) -> SE =
+  let seed: P2 = { p: p0, go: true } in
+  let done: P2 =
+    loop a = seed while a.go do
+      if a.p >= len then (let stop: P2 = { p: a.p, go: false } in stop)
+      else
+        let b: i64 = to_i64(string_get(mem, a.p)) in
+        let cont: bool =
+          if mode == 0 then is_alnum_us(b)
+          else if mode == 1 then is_digit(b)
+          else if mode == 2 then is_hex(b)
+          else b != 10
+        in
+        if cont then (let go2: P2 = { p: a.p + 1, go: true } in go2)
+        else (let stop: P2 = { p: a.p, go: false } in stop)
+  in
+  let res: SE = { mem: mem, end: done.p } in res
+
+// Fold the FNV-1a-32 digest over the bytes [ts, te) (all in bounds).
+fn fold_bytes(mem: string, ts: i64, te: i64, h0: u32) -> HF =
+  let seed: P2h = { h: h0, j: ts } in
+  let done: P2h =
+    loop a = seed while a.j < te do
+      { h: fnv_step(a.h, to_i64(string_get(mem, a.j))), j: a.j + 1 }
+  in
+  let res: HF = { mem: mem, hash: done.h } in res
+
+// Decide the geometry of the token starting at `i` (with the next byte `b1`),
+// threading the memory back. A separate function so its value ids (the per-arm
+// scan_end / Geo temporaries) stay off the loop frame (the v0 4095-byte budget).
+fn classify(mem: string, i: i64, b: i64, b1: i64, len: i64) -> Geo =
+  if is_ident_start(b) then
+    let se: SE = scan_end(mem, i + 1, len, 0) in
+    let gv: Geo = { mem: se.mem, ts: i, te: se.end, kind: 1, next: se.end } in gv
+  else if is_digit(b) then
+    (if b == 48 && (b1 == 120 || b1 == 88) then
+       let se: SE = scan_end(mem, i + 2, len, 2) in
+       let gv: Geo = { mem: se.mem, ts: i, te: se.end, kind: 2, next: se.end } in gv
+     else
+       let se: SE = scan_end(mem, i + 1, len, 1) in
+       let gv: Geo = { mem: se.mem, ts: i, te: se.end, kind: 2, next: se.end } in gv)
+  else if b == 47 && b1 == 47 then
+    let se: SE = scan_end(mem, i + 2, len, 3) in
+    let gv: Geo = { mem: se.mem, ts: i + 2, te: se.end, kind: 5, next: se.end } in gv
+  else if is_two_char(b, b1) then
+    let gv: Geo = { mem: mem, ts: i, te: i + 2, kind: 6, next: i + 2 } in gv
+  else
+    let gv: Geo = { mem: mem, ts: i, te: i + 1, kind: 6, next: i + 1 } in gv
+
+// One scan step: skip a whitespace byte, or emit one token (folding its kind +
+// text into the digest) and advance past it. Returns the next accumulator.
+fn step(mem: string, i: i64, count: i64, h: u32, len: i64) -> ScanS =
+  let b: i64 = to_i64(string_get(mem, i)) in
+  if is_ws(b) then
+    let r: ScanS = { mem: mem, i: i + 1, count: count, hash: h } in r
+  else
+    let b1: i64 = if i + 1 < len then to_i64(string_get(mem, i + 1)) else 0 in
+    let g: Geo = classify(mem, i, b, b1, len) in
+    let h1: u32 = fnv_step(h, g.kind) in
+    let hf: HF = fold_bytes(g.mem, g.ts, g.te, h1) in
+    let r: ScanS = { mem: hf.mem, i: g.next, count: count + 1, hash: hf.hash } in r
+
+// Tokenize the memory and return the probe digest of the stream (incl. Eof).
+fn probe(mem: string) -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let len: i64 = string_len(mem) in
+  let seed: ScanS = { mem: mem, i: 0, count: 0, hash: fnv_seed() } in
+  let final: ScanS =
+    loop s = seed while s.i < len do
+      let cur: ScanS = s in
+      step(cur.mem, cur.i, cur.count, cur.hash, len)
+  in
+  let hend: u32 = fnv_step(final.hash, 7) in
+  let total: i64 = final.count + 1 in
+  print_probe(total, to_i64(hend))
+
+fn mem_cap() -> i64 = 1048576
+
+fn main<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let printed: i64 = probe(read_all(string_with_capacity(mem_cap()))) in
+  0

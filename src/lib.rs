@@ -38,7 +38,7 @@ use serde_json::json;
 pub use cir::{CIR_SCHEMA, CirEmission};
 pub use expr::{
     ExternalFunctionSource, FunctionSource, ProgramItem, RawExpr, TypeDefinitionSource, Value,
-    set_process_args,
+    set_process_args, token_probe,
 };
 pub use op_registry::operator_kinds;
 pub use store::CodeDb;
@@ -408,6 +408,13 @@ impl CodeDb {
             report.push_str(&format!("history {history}\n"));
         }
         Ok(report)
+    }
+
+    /// Dump the object closure of `branch`'s current root as the deterministic
+    /// oracle reference for the self-hosted importer (docs/PLAN_V3.md Phase 15a).
+    pub fn export_objects_branch(&self, branch: &str) -> Result<String> {
+        let root_hash = self.branch(branch)?.root_hash;
+        self.export_objects_root(&root_hash)
     }
 
     pub fn export_branch(&mut self, branch: &str) -> Result<String> {

@@ -7524,6 +7524,41 @@ fn lex(source: &str) -> Result<Vec<Token>> {
     Ok(tokens)
 }
 
+/// One FNV-1a-32 step (`(hash XOR byte) * prime`, wrapping at u32).
+fn fnv1a32_step(hash: u32, byte: u8) -> u32 {
+    (hash ^ byte as u32).wrapping_mul(0x0100_0193)
+}
+
+/// The token-stream probe digest of `source` — the determinism-oracle
+/// reference for the self-hosted lexer (`compiler/front/lex.cdb`, docs/PLAN_V3.md
+/// Phase 15a.1). The result is the line `tokens <count> fnv32 <digest>`, where
+/// `digest` is the FNV-1a-32 over, for each token in stream order, its kind byte
+/// (`Ident`=1, `Number`=2, `String`=3, `ByteString`=4, `Comment`=5, `Symbol`=6,
+/// `Eof`=7) followed by its text bytes (the source slice for ident/number/symbol/
+/// comment, the decoded value for a string, the raw bytes for a byte string, and
+/// nothing for `Eof`). The `.cdb` lexer folds the identical sequence, so the two
+/// sides agree byte-for-byte on ASCII source — which is the gate.
+pub fn token_probe(source: &str) -> Result<String> {
+    let tokens = lex(source)?;
+    let mut hash: u32 = 0x811c_9dc5;
+    for token in &tokens {
+        let (kind, text): (u8, &[u8]) = match token {
+            Token::Ident(value) => (1, value.as_bytes()),
+            Token::Number(value) => (2, value.as_bytes()),
+            Token::String(value) => (3, value.as_bytes()),
+            Token::ByteString(value) => (4, value.as_slice()),
+            Token::Comment(value) => (5, value.as_bytes()),
+            Token::Symbol(value) => (6, value.as_bytes()),
+            Token::Eof => (7, &[][..]),
+        };
+        hash = fnv1a32_step(hash, kind);
+        for &byte in text {
+            hash = fnv1a32_step(hash, byte);
+        }
+    }
+    Ok(format!("tokens {} fnv32 {}", tokens.len(), hash))
+}
+
 fn lex_string(chars: &[char], quote: usize) -> Result<(String, usize)> {
     let mut i = quote + 1;
     let mut value = String::new();

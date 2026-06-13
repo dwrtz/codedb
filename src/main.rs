@@ -165,6 +165,20 @@ enum Command {
         out: PathBuf,
     },
     #[command(
+        about = "Dump the object closure (hash, kind, schema_version, canonical payload, root) — the self-hosted importer oracle (Phase 15a)"
+    )]
+    EmitObjects {
+        db: PathBuf,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    #[command(
+        about = "Print the token-stream probe digest of a source file — the self-hosted lexer oracle (Phase 15a)"
+    )]
+    EmitTokens { file: PathBuf },
+    #[command(
         about = "Emit the flat binary CIR artifact (the lowered-IR closure of an entry, for the CodeDB-hosted evaluator)"
     )]
     EmitCir {
@@ -886,6 +900,16 @@ fn main() -> Result<()> {
             let ir = codedb.emit_ir_main_branch(&function_name)?;
             std::fs::write(&out, ir)?;
             println!("emitted lowered IR {}", out.display());
+        }
+        Command::EmitObjects { db, branch, out } => {
+            let codedb = codedb::CodeDb::open(db)?;
+            let dump = codedb.export_objects_branch(&branch)?;
+            std::fs::write(&out, dump)?;
+            println!("emitted objects {}", out.display());
+        }
+        Command::EmitTokens { file } => {
+            let source = std::fs::read_to_string(&file)?;
+            println!("{}", codedb::token_probe(&source)?);
         }
         Command::EmitCir {
             db,
