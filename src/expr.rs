@@ -7559,6 +7559,382 @@ pub fn token_probe(source: &str) -> Result<String> {
     Ok(format!("tokens {} fnv32 {}", tokens.len(), hash))
 }
 
+/// A streaming FNV-1a-32 fold over a parsed program's AST — the building block of
+/// the parser-stage probe (`ast_probe`, the determinism-oracle reference for the
+/// self-hosted parser `compiler/front/parse.cdb`, docs/PLAN_V3.md Phase 15a.2).
+///
+/// The fold order is the *stream order of a recursive-descent parse* of the AST,
+/// not a free choice: a self-hosted parser folds bytes as it consumes tokens,
+/// without buffering, so a node's discriminant byte is emitted at the moment the
+/// parser commits to that node. For keyword/delimiter-led forms (`let`, `if`,
+/// records, …) the tag is known up front and is emitted *before* the children
+/// (pre-order); for forms discovered after their first child — infix `Binary`,
+/// postfix `Index`/`FieldAccess`, and the `[…]` array/fill split — the tag is
+/// emitted *after* that already-streamed child (post-order). Precedence climbing
+/// reproduces the canonical `Binary` nesting (`a + b * c` folds `a, +, b, *, c`),
+/// so a streaming parser and this tree walk agree byte-for-byte.
+///
+/// Variable-length lists (call args, array elements, record fields, params, case
+/// arms, effects, region/type params, members) are sentinel-encoded: a `1` byte
+/// before each element and a `0` byte to end — so the parser folds `1` as it
+/// commits to another element and `0` when it hits the closing delimiter, never
+/// needing the count up front. Every string/blob is length-prefixed (4-byte
+/// big-endian) so `"ab"+"c"` and `"a"+"bc"` cannot collide.
+struct AstProbe {
+    hash: u32,
+}
+
+impl AstProbe {
+    fn new() -> Self {
+        Self { hash: 0x811c_9dc5 }
+    }
+
+    fn byte(&mut self, b: u8) {
+        self.hash = fnv1a32_step(self.hash, b);
+    }
+
+    fn u32be(&mut self, v: u32) {
+        self.byte((v >> 24) as u8);
+        self.byte((v >> 16) as u8);
+        self.byte((v >> 8) as u8);
+        self.byte(v as u8);
+    }
+
+    fn blob(&mut self, bytes: &[u8]) {
+        self.u32be(bytes.len() as u32);
+        for &b in bytes {
+            self.byte(b);
+        }
+    }
+
+    fn text(&mut self, s: &str) {
+        self.blob(s.as_bytes());
+    }
+
+    /// A present/absent optional string: `1` + the blob, or a lone `0`.
+    fn opt_text(&mut self, s: Option<&str>) {
+        match s {
+            Some(value) => {
+                self.byte(1);
+                self.text(value);
+            }
+            None => self.byte(0),
+        }
+    }
+
+    /// A sentinel-terminated list of strings (region params, type params, effects).
+    fn text_list<'a>(&mut self, items: impl IntoIterator<Item = &'a str>) {
+        for item in items {
+            self.byte(1);
+            self.text(item);
+        }
+        self.byte(0);
+    }
+
+    /// A sentinel-terminated list of `(name, type)` pairs (params, members).
+    fn pair_list<'a>(&mut self, items: impl IntoIterator<Item = (&'a str, &'a str)>) {
+        for (name, ty) in items {
+            self.byte(1);
+            self.text(name);
+            self.text(ty);
+        }
+        self.byte(0);
+    }
+
+    fn program(&mut self, items: &[ProgramItem]) {
+        for item in items {
+            self.item(item);
+        }
+    }
+
+    fn item(&mut self, item: &ProgramItem) {
+        match item {
+            ProgramItem::TypeDefinition(definition) => {
+                self.byte(1);
+                self.text(&definition.module);
+                self.text(&definition.name);
+                self.text_list(definition.region_params.iter().map(String::as_str));
+                self.text_list(definition.type_params.iter().map(String::as_str));
+                match &definition.definition {
+                    TypeDefinitionKind::Record { fields } => {
+                        self.byte(1);
+                        self.pair_list(fields.iter().map(|f| (f.name.as_str(), f.ty.as_str())));
+                    }
+                    TypeDefinitionKind::Enum { variants } => {
+                        self.byte(2);
+                        self.pair_list(variants.iter().map(|v| (v.name.as_str(), v.ty.as_str())));
+                    }
+                }
+            }
+            ProgramItem::Function(function) => {
+                self.byte(2);
+                self.text(&function.module);
+                self.text(&function.name);
+                self.text_list(function.region_params.iter().map(String::as_str));
+                self.text_list(function.type_params.iter().map(String::as_str));
+                self.pair_list(function.params.iter().map(|p| (p.name.as_str(), p.ty.as_str())));
+                self.text(&function.return_type);
+                self.text_list(function.effects.iter().map(|e| e.as_str()));
+                self.expr(&function.body);
+            }
+            ProgramItem::ExternalFunction(function) => {
+                self.byte(3);
+                self.text(&function.module);
+                self.text(&function.name);
+                self.text_list(function.region_params.iter().map(String::as_str));
+                self.pair_list(function.params.iter().map(|p| (p.name.as_str(), p.ty.as_str())));
+                self.text(&function.return_type);
+                self.text_list(function.effects.iter().map(|e| e.as_str()));
+                self.text(&function.abi);
+                self.text(&function.link_name);
+                self.opt_text(function.library.as_deref());
+            }
+        }
+    }
+
+    fn expr(&mut self, expr: &RawExpr) {
+        match expr {
+            RawExpr::LiteralI64 { value } => {
+                self.byte(1);
+                self.text(value);
+            }
+            RawExpr::LiteralBool { value } => {
+                self.byte(2);
+                self.byte(u8::from(*value));
+            }
+            RawExpr::LiteralString { value } => {
+                self.byte(3);
+                self.text(value);
+            }
+            RawExpr::LiteralBytes { bytes_hex } => {
+                self.byte(4);
+                self.text(bytes_hex);
+            }
+            RawExpr::Unit => self.byte(5),
+            RawExpr::ParamRef { index } => {
+                self.byte(6);
+                self.u32be(*index as u32);
+            }
+            RawExpr::ParamName { name } => {
+                self.byte(7);
+                self.text(name);
+            }
+            RawExpr::Call { name, args } => {
+                // Tag known at `name(`; args stream after.
+                self.byte(8);
+                self.text(name);
+                for arg in args {
+                    self.byte(1);
+                    self.expr(arg);
+                }
+                self.byte(0);
+            }
+            RawExpr::Binary { op, left, right } => {
+                // Post-order: the left operand is already streamed when the infix
+                // operator is recognized.
+                self.expr(left);
+                self.byte(9);
+                self.text(op);
+                self.expr(right);
+            }
+            RawExpr::Unary { op, expr } => {
+                self.byte(10);
+                self.text(op);
+                self.expr(expr);
+            }
+            RawExpr::BorrowShared { region, target } => {
+                self.byte(11);
+                self.opt_text(region.as_deref());
+                self.expr(target);
+            }
+            RawExpr::BorrowMut { region, target } => {
+                self.byte(12);
+                self.opt_text(region.as_deref());
+                self.expr(target);
+            }
+            RawExpr::Assign { target, value } => {
+                self.byte(13);
+                self.expr(target);
+                self.expr(value);
+            }
+            RawExpr::Let {
+                name,
+                ty,
+                value,
+                body,
+            } => {
+                self.byte(14);
+                self.text(name);
+                self.text(ty);
+                self.expr(value);
+                self.expr(body);
+            }
+            RawExpr::If {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.byte(15);
+                self.expr(cond);
+                self.expr(then_expr);
+                self.expr(else_expr);
+            }
+            RawExpr::Return { value } => {
+                self.byte(16);
+                self.expr(value);
+            }
+            RawExpr::Fold {
+                item,
+                target,
+                acc,
+                init,
+                body,
+            } => {
+                self.byte(17);
+                self.text(item);
+                self.expr(target);
+                self.text(acc);
+                self.expr(init);
+                self.expr(body);
+            }
+            RawExpr::Loop {
+                acc,
+                init,
+                cond,
+                body,
+            } => {
+                self.byte(18);
+                self.text(acc);
+                self.expr(init);
+                self.expr(cond);
+                self.expr(body);
+            }
+            RawExpr::Array { elements } => {
+                // The `[` form streams its first element before the array/fill
+                // split is known, so the tag follows that first child.
+                self.expr(&elements[0]);
+                self.byte(19);
+                for element in &elements[1..] {
+                    self.byte(1);
+                    self.expr(element);
+                }
+                self.byte(0);
+            }
+            RawExpr::ArrayFill { value, count } => {
+                self.expr(value);
+                self.byte(20);
+                self.text(count);
+            }
+            RawExpr::Index { target, index } => {
+                self.expr(target);
+                self.byte(21);
+                self.expr(index);
+            }
+            RawExpr::Record { fields } => {
+                self.byte(22);
+                for field in fields {
+                    self.byte(1);
+                    self.text(&field.name);
+                    self.expr(&field.value);
+                }
+                self.byte(0);
+            }
+            RawExpr::EnumConstruct {
+                enum_type,
+                variant,
+                value,
+            } => {
+                self.byte(23);
+                self.text(enum_type);
+                self.text(variant);
+                self.expr(value);
+            }
+            RawExpr::FieldAccess { target, field } => {
+                self.expr(target);
+                self.byte(24);
+                self.text(field);
+            }
+            RawExpr::Case { expr, arms } => {
+                self.byte(25);
+                self.expr(expr);
+                for arm in arms {
+                    self.byte(1);
+                    self.arm(arm);
+                }
+                self.byte(0);
+            }
+        }
+    }
+
+    fn arm(&mut self, arm: &RawCaseArm) {
+        self.opt_text(arm.variant.as_deref());
+        match &arm.literal {
+            Some(literal) => {
+                self.byte(1);
+                self.expr(literal);
+            }
+            None => self.byte(0),
+        }
+        match &arm.range {
+            Some(range) => {
+                self.byte(1);
+                self.expr(&range.lo);
+                self.expr(&range.hi);
+                self.byte(u8::from(range.inclusive));
+            }
+            None => self.byte(0),
+        }
+        self.byte(u8::from(arm.default));
+        self.opt_text(arm.binding.as_deref());
+        match &arm.guard {
+            Some(guard) => {
+                self.byte(1);
+                self.expr(guard);
+            }
+            None => self.byte(0),
+        }
+        match &arm.payload_pattern {
+            Some(pattern) => {
+                self.byte(1);
+                self.pattern(pattern);
+            }
+            None => self.byte(0),
+        }
+        self.expr(&arm.body);
+    }
+
+    fn pattern(&mut self, pattern: &RawPattern) {
+        match pattern {
+            RawPattern::Binding(name) => {
+                self.byte(1);
+                self.text(name);
+            }
+            RawPattern::Wildcard => self.byte(2),
+            RawPattern::Variant { variant, sub } => {
+                self.byte(3);
+                self.text(variant);
+                self.pattern(sub);
+            }
+        }
+    }
+}
+
+/// The AST-shape probe digest of `source` — the determinism-oracle reference for
+/// the self-hosted parser (`compiler/front/parse.cdb`, docs/PLAN_V3.md Phase
+/// 15a.2). The result is the line `items <count> ast32 <digest>`, where `count`
+/// is the number of top-level program items (modules flattened, source order)
+/// and `digest` is the FNV-1a-32 over a streaming, recursive-descent traversal of
+/// the parsed AST (see `AstProbe`). The `.cdb` parser folds the identical
+/// sequence as it consumes tokens, so the two sides agree byte-for-byte — the
+/// gate (`tests/selfhost_frontend.rs`). It mirrors `token_probe`: a small digest
+/// that is wrong unless the whole parse is right, sitting one stage downstream.
+pub fn ast_probe(source: &str) -> Result<String> {
+    let items = parse_program(source)?;
+    let mut probe = AstProbe::new();
+    probe.program(&items);
+    Ok(format!("items {} ast32 {}", items.len(), probe.hash))
+}
+
 fn lex_string(chars: &[char], quote: usize) -> Result<(String, usize)> {
     let mut i = quote + 1;
     let mut value = String::new();

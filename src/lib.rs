@@ -38,7 +38,7 @@ use serde_json::json;
 pub use cir::{CIR_SCHEMA, CirEmission};
 pub use expr::{
     ExternalFunctionSource, FunctionSource, ProgramItem, RawExpr, TypeDefinitionSource, Value,
-    set_process_args, token_probe,
+    ast_probe, set_process_args, token_probe,
 };
 pub use op_registry::operator_kinds;
 pub use store::CodeDb;

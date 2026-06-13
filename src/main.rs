@@ -179,6 +179,10 @@ enum Command {
     )]
     EmitTokens { file: PathBuf },
     #[command(
+        about = "Print the AST-shape probe digest of a source file — the self-hosted parser oracle (Phase 15a)"
+    )]
+    EmitAst { file: PathBuf },
+    #[command(
         about = "Emit the flat binary CIR artifact (the lowered-IR closure of an entry, for the CodeDB-hosted evaluator)"
     )]
     EmitCir {
@@ -910,6 +914,10 @@ fn main() -> Result<()> {
         Command::EmitTokens { file } => {
             let source = std::fs::read_to_string(&file)?;
             println!("{}", codedb::token_probe(&source)?);
+        }
+        Command::EmitAst { file } => {
+            let source = std::fs::read_to_string(&file)?;
+            println!("{}", codedb::ast_probe(&source)?);
         }
         Command::EmitCir {
             db,

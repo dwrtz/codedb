@@ -405,3 +405,79 @@ fn emit_objects_is_a_deterministic_canonical_dump() {
         "emit-objects root pin equals the importer's reported root"
     );
 }
+
+#[test]
+fn ast_probe_covers_the_committed_corpus() {
+    // The 15a.2 parser-stage oracle substrate: `ast_probe` folds an FNV-1a-32 over
+    // a streaming recursive-descent traversal of the parsed AST and reports
+    // `items <count> ast32 <digest>`. It is the determinism reference the
+    // self-hosted parser (compiler/front/parse.cdb) will be gated against, one
+    // stage downstream of the lexer probe. As a substrate check, every committed
+    // .cdb source must parse and yield a well-formed, non-empty probe — the same
+    // corpus the lexer probe already covers token-for-token.
+    for file in [
+        "std/core.cdb",
+        "std/mem.cdb",
+        "std/result.cdb",
+        "std/alloc.cdb",
+        "std/string.cdb",
+        "std/fmt.cdb",
+        "std/io.cdb",
+        "examples/v3/tokenizer.cdb",
+        "examples/v3/sha256.cdb",
+        "compiler/eval/eval.cdb",
+        "compiler/front/lex.cdb",
+        "compiler/front/sha256.cdb",
+    ] {
+        let source = std::fs::read_to_string(file).unwrap_or_else(|_| panic!("read {file}"));
+        let probe = codedb::ast_probe(&source).unwrap_or_else(|e| panic!("ast_probe {file}: {e}"));
+        let mut words = probe.split_whitespace();
+        assert_eq!(words.next(), Some("items"), "probe shape for {file}: {probe}");
+        let count: usize = words.next().unwrap().parse().expect("item count");
+        assert_eq!(words.next(), Some("ast32"), "probe shape for {file}: {probe}");
+        words.next().expect("digest");
+        assert!(count > 0, "{file} parsed to zero items");
+    }
+}
+
+#[test]
+fn ast_probe_is_deterministic_and_discriminating() {
+    // The oracle must be a function of the AST: identical source reproduces the
+    // probe, and any structural difference the AST records (operand order,
+    // operator, call-argument order, binding name, nesting) changes it. This is
+    // what makes the probe a faithful gate — a self-hosted parser that builds a
+    // different tree cannot match it by accident.
+    let probe = |src: &str| codedb::ast_probe(src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+
+    // Deterministic: same source, same probe.
+    assert_eq!(
+        probe("fn main() -> i64 = 1 + 2 * 3\n"),
+        probe("fn main() -> i64 = 1 + 2 * 3\n"),
+    );
+
+    // Each of these differs from the baseline in exactly one AST-recorded way.
+    let baseline = probe("fn main() -> i64 = 1 + 2\n");
+    let cases = [
+        "fn main() -> i64 = 2 + 1\n",          // operand order
+        "fn main() -> i64 = 1 - 2\n",          // operator
+        "fn main() -> i64 = (1 + 2) * 3\n",    // extra node
+        "fn other() -> i64 = 1 + 2\n",         // function name
+        "fn main() -> i32 = 1 + 2\n",          // return type
+        "fn main(a: i64) -> i64 = 1 + 2\n",    // a parameter
+    ];
+    for case in cases {
+        assert_ne!(probe(case), baseline, "probe should distinguish {case:?}");
+    }
+
+    // Precedence changes the tree (and thus the probe) even with the same tokens.
+    assert_ne!(
+        probe("fn main() -> i64 = 1 + 2 * 3\n"),
+        probe("fn main() -> i64 = 1 * 2 + 3\n"),
+    );
+
+    // Call-argument order is structural.
+    assert_ne!(
+        probe("fn main() -> i64 = f(1, 2)\nfn f(a: i64, b: i64) -> i64 = a\n"),
+        probe("fn main() -> i64 = f(2, 1)\nfn f(a: i64, b: i64) -> i64 = a\n"),
+    );
+}
