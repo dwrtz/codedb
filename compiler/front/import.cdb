@@ -653,6 +653,19 @@ fn build_param_ref(index: i64, tyc: i64) -> string effects[alloc, state] =
   let p4: string = push_lit(p3, b"\"}") in
   hash_object(b"Expression", 1, p4)
 
+// Build an `int_cast` Expression (a `to_<type>(...)` builtin): the value being cast
+// (`valh`), its `source_type` (`srctyc`), and the target `type` (`tgttyc`, from the cast
+// name). Canonical key order: expr_kind, source_type, type, value.
+fn build_int_cast(srctyc: i64, tgttyc: i64, valh: string) -> string effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(512), b"{\"expr_kind\":\"int_cast\",\"source_type\":\"") in
+  let p1: string = push_str(p0, type_hash(srctyc)) in
+  let p2: string = push_lit(p1, b"\",\"type\":\"") in
+  let p3: string = push_str(p2, type_hash(tgttyc)) in
+  let p4: string = push_lit(p3, b"\",\"value\":\"") in
+  let p5: string = push_str(p4, valh) in
+  let p6: string = push_lit(p5, b"\"}") in
+  hash_object(b"Expression", 1, p6)
+
 // ---------------------------------------------------------------------------
 // the parser: precedence climbing, left-associative for the binary levels.
 //   bitor `|` -> bitxor `^` -> bitand `&` -> equality `== !=` -> relational
@@ -672,6 +685,31 @@ fn build_param_ref(index: i64, tyc: i64) -> string effects[alloc, state] =
 // parse_mul).
 // ---------------------------------------------------------------------------
 
+// Classify the identifier `mem`[p,e) into a dispatch code: 1 = `if`, 2 = `let`,
+// 3 = `true`/`false` (bool literal), 4 = a `to_<type>(` cast, 0 = a plain variable.
+// Each keyword test is length-gated by a nested `if` so the inner string_get reads stay
+// in bounds (`&&` is strict). A cast is the `to_` prefix (t/o/_ = 116/111/95) followed
+// by a `(` (byte 40) at `e`. Threads `mem` back, so these temporaries stay in this
+// frame rather than inflating parse_atom's (which is near the v0 frame budget).
+fn classify_kw(mem: string, p: i64, e: i64, len: i64) -> TC =
+  let klen: i64 = e - p in
+  let kw: i64 =
+    if klen == 2 then (if (to_i64(string_get(mem, p)) == 105 && to_i64(string_get(mem, p + 1)) == 102) then 1 else 0)
+    else if klen == 3 then (if (to_i64(string_get(mem, p)) == 108 && to_i64(string_get(mem, p + 1)) == 101 && to_i64(string_get(mem, p + 2)) == 116) then 2 else 0)
+    else if klen == 4 then (if (to_i64(string_get(mem, p)) == 116 && to_i64(string_get(mem, p + 1)) == 114 && to_i64(string_get(mem, p + 2)) == 117 && to_i64(string_get(mem, p + 3)) == 101) then 3 else 0)
+    else if klen == 5 then (if (to_i64(string_get(mem, p)) == 102 && to_i64(string_get(mem, p + 1)) == 97 && to_i64(string_get(mem, p + 2)) == 108 && to_i64(string_get(mem, p + 3)) == 115 && to_i64(string_get(mem, p + 4)) == 101) then 3 else 0)
+    else 0
+  in
+  let iscast: bool =
+    if klen >= 5 then
+      (if (to_i64(string_get(mem, p)) == 116 && to_i64(string_get(mem, p + 1)) == 111 && to_i64(string_get(mem, p + 2)) == 95) then
+         (if e < len then to_i64(string_get(mem, e)) == 40 else false)
+       else false)
+    else false
+  in
+  let code: i64 = if kw != 0 then kw else (if iscast then 4 else 0) in
+  let res: TC = { code: code, mem: mem } in res
+
 // atom := <decimal int> (i64) | `true` | `false` (bool) | `if` ... ; ws-skipped.
 fn parse_atom(mem: string, pos: i64, len: i64, scope: Scope, np: i64, etyc: i64) -> Pr effects[alloc, state] =
   let sw: MI = skip_ws(mem, pos, len) in
@@ -690,25 +728,19 @@ fn parse_atom(mem: string, pos: i64, len: i64, scope: Scope, np: i64, etyc: i64)
           let sd: MI = scan_digits(m1, p, len) in
           build_literal(sd.mem, p, sd.i, ltyc))
      else
-       // An identifier: a keyword (`if` / `let` / `true` / `false`) or a variable.
-       // `kw`: 0 = variable, 1 = if, 2 = let, 3 = bool literal. Each keyword test is
-       // length-gated by a nested `if` so the inner string_get reads stay in bounds
-       // (`&&` is strict). A non-keyword identifier resolves to a `local_ref` by its
-       // de-Bruijn depth in `scope`, typed by the binding it refers to.
+       // An identifier: a keyword (`if`/`let`/`true`/`false`), a `to_<type>(` cast, or a
+       // variable. classify_kw returns the dispatch code (kept in a helper so its
+       // byte-test temporaries do not inflate parse_atom's near-budget stack frame); a
+       // variable (code 0) resolves to a local_ref / param_ref via resolve_ident.
        let se: MI = scan_ident(m1, p, len) in
-       let m2: string = se.mem in
        let e: i64 = se.i in
-       let klen: i64 = e - p in
-       let kw: i64 =
-         if klen == 2 then (if (to_i64(string_get(m2, p)) == 105 && to_i64(string_get(m2, p + 1)) == 102) then 1 else 0)
-         else if klen == 3 then (if (to_i64(string_get(m2, p)) == 108 && to_i64(string_get(m2, p + 1)) == 101 && to_i64(string_get(m2, p + 2)) == 116) then 2 else 0)
-         else if klen == 4 then (if (to_i64(string_get(m2, p)) == 116 && to_i64(string_get(m2, p + 1)) == 114 && to_i64(string_get(m2, p + 2)) == 117 && to_i64(string_get(m2, p + 3)) == 101) then 3 else 0)
-         else if klen == 5 then (if (to_i64(string_get(m2, p)) == 102 && to_i64(string_get(m2, p + 1)) == 97 && to_i64(string_get(m2, p + 2)) == 108 && to_i64(string_get(m2, p + 3)) == 115 && to_i64(string_get(m2, p + 4)) == 101) then 3 else 0)
-         else 0
-       in
+       let cl: TC = classify_kw(se.mem, p, e, len) in
+       let m2: string = cl.mem in
+       let kw: i64 = cl.code in
        (if kw == 1 then parse_if(m2, e, len, scope, np, etyc)
         else if kw == 2 then parse_let(m2, e, len, scope, np, etyc)
         else if kw == 3 then build_bool_atom(m2, p, e)
+        else if kw == 4 then parse_cast(m2, p, e, len, scope, np)
         else resolve_ident(scope, np, m2, p, e)))
   else build_literal(m1, p, p, ltyc)
 
@@ -763,6 +795,19 @@ fn parse_let(mem: string, pos: i64, len: i64, scope: Scope, np: i64, etyc: i64) 
   let body: Pr = parse_bitor(ink.mem, ink.i, len, scope2, np, etyc) in
   let lb: MH = build_let(body.mem, ns, ne, btyc, val.hash, body.hash, body.tyc) in
   let res: Pr = { mem: lb.mem, hash: lb.hash, tyc: body.tyc, next: body.next } in res
+
+// cast := `to_<type>` `(` expr `)`. At entry the cast identifier is `mem`[p,e) (its
+// `to_` prefix and the `(` at `e` were confirmed by the caller). The target type is
+// `mem`[p+3,e); the argument is a full expression parsed with NO expectation (it keeps
+// its own type), recorded as the cast's `source_type`. The result type is the target,
+// fixed by the cast name regardless of the surrounding expectation.
+fn parse_cast(mem: string, p: i64, e: i64, len: i64, scope: Scope, np: i64) -> Pr effects[alloc, state] =
+  let tc: TC = type_code_of(mem, p + 3, e) in
+  let target: i64 = tc.code in
+  let arg: Pr = parse_bitor(tc.mem, e + 1, len, scope, np, 0 - 1) in
+  let sw: MI = skip_ws(arg.mem, arg.next, len) in
+  let h: string = build_int_cast(arg.tyc, target, arg.hash) in
+  let res: Pr = { mem: sw.mem, hash: h, tyc: target, next: sw.i + 1 } in res
 
 // unary := ('-'|'~'|'!') unary | atom   (prefix; `- ~` -> i64, `!` -> bool)
 fn parse_unary(mem: string, pos: i64, len: i64, scope: Scope, np: i64, etyc: i64) -> Pr effects[alloc, state] =

@@ -1397,6 +1397,23 @@ Remaining axis-1 surface: cast builtins (`to_u8`/… → `int_cast`), then no-ne
 builtins generally. Then 15a.4 (axis 2 — the migration/history chain for multi-function
 programs).
 
+Then the integer cast builtins landed (`to_u8`/`to_u16`/…/`to_i64`). In `parse_atom`,
+an identifier that begins `to_` and is immediately followed by `(` is a cast: the target
+type is named by the suffix, the argument is a full expression parsed with NO expectation
+(so it keeps its own type, recorded as `source_type`), and the result type is the target
+regardless of the surrounding expectation. Builds an `int_cast{source_type, type, value}`
+Expression (forms spiked against `emit-objects`). The keyword/cast classification was
+factored into a `classify_kw` helper — its byte-test temporaries were inflating
+`parse_atom`'s stack frame past the v0 4095-byte budget (a build failure caught in
+smoke-testing); moving them into a helper frame fixed it. Root-hash equality holds across
+18 cast fixtures — every target width, a hex and an arithmetic argument, casts as
+operands and in `let` bindings, parameter arguments (source_type = the parameter's type),
+and nested casts — plus regressions (`tests/selfhost_frontend.rs` 14/14). This completes
+the tractable axis-1 grammar for a single non-recursive function. Next: 15a.4 (axis 2 —
+the migration/history chain for multi-function programs; the spikes have already mapped
+the per-function `create_function` migration, the `birth_history_hash` chain, the raw-AST
+operation body, and the incremental output root).
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text

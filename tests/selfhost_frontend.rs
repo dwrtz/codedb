@@ -808,6 +808,68 @@ fn importer_reproduces_the_root_hash_for_sized_integers() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_int_casts() {
+    // 15a.2 (axis 1): the integer cast builtins `to_u8`/`to_u16`/…/`to_i64`. A
+    // `to_<type>(expr)` builds an `int_cast` Expression whose `source_type` is the
+    // argument's own inferred type, `type` is the target named by the cast (regardless
+    // of the surrounding expectation), and `value` is the argument. The argument is a
+    // full expression parsed with NO expectation (it keeps its own type, so a bare
+    // literal there is i64). Root-hash equality is exact, so a wrong source/target type
+    // or a misparsed argument changes the cast's hash. Covers every target width, a hex
+    // and an arithmetic argument, a parameter argument, nested casts, and casts inside
+    // expressions and `let` bindings.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        "fn main() -> u8 = to_u8(255)",
+        "fn main() -> u16 = to_u16(1000)",
+        "fn main() -> u32 = to_u32(5)",
+        "fn main() -> u64 = to_u64(5)",
+        "fn main() -> i8 = to_i8(5)",
+        "fn main() -> i32 = to_i32(5)",
+        "fn main() -> i64 = to_i64(5)",
+        // a hex and an arithmetic argument (the argument keeps its own type, i64 here)
+        "fn main() -> u8 = to_u8(0xff)",
+        "fn main() -> u8 = to_u8(1 + 2)",
+        "fn main() -> u32 = to_u32(10 * 10)",
+        // casts as operands inside an expression
+        "fn main() -> u32 = to_u32(5) + 1",
+        "fn main() -> u8 = to_u8(255) & 0x0f",
+        // a parameter argument (source_type is the parameter's type)
+        "fn main(a: i64) -> u8 = to_u8(a)",
+        "fn main(a: u32) -> i64 = to_i64(a)",
+        // nested casts
+        "fn main() -> i64 = to_i64(to_u32(5))",
+        "fn main() -> u8 = to_u8(to_i64(255))",
+        // casts in let bindings
+        "fn main() -> u8 = let x: u8 = to_u8(200) in x",
+        "fn main(a: u32) -> u64 = let b: u64 = to_u64(a) in b + 1",
+    ];
+    for (i, source_expr) in sources.iter().enumerate() {
+        let source = format!("{source_expr}\n");
+        let db = temp.path().join(format!("ref-cast-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-cast-{i}.cdb"));
+        std::fs::write(&src, &source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer int-cast root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate
