@@ -1342,6 +1342,32 @@ Remaining axis-1 surface: function params + `param_ref` (a separate index namesp
 then no-new-symbol builtins. Then 15a.4 (axis 2 — the migration/history chain for
 multi-function programs).
 
+Then function parameters + `param_ref` landed. The header now parses a parameter list
+`(a: i64, b: bool, ...)`, which feeds the FunctionSignature's `params` (a list of Type
+hashes, previously always empty) and the ProgramRoot's `param_names`; an in-body
+reference to a parameter becomes a `param_ref` by its positional index, typed by that
+parameter. The forms were spiked against `emit-objects` first (confirming `main` accepts
+parameters, the `param_ref`/signature/param_names shapes, and — critically — that a
+parameter reference inside nested lets is still a `param_ref`, a let shadows a same-named
+parameter, and a let's de-Bruijn depth does not count parameters: lets and params are
+separate namespaces). Implemented by widening the lexical scope to hold BOTH in one Copy
+array — parameters at indices [0, np), `let` bindings pushed on top at [np, n), with np
+threaded alongside — so resolution checks the let region first (`local_ref`, depth
+n-1-idx) then the parameter region (`param_ref`, index idx). The parameter list is parsed
+by a recursive `scan_params`; the signature param list and param_names are emitted by
+recursive helpers (`push_sig_params_at` / `push_pnames_at`). Root-hash equality holds
+across 17 fixtures — single/multiple/out-of-order params, mixed i64/bool param and return
+types, params mixed with lets (shadowing, a value using params, a param referenced from
+inside nested lets), and an 11-parameter case whose last `param_ref` index spans two
+decimal digits (`tests/selfhost_frontend.rs`, 12/12). One backend reality forced a design
+choice: the v0 arm64 backend sizes each aggregate stack local at its full byte width, so
+threading two 32-element scope arrays (or even one, given the new param-scanning /
+object-emitting functions that juggle several `Scope`-typed locals) overflowed the
+4095-byte frame; folding params + lets into a SINGLE array and capping it at 12 combined
+entries (ample for an axis-1 single function) brought every function back under budget.
+Still single-function / genesis-birth (axis 1). Remaining axis-1 surface: no-new-symbol
+builtins. Then 15a.4 (axis 2 — the migration/history chain for multi-function programs).
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text

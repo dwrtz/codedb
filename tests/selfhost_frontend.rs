@@ -622,7 +622,8 @@ fn importer_reproduces_the_root_hash_for_let_expressions() {
     // A deep nest (let v0=0 in let v1=1 in ... in v0): the body references the
     // outermost binding, so its depth is N-1 — past 9 it spans two decimal digits,
     // exercising the bare-integer `depth` renderer and the scope past ten entries.
-    for n in [11usize, 20] {
+    // (Capped at the scope's combined param+binding capacity.)
+    for n in [11usize, 12] {
         let mut s = String::from("fn main() -> i64 = ");
         for i in 0..n {
             s.push_str(&format!("let v{i}: i64 = {i} in "));
@@ -646,6 +647,77 @@ fn importer_reproduces_the_root_hash_for_let_expressions() {
             got,
             want,
             "self-hosted importer let-expression root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
+fn importer_reproduces_the_root_hash_for_parameters() {
+    // 15a.2 (axis 1): function parameters and `param_ref`. The header now parses a
+    // parameter list `(a: i64, b: bool, ...)`, which feeds the FunctionSignature's
+    // `params` (a list of Type hashes) and the ProgramRoot's `param_names`; an in-body
+    // reference to a parameter becomes a `param_ref` by its positional index, typed by
+    // that parameter. Parameters and `let` bindings are SEPARATE namespaces resolved
+    // from one combined scope (params at [0, np), lets pushed on top): a let is checked
+    // first (so it shadows a same-named parameter) and its de-Bruijn depth does not count
+    // parameters. Root-hash equality is exact, so a wrong param index/type, a wrong
+    // signature param list or param_names, or a let/param resolution mix-up changes the
+    // root. Covers single/multiple/out-of-order params, mixed i64/bool param and return
+    // types, params mixed with lets (shadowing, a value using params, a param referenced
+    // from inside nested lets), and a parameter index spanning two decimal digits.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let mut sources: Vec<String> = vec![
+        // single parameter, body is the parameter (index 0)
+        "fn main(a: i64) -> i64 = a".to_string(),
+        "fn main(x: i64) -> i64 = x * x + 2 * x + 1".to_string(),
+        // multiple parameters, in and out of declaration order
+        "fn main(a: i64, b: i64) -> i64 = a + b".to_string(),
+        "fn main(a: i64, b: i64) -> i64 = b - a".to_string(),
+        "fn main(a: i64, b: i64, c: i64) -> i64 = a * b + c".to_string(),
+        // mixed parameter / return types; a bool parameter feeding `if`
+        "fn main(a: i64, b: bool) -> i64 = if b then a else 0".to_string(),
+        "fn main(n: i64) -> bool = if n > 0 then true else false".to_string(),
+        "fn main(p: bool, q: bool) -> bool = p && q || !p".to_string(),
+        // parameters mixed with let bindings
+        "fn main(a: i64) -> i64 = let x: i64 = 5 in a + x".to_string(),
+        // a let shadows a same-named parameter (body resolves to the let, depth 0)
+        "fn main(a: i64) -> i64 = let a: i64 = 5 in a".to_string(),
+        // a binding's value references parameters
+        "fn main(a: i64, b: i64) -> i64 = let c: i64 = a + b in c".to_string(),
+        // a parameter referenced from inside nested lets (still a param_ref, not local)
+        "fn main(a: i64) -> i64 = let x: i64 = 1 in let y: i64 = 2 in a + x + y".to_string(),
+        "fn main(base: i64) -> i64 = let sq: i64 = base * base in let cube: i64 = sq * base in sq + cube"
+            .to_string(),
+        "fn main(a: i64, b: i64) -> bool = let s: i64 = a + b in s > 10 && s < 100".to_string(),
+        // a parameter used inside a let nested in an if branch
+        "fn main(n: i64) -> i64 = if n > 0 then let d: i64 = n - 1 in d else 0".to_string(),
+    ];
+    // Eleven parameters a..k: a reference to the last is `param_ref` index 10 — past 9
+    // it spans two decimal digits, exercising the bare-integer `index` renderer.
+    let params11 = "a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64, j: i64, k: i64";
+    sources.push(format!("fn main({params11}) -> i64 = k"));
+    sources.push(format!("fn main({params11}) -> i64 = a + k"));
+    for (i, source_expr) in sources.iter().enumerate() {
+        let source = format!("{source_expr}\n");
+        let db = temp.path().join(format!("ref-param-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-param-{i}.cdb"));
+        std::fs::write(&src, &source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer parameter root mismatch for `{}`",
             source.trim()
         );
     }
