@@ -1368,6 +1368,35 @@ entries (ample for an axis-1 single function) brought every function back under 
 Still single-function / genesis-birth (axis 1). Remaining axis-1 surface: no-new-symbol
 builtins. Then 15a.4 (axis 2 — the migration/history chain for multi-function programs).
 
+Then hex integer literals landed (a quick win): `parse_atom` recognizes a `0x`/`0X`
+prefix and scans hex digits; the canonical `value` is the raw source slice (no
+normalization), so it stays a `literal_i64` node.
+
+Then sized integer types (u8/u16/u32/u64/i8/i16/i32) + the EXPECTATION PROPAGATION they
+force. The importer was bottom-up only (literals defaulted to i64); reproducing the Rust
+importer's sized-literal typing required a real top-down pass, so an expected type code
+is now threaded down the parser alongside the scope. The rules (all spiked against
+`emit-objects` first): an integer literal takes the expected type if set, else i64; a
+binding/return/parameter annotation supplies it (`type_code_of` classifies the type
+name); arithmetic/bitwise/shift propagate it to both operands; a comparison's operands
+unify (left informs right) and yield bool; `if` is a propagation barrier (Rust does not
+push the expectation into branches, so `-> u32 = if c then 1 else 2` is a type error and
+out of scope); `let` value gets the binding type and body gets the outer expectation;
+casts are fixed by the cast name (next increment). `type_hash` grew to nine `type_kind`s.
+A subtle bug surfaced and was fixed: the lexical-scope entry packed `btyc` in one bit
+(`*2`), fine for i64/bool but corrupting a sized binding/param's type and name range —
+widened to four bits (`*16`). One documented gap: a bare literal LEFT of a concretely
+typed operand with no outer expectation (`1 < a`) is not unified in the single pass (the
+literal stays i64); such programs are out of scope (tighten when the importer grows real
+unification). Root-hash equality holds across 27 sized fixtures — every width as a
+return-driven literal, hex-in-sized, propagation through arithmetic/bitwise/shift, sized
+params feeding arithmetic/unary, sized `let` bindings propagating into the body, and
+uniform/concrete-left sized comparisons — plus the i64/bool regressions
+(`tests/selfhost_frontend.rs` 14/14). Still single-function / genesis-birth (axis 1).
+Remaining axis-1 surface: cast builtins (`to_u8`/… → `int_cast`), then no-new-symbol
+builtins generally. Then 15a.4 (axis 2 — the migration/history chain for multi-function
+programs).
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text

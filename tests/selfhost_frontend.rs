@@ -734,6 +734,80 @@ fn importer_reproduces_the_root_hash_for_parameters() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_sized_integers() {
+    // 15a.2 (axis 1): sized integer types (u8/u16/u32/u64/i8/i16/i32) and the
+    // EXPECTATION PROPAGATION they force. The importer now threads an expected type
+    // down the parser: an integer literal takes the expected type if one is set (else
+    // i64); a binding/return/param annotation supplies it; arithmetic propagates it to
+    // both operands; a comparison's operands unify (left informs right). So
+    // `fn main() -> u8 = 200` types `200` as u8, `let x: u32 = 1 in x + 2` types the `2`
+    // as u32, and `fn main(a: u32, b: u32) -> u32 = a + b` is all u32. Root-hash
+    // equality is exact, so a wrong inferred width anywhere changes a Type hash and the
+    // root. Only programs whose literal types are fixed top-down or by a concrete
+    // sibling are in scope (a bare literal LEFT of a concretely-typed operand, e.g.
+    // `1 < a`, is not yet unified — out of scope, as are cast builtins).
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        // a literal at each width, driven by the return type
+        "fn main() -> u8 = 200",
+        "fn main() -> u16 = 5",
+        "fn main() -> u32 = 5",
+        "fn main() -> u64 = 5",
+        "fn main() -> i8 = 5",
+        "fn main() -> i16 = 5",
+        "fn main() -> i32 = 5",
+        // hex literal in a sized context
+        "fn main() -> u32 = 0xff",
+        // propagation through arithmetic / bitwise / shift
+        "fn main() -> u32 = 1 + 2 * 3",
+        "fn main() -> u8 = 255 & 0x0f",
+        "fn main() -> u32 = 1 << 4 | 2",
+        // sized parameters feeding arithmetic / unary
+        "fn main(a: u32, b: u32) -> u32 = a + b",
+        "fn main(a: u32) -> u32 = a * a + 1",
+        "fn main(a: u8, b: u8) -> u8 = a + b * 2",
+        "fn main(a: u32) -> u32 = ~a",
+        "fn main(a: i32) -> i32 = -a",
+        "fn main() -> u32 = ~0 & 255",
+        "fn main(a: i16, b: i16) -> i16 = a + b",
+        "fn main(a: u64) -> u64 = a << 8 | 0xff",
+        // sized let bindings, propagating into the body
+        "fn main() -> u32 = let x: u32 = 5 in x",
+        "fn main() -> u8 = let x: u8 = 1 in x + 2",
+        "fn main(a: u32) -> u32 = let b: u32 = a + 1 in b * 2",
+        "fn main() -> u64 = let lo: u64 = 0xff in let hi: u64 = 0xff00 in lo + hi",
+        // sized comparisons (uniform or concrete-left) yielding bool
+        "fn main(a: u32, b: u32) -> bool = a < b",
+        "fn main(a: u32) -> bool = a < 10",
+        "fn main(a: u32) -> bool = a == 5 && a > 0",
+        "fn main(a: u8, b: u8) -> bool = a + b == 255",
+    ];
+    for (i, source_expr) in sources.iter().enumerate() {
+        let source = format!("{source_expr}\n");
+        let db = temp.path().join(format!("ref-sized-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-sized-{i}.cdb"));
+        std::fs::write(&src, &source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer sized-integer root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate
