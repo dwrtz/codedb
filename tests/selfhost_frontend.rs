@@ -11,10 +11,11 @@
 //                              == codedb::sha256_hex; its obj_hash entry frames the
 //                              object preimage and reproduces hash_object_canonical
 //                              (gated against emit-objects dumps).
-//   compiler/front/import.cdb  reads `fn main() -> i64 = <int>`, builds the six
-//                              canonical objects + chains their hashes, and emits a
-//                              ProgramRoot hash == the Rust importer's root for the
-//                              same source (rung-A importer milestone, minimal grammar).
+//   compiler/front/import.cdb  parses `fn main() -> i64 = <expr>` (15a.2: integer
+//                              arithmetic with `+ - * /`, precedence + associativity),
+//                              builds the typed Expression tree + the canonical
+//                              objects bottom-up, and emits a ProgramRoot hash == the
+//                              Rust importer's root for the same source.
 //
 // The 15a.0 substrate (`emit-objects`, the importer's object/root oracle) is also
 // pinned here for determinism across an independent rebuild.
@@ -361,6 +362,61 @@ fn importer_reproduces_the_root_hash_for_the_minimal_grammar() {
             got,
             want,
             "self-hosted importer root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
+fn importer_reproduces_the_root_hash_for_arithmetic_expressions() {
+    // 15a.2 (axis 1): the real expression parser. The .cdb importer now scans and
+    // parses `fn main() -> i64 = <expr>` where <expr> is integer arithmetic
+    // (`+ - * /`, left-associative, `* /` binding tighter than `+ -`), building the
+    // typed Expression tree bottom-up — each parse function returns the content hash
+    // of the Expression object it just built. Its ProgramRoot hash must equal the
+    // Rust importer's for the same source — an exact gate, since any precedence,
+    // associativity, or canonical-payload error changes a subtree's object hash and
+    // therefore the root.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let exprs = [
+        "1 + 2",
+        "1+2",
+        "2 * 3",
+        "1 + 2 * 3",
+        "2 * 3 + 4",
+        "10 - 2 - 3",
+        "100 / 5 / 2",
+        "1 + 2 + 3 + 4",
+        "2 * 3 * 4",
+        "1 - 2 * 3 + 4",
+        "7 + 6 * 5 - 4 / 2",
+        "8 / 4 * 2",
+        "1*2+3*4+5*6",
+        "9 - 8 - 7 - 6",
+        "100 - 10 * 9 + 1",
+    ];
+    for (i, expr) in exprs.iter().enumerate() {
+        let source = format!("fn main() -> i64 = {expr}\n");
+        // The Rust importer's root for this source.
+        let db = temp.path().join(format!("ref-arith-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-arith-{i}.cdb"));
+        std::fs::write(&src, &source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        // The self-hosted importer's root from the same source on stdin.
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer arithmetic root mismatch for `{}`",
             source.trim()
         );
     }

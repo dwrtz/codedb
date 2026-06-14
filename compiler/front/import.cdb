@@ -1,45 +1,57 @@
 // compiler/front/import.cdb - the self-hosted importer toward root-hash equality
-// (ladder rung A, stage 15a.3, minimal grammar).
+// (ladder rung A, stage 15a.2 — the real expression parser, axis 1).
 //
-// Reads a source `fn main() -> i64 = <int>` from stdin and prints the program
+// Reads a source `fn main() -> i64 = <expr>` from stdin and prints the program
 // ROOT HASH the Rust importer would compute for it (`codedb import` -> `root ...`).
-// This is the rung-A importer milestone on its smallest input: parse the source,
-// build the content-addressed objects with their EXACT canonical-JSON payloads in
-// dependency order, chain hash_object (= src/store.rs::hash_object_canonical) over
-// them, and emit the ProgramRoot's hash. Gate: that root equals the Rust
-// importer's for the same source (tests/selfhost_frontend.rs).
+// `<expr>` is now a real integer-arithmetic expression — decimal literals combined
+// with `+ - * /`, left-associative, two precedence levels (`* /` bind tighter than
+// `+ -`) — parsed by a scannerless recursive-descent parser that builds the TYPED
+// Expression object tree bottom-up: each parse function returns the content hash of
+// the Expression object it just built (with its children referenced by hash), so no
+// explicit AST tree is needed and objects are emitted in dependency order as they
+// are recognized. For a single non-recursive `main` the body's birth is genesis, so
+// there is no migration/history chain yet (that is axis 2, the multi-symbol step) —
+// only the typed objects, gated by root-hash equality (tests/selfhost_frontend.rs).
 //
-// The SHA-256 core, the stdin pump (read_all), padding (pad), the multi-block
-// driver (hash_blocks), the hex word emitter (push_word_hex), and mem_cap live in
-// compiler/front/lib.cdb (imported first); this file keeps only the canonical-JSON
-// string builders, the object-hash wrapper, the per-object-kind payload builders,
-// and the minimal int "parser".
+// Grammar (this increment): `expr := mul (('+'|'-') mul)*`, `mul := atom (('*'|'/')
+// atom)*`, `atom := <decimal int>`. No parens (they force mutual recursion — the
+// next increment), no unary minus, no other types: every node is i64, so type
+// inference is the constant i64 hash. The `fn main() -> i64 =` header is still
+// assumed (the parser locates `=` and parses the RHS); header/param parsing and the
+// other object kinds are later increments.
 //
-// For `fn main() -> i64 = V` the six objects are, in order:
-//   Type              {"type_kind":"I64"}                                  -> T
-//   Expression        {"expr_kind":"literal_i64","type":T,"value":V}       -> E
-//   FunctionSignature {"abi":"codedb-v0-internal","effects":[],
-//                      "params":[],"return":T}                             -> SIG
-//   SymbolBirth       {"birth_history_hash":"genesis",
-//                      "local_nonce":"import:main:main:0",
-//                      "symbol_kind":"function"}                           -> SYM
-//   FunctionDef       {"function_sig_hash":SIG,"symbol":SYM,
-//                      "typed_body_expr_hash":E}                           -> DEF
-//   ProgramRoot       {... names/param_names/symbols referencing SYM,DEF,SIG}-> ROOT
-// Reused hashes (T, SIG, SYM) are THREADED back from the build helpers (a .cdb
-// helper taking a `string` by value would drop it, and string_get rejects a
-// &string), so each survives its multiple uses.
-//
-// Minimal grammar: name=main, module=main, return type i64, body a decimal int
-// literal. The "parser" here only extracts the int (the digits after `=`); the
-// real tokenize+parse and the rest of the object kinds are the next increments.
+// The objects for `fn main() -> i64 = E` are, in order: the i64 Type; the body
+// Expression tree (literals + binaries); the FunctionSignature; the SymbolBirth;
+// the FunctionDef; the ProgramRoot. The SHA-256 core, stdin pump, padding, the
+// multi-block driver, the hex word emitter, and mem_cap live in
+// compiler/front/lib.cdb (imported first). The move-only memory string threads by
+// MOVE across helper calls (returned inside a record); within a function it stays
+// owned and `string_get` borrows it. Every bounds check is a nested `if p < len`
+// because the language's `&&` is strict (it evaluates both operands).
 
 record PBi { p: string  i: i64 }
 record OS { out: string  s: string }
-record EH { h: string  t: string }
 record DH { h: string  sig: string  sym: string }
-record Ext { out: string  p: i64  eq: bool }
 record OB { b: array<u8, 96>  i: i64 }
+
+// A pure inner-scan accumulator (Copy): a cursor and a keep-going flag.
+record P2 { p: i64  go: bool }
+// A scanner result: the threaded memory and the index it walked to.
+record MI { mem: string  i: i64 }
+// A parse result (and the add/mul loop accumulator): the threaded memory, the
+// content hash of the Expression object built, and the cursor past it.
+record Pr { mem: string  hash: string  next: i64 }
+// A push-range result: the string being built and the threaded source memory.
+record PRR { out: string  mem: string }
+
+// ---------------------------------------------------------------------------
+// byte classifiers (ASCII; + - * / and whitespace)
+// ---------------------------------------------------------------------------
+
+fn is_ws_b(b: i64) -> bool = b == 32 || b == 9 || b == 10 || b == 13
+fn is_digit_b(b: i64) -> bool = b >= 48 && b <= 57
+fn is_addop(b: i64) -> bool = b == 43 || b == 45
+fn is_mulop(b: i64) -> bool = b == 42 || b == 47
 
 // ---------------------------------------------------------------------------
 // canonical-string building
@@ -86,6 +98,17 @@ fn push_kept(out: string, s: string) -> OS effects[state] =
   in
   let res: OS = { out: done.p, s: s } in res
 
+// Append `mem`[start, end) to `out`, threading both move-only buffers back.
+fn push_range(out: string, mem: string, start: i64, endd: i64) -> PRR effects[state] =
+  let done: PBi =
+    loop a = { p: out, i: start } while a.i < endd do
+      let cur: PBi = a in
+      let oo: string = cur.p in
+      let pushed: unit = string_push(oo, string_get(mem, cur.i)) in
+      let r: PBi = { p: oo, i: cur.i + 1 } in r
+  in
+  let res: PRR = { out: done.p, mem: mem } in res
+
 // Render the 8-word state as "sha256:" + 64 lowercase hex chars (a string).
 fn state_to_hash(st: State) -> string effects[alloc, state] =
   let h0: string = push_lit(string_with_capacity(80), b"sha256:") in
@@ -117,23 +140,46 @@ fn hash_object(kind: slice<'static, u8>, schema: i64, payload: string) -> string
   state_to_hash(st)
 
 // ---------------------------------------------------------------------------
-// the object builders (canonical payloads in dependency order)
+// the scanners (memory threaded back; string_get borrows the owned `mem`)
+// ---------------------------------------------------------------------------
+
+// Advance past whitespace from `pos`; return the next significant index.
+fn skip_ws(mem: string, pos: i64, len: i64) -> MI =
+  let done: P2 =
+    loop a = { p: pos, go: true } while a.go do
+      if a.p >= len then (let s: P2 = { p: a.p, go: false } in s)
+      else if is_ws_b(to_i64(string_get(mem, a.p))) then (let s: P2 = { p: a.p + 1, go: true } in s)
+      else (let s: P2 = { p: a.p, go: false } in s)
+  in
+  let res: MI = { mem: mem, i: done.p } in res
+
+// Advance over decimal digits from `start`; return the first non-digit index.
+fn scan_digits(mem: string, start: i64, len: i64) -> MI =
+  let done: P2 =
+    loop a = { p: start, go: true } while a.go do
+      if a.p >= len then (let s: P2 = { p: a.p, go: false } in s)
+      else if is_digit_b(to_i64(string_get(mem, a.p))) then (let s: P2 = { p: a.p + 1, go: true } in s)
+      else (let s: P2 = { p: a.p, go: false } in s)
+  in
+  let res: MI = { mem: mem, i: done.p } in res
+
+// Return the index just past the first `=` (or `len` if none).
+fn find_eq(mem: string, len: i64) -> MI =
+  let done: P2 =
+    loop a = { p: 0, go: true } while a.go do
+      if a.p >= len then (let s: P2 = { p: a.p, go: false } in s)
+      else if to_i64(string_get(mem, a.p)) == 61 then (let s: P2 = { p: a.p + 1, go: false } in s)
+      else (let s: P2 = { p: a.p + 1, go: true } in s)
+  in
+  let res: MI = { mem: mem, i: done.p } in res
+
+// ---------------------------------------------------------------------------
+// the object builders (canonical payloads)
 // ---------------------------------------------------------------------------
 
 fn build_type() -> string effects[alloc, state] =
   let p: string = push_lit(string_with_capacity(64), b"{\"type_kind\":\"I64\"}") in
   hash_object(b"Type", 1, p)
-
-fn build_expr(t: string, val: string) -> EH effects[alloc, state] =
-  let p0: string = push_lit(string_with_capacity(256), b"{\"expr_kind\":\"literal_i64\",\"type\":\"") in
-  let k: OS = push_kept(p0, t) in
-  let p1: string = k.out in
-  let t2: string = k.s in
-  let p2: string = push_lit(p1, b"\",\"value\":\"") in
-  let p3: string = push_str(p2, val) in
-  let p4: string = push_lit(p3, b"\"}") in
-  let e: string = hash_object(b"Expression", 1, p4) in
-  let res: EH = { h: e, t: t2 } in res
 
 fn build_sig(t: string) -> string effects[alloc, state] =
   let p0: string = push_lit(string_with_capacity(192), b"{\"abi\":\"codedb-v0-internal\",\"effects\":[],\"params\":[],\"return\":\"") in
@@ -178,39 +224,106 @@ fn build_root_obj(sym: string, def: string, sig: string) -> string effects[alloc
   let p10: string = push_lit(p9, b"\"}]}") in
   hash_object(b"ProgramRoot", 1, p10)
 
-fn import_root(val: string) -> string effects[alloc, state] =
+// Build a `literal_i64` Expression over the digits `mem`[start, end), returning
+// its content hash with the memory threaded back.
+fn build_literal(mem: string, start: i64, endd: i64) -> Pr effects[alloc, state] =
   let t: string = build_type() in
-  let re: EH = build_expr(t, val) in
-  let e: string = re.h in
-  let t2: string = re.t in
-  let sig: string = build_sig(t2) in
+  let p0: string = push_lit(string_with_capacity(512), b"{\"expr_kind\":\"literal_i64\",\"type\":\"") in
+  let p1: string = push_str(p0, t) in
+  let p2: string = push_lit(p1, b"\",\"value\":\"") in
+  let pv: PRR = push_range(p2, mem, start, endd) in
+  let p3: string = pv.out in
+  let m3: string = pv.mem in
+  let p4: string = push_lit(p3, b"\"}") in
+  let h: string = hash_object(b"Expression", 1, p4) in
+  let res: Pr = { mem: m3, hash: h, next: endd } in res
+
+// Build a `binary` Expression from the child hashes `lh`/`rh` and operator byte
+// `opb`; every node is i64 in this increment, so the type is the i64 hash.
+fn build_binary(lh: string, opb: i64, rh: string) -> string effects[alloc, state] =
+  let t: string = build_type() in
+  let p0: string = push_lit(string_with_capacity(512), b"{\"expr_kind\":\"binary\",\"left\":\"") in
+  let p1: string = push_str(p0, lh) in
+  let p2: string = push_lit(p1, b"\",\"op\":\"") in
+  let p3: string = push_byte(p2, to_u8(opb)) in
+  let p4: string = push_lit(p3, b"\",\"right\":\"") in
+  let p5: string = push_str(p4, rh) in
+  let p6: string = push_lit(p5, b"\",\"type\":\"") in
+  let p7: string = push_str(p6, t) in
+  let p8: string = push_lit(p7, b"\"}") in
+  hash_object(b"Expression", 1, p8)
+
+// ---------------------------------------------------------------------------
+// the parser: atom -> mul -> add (precedence climbing, left-associative)
+// ---------------------------------------------------------------------------
+
+// atom := <decimal int> (whitespace-skipped).
+fn parse_atom(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
+  let sw: MI = skip_ws(mem, pos, len) in
+  let sd: MI = scan_digits(sw.mem, sw.i, len) in
+  build_literal(sd.mem, sw.i, sd.i)
+
+// mul := atom (('*'|'/') atom)*
+fn parse_mul(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_atom(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Pr = { mem: s0.mem, hash: lft.hash, next: s0.i } in
+  let done: Pr =
+    loop a = seed while (if a.next < len then is_mulop(to_i64(string_get(a.mem, a.next))) else false) do
+      let cur: Pr = a in
+      let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
+      let rgt: Pr = parse_atom(cur.mem, cur.next + 1, len) in
+      let bh: string = build_binary(cur.hash, opb, rgt.hash) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Pr = { mem: s1.mem, hash: bh, next: s1.i } in nx
+  in
+  // BACKEND-BUG WORKAROUND: returning the move-only loop accumulator `done`
+  // directly (`in done`) miscompiles to a native SIGTRAP when the loop body
+  // calls an aggregate-returning function (here parse_mul/parse_atom) — a
+  // loop-accumulator/return-slot aliasing bug in the v0 backend. Rebuilding the
+  // result into a fresh record decouples the slots and compiles correctly. The
+  // reference evaluator computes both forms identically; this is native-only.
+  let r: Pr = { mem: done.mem, hash: done.hash, next: done.next } in r
+
+// add := mul (('+'|'-') mul)*
+fn parse_add(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_mul(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Pr = { mem: s0.mem, hash: lft.hash, next: s0.i } in
+  let done: Pr =
+    loop a = seed while (if a.next < len then is_addop(to_i64(string_get(a.mem, a.next))) else false) do
+      let cur: Pr = a in
+      let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
+      let rgt: Pr = parse_mul(cur.mem, cur.next + 1, len) in
+      let bh: string = build_binary(cur.hash, opb, rgt.hash) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Pr = { mem: s1.mem, hash: bh, next: s1.i } in nx
+  in
+  // BACKEND-BUG WORKAROUND: returning the move-only loop accumulator `done`
+  // directly (`in done`) miscompiles to a native SIGTRAP when the loop body
+  // calls an aggregate-returning function (here parse_mul/parse_atom) — a
+  // loop-accumulator/return-slot aliasing bug in the v0 backend. Rebuilding the
+  // result into a fresh record decouples the slots and compiles correctly. The
+  // reference evaluator computes both forms identically; this is native-only.
+  let r: Pr = { mem: done.mem, hash: done.hash, next: done.next } in r
+
+// ---------------------------------------------------------------------------
+// import: parse the body, build the objects, return the ProgramRoot hash
+// ---------------------------------------------------------------------------
+
+fn import_root(mem: string) -> string effects[alloc, state] =
+  let len: i64 = string_len(mem) in
+  let fe: MI = find_eq(mem, len) in
+  let body: Pr = parse_add(fe.mem, fe.i, len) in
+  let bodyhash: string = body.hash in
+  let leftover: string = body.mem in
+  let sig: string = build_sig(build_type()) in
   let sym: string = build_sym() in
-  let rd: DH = build_def(sig, sym, e) in
+  let rd: DH = build_def(sig, sym, bodyhash) in
   let def: string = rd.h in
   let sig2: string = rd.sig in
   let sym2: string = rd.sym in
   build_root_obj(sym2, def, sig2)
-
-// ---------------------------------------------------------------------------
-// minimal "parser": the decimal int literal is the digits after `=`
-// ---------------------------------------------------------------------------
-
-fn extract_int(src: string) -> string effects[alloc, state] =
-  let n: i64 = string_len(src) in
-  let seed: Ext = { out: string_with_capacity(32), p: 0, eq: false } in
-  let done: Ext =
-    loop a = seed while a.p < n do
-      let cur: Ext = a in
-      let oo: string = cur.out in
-      let b: i64 = to_i64(string_get(src, cur.p)) in
-      if cur.eq then
-        (if b >= 48 && b <= 57 then
-           let pushed: unit = string_push(oo, to_u8(b)) in
-           (let r: Ext = { out: oo, p: cur.p + 1, eq: true } in r)
-         else (let r: Ext = { out: oo, p: cur.p + 1, eq: true } in r))
-      else
-        (let r: Ext = { out: oo, p: cur.p + 1, eq: b == 61 } in r)
-  in done.out
 
 fn print_str<'r>(s: string) -> i64 effects[io, state, ffi, unsafe] =
   let n: i64 = string_len(s) in
@@ -224,7 +337,6 @@ fn print_str<'r>(s: string) -> i64 effects[io, state, ffi, unsafe] =
 
 fn main<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
   let src: string = read_all(string_with_capacity(mem_cap())) in
-  let val: string = extract_int(src) in
-  let root: string = import_root(val) in
+  let root: string = import_root(src) in
   let printed: i64 = print_str(root) in
   0

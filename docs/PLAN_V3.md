@@ -1265,6 +1265,29 @@ multi-file composition the later stages (15b–15e) depend on: root-module funct
 record types, and externs all resolve across imported files, and dead lib functions
 drop from each entry's build. `tests/selfhost_frontend.rs` stays green (7/7).
 
+Landed 2026-06-14: step 2 (15a.2) — the real expression parser. `import.cdb` replaces
+the int-extraction hack with a scannerless recursive-descent parser (`atom -> mul ->
+add`, precedence-climbing) for `fn main() -> i64 = <expr>` where `<expr>` is integer
+arithmetic (`+ - * /`, left-associative, `* /` binding tighter than `+ -`). Each parse
+function returns the content hash of the typed Expression object it just built (children
+referenced by hash), so no AST data structure is needed and objects emit in dependency
+order. Single function, genesis birth — still axis 1, no chain. Root-hash equality holds
+across 15 arithmetic fixtures plus the 6 literal ones (`tests/selfhost_frontend.rs`, now
+8/8). Surfaced a v0-backend codegen bug en route, worked around in `.cdb` and flagged for
+a proper fix:
+
+```text
+v0-backend bug (native-only): a function that returns a move-only LOOP ACCUMULATOR
+  directly (`... in done`) miscompiles to a SIGTRAP when the loop body calls an
+  aggregate-returning function — a loop-accumulator / return-slot aliasing bug.
+  Workaround: rebuild the result into a fresh record before returning
+  (`let r: Pr = { ..done fields.. } in r`). The reference evaluator computes both
+  forms identically, so it is a backend codegen defect, not a language-semantics one;
+  a minimal Rust-side repro + lowering/backend fix is a follow-on (it will recur as the
+  parser grows more loop-returning functions, so the workaround is load-bearing until
+  fixed).
+```
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text
