@@ -423,6 +423,16 @@ fn importer_reproduces_the_root_hash_for_integer_expressions() {
         "1 << 4 | 2",
         "2 + 3 << 1",
         "1 | 2 | 4 | 8",
+        // hex literals (0x…): the canonical `value` is the raw source slice, so a
+        // wrong scan (digits, case, or the 0x prefix) changes the literal's hash.
+        "0xff",
+        "0x0",
+        "0xFF",
+        "0xdeadbeef",
+        "0xff + 1",
+        "0x10 * 0x10",
+        "0xff & 0x0f | 0x80",
+        "1 + 0xa * 2",
     ];
     for (i, expr) in exprs.iter().enumerate() {
         let source = format!("fn main() -> i64 = {expr}\n");

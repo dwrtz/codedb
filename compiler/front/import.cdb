@@ -113,6 +113,8 @@ record MH { mem: string  hash: string }
 
 fn is_ws_b(b: i64) -> bool = b == 32 || b == 9 || b == 10 || b == 13
 fn is_digit_b(b: i64) -> bool = b >= 48 && b <= 57
+// A hex digit: 0-9, a-f, or A-F (for `0x...` integer literals).
+fn is_hexdigit_b(b: i64) -> bool = (b >= 48 && b <= 57) || (b >= 97 && b <= 102) || (b >= 65 && b <= 70)
 fn is_ident_b(b: i64) -> bool = (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 95
 fn is_unary_op(b: i64) -> bool = b == 45 || b == 126 || b == 33
 fn is_mulop(b: i64) -> bool = b == 42 || b == 47 || b == 37
@@ -251,7 +253,16 @@ fn scan_digits(mem: string, start: i64, len: i64) -> MI =
   in
   let res: MI = { mem: mem, i: done.p } in res
 
-// Return the index just past the first `=` (or `len` if none).
+// Advance over hex digits from `start`; return the first non-hex-digit index.
+fn scan_hex(mem: string, start: i64, len: i64) -> MI =
+  let done: P2 =
+    loop a = { p: start, go: true } while a.go do
+      if a.p >= len then (let s: P2 = { p: a.p, go: false } in s)
+      else if is_hexdigit_b(to_i64(string_get(mem, a.p))) then (let s: P2 = { p: a.p + 1, go: true } in s)
+      else (let s: P2 = { p: a.p, go: false } in s)
+  in
+  let res: MI = { mem: mem, i: done.p } in res
+
 // Advance over identifier bytes from `start`; return the first non-ident index.
 fn scan_ident(mem: string, start: i64, len: i64) -> MI =
   let done: P2 =
@@ -642,8 +653,14 @@ fn parse_atom(mem: string, pos: i64, len: i64, scope: Scope, np: i64) -> Pr effe
   let p: i64 = sw.i in
   if p < len then
     (if is_digit_b(to_i64(string_get(m1, p))) then
-       let sd: MI = scan_digits(m1, p, len) in
-       build_literal(sd.mem, p, sd.i)
+       // A `0x`/`0X` prefix selects a hex literal; otherwise decimal. The literal's
+       // canonical `value` is the raw source slice either way (e.g. "0xff", "42").
+       (if (if to_i64(string_get(m1, p)) == 48 then (if p + 1 < len then (let b1: i64 = to_i64(string_get(m1, p + 1)) in b1 == 120 || b1 == 88) else false) else false) then
+          let sh: MI = scan_hex(m1, p + 2, len) in
+          build_literal(sh.mem, p, sh.i)
+        else
+          let sd: MI = scan_digits(m1, p, len) in
+          build_literal(sd.mem, p, sd.i))
      else
        // An identifier: a keyword (`if` / `let` / `true` / `false`) or a variable.
        // `kw`: 0 = variable, 1 = if, 2 = let, 3 = bool literal. Each keyword test is
