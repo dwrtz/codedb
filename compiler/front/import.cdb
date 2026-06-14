@@ -357,6 +357,20 @@ fn build_bool_atom(mem: string, start: i64, endd: i64) -> Pr effects[alloc, stat
   let h: string = hash_object(b"Expression", 1, p4) in
   let res: Pr = { mem: mem, hash: h, tyc: 1, next: endd } in res
 
+// Build an `if` Expression from the child hashes; the result type is the then/else
+// branch type (`rtyc`). Canonical key order is cond, else, expr_kind, then, type.
+fn build_if(condh: string, thenh: string, elseh: string, rtyc: i64) -> string effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(512), b"{\"cond\":\"") in
+  let p1: string = push_str(p0, condh) in
+  let p2: string = push_lit(p1, b"\",\"else\":\"") in
+  let p3: string = push_str(p2, elseh) in
+  let p4: string = push_lit(p3, b"\",\"expr_kind\":\"if\",\"then\":\"") in
+  let p5: string = push_str(p4, thenh) in
+  let p6: string = push_lit(p5, b"\",\"type\":\"") in
+  let p7: string = push_str(p6, type_hash(rtyc)) in
+  let p8: string = push_lit(p7, b"\"}") in
+  hash_object(b"Expression", 1, p8)
+
 // ---------------------------------------------------------------------------
 // the parser: precedence climbing, left-associative for the binary levels.
 //   bitor `|` -> bitxor `^` -> bitand `&` -> equality `== !=` -> relational
@@ -367,13 +381,16 @@ fn build_bool_atom(mem: string, start: i64, endd: i64) -> Pr effects[alloc, stat
 // (equality, relational) yield bool (type code 1); the arithmetic/bitwise/shift
 // levels yield i64 (type code 0); the logical levels (logor `||`, logand `&&`) and
 // `!` yield bool. Each result type threads up through `Pr.tyc` so a node's `type`
-// field and the function's return type are correct. (`if` is a later increment;
-// `<<`/`>>` are distinguished from lone `<`/`>`, and `&&`/`||` from `&`/`|`.) The
-// move-only loop result is rebuilt into a fresh record before return (see the
-// v0-backend workaround note on parse_mul).
+// field and the function's return type are correct. `<<`/`>>` are distinguished from
+// lone `<`/`>`, and `&&`/`||` from `&`/`|`. The atom level also handles `if cond then
+// a else b` (an expression), whose sub-expressions recurse back to the top of the
+// ladder — so parse_atom/parse_if and the binary levels form one mutual-recursion
+// clique (codedb compiles it as a recursion group). The move-only loop result is
+// rebuilt into a fresh record before return (see the v0-backend workaround on
+// parse_mul).
 // ---------------------------------------------------------------------------
 
-// atom := <decimal int> (i64) | `true` | `false` (bool); whitespace-skipped.
+// atom := <decimal int> (i64) | `true` | `false` (bool) | `if` ... ; ws-skipped.
 fn parse_atom(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
   let sw: MI = skip_ws(mem, pos, len) in
   let m1: string = sw.mem in
@@ -383,10 +400,33 @@ fn parse_atom(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
        let sd: MI = scan_digits(m1, p, len) in
        build_literal(sd.mem, p, sd.i)
      else
-       // An identifier here is a `true`/`false` keyword (variables await scope/let).
+       // An identifier here is `if`, or a `true`/`false` keyword (other identifiers
+       // are variables, which await scope/let).
        let se: MI = scan_ident(m1, p, len) in
-       build_bool_atom(se.mem, p, se.i))
+       let m2: string = se.mem in
+       let e: i64 = se.i in
+       (if (if e - p == 2 then (to_i64(string_get(m2, p)) == 105 && to_i64(string_get(m2, p + 1)) == 102) else false) then
+          parse_if(m2, e, len)
+        else build_bool_atom(m2, p, e)))
   else build_literal(m1, p, p)
+
+// if := `if` expr `then` expr `else` expr  (the `then`/`else` keyword tokens are
+// skipped; the result type is the then-branch's type). The cond/then/else are full
+// expressions, so this recurses to parse_bitor (the top of the ladder).
+// NOTE: treating `if` as an atom is more permissive than the Rust grammar, which
+// only allows `if` at an expression-start position (e.g. `1 + if ...` is a Rust
+// parse error). This never diverges on a Rust-valid program, so root-hash equality
+// holds; matching Rust's exact rejection is a later grammar-tightening.
+fn parse_if(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
+  let cond: Pr = parse_bitor(mem, pos, len) in
+  let sw1: MI = skip_ws(cond.mem, cond.next, len) in
+  let tk: MI = scan_ident(sw1.mem, sw1.i, len) in
+  let thn: Pr = parse_bitor(tk.mem, tk.i, len) in
+  let sw2: MI = skip_ws(thn.mem, thn.next, len) in
+  let ek: MI = scan_ident(sw2.mem, sw2.i, len) in
+  let els: Pr = parse_bitor(ek.mem, ek.i, len) in
+  let h: string = build_if(cond.hash, thn.hash, els.hash, thn.tyc) in
+  let res: Pr = { mem: els.mem, hash: h, tyc: thn.tyc, next: els.next } in res
 
 // unary := ('-'|'~'|'!') unary | atom   (prefix; `- ~` -> i64, `!` -> bool)
 fn parse_unary(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =

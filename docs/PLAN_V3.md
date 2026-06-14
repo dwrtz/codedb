@@ -1308,9 +1308,20 @@ value a bare JSON boolean), logical `&&`/`||` (new logor/logand levels between b
 bitxor, bool-typed), and unary `!` (bool); `build_unary` gained a result-type code. 30
 bool-expression fixtures now hold (comparisons, literals, `! && ||`, precedence cross-
 checks like `(true && false) || true` and `1 < 2 && 3 < 4`), `tests/selfhost_frontend.rs`
-9/9. Remaining axis-1 surface, in order: `if` (introduces the atom<->expr mutual recursion
-— the whole parser becomes one recursion group); then `let` + identifiers + `local_ref`
-by de-Bruijn depth (scope tracking); then params/param_ref; then no-new-symbol builtins.
+9/9.
+
+Then `if cond then a else b` landed — the structural step. Because cond/then/else are
+full expressions, `parse_atom`/`parse_if` and the binary ladder become one mutual-
+recursion clique, which codedb imports + compiles as a single recursion group (the
+keystone Phase 5/6 machinery, now exercised at ~14 members from a real .cdb). The if
+node's type is the then/else branch type, threaded like any other; root-hash equality
+holds across 9 if fixtures (i64/bool results, logical/comparison conds, nested if,
+else-if chains), `tests/selfhost_frontend.rs` 10/10. Known intentional over-permissiveness:
+the parser treats `if` as an atom, so it accepts `1 + if ...` which the Rust grammar
+rejects as a parse error — harmless for the oracle (valid programs only); matching Rust's
+exact `if`-position rejection is a later grammar-tightening. Remaining axis-1 surface, in
+order: `let` + identifiers + `local_ref` by de-Bruijn depth (scope tracking — a threaded
+name-stack); then params/param_ref; then no-new-symbol builtins.
 
 Sub-stages (each independently oracle-checked at its artifact):
 

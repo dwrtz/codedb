@@ -523,6 +523,53 @@ fn importer_reproduces_the_root_hash_for_bool_expressions() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_if_expressions() {
+    // 15a.2 (axis 1): `if cond then a else b`. `if` is an expression whose cond/then/
+    // else are full expressions, so the parser becomes mutually recursive (atom ->
+    // if -> the binary ladder -> atom) and the .cdb compiles as one recursion group.
+    // The if node's type is the then/else branch type, which threads up like any
+    // other. Covers bool and i64 results, complex (logical/comparison) conditions,
+    // nested `if` in the then-branch, and an else-if chain. Root-hash equality is
+    // exact. (`if` in operand position, e.g. `1 + if ...`, is a Rust parse error and
+    // out of scope — the parser is intentionally more permissive there for now.)
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        "fn main() -> i64 = if 1 < 2 then 10 else 20",
+        "fn main() -> i64 = if true then 1 else 2",
+        "fn main() -> i64 = if 1 == 1 then 100 else 0",
+        "fn main() -> bool = if 1 < 2 then true else false",
+        "fn main() -> bool = if true then false else true",
+        "fn main() -> i64 = if 1 + 1 == 2 && 3 > 0 then 9 else 8",
+        "fn main() -> i64 = if 1 < 2 then if 3 < 4 then 5 else 6 else 7",
+        "fn main() -> i64 = if 1 < 2 then 10 else if 3 < 4 then 20 else 30",
+        "fn main() -> i64 = if 5 % 2 == 1 then 1 << 3 else 0",
+    ];
+    for (i, source_expr) in sources.iter().enumerate() {
+        let source = format!("{source_expr}\n");
+        let db = temp.path().join(format!("ref-if-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-if-{i}.cdb"));
+        std::fs::write(&src, &source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer if-expression root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate
