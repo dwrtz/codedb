@@ -1290,6 +1290,22 @@ v0-backend bug (native-only): a function that returns a move-only LOOP ACCUMULAT
   fixed).
 ```
 
+Landed 2026-06-14: step 2 (15a.2) gains TYPE INFERENCE. `import.cdb` now infers each
+expression's type (i64 vs bool) and threads it through every parse result (`Pr.tyc`)
+into the node's `type` field, and reads the function's declared return type from the
+header. New levels: equality (`== !=`) and relational (`< > <= >=`), which take i64
+operands and yield bool, inserted between bitand and shift; plus a `parse_header` that
+reads `-> i64` / `-> bool`. So `fn main() -> bool = <comparison>` builds the bool Type,
+the bool-typed comparison node, and the bool-returning signature — all matching the Rust
+importer. Root-hash equality holds across 17 comparison/bool-return fixtures plus the 33
+integer + 6 literal ones (`tests/selfhost_frontend.rs`, 9/9). The parser deliberately
+does NOT type-check (it builds the tree and infers result types), so the oracle is
+defined only on type-valid programs — a `7 & (3==3)` (i64 & bool) is rejected by the Rust
+importer and out of scope. Still single-function / genesis-birth (axis 1). Remaining
+axis-1 surface, in order: logical `&& || !` + bool literals `true`/`false`; then `if`
+(introduces the atom<->expr mutual recursion — the parser becomes one recursion group);
+then `let` + identifiers + `local_ref` by de-Bruijn depth (scope tracking); then params.
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text

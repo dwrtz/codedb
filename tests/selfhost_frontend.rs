@@ -448,6 +448,68 @@ fn importer_reproduces_the_root_hash_for_integer_expressions() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_comparisons_and_bool_returns() {
+    // 15a.2 (axis 1, type inference): the parser now infers each expression's type
+    // (i64 vs bool) and threads it into every node's `type` field, and reads the
+    // declared return type from the header. Comparisons (`< > <= >= == !=`) take i64
+    // operands and yield bool, so a `fn main() -> bool = <comparison>` exercises the
+    // full machinery: the bool Type object, the bool-typed comparison node, and the
+    // bool-returning signature. Each source is the COMPLETE program (with its return
+    // type) — only type-valid programs are gated (the .cdb importer does not type
+    // check, so the Rust importer is the authority on what is well-typed). Root-hash
+    // equality is exact: a wrong inferred type changes a node's `type` hash and the
+    // root.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        // i64-returning regressions (the previous increment still holds)
+        "fn main() -> i64 = 42",
+        "fn main() -> i64 = 1 + 2 * 3",
+        "fn main() -> i64 = 1 << 4 | 2",
+        "fn main() -> i64 = ~0 & 255",
+        // each comparison operator, bool-returning
+        "fn main() -> bool = 1 < 2",
+        "fn main() -> bool = 5 > 2",
+        "fn main() -> bool = 1 <= 1",
+        "fn main() -> bool = 2 >= 3",
+        "fn main() -> bool = 3 == 3",
+        "fn main() -> bool = 3 != 4",
+        // arithmetic/bitwise/shift operands feeding a comparison (i64 -> bool)
+        "fn main() -> bool = 1 + 1 == 2",
+        "fn main() -> bool = 2 * 3 > 5",
+        "fn main() -> bool = 10 % 3 == 1",
+        "fn main() -> bool = 1 << 1 == 2",
+        "fn main() -> bool = 1 + 2 == 3 - 1",
+        "fn main() -> bool = 100 >> 2 < 30",
+        "fn main() -> bool = -3 < 0",
+    ];
+    for (i, source_expr) in sources.iter().enumerate() {
+        let source = format!("{source_expr}\n");
+        // The Rust importer's root for this source.
+        let db = temp.path().join(format!("ref-bool-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-bool-{i}.cdb"));
+        std::fs::write(&src, &source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        // The self-hosted importer's root from the same source on stdin.
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer comparison/bool root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate
