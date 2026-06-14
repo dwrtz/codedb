@@ -448,24 +448,23 @@ fn importer_reproduces_the_root_hash_for_integer_expressions() {
 }
 
 #[test]
-fn importer_reproduces_the_root_hash_for_comparisons_and_bool_returns() {
-    // 15a.2 (axis 1, type inference): the parser now infers each expression's type
+fn importer_reproduces_the_root_hash_for_bool_expressions() {
+    // 15a.2 (axis 1, type inference): the parser infers each expression's type
     // (i64 vs bool) and threads it into every node's `type` field, and reads the
     // declared return type from the header. Comparisons (`< > <= >= == !=`) take i64
-    // operands and yield bool, so a `fn main() -> bool = <comparison>` exercises the
-    // full machinery: the bool Type object, the bool-typed comparison node, and the
-    // bool-returning signature. Each source is the COMPLETE program (with its return
-    // type) — only type-valid programs are gated (the .cdb importer does not type
-    // check, so the Rust importer is the authority on what is well-typed). Root-hash
-    // equality is exact: a wrong inferred type changes a node's `type` hash and the
-    // root.
+    // operands and yield bool; bool literals `true`/`false`, logical `&& || !`, and
+    // the bool-returning signature round out the bool surface. Each source is the
+    // COMPLETE program (with its return type) — only type-valid programs are gated
+    // (the .cdb importer does not type check, so the Rust importer is the authority
+    // on what is well-typed). Root-hash equality is exact: a wrong inferred type
+    // changes a node's `type` hash and the root.
     if !can_build_default_native_target() {
         return;
     }
     let exe = importer();
     let temp = tempdir().unwrap();
     let sources = [
-        // i64-returning regressions (the previous increment still holds)
+        // i64-returning regressions (the previous increments still hold)
         "fn main() -> i64 = 42",
         "fn main() -> i64 = 1 + 2 * 3",
         "fn main() -> i64 = 1 << 4 | 2",
@@ -485,6 +484,20 @@ fn importer_reproduces_the_root_hash_for_comparisons_and_bool_returns() {
         "fn main() -> bool = 1 + 2 == 3 - 1",
         "fn main() -> bool = 100 >> 2 < 30",
         "fn main() -> bool = -3 < 0",
+        // bool literals and logical `! && ||`, with their precedence
+        "fn main() -> bool = true",
+        "fn main() -> bool = false",
+        "fn main() -> bool = !true",
+        "fn main() -> bool = true && false",
+        "fn main() -> bool = true || false",
+        "fn main() -> bool = true && false || true",
+        "fn main() -> bool = true || false && false",
+        "fn main() -> bool = 1 < 2 && 3 < 4",
+        "fn main() -> bool = 1 == 1 && 2 == 2",
+        "fn main() -> bool = true && 1 == 1",
+        "fn main() -> bool = !true || false",
+        "fn main() -> bool = !true && !false",
+        "fn main() -> bool = 1 + 1 == 2 && 3 * 2 > 5",
     ];
     for (i, source_expr) in sources.iter().enumerate() {
         let source = format!("{source_expr}\n");

@@ -1301,10 +1301,16 @@ importer. Root-hash equality holds across 17 comparison/bool-return fixtures plu
 integer + 6 literal ones (`tests/selfhost_frontend.rs`, 9/9). The parser deliberately
 does NOT type-check (it builds the tree and infers result types), so the oracle is
 defined only on type-valid programs — a `7 & (3==3)` (i64 & bool) is rejected by the Rust
-importer and out of scope. Still single-function / genesis-birth (axis 1). Remaining
-axis-1 surface, in order: logical `&& || !` + bool literals `true`/`false`; then `if`
-(introduces the atom<->expr mutual recursion — the parser becomes one recursion group);
-then `let` + identifiers + `local_ref` by de-Bruijn depth (scope tracking); then params.
+importer and out of scope. Still single-function / genesis-birth (axis 1).
+
+Then (same day) the bool surface was completed: bool literals `true`/`false` (atoms,
+value a bare JSON boolean), logical `&&`/`||` (new logor/logand levels between bitor and
+bitxor, bool-typed), and unary `!` (bool); `build_unary` gained a result-type code. 30
+bool-expression fixtures now hold (comparisons, literals, `! && ||`, precedence cross-
+checks like `(true && false) || true` and `1 < 2 && 3 < 4`), `tests/selfhost_frontend.rs`
+9/9. Remaining axis-1 surface, in order: `if` (introduces the atom<->expr mutual recursion
+— the whole parser becomes one recursion group); then `let` + identifiers + `local_ref`
+by de-Bruijn depth (scope tracking); then params/param_ref; then no-new-symbol builtins.
 
 Sub-stages (each independently oracle-checked at its artifact):
 

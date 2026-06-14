@@ -71,7 +71,7 @@ record HdrR { mem: string  rettyc: i64  bodypos: i64 }
 fn is_ws_b(b: i64) -> bool = b == 32 || b == 9 || b == 10 || b == 13
 fn is_digit_b(b: i64) -> bool = b >= 48 && b <= 57
 fn is_ident_b(b: i64) -> bool = (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 95
-fn is_unary_op(b: i64) -> bool = b == 45 || b == 126
+fn is_unary_op(b: i64) -> bool = b == 45 || b == 126 || b == 33
 fn is_mulop(b: i64) -> bool = b == 42 || b == 47 || b == 37
 fn is_addop(b: i64) -> bool = b == 43 || b == 45
 // Two-char `<<` / `>>`.
@@ -85,6 +85,9 @@ fn is_eq_start(b1: i64, b2: i64) -> bool = (b1 == 61 || b1 == 33) && b2 == 61
 // Relational `<` `>` `<=` `>=` — a `<`/`>` NOT doubled (a doubled one is shift,
 // which binds tighter and is consumed first); `<=`/`>=` when followed by `=`.
 fn is_rel_start(b1: i64, b2: i64) -> bool = (b1 == 60 && b2 != 60) || (b1 == 62 && b2 != 62)
+// Logical `&&` / `||` (doubled; the single `&`/`|` is bitwise, tighter).
+fn is_logand(b1: i64, b2: i64) -> bool = b1 == 38 && b2 == 38
+fn is_logor(b1: i64, b2: i64) -> bool = b1 == 124 && b2 == 124
 
 // ---------------------------------------------------------------------------
 // canonical-string building
@@ -329,16 +332,30 @@ fn build_binary(lh: string, ob1: i64, ob2: i64, rh: string, rtyc: i64) -> string
   let p8: string = push_lit(p7, b"\"}") in
   hash_object(b"Expression", 1, p8)
 
-// Build a `unary` Expression (prefix `-`/`~`) over child hash `eh`; i64 -> i64.
-fn build_unary(opb: i64, eh: string) -> string effects[alloc, state] =
+// Build a `unary` Expression (prefix `-`/`~` -> i64; `!` -> bool) over child hash
+// `eh`, with the result type code `rtyc`.
+fn build_unary(opb: i64, eh: string, rtyc: i64) -> string effects[alloc, state] =
   let p0: string = push_lit(string_with_capacity(512), b"{\"expr\":\"") in
   let p1: string = push_str(p0, eh) in
   let p2: string = push_lit(p1, b"\",\"expr_kind\":\"unary\",\"op\":\"") in
   let p3: string = push_byte(p2, to_u8(opb)) in
   let p4: string = push_lit(p3, b"\",\"type\":\"") in
-  let p5: string = push_str(p4, build_type_i64()) in
+  let p5: string = push_str(p4, type_hash(rtyc)) in
   let p6: string = push_lit(p5, b"\"}") in
   hash_object(b"Expression", 1, p6)
+
+// Build a `literal_bool` Expression for the keyword `mem`[start, end) (`true` or
+// `false`, distinguished by the first byte: 't' = true). The JSON `value` is a bare
+// boolean, not a quoted string. Type code 1 (bool); memory threaded back.
+fn build_bool_atom(mem: string, start: i64, endd: i64) -> Pr effects[alloc, state] =
+  let v: bool = to_i64(string_get(mem, start)) == 116 in
+  let p0: string = push_lit(string_with_capacity(256), b"{\"expr_kind\":\"literal_bool\",\"type\":\"") in
+  let p1: string = push_str(p0, build_type_bool()) in
+  let p2: string = push_lit(p1, b"\",\"value\":") in
+  let p3: string = if v then push_lit(p2, b"true") else push_lit(p2, b"false") in
+  let p4: string = push_lit(p3, b"}") in
+  let h: string = hash_object(b"Expression", 1, p4) in
+  let res: Pr = { mem: mem, hash: h, tyc: 1, next: endd } in res
 
 // ---------------------------------------------------------------------------
 // the parser: precedence climbing, left-associative for the binary levels.
@@ -348,20 +365,30 @@ fn build_unary(opb: i64, eh: string) -> string effects[alloc, state] =
 // Each binary level is the same loop: parse a tighter operand, then while the next
 // significant bytes are an operator of this level, fold left. The comparison levels
 // (equality, relational) yield bool (type code 1); the arithmetic/bitwise/shift
-// levels yield i64 (type code 0). Each result type threads up through `Pr.tyc` so a
-// node's `type` field and the function's return type are correct. (Logical `&& ||`
-// and `!`, and `if`, are later increments; `<<`/`>>` are distinguished from lone
-// `<`/`>`, and `&`/`|` from `&&`/`||`.) The move-only loop result is rebuilt into a
-// fresh record before return (see the v0-backend workaround note on parse_mul).
+// levels yield i64 (type code 0); the logical levels (logor `||`, logand `&&`) and
+// `!` yield bool. Each result type threads up through `Pr.tyc` so a node's `type`
+// field and the function's return type are correct. (`if` is a later increment;
+// `<<`/`>>` are distinguished from lone `<`/`>`, and `&&`/`||` from `&`/`|`.) The
+// move-only loop result is rebuilt into a fresh record before return (see the
+// v0-backend workaround note on parse_mul).
 // ---------------------------------------------------------------------------
 
-// atom := <decimal int> (whitespace-skipped); type code 0 (i64).
+// atom := <decimal int> (i64) | `true` | `false` (bool); whitespace-skipped.
 fn parse_atom(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
   let sw: MI = skip_ws(mem, pos, len) in
-  let sd: MI = scan_digits(sw.mem, sw.i, len) in
-  build_literal(sd.mem, sw.i, sd.i)
+  let m1: string = sw.mem in
+  let p: i64 = sw.i in
+  if p < len then
+    (if is_digit_b(to_i64(string_get(m1, p))) then
+       let sd: MI = scan_digits(m1, p, len) in
+       build_literal(sd.mem, p, sd.i)
+     else
+       // An identifier here is a `true`/`false` keyword (variables await scope/let).
+       let se: MI = scan_ident(m1, p, len) in
+       build_bool_atom(se.mem, p, se.i))
+  else build_literal(m1, p, p)
 
-// unary := ('-'|'~') unary | atom   (right-associative prefix; `- ~` are i64)
+// unary := ('-'|'~'|'!') unary | atom   (prefix; `- ~` -> i64, `!` -> bool)
 fn parse_unary(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
   let sw: MI = skip_ws(mem, pos, len) in
   let m1: string = sw.mem in
@@ -369,9 +396,10 @@ fn parse_unary(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
   if p < len then
     (if is_unary_op(to_i64(string_get(m1, p))) then
        let opb: i64 = to_i64(string_get(m1, p)) in
+       let utyc: i64 = if opb == 33 then 1 else 0 in
        let inner: Pr = parse_unary(m1, p + 1, len) in
-       let h: string = build_unary(opb, inner.hash) in
-       let res: Pr = { mem: inner.mem, hash: h, tyc: 0, next: inner.next } in res
+       let h: string = build_unary(opb, inner.hash, utyc) in
+       let res: Pr = { mem: inner.mem, hash: h, tyc: utyc, next: inner.next } in res
      else parse_atom(m1, p, len))
   else parse_atom(m1, p, len)
 
@@ -499,16 +527,46 @@ fn parse_bitxor(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
   in
   let r: Pr = { mem: done.mem, hash: done.hash, tyc: done.tyc, next: done.next } in r
 
-// bitor := bitxor (('|' not '||') bitxor)*   (i64)
-fn parse_bitor(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
+// logand := bitxor ('&&' bitxor)*   (result bool, type code 1)
+fn parse_logand(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
   let lft: Pr = parse_bitxor(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Pr = { mem: s0.mem, hash: lft.hash, tyc: lft.tyc, next: s0.i } in
+  let done: Pr =
+    loop a = seed while (if a.next + 1 < len then is_logand(to_i64(string_get(a.mem, a.next)), to_i64(string_get(a.mem, a.next + 1))) else false) do
+      let cur: Pr = a in
+      let rgt: Pr = parse_bitxor(cur.mem, cur.next + 2, len) in
+      let bh: string = build_binary(cur.hash, 38, 38, rgt.hash, 1) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Pr = { mem: s1.mem, hash: bh, tyc: 1, next: s1.i } in nx
+  in
+  let r: Pr = { mem: done.mem, hash: done.hash, tyc: done.tyc, next: done.next } in r
+
+// logor := logand ('||' logand)*   (result bool, type code 1)
+fn parse_logor(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_logand(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Pr = { mem: s0.mem, hash: lft.hash, tyc: lft.tyc, next: s0.i } in
+  let done: Pr =
+    loop a = seed while (if a.next + 1 < len then is_logor(to_i64(string_get(a.mem, a.next)), to_i64(string_get(a.mem, a.next + 1))) else false) do
+      let cur: Pr = a in
+      let rgt: Pr = parse_logand(cur.mem, cur.next + 2, len) in
+      let bh: string = build_binary(cur.hash, 124, 124, rgt.hash, 1) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Pr = { mem: s1.mem, hash: bh, tyc: 1, next: s1.i } in nx
+  in
+  let r: Pr = { mem: done.mem, hash: done.hash, tyc: done.tyc, next: done.next } in r
+
+// bitor := logor (('|' not '||') logor)*   (i64)
+fn parse_bitor(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_logor(mem, pos, len) in
   let s0: MI = skip_ws(lft.mem, lft.next, len) in
   let seed: Pr = { mem: s0.mem, hash: lft.hash, tyc: lft.tyc, next: s0.i } in
   let done: Pr =
     loop a = seed while (if a.next < len then is_or_op(to_i64(string_get(a.mem, a.next)), (if a.next + 1 < len then to_i64(string_get(a.mem, a.next + 1)) else 0)) else false) do
       let cur: Pr = a in
       let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
-      let rgt: Pr = parse_bitxor(cur.mem, cur.next + 1, len) in
+      let rgt: Pr = parse_logor(cur.mem, cur.next + 1, len) in
       let bh: string = build_binary(cur.hash, opb, 0, rgt.hash, 0) in
       let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
       let nx: Pr = { mem: s1.mem, hash: bh, tyc: 0, next: s1.i } in nx
