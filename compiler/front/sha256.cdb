@@ -6,207 +6,23 @@
 // proved the COMPRESSION core natively but only for the single fixed "abc" block;
 // the importer hashes arbitrary object payloads (hundreds of bytes, many blocks),
 // so this file generalizes it: read arbitrary bytes from stdin, pad them per the
-// SHA-256 spec (append 0x80, zero-fill to 56 mod 64, append the 64-bit big-endian
-// bit length), process every 512-bit block chaining the eight-word state, and
+// SHA-256 spec, process every 512-bit block chaining the eight-word state, and
 // print the 64-char lowercase hex digest. Gate: its output equals
 // `codedb::sha256_hex` (the sha2 crate) on every input — tests/selfhost_frontend.rs.
 //
-// The compression core (rotr/ssig/bsig/ch/maj/round/round_keys/State) is copied
-// verbatim from the example; only ingestion, padding, multi-block chaining, the
-// big-endian word reads, and hex output are new. The memory string is move-only
-// and threads by MOVE (the Phase 8 discipline); string_get/string_len/string_push
-// are borrowing/mutating builtins, so reads inside a helper that owns `mem` need
-// no threading — only helpers that span the buffer return it inside a record.
+// The SHA-256 core, the stdin pump, padding, the multi-block driver, the hex word
+// emitter, and mem_cap now live in compiler/front/lib.cdb (imported first); this
+// file keeps only the two entries — `main` (hash stdin -> hex) and `obj_hash`
+// (hash_object_canonical over a framed object preimage) — and obj_hash's framing.
 
-module std.platform {
-extern fn write(fd: i64, ptr: raw_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "write" library "c"
-extern fn read(fd: i64, ptr: raw_mut_ptr<u8>, len: i64) -> i64 abi[c] effects[io, ffi, unsafe] link_name "read" library "c"
+// ---------------------------------------------------------------------------
+// hex output (state -> 64 hex chars + newline, written to stdout)
+// ---------------------------------------------------------------------------
+
+record OutBuf {
+  b: array<u8, 72>
+  i: i64
 }
-
-// ---------------------------------------------------------------------------
-// the SHA-256 compression core (verbatim from examples/v3/sha256.cdb)
-// ---------------------------------------------------------------------------
-
-fn rotr(x: u32, n: u32) -> u32 = (x >> n) | (x << (32 - n))
-fn ssig0(x: u32) -> u32 = rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3)
-fn ssig1(x: u32) -> u32 = rotr(x, 17) ^ rotr(x, 19) ^ (x >> 10)
-fn bsig0(x: u32) -> u32 = rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22)
-fn bsig1(x: u32) -> u32 = rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25)
-fn ch(x: u32, y: u32, z: u32) -> u32 = (x & y) ^ (~x & z)
-fn maj(x: u32, y: u32, z: u32) -> u32 = (x & y) ^ (x & z) ^ (y & z)
-
-record State {
-  a: u32
-  b: u32
-  c: u32
-  d: u32
-  e: u32
-  f: u32
-  g: u32
-  h: u32
-}
-
-fn round(s: State, k: u32, w: u32) -> State =
-  let t1: u32 = s.h + bsig1(s.e) + ch(s.e, s.f, s.g) + k + w in
-  let t2: u32 = bsig0(s.a) + maj(s.a, s.b, s.c) in
-  { a: t1 + t2, b: s.a, c: s.b, d: s.c, e: s.d + t1, f: s.e, g: s.f, h: s.g }
-
-fn round_keys() -> array<u32, 64> =
-  [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0xfc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x6ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2]
-
-// ---------------------------------------------------------------------------
-// records
-// ---------------------------------------------------------------------------
-
-// The stdin pump's move-only accumulator (the Phase 8 idiom).
-record Pump {
-  mem: string
-  more: bool
-}
-
-// The message-schedule build accumulator (Copy): the 64 words and the index.
-record Sched {
-  w: array<u32, 64>
-  t: i64
-}
-
-// A schedule result: the threaded memory and the 64-word schedule of one block.
-record SchedR {
-  mem: string
-  w: array<u32, 64>
-}
-
-// The compression accumulator (Copy): the working state and the round index.
-record Working {
-  st: State
-  t: i64
-}
-
-// The per-block driver accumulator (move-only): the padded message, the running
-// eight-word hash state, and the current block index.
-record BlkAcc {
-  mem: string
-  h: State
-  b: i64
-}
-
-// ---------------------------------------------------------------------------
-// the stdin shell (the Phase 8 read_all, verbatim)
-// ---------------------------------------------------------------------------
-
-fn read_all<'r>(mem: string) -> string effects[io, state, ffi, unsafe] =
-  let bounce: array<u8, 1> = [0x0; 1] in
-  let done: Pump =
-    loop s = { mem: mem, more: true } while s.more do
-      let cur: Pump = s in
-      let m: string = cur.mem in
-      let p: raw_mut_ptr<u8> = raw_mut_ptr(&'r mut bounce[0]) in
-      let n: i64 = std.platform.read(0, p, 1) in
-      if n <= 0 then
-        let fin: Pump = { mem: m, more: false } in
-        fin
-      else
-        let pushed: unit = string_push(m, bounce[0]) in
-        let nxt: Pump = { mem: m, more: true } in
-        nxt
-  in
-  done.mem
-
-// ---------------------------------------------------------------------------
-// padding: append 0x80, zero-fill to 56 mod 64, append the 64-bit BE bit length
-// ---------------------------------------------------------------------------
-
-fn pad(mem: string, msglen: i64) -> string effects[state] =
-  let p80: unit = string_push(mem, to_u8(0x80)) in
-  let zeroed: string =
-    loop m = mem while (string_len(m) % 64) != 56 do
-      let z: unit = string_push(m, to_u8(0)) in
-      m
-  in
-  let bits: i64 = msglen * 8 in
-  let b0: unit = string_push(zeroed, to_u8((bits >> 56) & 0xff)) in
-  let b1: unit = string_push(zeroed, to_u8((bits >> 48) & 0xff)) in
-  let b2: unit = string_push(zeroed, to_u8((bits >> 40) & 0xff)) in
-  let b3: unit = string_push(zeroed, to_u8((bits >> 32) & 0xff)) in
-  let b4: unit = string_push(zeroed, to_u8((bits >> 24) & 0xff)) in
-  let b5: unit = string_push(zeroed, to_u8((bits >> 16) & 0xff)) in
-  let b6: unit = string_push(zeroed, to_u8((bits >> 8) & 0xff)) in
-  let b7: unit = string_push(zeroed, to_u8(bits & 0xff)) in
-  zeroed
-
-// ---------------------------------------------------------------------------
-// per-block schedule + compression
-// ---------------------------------------------------------------------------
-
-// Build the 64-word message schedule for the block at byte `base`: words 0..15
-// are the block's big-endian u32s (read inline so string_get borrows the owned
-// `mem` rather than a helper consuming it), words 16..63 the standard recurrence.
-fn schedule_at(mem: string, base: i64) -> SchedR =
-  let seed: Sched = { w: [0x0; 64], t: 0 } in
-  let done: Sched =
-    loop s = seed while s.t < 64 do
-      let word: u32 =
-        if s.t < 16 then
-          let o: i64 = base + s.t * 4 in
-          to_u32(
-            (to_i64(string_get(mem, o)) << 24) |
-            (to_i64(string_get(mem, o + 1)) << 16) |
-            (to_i64(string_get(mem, o + 2)) << 8) |
-            to_i64(string_get(mem, o + 3))
-          )
-        else ssig1(s.w[s.t - 2]) + s.w[s.t - 7] + ssig0(s.w[s.t - 15]) + s.w[s.t - 16]
-      in
-      let nx: Sched = { w: array_set(s.w, s.t, word), t: s.t + 1 } in nx
-  in
-  let res: SchedR = { mem: mem, w: done.w } in res
-
-// Compress one block's schedule into the running state `h`: 64 rounds starting
-// from `h`, then add `h` back (the SHA-256 chaining step).
-fn compress_from(h: State, w: array<u32, 64>) -> State =
-  let k: array<u32, 64> = round_keys() in
-  let done: Working =
-    loop cs = { st: h, t: 0 } while cs.t < 64 do
-      let nx: Working = { st: round(cs.st, k[cs.t], w[cs.t]), t: cs.t + 1 } in nx
-  in
-  let s: State = done.st in
-  let out: State = {
-    a: h.a + s.a, b: h.b + s.b, c: h.c + s.c, d: h.d + s.d,
-    e: h.e + s.e, f: h.f + s.f, g: h.g + s.g, h: h.h + s.h
-  } in out
-
-// Hash the padded message (nblocks 512-bit blocks), returning the final state.
-fn hash_blocks(mem: string, nblocks: i64) -> State =
-  let h0: State = { a: 0x6a09e667, b: 0xbb67ae85, c: 0x3c6ef372, d: 0xa54ff53a, e: 0x510e527f, f: 0x9b05688c, g: 0x1f83d9ab, h: 0x5be0cd19 } in
-  let seed: BlkAcc = { mem: mem, h: h0, b: 0 } in
-  let done: BlkAcc =
-    loop s = seed while s.b < nblocks do
-      let cur: BlkAcc = s in
-      let bb: i64 = cur.b in
-      let hh: State = cur.h in
-      let sr: SchedR = schedule_at(cur.mem, bb * 64) in
-      let nh: State = compress_from(hh, sr.w) in
-      let r: BlkAcc = { mem: sr.mem, h: nh, b: bb + 1 } in r
-  in
-  done.h
-
-// ---------------------------------------------------------------------------
-// hex output
-// ---------------------------------------------------------------------------
-
-fn hex_nibble(v: i64) -> i64 = if v < 10 then 48 + v else 97 + v - 10
-
-// Push the 8 lowercase hex digits of `w` (most significant nibble first).
-fn push_word_hex(out: string, w: u32) -> string effects[state] =
-  let wi: i64 = to_i64(w) in
-  let p0: unit = string_push(out, to_u8(hex_nibble((wi >> 28) & 0xf))) in
-  let p1: unit = string_push(out, to_u8(hex_nibble((wi >> 24) & 0xf))) in
-  let p2: unit = string_push(out, to_u8(hex_nibble((wi >> 20) & 0xf))) in
-  let p3: unit = string_push(out, to_u8(hex_nibble((wi >> 16) & 0xf))) in
-  let p4: unit = string_push(out, to_u8(hex_nibble((wi >> 12) & 0xf))) in
-  let p5: unit = string_push(out, to_u8(hex_nibble((wi >> 8) & 0xf))) in
-  let p6: unit = string_push(out, to_u8(hex_nibble((wi >> 4) & 0xf))) in
-  let p7: unit = string_push(out, to_u8(hex_nibble(wi & 0xf))) in
-  out
 
 // Render the eight-word state as 64 lowercase hex chars + newline, and write it.
 fn print_hex<'r>(s: State) -> i64 effects[io, alloc, state, ffi, unsafe] =
@@ -226,13 +42,6 @@ fn print_hex<'r>(s: State) -> i64 effects[io, alloc, state, ffi, unsafe] =
   in
   let out: array<u8, 72> = array_set(filled.b, ln, 0xa) in
   std.platform.write(1, raw_ptr(&'r out[0]), ln + 1)
-
-record OutBuf {
-  b: array<u8, 72>
-  i: i64
-}
-
-fn mem_cap() -> i64 = 1048576
 
 fn main<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
   let raw: string = read_all(string_with_capacity(mem_cap())) in

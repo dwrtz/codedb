@@ -1258,6 +1258,13 @@ step 5  15b–15e: extend through lowering to CIR-byte equality — the mixed co
         meeting the Phase 8 rung-0 evaluator at the same flat binary.
 ```
 
+Landed 2026-06-14: step 1 is done. `compiler/front/lib.cdb` holds the shared SHA-256
+core + object framing + hex/stdin plumbing, imported first; `sha256.cdb` and
+`import.cdb` are slimmed to their unique parts and resolve it cross-file — proving the
+multi-file composition the later stages (15b–15e) depend on: root-module functions,
+record types, and externs all resolve across imported files, and dead lib functions
+drop from each entry's build. `tests/selfhost_frontend.rs` stays green (7/7).
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text

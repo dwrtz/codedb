@@ -105,6 +105,7 @@ fn hasher() -> &'static Path {
             let temp = tempdir().unwrap();
             let db = temp.path().join("selfhost-sha256.sqlite");
             run(&["init", path(&db)]);
+            run(&["import", path(&db), "compiler/front/lib.cdb"]);
             run(&["import", path(&db), "compiler/front/sha256.cdb"]);
             run(&["verify", path(&db)]);
             let exe = temp.path().join("sha-bin");
@@ -124,6 +125,7 @@ fn obj_hasher() -> &'static Path {
             let temp = tempdir().unwrap();
             let db = temp.path().join("selfhost-objhash.sqlite");
             run(&["init", path(&db)]);
+            run(&["import", path(&db), "compiler/front/lib.cdb"]);
             run(&["import", path(&db), "compiler/front/sha256.cdb"]);
             run(&["verify", path(&db)]);
             let exe = temp.path().join("obj-bin");
@@ -318,6 +320,7 @@ fn importer() -> &'static Path {
             let temp = tempdir().unwrap();
             let db = temp.path().join("selfhost-import.sqlite");
             run(&["init", path(&db)]);
+            run(&["import", path(&db), "compiler/front/lib.cdb"]);
             run(&["import", path(&db), "compiler/front/import.cdb"]);
             run(&["verify", path(&db)]);
             let exe = temp.path().join("import-bin");
