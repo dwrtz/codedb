@@ -3,22 +3,33 @@
 //
 // Reads a source `fn main() -> i64 = <expr>` from stdin and prints the program
 // ROOT HASH the Rust importer would compute for it (`codedb import` -> `root ...`).
-// `<expr>` is now a real integer-arithmetic expression — decimal literals combined
-// with `+ - * /`, left-associative, two precedence levels (`* /` bind tighter than
-// `+ -`) — parsed by a scannerless recursive-descent parser that builds the TYPED
-// Expression object tree bottom-up: each parse function returns the content hash of
-// the Expression object it just built (with its children referenced by hash), so no
-// explicit AST tree is needed and objects are emitted in dependency order as they
-// are recognized. For a single non-recursive `main` the body's birth is genesis, so
-// there is no migration/history chain yet (that is axis 2, the multi-symbol step) —
-// only the typed objects, gated by root-hash equality (tests/selfhost_frontend.rs).
+// `<expr>` is a real integer expression — decimal literals combined with the full
+// i64 operator set, parsed by a scannerless recursive-descent parser that builds the
+// TYPED Expression object tree bottom-up: each parse function returns the content
+// hash of the Expression object it just built (with its children referenced by
+// hash), so no explicit AST tree is needed and objects are emitted in dependency
+// order as they are recognized. For a single non-recursive `main` the body's birth
+// is genesis, so there is no migration/history chain yet (that is axis 2, the
+// multi-symbol step) — only the typed objects, gated by root-hash equality
+// (tests/selfhost_frontend.rs).
 //
-// Grammar (this increment): `expr := mul (('+'|'-') mul)*`, `mul := atom (('*'|'/')
-// atom)*`, `atom := <decimal int>`. No parens (they force mutual recursion — the
-// next increment), no unary minus, no other types: every node is i64, so type
-// inference is the constant i64 hash. The `fn main() -> i64 =` header is still
-// assumed (the parser locates `=` and parses the RHS); header/param parsing and the
-// other object kinds are later increments.
+// Grammar (this increment), in loosest-to-tightest precedence:
+//   expr   := bitor
+//   bitor  := bitxor (('|' not '||') bitxor)*
+//   bitxor := bitand ('^' bitand)*
+//   bitand := shift (('&' not '&&') shift)*
+//   shift  := add (('<<'|'>>') add)*
+//   add    := mul (('+'|'-') mul)*
+//   mul    := unary (('*'|'/'|'%') unary)*
+//   unary  := ('-'|'~') unary | atom
+//   atom   := <decimal int>
+// Binary levels are left-associative. Relational `< >`, equality `== !=`, and
+// logical `&& || !` are bool-typed and a later increment (so the i64 levels match
+// only `<<`/`>>` not lone `<`/`>`, and `&`/`|` not `&&`/`||`). No parens yet (they
+// force mutual recursion atom<->expr). Every node is i64, so type inference is the
+// constant i64 hash. The `fn main() -> i64 =` header is still assumed (the parser
+// locates `=` and parses the RHS); header/param parsing and the other object kinds
+// are later increments.
 //
 // The objects for `fn main() -> i64 = E` are, in order: the i64 Type; the body
 // Expression tree (literals + binaries); the FunctionSignature; the SymbolBirth;
@@ -50,8 +61,15 @@ record PRR { out: string  mem: string }
 
 fn is_ws_b(b: i64) -> bool = b == 32 || b == 9 || b == 10 || b == 13
 fn is_digit_b(b: i64) -> bool = b >= 48 && b <= 57
+fn is_unary_op(b: i64) -> bool = b == 45 || b == 126
+fn is_mulop(b: i64) -> bool = b == 42 || b == 47 || b == 37
 fn is_addop(b: i64) -> bool = b == 43 || b == 45
-fn is_mulop(b: i64) -> bool = b == 42 || b == 47
+// Two-char `<<` / `>>` (a lone `<`/`>` is relational — bool, a later increment).
+fn is_shift_op(b1: i64, b2: i64) -> bool = (b1 == 60 && b2 == 60) || (b1 == 62 && b2 == 62)
+// Single-char bitwise (a doubled `&&`/`||` is logical — bool, a later increment).
+fn is_and_op(b1: i64, b2: i64) -> bool = b1 == 38 && b2 != 38
+fn is_xor_op(b: i64) -> bool = b == 94
+fn is_or_op(b1: i64, b2: i64) -> bool = b1 == 124 && b2 != 124
 
 // ---------------------------------------------------------------------------
 // canonical-string building
@@ -238,23 +256,45 @@ fn build_literal(mem: string, start: i64, endd: i64) -> Pr effects[alloc, state]
   let h: string = hash_object(b"Expression", 1, p4) in
   let res: Pr = { mem: m3, hash: h, next: endd } in res
 
-// Build a `binary` Expression from the child hashes `lh`/`rh` and operator byte
-// `opb`; every node is i64 in this increment, so the type is the i64 hash.
-fn build_binary(lh: string, opb: i64, rh: string) -> string effects[alloc, state] =
+// Build a `binary` Expression from the child hashes `lh`/`rh` and the operator
+// bytes `ob1` (and `ob2`, or 0 for a single-char operator); every node is i64 in
+// this increment, so the type is the i64 hash.
+fn build_binary(lh: string, ob1: i64, ob2: i64, rh: string) -> string effects[alloc, state] =
   let t: string = build_type() in
   let p0: string = push_lit(string_with_capacity(512), b"{\"expr_kind\":\"binary\",\"left\":\"") in
   let p1: string = push_str(p0, lh) in
   let p2: string = push_lit(p1, b"\",\"op\":\"") in
-  let p3: string = push_byte(p2, to_u8(opb)) in
-  let p4: string = push_lit(p3, b"\",\"right\":\"") in
+  let p3: string = push_byte(p2, to_u8(ob1)) in
+  let p3b: string = if ob2 == 0 then p3 else push_byte(p3, to_u8(ob2)) in
+  let p4: string = push_lit(p3b, b"\",\"right\":\"") in
   let p5: string = push_str(p4, rh) in
   let p6: string = push_lit(p5, b"\",\"type\":\"") in
   let p7: string = push_str(p6, t) in
   let p8: string = push_lit(p7, b"\"}") in
   hash_object(b"Expression", 1, p8)
 
+// Build a `unary` Expression (prefix `-`/`~`) over child hash `eh`; i64 -> i64.
+fn build_unary(opb: i64, eh: string) -> string effects[alloc, state] =
+  let t: string = build_type() in
+  let p0: string = push_lit(string_with_capacity(512), b"{\"expr\":\"") in
+  let p1: string = push_str(p0, eh) in
+  let p2: string = push_lit(p1, b"\",\"expr_kind\":\"unary\",\"op\":\"") in
+  let p3: string = push_byte(p2, to_u8(opb)) in
+  let p4: string = push_lit(p3, b"\",\"type\":\"") in
+  let p5: string = push_str(p4, t) in
+  let p6: string = push_lit(p5, b"\"}") in
+  hash_object(b"Expression", 1, p6)
+
 // ---------------------------------------------------------------------------
-// the parser: atom -> mul -> add (precedence climbing, left-associative)
+// the parser: precedence climbing, left-associative for the binary levels.
+//   bitor `|` -> bitxor `^` -> bitand `&` -> shift `<< >>` -> add `+ -`
+//   -> mul `* / %` -> unary (prefix `- ~`) -> atom (<decimal int>)
+// Each binary level is the same loop: parse a tighter operand, then while the next
+// significant bytes are an operator of this level, fold left. (Relational `< >`,
+// equality `== !=`, and logical `&& || !` are bool — a later increment — so this
+// level matches only the i64 forms: `<<`/`>>` not lone `<`/`>`, `&`/`|` not
+// `&&`/`||`.) The move-only loop result is rebuilt into a fresh record before
+// return (see the v0-backend workaround note on parse_mul).
 // ---------------------------------------------------------------------------
 
 // atom := <decimal int> (whitespace-skipped).
@@ -263,26 +303,40 @@ fn parse_atom(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
   let sd: MI = scan_digits(sw.mem, sw.i, len) in
   build_literal(sd.mem, sw.i, sd.i)
 
-// mul := atom (('*'|'/') atom)*
+// unary := ('-'|'~') unary | atom   (right-associative prefix)
+fn parse_unary(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
+  let sw: MI = skip_ws(mem, pos, len) in
+  let m1: string = sw.mem in
+  let p: i64 = sw.i in
+  if p < len then
+    (if is_unary_op(to_i64(string_get(m1, p))) then
+       let opb: i64 = to_i64(string_get(m1, p)) in
+       let inner: Pr = parse_unary(m1, p + 1, len) in
+       let h: string = build_unary(opb, inner.hash) in
+       let res: Pr = { mem: inner.mem, hash: h, next: inner.next } in res
+     else parse_atom(m1, p, len))
+  else parse_atom(m1, p, len)
+
+// mul := unary (('*'|'/'|'%') unary)*
 fn parse_mul(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
-  let lft: Pr = parse_atom(mem, pos, len) in
+  let lft: Pr = parse_unary(mem, pos, len) in
   let s0: MI = skip_ws(lft.mem, lft.next, len) in
   let seed: Pr = { mem: s0.mem, hash: lft.hash, next: s0.i } in
   let done: Pr =
     loop a = seed while (if a.next < len then is_mulop(to_i64(string_get(a.mem, a.next))) else false) do
       let cur: Pr = a in
       let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
-      let rgt: Pr = parse_atom(cur.mem, cur.next + 1, len) in
-      let bh: string = build_binary(cur.hash, opb, rgt.hash) in
+      let rgt: Pr = parse_unary(cur.mem, cur.next + 1, len) in
+      let bh: string = build_binary(cur.hash, opb, 0, rgt.hash) in
       let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
       let nx: Pr = { mem: s1.mem, hash: bh, next: s1.i } in nx
   in
   // BACKEND-BUG WORKAROUND: returning the move-only loop accumulator `done`
-  // directly (`in done`) miscompiles to a native SIGTRAP when the loop body
-  // calls an aggregate-returning function (here parse_mul/parse_atom) — a
-  // loop-accumulator/return-slot aliasing bug in the v0 backend. Rebuilding the
-  // result into a fresh record decouples the slots and compiles correctly. The
-  // reference evaluator computes both forms identically; this is native-only.
+  // directly (`in done`) miscompiles to a native SIGTRAP when the loop body calls
+  // an aggregate-returning function — a loop-accumulator/return-slot aliasing bug
+  // in the v0 backend. Rebuilding into a fresh record decouples the slots; the
+  // reference evaluator computes both identically (native-only). Applies to every
+  // binary level below too.
   let r: Pr = { mem: done.mem, hash: done.hash, next: done.next } in r
 
 // add := mul (('+'|'-') mul)*
@@ -295,16 +349,75 @@ fn parse_add(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
       let cur: Pr = a in
       let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
       let rgt: Pr = parse_mul(cur.mem, cur.next + 1, len) in
-      let bh: string = build_binary(cur.hash, opb, rgt.hash) in
+      let bh: string = build_binary(cur.hash, opb, 0, rgt.hash) in
       let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
       let nx: Pr = { mem: s1.mem, hash: bh, next: s1.i } in nx
   in
-  // BACKEND-BUG WORKAROUND: returning the move-only loop accumulator `done`
-  // directly (`in done`) miscompiles to a native SIGTRAP when the loop body
-  // calls an aggregate-returning function (here parse_mul/parse_atom) — a
-  // loop-accumulator/return-slot aliasing bug in the v0 backend. Rebuilding the
-  // result into a fresh record decouples the slots and compiles correctly. The
-  // reference evaluator computes both forms identically; this is native-only.
+  let r: Pr = { mem: done.mem, hash: done.hash, next: done.next } in r
+
+// shift := add (('<<'|'>>') add)*
+fn parse_shift(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_add(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Pr = { mem: s0.mem, hash: lft.hash, next: s0.i } in
+  let done: Pr =
+    loop a = seed while (if a.next + 1 < len then is_shift_op(to_i64(string_get(a.mem, a.next)), to_i64(string_get(a.mem, a.next + 1))) else false) do
+      let cur: Pr = a in
+      let ob1: i64 = to_i64(string_get(cur.mem, cur.next)) in
+      let ob2: i64 = to_i64(string_get(cur.mem, cur.next + 1)) in
+      let rgt: Pr = parse_add(cur.mem, cur.next + 2, len) in
+      let bh: string = build_binary(cur.hash, ob1, ob2, rgt.hash) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Pr = { mem: s1.mem, hash: bh, next: s1.i } in nx
+  in
+  let r: Pr = { mem: done.mem, hash: done.hash, next: done.next } in r
+
+// bitand := shift (('&' not '&&') shift)*
+fn parse_bitand(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_shift(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Pr = { mem: s0.mem, hash: lft.hash, next: s0.i } in
+  let done: Pr =
+    loop a = seed while (if a.next < len then is_and_op(to_i64(string_get(a.mem, a.next)), (if a.next + 1 < len then to_i64(string_get(a.mem, a.next + 1)) else 0)) else false) do
+      let cur: Pr = a in
+      let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
+      let rgt: Pr = parse_shift(cur.mem, cur.next + 1, len) in
+      let bh: string = build_binary(cur.hash, opb, 0, rgt.hash) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Pr = { mem: s1.mem, hash: bh, next: s1.i } in nx
+  in
+  let r: Pr = { mem: done.mem, hash: done.hash, next: done.next } in r
+
+// bitxor := bitand ('^' bitand)*
+fn parse_bitxor(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_bitand(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Pr = { mem: s0.mem, hash: lft.hash, next: s0.i } in
+  let done: Pr =
+    loop a = seed while (if a.next < len then is_xor_op(to_i64(string_get(a.mem, a.next))) else false) do
+      let cur: Pr = a in
+      let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
+      let rgt: Pr = parse_bitand(cur.mem, cur.next + 1, len) in
+      let bh: string = build_binary(cur.hash, opb, 0, rgt.hash) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Pr = { mem: s1.mem, hash: bh, next: s1.i } in nx
+  in
+  let r: Pr = { mem: done.mem, hash: done.hash, next: done.next } in r
+
+// bitor := bitxor (('|' not '||') bitxor)*
+fn parse_bitor(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_bitxor(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Pr = { mem: s0.mem, hash: lft.hash, next: s0.i } in
+  let done: Pr =
+    loop a = seed while (if a.next < len then is_or_op(to_i64(string_get(a.mem, a.next)), (if a.next + 1 < len then to_i64(string_get(a.mem, a.next + 1)) else 0)) else false) do
+      let cur: Pr = a in
+      let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
+      let rgt: Pr = parse_bitxor(cur.mem, cur.next + 1, len) in
+      let bh: string = build_binary(cur.hash, opb, 0, rgt.hash) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Pr = { mem: s1.mem, hash: bh, next: s1.i } in nx
+  in
   let r: Pr = { mem: done.mem, hash: done.hash, next: done.next } in r
 
 // ---------------------------------------------------------------------------
@@ -314,7 +427,7 @@ fn parse_add(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
 fn import_root(mem: string) -> string effects[alloc, state] =
   let len: i64 = string_len(mem) in
   let fe: MI = find_eq(mem, len) in
-  let body: Pr = parse_add(fe.mem, fe.i, len) in
+  let body: Pr = parse_bitor(fe.mem, fe.i, len) in
   let bodyhash: string = body.hash in
   let leftover: string = body.mem in
   let sig: string = build_sig(build_type()) in

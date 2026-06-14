@@ -368,42 +368,67 @@ fn importer_reproduces_the_root_hash_for_the_minimal_grammar() {
 }
 
 #[test]
-fn importer_reproduces_the_root_hash_for_arithmetic_expressions() {
-    // 15a.2 (axis 1): the real expression parser. The .cdb importer now scans and
-    // parses `fn main() -> i64 = <expr>` where <expr> is integer arithmetic
-    // (`+ - * /`, left-associative, `* /` binding tighter than `+ -`), building the
-    // typed Expression tree bottom-up — each parse function returns the content hash
-    // of the Expression object it just built. Its ProgramRoot hash must equal the
-    // Rust importer's for the same source — an exact gate, since any precedence,
-    // associativity, or canonical-payload error changes a subtree's object hash and
-    // therefore the root.
+fn importer_reproduces_the_root_hash_for_integer_expressions() {
+    // 15a.2 (axis 1): the real expression parser. The .cdb importer scans and parses
+    // `fn main() -> i64 = <expr>` where <expr> is an integer expression over the full
+    // i64 operator set — prefix unary `- ~`; `* / %`; `+ -`; shifts `<< >>`; bitwise
+    // `& ^ |` — with the Rust precedence and left-associativity, building the typed
+    // Expression tree bottom-up (each parse function returns the content hash of the
+    // object it built). Its ProgramRoot hash must equal the Rust importer's for the
+    // same source — an exact gate, since any precedence, associativity, operator
+    // spelling, or canonical-payload error changes a subtree's object hash and so the
+    // root.
     if !can_build_default_native_target() {
         return;
     }
     let exe = importer();
     let temp = tempdir().unwrap();
     let exprs = [
+        // arithmetic: precedence + associativity
         "1 + 2",
         "1+2",
-        "2 * 3",
         "1 + 2 * 3",
         "2 * 3 + 4",
         "10 - 2 - 3",
-        "100 / 5 / 2",
-        "1 + 2 + 3 + 4",
-        "2 * 3 * 4",
-        "1 - 2 * 3 + 4",
         "7 + 6 * 5 - 4 / 2",
-        "8 / 4 * 2",
         "1*2+3*4+5*6",
-        "9 - 8 - 7 - 6",
         "100 - 10 * 9 + 1",
+        // modulo
+        "10 % 3",
+        "17 % 5 % 2",
+        "10 - 2 * 3 % 4",
+        // prefix unary (single, double, mixed with binary)
+        "-5",
+        "~5",
+        "1 + -2",
+        "1 - - 3",
+        "~-5",
+        "-~-1",
+        "-2 * 3 + 1",
+        "~0 & 255",
+        // shifts (and their precedence vs +)
+        "1 << 4",
+        "256 >> 2",
+        "1 << 2 + 3",
+        "1 + 2 << 3",
+        "100 >> 1 >> 1",
+        // bitwise and the &-^-| precedence chain
+        "12 & 10",
+        "12 | 3",
+        "5 ^ 3",
+        "1 | 2 & 3",
+        "1 ^ 2 & 3",
+        "6 & 3 ^ 1",
+        "255 & 15 ^ 1",
+        "1 << 4 | 2",
+        "2 + 3 << 1",
+        "1 | 2 | 4 | 8",
     ];
     for (i, expr) in exprs.iter().enumerate() {
         let source = format!("fn main() -> i64 = {expr}\n");
         // The Rust importer's root for this source.
-        let db = temp.path().join(format!("ref-arith-{i}.sqlite"));
-        let src = temp.path().join(format!("ref-arith-{i}.cdb"));
+        let db = temp.path().join(format!("ref-int-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-int-{i}.cdb"));
         std::fs::write(&src, &source).unwrap();
         run(&["init", path(&db)]);
         let report = run(&["import", path(&db), path(&src)]);

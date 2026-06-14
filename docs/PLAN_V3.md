@@ -1266,15 +1266,17 @@ record types, and externs all resolve across imported files, and dead lib functi
 drop from each entry's build. `tests/selfhost_frontend.rs` stays green (7/7).
 
 Landed 2026-06-14: step 2 (15a.2) — the real expression parser. `import.cdb` replaces
-the int-extraction hack with a scannerless recursive-descent parser (`atom -> mul ->
-add`, precedence-climbing) for `fn main() -> i64 = <expr>` where `<expr>` is integer
-arithmetic (`+ - * /`, left-associative, `* /` binding tighter than `+ -`). Each parse
-function returns the content hash of the typed Expression object it just built (children
-referenced by hash), so no AST data structure is needed and objects emit in dependency
-order. Single function, genesis birth — still axis 1, no chain. Root-hash equality holds
-across 15 arithmetic fixtures plus the 6 literal ones (`tests/selfhost_frontend.rs`, now
-8/8). Surfaced a v0-backend codegen bug en route, worked around in `.cdb` and flagged for
-a proper fix:
+the int-extraction hack with a scannerless recursive-descent parser for `fn main() ->
+i64 = <expr>` over the full i64 operator set: prefix unary `- ~`, then the precedence
+ladder `bitor | -> bitxor ^ -> bitand & -> shift << >> -> add + - -> mul * / % -> unary
+-> atom` (Rust precedence, left-associative; `<<`/`>>` distinguished from lone `<`/`>`
+and `&`/`|` from `&&`/`||`, the bool forms being a later increment). Each parse function
+returns the content hash of the typed Expression object it just built (children by hash),
+so no AST data structure is needed and objects emit in dependency order. Single function,
+genesis birth — still axis 1, no chain. Root-hash equality holds across 33 integer-
+expression fixtures (precedence, associativity, unary, shifts, bitwise) plus the 6 literal
+ones (`tests/selfhost_frontend.rs`, 8/8). Surfaced a v0-backend codegen bug en route,
+worked around in `.cdb` and flagged for a proper fix:
 
 ```text
 v0-backend bug (native-only): a function that returns a move-only LOOP ACCUMULATOR
