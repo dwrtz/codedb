@@ -3,23 +3,25 @@
 //
 // Reads a source `fn main() -> <i64|bool> = <expr>` from stdin and prints the
 // program ROOT HASH the Rust importer would compute for it (`codedb import` ->
-// `root ...`). `<expr>` is a real expression over decimal integers with the full i64
-// operator set plus the comparison operators, parsed by a scannerless recursive-
-// descent parser that builds the TYPED Expression object tree bottom-up: each parse
-// function returns the content hash of the Expression object it just built (children
-// referenced by hash) AND its inferred TYPE CODE (`tyc`: 0 = i64, 1 = bool), so no
-// explicit AST tree is needed and objects are emitted in dependency order. This is
-// the type-inference increment: comparisons (`< > <= >= == !=`) take i64 operands and
-// yield bool, the type threads up through `Pr.tyc` into each node's `type` field, and
-// the declared return type (parsed from the header, `i64` or `bool`) sets the
-// signature's return. For a single non-recursive `main` the body's birth is genesis,
-// so there is no migration/history chain yet (axis 2, the multi-symbol step) — only
-// the typed objects, gated by root-hash equality (tests/selfhost_frontend.rs). The
-// parser does NOT type-check, so the oracle only applies to type-valid programs.
+// `root ...`). `<expr>` is a real expression over the full i64 operator set, the
+// comparison and logical operators, bool literals, `if`, and `let` bindings with
+// identifier (local variable) references — parsed by a scannerless recursive-descent
+// parser that builds the TYPED Expression object tree bottom-up: each parse function
+// returns the content hash of the Expression object it just built (children referenced
+// by hash) AND its inferred TYPE CODE (`tyc`: 0 = i64, 1 = bool), so no explicit AST
+// tree is needed and objects are emitted in dependency order. Type inference threads
+// up through `Pr.tyc` into each node's `type` field, and the declared return type
+// (parsed from the header, `i64` or `bool`) sets the signature's return. For a single
+// non-recursive `main` the body's birth is genesis, so there is no migration/history
+// chain yet (axis 2, the multi-symbol step) — only the typed objects, gated by
+// root-hash equality (tests/selfhost_frontend.rs). The parser does NOT type-check, so
+// the oracle only applies to type-valid programs.
 //
 // Grammar (this increment), in loosest-to-tightest precedence:
 //   expr       := bitor
-//   bitor      := bitxor (('|' not '||') bitxor)*           i64
+//   bitor      := logor (('|' not '||') logor)*             i64
+//   logor      := logand ('||' logand)*                     bool
+//   logand     := bitxor ('&&' bitxor)*                     bool
 //   bitxor     := bitand ('^' bitand)*                      i64
 //   bitand     := equality (('&' not '&&') equality)*       i64
 //   equality   := relational (('=='|'!=') relational)*      bool
@@ -27,13 +29,21 @@
 //   shift      := add (('<<'|'>>') add)*                    i64
 //   add        := mul (('+'|'-') mul)*                      i64
 //   mul        := unary (('*'|'/'|'%') unary)*              i64
-//   unary      := ('-'|'~') unary | atom                    i64
-//   atom       := <decimal int>                             i64
-// Binary levels are left-associative. Logical `&& || !`, bool literals `true`/`false`,
-// and `if` are later increments (so `<<`/`>>` are still distinguished from lone
-// `<`/`>`, and `&`/`|` from `&&`/`||`). No parens yet (they force mutual recursion
-// atom<->expr). Header/param parsing beyond the return type, and the other object
-// kinds, are later increments.
+//   unary      := ('-'|'~'|'!') unary | atom                i64/bool
+//   atom       := <decimal int>                  i64
+//               | `true` | `false`               bool
+//               | `if` expr `then` expr `else` expr
+//               | `let` IDENT `:` TYPE `=` expr `in` expr
+//               | IDENT                           (local_ref, by de-Bruijn depth)
+// Binary levels are left-associative; `<<`/`>>` are distinguished from lone `<`/`>`,
+// and `&&`/`||` from single `&`/`|`. `let`/`if` make the parser mutually recursive
+// (atom <-> the binary ladder), so import.cdb imports + compiles as one recursion
+// group. Identifiers resolve to a `local_ref` by de-Bruijn depth (innermost binding =
+// 0) via a Copy `Scope` threaded as an input param down the ladder, extended only into
+// a `let` body; shadowing resolves to the nearest binding, and the ref is typed by the
+// binding it names. No parens yet, and `let` binding types are i64/bool only. Function
+// params/`param_ref`, no-new-symbol builtins, and the other object kinds are later
+// increments.
 //
 // The objects for `fn main() -> <ret> = E` are, in order: the result Type(s) (i64
 // and/or bool); the body Expression tree; the FunctionSignature; the SymbolBirth;
@@ -63,6 +73,27 @@ record PRR { out: string  mem: string }
 // A header-parse result: the threaded memory, the declared return type code, and
 // the body's start position (just past `=`).
 record HdrR { mem: string  rettyc: i64  bodypos: i64 }
+
+// The lexical scope for de-Bruijn resolution (Copy, so it threads as a plain input
+// param — never moved/returned). Each in-scope `let` binding is encoded as one i64,
+// (start * 2000000 + end) * 2 + btyc, where [start,end) is the binding name's byte
+// range in the source and btyc its declared type code (0 = i64, 1 = bool). `n`
+// bindings are live; index n-1 is the innermost (de-Bruijn depth 0). 32 nesting
+// levels is far beyond any axis-1 single-function test.
+record Scope { ids: array<i64, 32>  n: i64 }
+// A variable-resolution result: the de-Bruijn depth, the binding's type code, and the
+// threaded source memory.
+record RD { depth: i64  btyc: i64  mem: string }
+// The resolve loop's accumulator (move-only — it carries the threaded memory): the
+// scan index and the best (highest = innermost) matching binding index (-1 = none).
+record RScan { i: i64  best: i64  mem: string }
+// A range-compare result: whether the two byte ranges are equal, and threaded memory.
+record REq { eq: bool  mem: string }
+// The byte-compare loop accumulator (Copy): the offset and the still-equal flag.
+record CCmp { j: i64  eq: bool }
+// A built node carrying the threaded memory and its content hash (the caller assembles
+// the surrounding Pr, supplying the type code and cursor).
+record MH { mem: string  hash: string }
 
 // ---------------------------------------------------------------------------
 // byte classifiers (ASCII; + - * / and whitespace)
@@ -108,6 +139,15 @@ fn push_lit(out: string, s: slice<'static, u8>) -> string effects[state] =
 fn push_byte(out: string, b: u8) -> string effects[state] =
   let pushed: unit = string_push(out, b) in
   out
+
+// Append the decimal digits of a non-negative integer `n` to `out`, most-significant
+// digit first (recursive: thread the move-only buffer through the higher-digit call,
+// then push the last digit). Used for the bare-integer `depth` of a local_ref.
+fn push_dec(out: string, n: i64) -> string effects[state] =
+  if n < 10 then push_byte(out, to_u8(48 + n))
+  else
+    let hi: string = push_dec(out, n / 10) in
+    push_byte(hi, to_u8(48 + n % 10))
 
 // Append `s` to `out`, CONSUMING s (for a value used exactly once).
 fn push_str(out: string, s: string) -> string effects[state] =
@@ -245,6 +285,58 @@ fn parse_header(mem: string, len: i64) -> HdrR =
   let res: HdrR = { mem: m2, rettyc: rettyc, bodypos: eqr.p } in res
 
 // ---------------------------------------------------------------------------
+// lexical scope: push a `let` binding; resolve an identifier to its de-Bruijn depth
+// ---------------------------------------------------------------------------
+
+// Push a `let` binding (name `mem`[start,end), declared type code `btyc`) onto `scope`.
+fn push_scope(scope: Scope, start: i64, endd: i64, btyc: i64) -> Scope =
+  let code: i64 = (start * 2000000 + endd) * 2 + btyc in
+  let r: Scope = { ids: array_set(scope.ids, scope.n, code), n: scope.n + 1 } in r
+
+// Compare `mem`[a, a+tlen) to `mem`[b, b+tlen) byte by byte; thread `mem` back (a
+// helper taking `mem` by value drops it, and string_get rejects `&string`, so the
+// move-only buffer is returned rather than borrowed). The loop stops at the first
+// mismatch — the condition is a nested `if` because `&&` is strict.
+fn range_eq(mem: string, a: i64, b: i64, tlen: i64) -> REq =
+  let done: CCmp =
+    loop c = { j: 0, eq: true } while (if c.j < tlen then c.eq else false) do
+      let cc: CCmp = c in
+      let lb: i64 = to_i64(string_get(mem, a + cc.j)) in
+      let rb: i64 = to_i64(string_get(mem, b + cc.j)) in
+      let r: CCmp = { j: cc.j + 1, eq: if lb == rb then true else false } in r
+  in
+  let res: REq = { eq: done.eq, mem: mem } in res
+
+// Resolve the identifier `mem`[start,end) to its de-Bruijn depth (innermost binding =
+// 0) and the binding's type code. Scan the scope bottom-to-top keeping the highest
+// (innermost) match, so a shadowing binding resolves to the nearest one. The loop
+// carries the move-only `mem` (range_eq consumes and returns it each step), so the
+// result is rebuilt into a fresh record (the v0 loop-accumulator-return workaround).
+fn resolve_depth(scope: Scope, mem: string, start: i64, endd: i64) -> RD =
+  let n: i64 = scope.n in
+  let tlen: i64 = endd - start in
+  let done: RScan =
+    loop a = { i: 0, best: 0 - 1, mem: mem } while a.i < n do
+      let cur: RScan = a in
+      let code: i64 = scope.ids[cur.i] in
+      let rest: i64 = code / 2 in
+      let be: i64 = rest % 2000000 in
+      let bs: i64 = rest / 2000000 in
+      let m0: string = cur.mem in
+      let er: REq =
+        if be - bs == tlen then range_eq(m0, bs, start, tlen)
+        else (let rr: REq = { eq: false, mem: m0 } in rr)
+      in
+      let nb: i64 = if er.eq then cur.i else cur.best in
+      let r: RScan = { i: cur.i + 1, best: nb, mem: er.mem } in r
+  in
+  let bi: i64 = done.best in
+  let m1: string = done.mem in
+  let dep: i64 = if bi < 0 then 0 else n - 1 - bi in
+  let bt: i64 = if bi < 0 then 0 else scope.ids[bi] % 2 in
+  let res: RD = { depth: dep, btyc: bt, mem: m1 } in res
+
+// ---------------------------------------------------------------------------
 // the object builders (canonical payloads)
 // ---------------------------------------------------------------------------
 
@@ -371,6 +463,38 @@ fn build_if(condh: string, thenh: string, elseh: string, rtyc: i64) -> string ef
   let p8: string = push_lit(p7, b"\"}") in
   hash_object(b"Expression", 1, p8)
 
+// Build a `let` Expression: the binding name is the raw identifier `mem`[ns,ne); its
+// declared type is `btyc`; `valh`/`bodyh` are the value/body child hashes; the let's
+// own type is the body's type `bodytyc`. Canonical key order: binding_name,
+// binding_type, body, expr_kind, type, value. Threads `mem` back (for the name copy);
+// the caller assembles the Pr (tyc = bodytyc, cursor = the body's).
+fn build_let(mem: string, ns: i64, ne: i64, btyc: i64, valh: string, bodyh: string, bodytyc: i64) -> MH effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(1024), b"{\"binding_name\":\"") in
+  let pv: PRR = push_range(p0, mem, ns, ne) in
+  let p1: string = pv.out in
+  let m1: string = pv.mem in
+  let p2: string = push_lit(p1, b"\",\"binding_type\":\"") in
+  let p3: string = push_str(p2, type_hash(btyc)) in
+  let p4: string = push_lit(p3, b"\",\"body\":\"") in
+  let p5: string = push_str(p4, bodyh) in
+  let p6: string = push_lit(p5, b"\",\"expr_kind\":\"let\",\"type\":\"") in
+  let p7: string = push_str(p6, type_hash(bodytyc)) in
+  let p8: string = push_lit(p7, b"\",\"value\":\"") in
+  let p9: string = push_str(p8, valh) in
+  let p10: string = push_lit(p9, b"\"}") in
+  let h: string = hash_object(b"Expression", 1, p10) in
+  let res: MH = { mem: m1, hash: h } in res
+
+// Build a `local_ref` Expression: the bare-integer de-Bruijn `depth` and the variable's
+// type `tyc`. Canonical key order: depth, expr_kind, type.
+fn build_local_ref(depth: i64, tyc: i64) -> string effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(256), b"{\"depth\":") in
+  let p1: string = push_dec(p0, depth) in
+  let p2: string = push_lit(p1, b",\"expr_kind\":\"local_ref\",\"type\":\"") in
+  let p3: string = push_str(p2, type_hash(tyc)) in
+  let p4: string = push_lit(p3, b"\"}") in
+  hash_object(b"Expression", 1, p4)
+
 // ---------------------------------------------------------------------------
 // the parser: precedence climbing, left-associative for the binary levels.
 //   bitor `|` -> bitxor `^` -> bitand `&` -> equality `== !=` -> relational
@@ -391,7 +515,7 @@ fn build_if(condh: string, thenh: string, elseh: string, rtyc: i64) -> string ef
 // ---------------------------------------------------------------------------
 
 // atom := <decimal int> (i64) | `true` | `false` (bool) | `if` ... ; ws-skipped.
-fn parse_atom(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
+fn parse_atom(mem: string, pos: i64, len: i64, scope: Scope) -> Pr effects[alloc, state] =
   let sw: MI = skip_ws(mem, pos, len) in
   let m1: string = sw.mem in
   let p: i64 = sw.i in
@@ -400,14 +524,29 @@ fn parse_atom(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
        let sd: MI = scan_digits(m1, p, len) in
        build_literal(sd.mem, p, sd.i)
      else
-       // An identifier here is `if`, or a `true`/`false` keyword (other identifiers
-       // are variables, which await scope/let).
+       // An identifier: a keyword (`if` / `let` / `true` / `false`) or a variable.
+       // `kw`: 0 = variable, 1 = if, 2 = let, 3 = bool literal. Each keyword test is
+       // length-gated by a nested `if` so the inner string_get reads stay in bounds
+       // (`&&` is strict). A non-keyword identifier resolves to a `local_ref` by its
+       // de-Bruijn depth in `scope`, typed by the binding it refers to.
        let se: MI = scan_ident(m1, p, len) in
        let m2: string = se.mem in
        let e: i64 = se.i in
-       (if (if e - p == 2 then (to_i64(string_get(m2, p)) == 105 && to_i64(string_get(m2, p + 1)) == 102) else false) then
-          parse_if(m2, e, len)
-        else build_bool_atom(m2, p, e)))
+       let klen: i64 = e - p in
+       let kw: i64 =
+         if klen == 2 then (if (to_i64(string_get(m2, p)) == 105 && to_i64(string_get(m2, p + 1)) == 102) then 1 else 0)
+         else if klen == 3 then (if (to_i64(string_get(m2, p)) == 108 && to_i64(string_get(m2, p + 1)) == 101 && to_i64(string_get(m2, p + 2)) == 116) then 2 else 0)
+         else if klen == 4 then (if (to_i64(string_get(m2, p)) == 116 && to_i64(string_get(m2, p + 1)) == 114 && to_i64(string_get(m2, p + 2)) == 117 && to_i64(string_get(m2, p + 3)) == 101) then 3 else 0)
+         else if klen == 5 then (if (to_i64(string_get(m2, p)) == 102 && to_i64(string_get(m2, p + 1)) == 97 && to_i64(string_get(m2, p + 2)) == 108 && to_i64(string_get(m2, p + 3)) == 115 && to_i64(string_get(m2, p + 4)) == 101) then 3 else 0)
+         else 0
+       in
+       (if kw == 1 then parse_if(m2, e, len, scope)
+        else if kw == 2 then parse_let(m2, e, len, scope)
+        else if kw == 3 then build_bool_atom(m2, p, e)
+        else
+          let rr: RD = resolve_depth(scope, m2, p, e) in
+          let h: string = build_local_ref(rr.depth, rr.btyc) in
+          let res: Pr = { mem: rr.mem, hash: h, tyc: rr.btyc, next: e } in res))
   else build_literal(m1, p, p)
 
 // if := `if` expr `then` expr `else` expr  (the `then`/`else` keyword tokens are
@@ -417,19 +556,56 @@ fn parse_atom(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
 // only allows `if` at an expression-start position (e.g. `1 + if ...` is a Rust
 // parse error). This never diverges on a Rust-valid program, so root-hash equality
 // holds; matching Rust's exact rejection is a later grammar-tightening.
-fn parse_if(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
-  let cond: Pr = parse_bitor(mem, pos, len) in
+fn parse_if(mem: string, pos: i64, len: i64, scope: Scope) -> Pr effects[alloc, state] =
+  let cond: Pr = parse_bitor(mem, pos, len, scope) in
   let sw1: MI = skip_ws(cond.mem, cond.next, len) in
   let tk: MI = scan_ident(sw1.mem, sw1.i, len) in
-  let thn: Pr = parse_bitor(tk.mem, tk.i, len) in
+  let thn: Pr = parse_bitor(tk.mem, tk.i, len, scope) in
   let sw2: MI = skip_ws(thn.mem, thn.next, len) in
   let ek: MI = scan_ident(sw2.mem, sw2.i, len) in
-  let els: Pr = parse_bitor(ek.mem, ek.i, len) in
+  let els: Pr = parse_bitor(ek.mem, ek.i, len, scope) in
   let h: string = build_if(cond.hash, thn.hash, els.hash, thn.tyc) in
   let res: Pr = { mem: els.mem, hash: h, tyc: thn.tyc, next: els.next } in res
 
+// let := `let` IDENT `:` TYPE `=` expr `in` expr. At entry `pos` is just past the
+// `let` keyword. The value is parsed in the CURRENT scope; the body in `scope`
+// extended with this binding (so a body identifier matching it resolves to depth 0).
+// The let's type is the body's type. Only i64/bool binding types so far (the type
+// identifier is `bool` -> 1, else i64 -> 0), matching the importer's type surface.
+fn parse_let(mem: string, pos: i64, len: i64, scope: Scope) -> Pr effects[alloc, state] =
+  // the binding name [ns, ne)
+  let sw1: MI = skip_ws(mem, pos, len) in
+  let ns: i64 = sw1.i in
+  let nm: MI = scan_ident(sw1.mem, ns, len) in
+  let ne: i64 = nm.i in
+  // `:` then the declared type identifier [ts, te)
+  let sw2: MI = skip_ws(nm.mem, ne, len) in
+  let sw3: MI = skip_ws(sw2.mem, sw2.i + 1, len) in
+  let ts: i64 = sw3.i in
+  let ty: MI = scan_ident(sw3.mem, ts, len) in
+  let te: i64 = ty.i in
+  let isbool: bool =
+    if te - ts == 4 then
+      (to_i64(string_get(ty.mem, ts)) == 98 &&
+       to_i64(string_get(ty.mem, ts + 1)) == 111 &&
+       to_i64(string_get(ty.mem, ts + 2)) == 111 &&
+       to_i64(string_get(ty.mem, ts + 3)) == 108)
+    else false
+  in
+  let btyc: i64 = if isbool then 1 else 0 in
+  // `=` then the value expression (current scope)
+  let sw4: MI = skip_ws(ty.mem, te, len) in
+  let val: Pr = parse_bitor(sw4.mem, sw4.i + 1, len, scope) in
+  // the `in` keyword, then the body expression (extended scope)
+  let sw5: MI = skip_ws(val.mem, val.next, len) in
+  let ink: MI = scan_ident(sw5.mem, sw5.i, len) in
+  let scope2: Scope = push_scope(scope, ns, ne, btyc) in
+  let body: Pr = parse_bitor(ink.mem, ink.i, len, scope2) in
+  let lb: MH = build_let(body.mem, ns, ne, btyc, val.hash, body.hash, body.tyc) in
+  let res: Pr = { mem: lb.mem, hash: lb.hash, tyc: body.tyc, next: body.next } in res
+
 // unary := ('-'|'~'|'!') unary | atom   (prefix; `- ~` -> i64, `!` -> bool)
-fn parse_unary(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
+fn parse_unary(mem: string, pos: i64, len: i64, scope: Scope) -> Pr effects[alloc, state] =
   let sw: MI = skip_ws(mem, pos, len) in
   let m1: string = sw.mem in
   let p: i64 = sw.i in
@@ -437,22 +613,22 @@ fn parse_unary(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
     (if is_unary_op(to_i64(string_get(m1, p))) then
        let opb: i64 = to_i64(string_get(m1, p)) in
        let utyc: i64 = if opb == 33 then 1 else 0 in
-       let inner: Pr = parse_unary(m1, p + 1, len) in
+       let inner: Pr = parse_unary(m1, p + 1, len, scope) in
        let h: string = build_unary(opb, inner.hash, utyc) in
        let res: Pr = { mem: inner.mem, hash: h, tyc: utyc, next: inner.next } in res
-     else parse_atom(m1, p, len))
-  else parse_atom(m1, p, len)
+     else parse_atom(m1, p, len, scope))
+  else parse_atom(m1, p, len, scope)
 
 // mul := unary (('*'|'/'|'%') unary)*   (i64)
-fn parse_mul(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
-  let lft: Pr = parse_unary(mem, pos, len) in
+fn parse_mul(mem: string, pos: i64, len: i64, scope: Scope) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_unary(mem, pos, len, scope) in
   let s0: MI = skip_ws(lft.mem, lft.next, len) in
   let seed: Pr = { mem: s0.mem, hash: lft.hash, tyc: lft.tyc, next: s0.i } in
   let done: Pr =
     loop a = seed while (if a.next < len then is_mulop(to_i64(string_get(a.mem, a.next))) else false) do
       let cur: Pr = a in
       let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
-      let rgt: Pr = parse_unary(cur.mem, cur.next + 1, len) in
+      let rgt: Pr = parse_unary(cur.mem, cur.next + 1, len, scope) in
       let bh: string = build_binary(cur.hash, opb, 0, rgt.hash, 0) in
       let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
       let nx: Pr = { mem: s1.mem, hash: bh, tyc: 0, next: s1.i } in nx
@@ -466,15 +642,15 @@ fn parse_mul(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
   let r: Pr = { mem: done.mem, hash: done.hash, tyc: done.tyc, next: done.next } in r
 
 // add := mul (('+'|'-') mul)*   (i64)
-fn parse_add(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
-  let lft: Pr = parse_mul(mem, pos, len) in
+fn parse_add(mem: string, pos: i64, len: i64, scope: Scope) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_mul(mem, pos, len, scope) in
   let s0: MI = skip_ws(lft.mem, lft.next, len) in
   let seed: Pr = { mem: s0.mem, hash: lft.hash, tyc: lft.tyc, next: s0.i } in
   let done: Pr =
     loop a = seed while (if a.next < len then is_addop(to_i64(string_get(a.mem, a.next))) else false) do
       let cur: Pr = a in
       let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
-      let rgt: Pr = parse_mul(cur.mem, cur.next + 1, len) in
+      let rgt: Pr = parse_mul(cur.mem, cur.next + 1, len, scope) in
       let bh: string = build_binary(cur.hash, opb, 0, rgt.hash, 0) in
       let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
       let nx: Pr = { mem: s1.mem, hash: bh, tyc: 0, next: s1.i } in nx
@@ -482,8 +658,8 @@ fn parse_add(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
   let r: Pr = { mem: done.mem, hash: done.hash, tyc: done.tyc, next: done.next } in r
 
 // shift := add (('<<'|'>>') add)*   (i64)
-fn parse_shift(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
-  let lft: Pr = parse_add(mem, pos, len) in
+fn parse_shift(mem: string, pos: i64, len: i64, scope: Scope) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_add(mem, pos, len, scope) in
   let s0: MI = skip_ws(lft.mem, lft.next, len) in
   let seed: Pr = { mem: s0.mem, hash: lft.hash, tyc: lft.tyc, next: s0.i } in
   let done: Pr =
@@ -491,7 +667,7 @@ fn parse_shift(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
       let cur: Pr = a in
       let ob1: i64 = to_i64(string_get(cur.mem, cur.next)) in
       let ob2: i64 = to_i64(string_get(cur.mem, cur.next + 1)) in
-      let rgt: Pr = parse_add(cur.mem, cur.next + 2, len) in
+      let rgt: Pr = parse_add(cur.mem, cur.next + 2, len, scope) in
       let bh: string = build_binary(cur.hash, ob1, ob2, rgt.hash, 0) in
       let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
       let nx: Pr = { mem: s1.mem, hash: bh, tyc: 0, next: s1.i } in nx
@@ -499,8 +675,8 @@ fn parse_shift(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
   let r: Pr = { mem: done.mem, hash: done.hash, tyc: done.tyc, next: done.next } in r
 
 // relational := shift (('<'|'>'|'<='|'>=') shift)*   (result bool, type code 1)
-fn parse_relational(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
-  let lft: Pr = parse_shift(mem, pos, len) in
+fn parse_relational(mem: string, pos: i64, len: i64, scope: Scope) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_shift(mem, pos, len, scope) in
   let s0: MI = skip_ws(lft.mem, lft.next, len) in
   let seed: Pr = { mem: s0.mem, hash: lft.hash, tyc: lft.tyc, next: s0.i } in
   let done: Pr =
@@ -511,7 +687,7 @@ fn parse_relational(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state]
       let two: bool = b2 == 61 in
       let ob2: i64 = if two then 61 else 0 in
       let oplen: i64 = if two then 2 else 1 in
-      let rgt: Pr = parse_shift(cur.mem, cur.next + oplen, len) in
+      let rgt: Pr = parse_shift(cur.mem, cur.next + oplen, len, scope) in
       let bh: string = build_binary(cur.hash, ob1, ob2, rgt.hash, 1) in
       let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
       let nx: Pr = { mem: s1.mem, hash: bh, tyc: 1, next: s1.i } in nx
@@ -519,8 +695,8 @@ fn parse_relational(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state]
   let r: Pr = { mem: done.mem, hash: done.hash, tyc: done.tyc, next: done.next } in r
 
 // equality := relational (('=='|'!=') relational)*   (result bool, type code 1)
-fn parse_equality(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
-  let lft: Pr = parse_relational(mem, pos, len) in
+fn parse_equality(mem: string, pos: i64, len: i64, scope: Scope) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_relational(mem, pos, len, scope) in
   let s0: MI = skip_ws(lft.mem, lft.next, len) in
   let seed: Pr = { mem: s0.mem, hash: lft.hash, tyc: lft.tyc, next: s0.i } in
   let done: Pr =
@@ -528,7 +704,7 @@ fn parse_equality(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
       let cur: Pr = a in
       let ob1: i64 = to_i64(string_get(cur.mem, cur.next)) in
       let ob2: i64 = to_i64(string_get(cur.mem, cur.next + 1)) in
-      let rgt: Pr = parse_relational(cur.mem, cur.next + 2, len) in
+      let rgt: Pr = parse_relational(cur.mem, cur.next + 2, len, scope) in
       let bh: string = build_binary(cur.hash, ob1, ob2, rgt.hash, 1) in
       let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
       let nx: Pr = { mem: s1.mem, hash: bh, tyc: 1, next: s1.i } in nx
@@ -536,15 +712,15 @@ fn parse_equality(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
   let r: Pr = { mem: done.mem, hash: done.hash, tyc: done.tyc, next: done.next } in r
 
 // bitand := equality (('&' not '&&') equality)*   (i64)
-fn parse_bitand(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
-  let lft: Pr = parse_equality(mem, pos, len) in
+fn parse_bitand(mem: string, pos: i64, len: i64, scope: Scope) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_equality(mem, pos, len, scope) in
   let s0: MI = skip_ws(lft.mem, lft.next, len) in
   let seed: Pr = { mem: s0.mem, hash: lft.hash, tyc: lft.tyc, next: s0.i } in
   let done: Pr =
     loop a = seed while (if a.next < len then is_and_op(to_i64(string_get(a.mem, a.next)), (if a.next + 1 < len then to_i64(string_get(a.mem, a.next + 1)) else 0)) else false) do
       let cur: Pr = a in
       let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
-      let rgt: Pr = parse_equality(cur.mem, cur.next + 1, len) in
+      let rgt: Pr = parse_equality(cur.mem, cur.next + 1, len, scope) in
       let bh: string = build_binary(cur.hash, opb, 0, rgt.hash, 0) in
       let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
       let nx: Pr = { mem: s1.mem, hash: bh, tyc: 0, next: s1.i } in nx
@@ -552,15 +728,15 @@ fn parse_bitand(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
   let r: Pr = { mem: done.mem, hash: done.hash, tyc: done.tyc, next: done.next } in r
 
 // bitxor := bitand ('^' bitand)*   (i64)
-fn parse_bitxor(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
-  let lft: Pr = parse_bitand(mem, pos, len) in
+fn parse_bitxor(mem: string, pos: i64, len: i64, scope: Scope) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_bitand(mem, pos, len, scope) in
   let s0: MI = skip_ws(lft.mem, lft.next, len) in
   let seed: Pr = { mem: s0.mem, hash: lft.hash, tyc: lft.tyc, next: s0.i } in
   let done: Pr =
     loop a = seed while (if a.next < len then is_xor_op(to_i64(string_get(a.mem, a.next))) else false) do
       let cur: Pr = a in
       let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
-      let rgt: Pr = parse_bitand(cur.mem, cur.next + 1, len) in
+      let rgt: Pr = parse_bitand(cur.mem, cur.next + 1, len, scope) in
       let bh: string = build_binary(cur.hash, opb, 0, rgt.hash, 0) in
       let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
       let nx: Pr = { mem: s1.mem, hash: bh, tyc: 0, next: s1.i } in nx
@@ -568,14 +744,14 @@ fn parse_bitxor(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
   let r: Pr = { mem: done.mem, hash: done.hash, tyc: done.tyc, next: done.next } in r
 
 // logand := bitxor ('&&' bitxor)*   (result bool, type code 1)
-fn parse_logand(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
-  let lft: Pr = parse_bitxor(mem, pos, len) in
+fn parse_logand(mem: string, pos: i64, len: i64, scope: Scope) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_bitxor(mem, pos, len, scope) in
   let s0: MI = skip_ws(lft.mem, lft.next, len) in
   let seed: Pr = { mem: s0.mem, hash: lft.hash, tyc: lft.tyc, next: s0.i } in
   let done: Pr =
     loop a = seed while (if a.next + 1 < len then is_logand(to_i64(string_get(a.mem, a.next)), to_i64(string_get(a.mem, a.next + 1))) else false) do
       let cur: Pr = a in
-      let rgt: Pr = parse_bitxor(cur.mem, cur.next + 2, len) in
+      let rgt: Pr = parse_bitxor(cur.mem, cur.next + 2, len, scope) in
       let bh: string = build_binary(cur.hash, 38, 38, rgt.hash, 1) in
       let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
       let nx: Pr = { mem: s1.mem, hash: bh, tyc: 1, next: s1.i } in nx
@@ -583,14 +759,14 @@ fn parse_logand(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
   let r: Pr = { mem: done.mem, hash: done.hash, tyc: done.tyc, next: done.next } in r
 
 // logor := logand ('||' logand)*   (result bool, type code 1)
-fn parse_logor(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
-  let lft: Pr = parse_logand(mem, pos, len) in
+fn parse_logor(mem: string, pos: i64, len: i64, scope: Scope) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_logand(mem, pos, len, scope) in
   let s0: MI = skip_ws(lft.mem, lft.next, len) in
   let seed: Pr = { mem: s0.mem, hash: lft.hash, tyc: lft.tyc, next: s0.i } in
   let done: Pr =
     loop a = seed while (if a.next + 1 < len then is_logor(to_i64(string_get(a.mem, a.next)), to_i64(string_get(a.mem, a.next + 1))) else false) do
       let cur: Pr = a in
-      let rgt: Pr = parse_logand(cur.mem, cur.next + 2, len) in
+      let rgt: Pr = parse_logand(cur.mem, cur.next + 2, len, scope) in
       let bh: string = build_binary(cur.hash, 124, 124, rgt.hash, 1) in
       let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
       let nx: Pr = { mem: s1.mem, hash: bh, tyc: 1, next: s1.i } in nx
@@ -598,15 +774,15 @@ fn parse_logor(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
   let r: Pr = { mem: done.mem, hash: done.hash, tyc: done.tyc, next: done.next } in r
 
 // bitor := logor (('|' not '||') logor)*   (i64)
-fn parse_bitor(mem: string, pos: i64, len: i64) -> Pr effects[alloc, state] =
-  let lft: Pr = parse_logor(mem, pos, len) in
+fn parse_bitor(mem: string, pos: i64, len: i64, scope: Scope) -> Pr effects[alloc, state] =
+  let lft: Pr = parse_logor(mem, pos, len, scope) in
   let s0: MI = skip_ws(lft.mem, lft.next, len) in
   let seed: Pr = { mem: s0.mem, hash: lft.hash, tyc: lft.tyc, next: s0.i } in
   let done: Pr =
     loop a = seed while (if a.next < len then is_or_op(to_i64(string_get(a.mem, a.next)), (if a.next + 1 < len then to_i64(string_get(a.mem, a.next + 1)) else 0)) else false) do
       let cur: Pr = a in
       let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
-      let rgt: Pr = parse_logor(cur.mem, cur.next + 1, len) in
+      let rgt: Pr = parse_logor(cur.mem, cur.next + 1, len, scope) in
       let bh: string = build_binary(cur.hash, opb, 0, rgt.hash, 0) in
       let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
       let nx: Pr = { mem: s1.mem, hash: bh, tyc: 0, next: s1.i } in nx
@@ -623,7 +799,8 @@ fn import_root(mem: string) -> string effects[alloc, state] =
   let hdr: HdrR = parse_header(mem, len) in
   let m1: string = hdr.mem in
   let rettyc: i64 = hdr.rettyc in
-  let body: Pr = parse_bitor(m1, hdr.bodypos, len) in
+  let scope0: Scope = { ids: [0x0; 32], n: 0 } in
+  let body: Pr = parse_bitor(m1, hdr.bodypos, len, scope0) in
   let bodyhash: string = body.hash in
   let leftover: string = body.mem in
   let sig: string = build_sig(rettyc) in

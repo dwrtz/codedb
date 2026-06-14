@@ -1319,9 +1319,28 @@ holds across 9 if fixtures (i64/bool results, logical/comparison conds, nested i
 else-if chains), `tests/selfhost_frontend.rs` 10/10. Known intentional over-permissiveness:
 the parser treats `if` as an atom, so it accepts `1 + if ...` which the Rust grammar
 rejects as a parse error — harmless for the oracle (valid programs only); matching Rust's
-exact `if`-position rejection is a later grammar-tightening. Remaining axis-1 surface, in
-order: `let` + identifiers + `local_ref` by de-Bruijn depth (scope tracking — a threaded
-name-stack); then params/param_ref; then no-new-symbol builtins.
+exact `if`-position rejection is a later grammar-tightening.
+
+Then `let IDENT: TYPE = value in body` + identifier (local variable) references landed —
+the scope-tracking step, completing the tractable axis-1 expression surface. An identifier
+resolves to a `local_ref` by **de-Bruijn depth** (innermost binding = 0); the parser
+threads a lexical scope down the ladder as a *Copy* input param (`Scope { ids: array<i64,
+32>, n }`, each binding encoding its name's source byte-range + type code in one i64),
+extended only into a `let` body and never returned — so lexical scope restores naturally
+on exit. Resolution scans the scope keeping the highest (innermost) match, so a shadowing
+binding resolves to the nearest one, and the ref is typed by the binding it names; the
+let's own type is its body's type, the value is parsed in the outer scope and the body in
+the extended scope. `let` joins `if` in the mutual-recursion clique (the .cdb still
+imports + compiles as one recursion group, now ~15 members, plus a self-recursive decimal
+renderer for the bare-integer `depth`). The de-Bruijn depth and binding/ref types were all
+spiked against `emit-objects` before coding, never guessed. Root-hash equality holds across
+17 fixtures — single/nested/three-level bindings, shadowing, a value referencing an outer
+binding, bool bindings, lets nested with `if`, multi-character identifiers, and deep nests
+whose depths span two decimal digits (also smoke-tested to the 32-entry scope capacity)
+(`tests/selfhost_frontend.rs`, 11/11). Still single-function / genesis-birth (axis 1).
+Remaining axis-1 surface: function params + `param_ref` (a separate index namespace);
+then no-new-symbol builtins. Then 15a.4 (axis 2 — the migration/history chain for
+multi-function programs).
 
 Sub-stages (each independently oracle-checked at its artifact):
 

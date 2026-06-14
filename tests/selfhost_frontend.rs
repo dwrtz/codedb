@@ -570,6 +570,88 @@ fn importer_reproduces_the_root_hash_for_if_expressions() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_let_expressions() {
+    // 15a.2 (axis 1): `let IDENT: TYPE = value in body` plus identifier (local
+    // variable) references. Identifiers resolve to a `local_ref` by de-Bruijn depth
+    // (innermost binding = 0), tracked through a lexical scope threaded down the
+    // parser and extended only into a let body; a shadowing binding resolves to the
+    // nearest one, and the ref is typed by the binding it names. The let's own type is
+    // its body's type, the value is parsed in the outer scope and the body in the
+    // extended scope. Root-hash equality is exact: a wrong depth, a wrong binding/ref
+    // type, a misplaced scope boundary, or a non-canonical payload changes a subtree's
+    // object hash and so the root. Covers single/nested/three-level bindings, shadowing,
+    // a value that references an outer binding, bool bindings, lets nested with `if`,
+    // multi-character identifiers, and a deep nest whose depths span two decimal digits.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let mut sources: Vec<String> = vec![
+        // single binding, body is the variable (depth 0)
+        "fn main() -> i64 = let x: i64 = 5 in x".to_string(),
+        // binding used inside an operator expression
+        "fn main() -> i64 = let x: i64 = 10 in x * x + 1".to_string(),
+        // no spaces around the `:` / `=`
+        "fn main() -> i64 = let x:i64=3 in x".to_string(),
+        // two-level nest: a = depth 1, b = depth 0
+        "fn main() -> i64 = let a: i64 = 1 in let b: i64 = 2 in a + b".to_string(),
+        // three-level nest: a = 2, b = 1, c = 0
+        "fn main() -> i64 = let a: i64 = 1 in let b: i64 = 2 in let c: i64 = 3 in a + b + c"
+            .to_string(),
+        // shadowing: the body's `x` resolves to the inner binding (depth 0)
+        "fn main() -> i64 = let x: i64 = 1 in let x: i64 = 2 in x".to_string(),
+        // a binding's value references an outer binding
+        "fn main() -> i64 = let a: i64 = 5 in let b: i64 = a + 1 in b".to_string(),
+        // a chain of single-variable bindings
+        "fn main() -> i64 = let a: i64 = 1 in let b: i64 = a in let c: i64 = b in c".to_string(),
+        // bool binding, bool body
+        "fn main() -> bool = let p: bool = true in p".to_string(),
+        // bool binding whose value is a comparison
+        "fn main() -> bool = let p: bool = 1 < 2 in p".to_string(),
+        // i64 bindings feeding a bool body
+        "fn main() -> bool = let a: i64 = 1 in let b: i64 = 2 in a < b".to_string(),
+        "fn main() -> bool = let x: i64 = 5 in let y: i64 = 5 in x == y && x > 0".to_string(),
+        // let interacting with if (binding used in the condition / branches)
+        "fn main() -> i64 = let cond: bool = 1 < 2 in if cond then 100 else 200".to_string(),
+        "fn main() -> i64 = let n: i64 = 7 in if n > 5 then n - 5 else n".to_string(),
+        // multi-character identifiers, one referencing the other
+        "fn main() -> i64 = let outer: i64 = 100 in let inner: i64 = outer * 2 in outer + inner"
+            .to_string(),
+    ];
+    // A deep nest (let v0=0 in let v1=1 in ... in v0): the body references the
+    // outermost binding, so its depth is N-1 — past 9 it spans two decimal digits,
+    // exercising the bare-integer `depth` renderer and the scope past ten entries.
+    for n in [11usize, 20] {
+        let mut s = String::from("fn main() -> i64 = ");
+        for i in 0..n {
+            s.push_str(&format!("let v{i}: i64 = {i} in "));
+        }
+        s.push_str("v0");
+        sources.push(s);
+    }
+    for (i, source_expr) in sources.iter().enumerate() {
+        let source = format!("{source_expr}\n");
+        let db = temp.path().join(format!("ref-let-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-let-{i}.cdb"));
+        std::fs::write(&src, &source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer let-expression root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate
