@@ -1191,10 +1191,72 @@ kinds are what GROWING the grammar adds.
 `tests/selfhost_frontend.rs` is the gate (7 tests: lexer × full corpus, the §11
 checked-view gate, emit-objects determinism, SHA-256 × lengths/blocks, obj_hash ×
 real objects, and importer root-hash equality × int values). Next: grow the importer
-grammar (params, more types, body expressions, multiple functions, records/enums —
-each adding object kinds plus the real recursive-descent parser, 15a.2), widening
-root-hash equality toward the full corpus; then 15b–15e (typecheck → … → lowering →
-CIR) for IR-hash equality, the mixed compiler.
+grammar (15a.2+) toward full-corpus root-hash equality, then 15b–15e (typecheck → …
+→ lowering → CIR) for the mixed compiler.
+
+Continuation plan (de-risking spikes, 2026-06-14). Two empirical spikes against the
+Rust importer settled the shape of the remaining importer work and split it into two
+orthogonal axes — only one of which the one-symbol minimal grammar has paid:
+
+```text
+axis 1 — grammar width   a single NON-recursive function: lex -> parse -> typecheck
+                         -> build the TYPED objects. birth is genesis, so there is no
+                         chain; testable per-object against emit-objects lines.
+axis 2 — chain depth     2+ items: canonical item ordering (Tarjan SCC + Kahn
+                         toposort + alphabetical tie-break) + the migration/history
+                         hash chain that seeds every non-first symbol's birth.
+```
+
+The chain mechanism the importer must reproduce for any multi-item program (and the
+reason the one-symbol minimal grammar needed none of it):
+
+```text
+migration_hash = sha256(MIGRATION_DOMAIN || canonical_json{parent_history_hash,
+                   input_root_hash, output_root_hash, operation, preconditions,
+                   postconditions})
+history_hash   = sha256(HISTORY_DOMAIN || parent_history || \0 || migration_hash
+                   || \0 || output_root)
+birth_history_hash(symbol) = the running history_hash at its creation ("genesis" for
+                   the first); local_nonce = import:<module>:<name>:<item_ordinal>
+```
+
+Three findings fix the build order:
+
+```text
+- preconditions/postconditions are a FIXED template, mechanically derivable from the
+  operation: [root_is_current(in_root), name_is_available(mod, name)] and
+  [root_exists(out_root), function_source_matches(<operation minus birth_seed/kind>)].
+  So the chain is string-templating, like the importer already does for payloads.
+- DUAL serialization. The operation body (which feeds migration_hash) is the RAW
+  source AST (param_name, types as strings, kind: let/if/unary/binary/call). The
+  Expression OBJECTS are the TYPED form (param_ref by index, local_ref by de-Bruijn
+  depth, type hashes, content-addressed children, == inferring Bool). Multi-item
+  root-hash equality needs BOTH serializers; one symbol needs only the typed one.
+- self-recursion — even a single fn calling itself — emits create_recursion_group
+  with member seed recursion_group:<ordinal>, NOT create_function. Recursion is
+  therefore axis-2 work (recursion-group + canonical member ordinals); axis-1 stays
+  on non-recursive single functions.
+```
+
+Recommended sequence (steps 2–4 all widen sub-stage 15a):
+
+```text
+step 1  shared compiler/front/lib.cdb: dedup the SHA-256 core + object framing +
+        canonical-json/string helpers, imported first (the multi-file bootstrap the
+        lexer test already uses) — the substrate for every later step.
+step 2  15a.2 (axis 1): real lexer -> parser -> typechecker -> typed-object builder
+        for a single non-recursive fn. oracle: per-object hash, then root-hash
+        equality. widen the body in order: binary -> let/if/unary -> sized/bool/hex
+        literals + the inference they force -> params/param_ref -> no-new-symbol
+        builtins.
+step 3  15a.4 (axis 2): the migration/history chain on a trivial multi-fn grammar
+        (raw-AST serializer + the pre/post templates + migration_hash + apply-to-root
+        + history chaining + canonical item ordering). oracle: multi-fn root equality.
+step 4  object-kind breadth: calls (cross-symbol), records, enums, externs, recursion
+        groups (canonical member ordinals, reusing Phase 5), generics.
+step 5  15b–15e: extend through lowering to CIR-byte equality — the mixed compiler,
+        meeting the Phase 8 rung-0 evaluator at the same flat binary.
+```
 
 Sub-stages (each independently oracle-checked at its artifact):
 
