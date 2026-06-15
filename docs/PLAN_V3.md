@@ -1414,6 +1414,36 @@ the migration/history chain for multi-function programs; the spikes have already
 the per-function `create_function` migration, the `birth_history_hash` chain, the raw-AST
 operation body, and the incremental output root).
 
+Landed 2026-06-15: 15a.4 (axis 2) KEYSTONE — the migration/history chain for a TWO-FUNCTION
+program. `import_root` now detects a second `fn` (parse the first body, skip_ws past its
+end; EOF ⇒ the unchanged single-function path, else the two-function path) and builds the
+ROOT through the real chain: order the two functions canonically (alphabetical by name via
+`name_le`), build the FIRST function's single-symbol ProgramRoot (out1), fold it through
+the first migration into the running history (hh1), then build the final two-symbol
+ProgramRoot with the second symbol born at hh1. The migration is the dual/raw serialization:
+`hash_domain` (a kind/schema-less `"sha256:"+hex(SHA-256(domain||payload))` — added
+alongside the object hasher) over the canonical migration JSON (operation = create_function
+with a RAW-AST body `{kind:literal_i64,value}`, plus root_is_current/name_is_available
+preconditions and root_exists/function_source_matches postconditions, MIGRATION_DOMAIN),
+then `history_hash` = hash_domain(HISTORY_DOMAIN, ""+\0+migration_hash+\0+out1); the first
+symbol's SymbolBirth carries the literal `"genesis"`, the second carries hh1. **Subtlety
+caught in smoke (the keystone's whole point):** a ProgramRoot's `names` array is ordered by
+display-name but its `param_names`/`symbols` arrays are ordered by SYMBOL HASH
+(`src/model.rs` normalize_root) — the two coincide only when symbol-hash order matches name
+order, so `helper=5,main=5` (helper symbol 4ac4… > main symbol 3c4d…) diverged until
+`build_root2` compared the symbols (`sym_le`) and emitted those two arrays in hash order.
+Root-hash equality is exact and holds across 6 fixtures — source order ==/!= canonical
+order, both-non-main names, assorted/equal values — plus all single-function regressions
+(`tests/selfhost_frontend.rs` 15/15). Whole-spec de-risked in Python first (every object
+hash + the chain reproduced byte-exactly before any `.cdb`), and the v0 frame budget forced
+heavy factoring (the migration-payload and two-symbol-ProgramRoot builders each split in two
+via carrier records; parse_header's three scan loops factored into `find_byte`/
+`skip_to_arrow`; frames validated OFFLINE via `emit-ir` + a backend-formula replica before
+each slow verify+build). Keystone scope: two no-param i64-returning functions with literal
+bodies; growing the raw-AST serializer (operators/let/if/refs/casts), cross-symbol calls,
+params-in-multi-fn, and recursion groups (`create_recursion_group`) is the remaining axis-2
+surface.
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text

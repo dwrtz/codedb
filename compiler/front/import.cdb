@@ -87,8 +87,10 @@ record PRR { out: string  mem: string }
 // 12 combined params+bindings is ample for an axis-1 single function.
 record Scope { ids: array<i64, 12>  n: i64 }
 // A header-parse result: the threaded memory, the declared return type code, the
-// body's start position (just past `=`), and the parameter table.
-record HdrR { mem: string  rettyc: i64  bodypos: i64  params: Scope }
+// body's start position (just past `=`), the parameter table, and the function
+// name's byte range [ns, ne) in the source (used by axis-2's canonical ordering
+// and SymbolBirth local_nonce; ignored on the single-function path).
+record HdrR { mem: string  rettyc: i64  bodypos: i64  params: Scope  ns: i64  ne: i64 }
 // A param-list-scan result: the threaded memory, the position just past `)`, and the
 // accumulated parameter table.
 record PpR { mem: string  pos: i64  ps: Scope }
@@ -108,6 +110,29 @@ record CCmp { j: i64  eq: bool }
 record MH { mem: string  hash: string }
 // A type-name classification result: the type code and the threaded source memory.
 record TC { code: i64  mem: string }
+// A parsed top-level function's source spans (all Copy): the name's byte range
+// [ns, ne) and the (literal) body value's byte range [vs, ve) in the source. Axis-2
+// carries two of these (one per function) to drive canonical ordering and the
+// migration/history chain without re-walking the source.
+record Sl { ns: i64  ne: i64  vs: i64  ve: i64 }
+// A function's three content hashes (SymbolBirth, FunctionDef, FunctionSignature)
+// with the threaded source memory — the per-symbol inputs to a ProgramRoot.
+record FObj { mem: string  sym: string  def: string  sig: string }
+// The lexicographic-compare loop accumulator (Copy): the offset `j` and a 3-state code
+// `c` (2 = still equal/continue, 0 = A<B, 1 = A>B, 3 = equal at exhaustion).
+record Lc { j: i64  c: i64 }
+// Carrier between build_mig1's two payload halves (also split for the frame budget): the
+// partial buffer, the threaded source memory, and the reused name/genesis/out1/value.
+record Pc { out: string  mem: string  name: string  gen: string  o1: string  val: string }
+// build_mig1's second payload half returns the full payload, out1 (kept for the history
+// preimage), and the threaded memory.
+record MigB { pay: string  o1: string  mem: string }
+// A symbol-hash comparison result, threading both (move-only) operands back out.
+record CmpS { le: bool  a: string  b: string }
+// Two functions' (SymbolBirth, FunctionDef, FunctionSignature) hashes ordered by symbol
+// hash — the ProgramRoot's `symbols`/`param_names` arrays are symbol-hash-ordered (its
+// `names` array is display-name-ordered), so the two can disagree and must be sorted apart.
+record Six { s0: string  d0: string  g0: string  s1: string  d1: string  g1: string }
 
 // ---------------------------------------------------------------------------
 // byte classifiers (ASCII; + - * / and whitespace)
@@ -231,6 +256,20 @@ fn hash_object(kind: slice<'static, u8>, schema: i64, payload: string) -> string
   let st: State = hash_blocks(padded, nblocks) in
   state_to_hash(st)
 
+// hash_bytes: "sha256:" + hex(SHA-256(domain || payload)). Unlike hash_object there is
+// no kind/schema framing — this is the raw domain-separated hash used for migration and
+// history records (MIGRATION_DOMAIN/HISTORY_DOMAIN, which already include a trailing \0).
+// `payload` is consumed.
+fn hash_domain(domain: slice<'static, u8>, payload: string) -> string effects[alloc, state] =
+  let p0: string = string_with_capacity(4096) in
+  let p1: string = push_lit(p0, domain) in
+  let p2: string = push_str(p1, payload) in
+  let msglen: i64 = string_len(p2) in
+  let padded: string = pad(p2, msglen) in
+  let nblocks: i64 = string_len(padded) / 64 in
+  let st: State = hash_blocks(padded, nblocks) in
+  state_to_hash(st)
+
 // ---------------------------------------------------------------------------
 // the scanners (memory threaded back; string_get borrows the owned `mem`)
 // ---------------------------------------------------------------------------
@@ -275,30 +314,56 @@ fn scan_ident(mem: string, start: i64, len: i64) -> MI =
   in
   let res: MI = { mem: mem, i: done.p } in res
 
-// Parse the `fn main(<params>) -> <rettype> =` header: find `(`, scan the parameter
-// list into a positional table, then find `->`, read the return-type identifier
-// (`bool` -> 1, else i64 -> 0), and find the separating `=`. Returns the threaded
-// memory, the return type code, the body's start (past `=`), and the parameter table.
-fn parse_header(mem: string, len: i64) -> HdrR =
-  // find the opening `(` (byte 40) of the parameter list
-  let op: P2 =
-    loop a = { p: 0, go: true } while a.go do
+// Scan forward from `start` for the first byte == `target`; return the index JUST PAST it
+// (or `len` if absent), with `mem` threaded back. Factored out of parse_header so its
+// loop's intermediate values do not inflate parse_header's stack frame past the v0 budget.
+fn find_byte(mem: string, start: i64, len: i64, target: i64) -> MI =
+  let done: P2 =
+    loop a = { p: start, go: true } while a.go do
       if a.p >= len then (let s: P2 = { p: a.p, go: false } in s)
-      else if to_i64(string_get(mem, a.p)) == 40 then (let s: P2 = { p: a.p + 1, go: false } in s)
+      else if to_i64(string_get(mem, a.p)) == target then (let s: P2 = { p: a.p + 1, go: false } in s)
       else (let s: P2 = { p: a.p + 1, go: true } in s)
   in
+  let res: MI = { mem: mem, i: done.p } in res
+
+// Scan forward from `start` for the `->` token (bytes 45, 62); return the index just past
+// it. Same frame-budget rationale as find_byte (two-byte variant).
+fn skip_to_arrow(mem: string, start: i64, len: i64) -> MI =
+  let done: P2 =
+    loop a = { p: start, go: true } while a.go do
+      if a.p + 1 >= len then (let s: P2 = { p: a.p, go: false } in s)
+      else if to_i64(string_get(mem, a.p)) == 45 && to_i64(string_get(mem, a.p + 1)) == 62 then (let s: P2 = { p: a.p + 2, go: false } in s)
+      else (let s: P2 = { p: a.p + 1, go: true } in s)
+  in
+  let res: MI = { mem: mem, i: done.p } in res
+
+// Parse a `fn <name>(<params>) -> <rettype> =` header beginning at `start`: skip the
+// `fn` keyword and read the name into [ns, ne), find `(`, scan the parameter list into
+// a positional table, then find `->`, read the return-type identifier (sized/bool/i64),
+// and find the separating `=`. Returns the threaded memory, the return type code, the
+// body's start (past `=`), the parameter table, and the name range. A multi-function
+// program calls this once per function, passing the previous body's end as `start`.
+fn parse_header(mem: string, start: i64, len: i64) -> HdrR =
+  // skip whitespace, the two-byte `fn` keyword, and the gap before the name
+  let sw0: MI = skip_ws(mem, start, len) in
+  let m_a: string = sw0.mem in
+  let sw1: MI = skip_ws(m_a, sw0.i + 2, len) in
+  let m_b: string = sw1.mem in
+  let ns: i64 = sw1.i in
+  let nm: MI = scan_ident(m_b, ns, len) in
+  let m_c: string = nm.mem in
+  let ne: i64 = nm.i in
+  // find the opening `(` (byte 40) of the parameter list, starting past the name
+  let op: MI = find_byte(m_c, ne, len, 40) in
+  let m_d: string = op.mem in
   let emptyp: Scope = { ids: [0x0; 12], n: 0 } in
-  let pr: PpR = scan_params(mem, op.p, len, emptyp) in
+  let pr: PpR = scan_params(m_d, op.i, len, emptyp) in
   let m0: string = pr.mem in
   let params: Scope = pr.ps in
-  // find `->` (bytes 45, 62) starting just past the `)`
-  let arrow: P2 =
-    loop a = { p: pr.pos, go: true } while a.go do
-      if a.p + 1 >= len then (let s: P2 = { p: a.p, go: false } in s)
-      else if to_i64(string_get(m0, a.p)) == 45 && to_i64(string_get(m0, a.p + 1)) == 62 then (let s: P2 = { p: a.p + 2, go: false } in s)
-      else (let s: P2 = { p: a.p + 1, go: true } in s)
-  in
-  let sw: MI = skip_ws(m0, arrow.p, len) in
+  // find `->` just past the `)`, then read the return-type identifier
+  let arrow: MI = skip_to_arrow(m0, pr.pos, len) in
+  let m_e: string = arrow.mem in
+  let sw: MI = skip_ws(m_e, arrow.i, len) in
   let m1: string = sw.mem in
   let ts: i64 = sw.i in
   let te_r: MI = scan_ident(m1, ts, len) in
@@ -308,13 +373,10 @@ fn parse_header(mem: string, len: i64) -> HdrR =
   let rc: TC = type_code_of(m2, ts, te) in
   let rettyc: i64 = rc.code in
   let m3: string = rc.mem in
-  let eqr: P2 =
-    loop a = { p: te, go: true } while a.go do
-      if a.p >= len then (let s: P2 = { p: a.p, go: false } in s)
-      else if to_i64(string_get(m3, a.p)) == 61 then (let s: P2 = { p: a.p + 1, go: false } in s)
-      else (let s: P2 = { p: a.p + 1, go: true } in s)
-  in
-  let res: HdrR = { mem: m3, rettyc: rettyc, bodypos: eqr.p, params: params } in res
+  // find the separating `=`
+  let eqr: MI = find_byte(m3, te, len, 61) in
+  let m4: string = eqr.mem in
+  let res: HdrR = { mem: m4, rettyc: rettyc, bodypos: eqr.i, params: params, ns: ns, ne: ne } in res
 
 // ---------------------------------------------------------------------------
 // lexical scope: push a `let` binding; resolve an identifier to its de-Bruijn depth
@@ -338,6 +400,27 @@ fn range_eq(mem: string, a: i64, b: i64, tlen: i64) -> REq =
       let r: CCmp = { j: cc.j + 1, eq: if lb == rb then true else false } in r
   in
   let res: REq = { eq: done.eq, mem: mem } in res
+
+// Lexicographically compare two names mem[as_, ae) and mem[bs, be); return eq = true iff
+// name A <= name B (the canonical-ordering predicate for axis-2's two functions). Bytes
+// are compared one at a time; a name that is a prefix of (or equal to) the other is the
+// smaller-or-equal one. `string_get` borrows `mem` inside the loop (as in range_eq); the
+// owned `mem` is threaded back out.
+fn name_le(mem: string, as_: i64, ae: i64, bs: i64, be: i64) -> REq =
+  let done: Lc =
+    loop a = { j: 0, c: 2 } while a.c == 2 do
+      if a.j >= ae - as_ && a.j >= be - bs then (let s: Lc = { j: a.j, c: 3 } in s)
+      else if a.j >= ae - as_ then (let s: Lc = { j: a.j, c: 0 } in s)
+      else if a.j >= be - bs then (let s: Lc = { j: a.j, c: 1 } in s)
+      else
+        let ca: i64 = to_i64(string_get(mem, as_ + a.j)) in
+        let cb: i64 = to_i64(string_get(mem, bs + a.j)) in
+        if ca < cb then (let s: Lc = { j: a.j, c: 0 } in s)
+        else if ca > cb then (let s: Lc = { j: a.j, c: 1 } in s)
+        else (let s: Lc = { j: a.j + 1, c: 2 } in s)
+  in
+  let le: bool = done.c != 1 in
+  let res: REq = { eq: le, mem: mem } in res
 
 // Look up the name `mem`[start,end) among scope slots [lo, hi), keeping the highest
 // (innermost / last) match — so a shadowing let binding resolves to the nearest one —
@@ -487,6 +570,30 @@ fn build_sym() -> string effects[alloc, state] =
   let p: string = push_lit(string_with_capacity(160), b"{\"birth_history_hash\":\"genesis\",\"local_nonce\":\"import:main:main:0\",\"symbol_kind\":\"function\"}") in
   hash_object(b"SymbolBirth", 1, p)
 
+// The empty-program ProgramRoot — the genesis root that seeds the migration chain (the
+// input_root of the first migration). Building it (rather than hard-coding the hash)
+// exercises the same ProgramRoot framing the rest of the importer uses.
+fn build_genesis_root() -> string effects[alloc, state] =
+  let p: string = push_lit(string_with_capacity(80), b"{\"metadata\":{},\"names\":[],\"param_names\":[],\"symbols\":[]}") in
+  hash_object(b"ProgramRoot", 1, p)
+
+// Build a SymbolBirth for the function named mem[sl.ns, sl.ne) with birth history `bh`
+// (the literal "genesis" for the first symbol, else the running history hash) and the
+// given creation `ordv`: local_nonce = "import:main:<name>:<ordv>". Returns the content
+// hash with `mem` threaded back; `bh` is consumed.
+fn build_sym_at(bh: string, mem: string, sl: Sl, ordv: i64) -> MH effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(256), b"{\"birth_history_hash\":\"") in
+  let p1: string = push_str(p0, bh) in
+  let p2: string = push_lit(p1, b"\",\"local_nonce\":\"import:main:") in
+  let pr: PRR = push_range(p2, mem, sl.ns, sl.ne) in
+  let p3: string = pr.out in
+  let m1: string = pr.mem in
+  let p4: string = push_byte(p3, to_u8(58)) in
+  let p5: string = push_dec(p4, ordv) in
+  let p6: string = push_lit(p5, b"\",\"symbol_kind\":\"function\"}") in
+  let h: string = hash_object(b"SymbolBirth", 1, p6) in
+  let r: MH = { mem: m1, hash: h } in r
+
 fn build_def(sig: string, sym: string, e: string) -> DH effects[alloc, state] =
   let p0: string = push_lit(string_with_capacity(320), b"{\"function_sig_hash\":\"") in
   let k1: OS = push_kept(p0, sig) in
@@ -540,6 +647,156 @@ fn build_root_obj(sym: string, def: string, sig: string, mem: string, params: Sc
   let p9: string = push_str(p8, sym2) in
   let p10: string = push_lit(p9, b"\"}]}") in
   hash_object(b"ProgramRoot", 1, p10)
+
+// Build the three content hashes for one function (a no-param `fn <name>() -> i64 =
+// <literal>`): its SymbolBirth (birth history `bh`, ordinal `ordv`), its literal-body
+// Expression (i64), and its FunctionSignature, combined into a FunctionDef. Returns the
+// SymbolBirth/FunctionDef/FunctionSignature hashes with `mem` threaded back. Rebuilt (it
+// is deterministic) rather than threaded across the two ProgramRoots that consume it.
+fn build_fn_objs(mem: string, sl: Sl, bh: string, ordv: i64) -> FObj effects[alloc, state] =
+  let s: MH = build_sym_at(bh, mem, sl, ordv) in
+  let m1: string = s.mem in
+  let symh: string = s.hash in
+  let e: Pr = build_literal(m1, sl.vs, sl.ve, 0) in
+  let m2: string = e.mem in
+  let exprh: string = e.hash in
+  let emptyp: Scope = { ids: [0x0; 12], n: 0 } in
+  let sig: string = build_sig(0, emptyp) in
+  let d: DH = build_def(sig, symh, exprh) in
+  let r: FObj = { mem: m2, sym: d.sym, def: d.h, sig: d.sig } in r
+
+// Build a ProgramRoot over a single function `sl` (the first migration's output_root):
+// one names/param_names/symbols entry each. The symbol hash appears three times, so it
+// is threaded via push_kept. Returns the root hash with `mem` threaded back.
+fn build_root1(mem: string, sl: Sl) -> MH effects[alloc, state] =
+  let gstr: string = push_lit(string_with_capacity(16), b"genesis") in
+  let fo: FObj = build_fn_objs(mem, sl, gstr, 0) in
+  let m1: string = fo.mem in
+  let sym: string = fo.sym in
+  let def: string = fo.def in
+  let sig: string = fo.sig in
+  let p0: string = push_lit(string_with_capacity(1024), b"{\"metadata\":{},\"names\":[{\"display_name\":\"") in
+  let pn: PRR = push_range(p0, m1, sl.ns, sl.ne) in
+  let p1: string = pn.out in
+  let m2: string = pn.mem in
+  let p2: string = push_lit(p1, b"\",\"is_preferred\":true,\"module\":\"main\",\"symbol\":\"") in
+  let k1: OS = push_kept(p2, sym) in
+  let p3: string = k1.out in
+  let sym1: string = k1.s in
+  let p4: string = push_lit(p3, b"\"}],\"param_names\":[{\"names\":[],\"symbol\":\"") in
+  let k2: OS = push_kept(p4, sym1) in
+  let p5: string = k2.out in
+  let sym2: string = k2.s in
+  let p6: string = push_lit(p5, b"\"}],\"symbols\":[{\"definition\":\"") in
+  let p7: string = push_str(p6, def) in
+  let p8: string = push_lit(p7, b"\",\"signature\":\"") in
+  let p9: string = push_str(p8, sig) in
+  let p10: string = push_lit(p9, b"\",\"symbol\":\"") in
+  let p11: string = push_str(p10, sym2) in
+  let p12: string = push_lit(p11, b"\"}]}") in
+  let h: string = hash_object(b"ProgramRoot", 1, p12) in
+  let r: MH = { mem: m2, hash: h } in r
+
+// Lexicographically compare two symbol-hash strings `a`, `b` (each "sha256:" + 64 hex,
+// length 71); return le = true iff a <= b, with both operands threaded back out. Used to
+// order the ProgramRoot's symbol-hash-sorted arrays.
+fn sym_le(a: string, b: string) -> CmpS =
+  let done: Lc =
+    loop k = { j: 0, c: 2 } while k.c == 2 do
+      if k.j >= 71 then (let s: Lc = { j: k.j, c: 3 } in s)
+      else
+        let ca: i64 = to_i64(string_get(a, k.j)) in
+        let cb: i64 = to_i64(string_get(b, k.j)) in
+        if ca < cb then (let s: Lc = { j: k.j, c: 0 } in s)
+        else if ca > cb then (let s: Lc = { j: k.j, c: 1 } in s)
+        else (let s: Lc = { j: k.j + 1, c: 2 } in s)
+  in
+  let le: bool = done.c != 1 in
+  let r: CmpS = { le: le, a: a, b: b } in r
+
+// Order two functions' (sym, def, sig) triples by symbol hash: if `le` (symbol A <= B)
+// keep A first, else swap. Both branches consume all six strings into the result record.
+fn order_triples(le: bool, sA: string, dA: string, gA: string, sB: string, dB: string, gB: string) -> Six =
+  if le then (let r: Six = { s0: sA, d0: dA, g0: gA, s1: sB, d1: dB, g1: gB } in r)
+  else (let r: Six = { s0: sB, d0: dB, g0: gB, s1: sA, d1: dA, g1: gA } in r)
+
+// Build the final ProgramRoot over the two functions in canonical order (`first`,
+// `second`), the importer's output root. Each function's objects are rebuilt here (first
+// with birth history "genesis"/ordinal 0, second with `hh1`/ordinal 1); each symbol hash
+// appears three times (names, param_names, symbols) and is threaded via push_kept. The
+// ProgramRoot assembly is split into a head (metadata + names + param_names) and a tail
+// (the symbols array) so each function stays under the v0 4095-byte stack-frame budget;
+// the head hands the partial buffer and the six object hashes to the tail via `Rc`.
+fn build_root2(mem: string, first: Sl, second: Sl, hh1: string) -> string effects[alloc, state] =
+  let gstr: string = push_lit(string_with_capacity(16), b"genesis") in
+  let foA: FObj = build_fn_objs(mem, first, gstr, 0) in
+  let mA: string = foA.mem in
+  let symA: string = foA.sym in
+  let defA: string = foA.def in
+  let sigA: string = foA.sig in
+  let foB: FObj = build_fn_objs(mA, second, hh1, 1) in
+  let mB: string = foB.mem in
+  let symB: string = foB.sym in
+  let defB: string = foB.def in
+  let sigB: string = foB.sig in
+  let p0: string = push_lit(string_with_capacity(2048), b"{\"metadata\":{},\"names\":[{\"display_name\":\"") in
+  let pnA: PRR = push_range(p0, mB, first.ns, first.ne) in
+  let q0: string = pnA.out in
+  let m1: string = pnA.mem in
+  let p1: string = push_lit(q0, b"\",\"is_preferred\":true,\"module\":\"main\",\"symbol\":\"") in
+  let kA1: OS = push_kept(p1, symA) in
+  let p2: string = kA1.out in
+  let symA1: string = kA1.s in
+  let p3: string = push_lit(p2, b"\"},{\"display_name\":\"") in
+  let pnB: PRR = push_range(p3, m1, second.ns, second.ne) in
+  let q1: string = pnB.out in
+  let p4: string = push_lit(q1, b"\",\"is_preferred\":true,\"module\":\"main\",\"symbol\":\"") in
+  let kB1: OS = push_kept(p4, symB) in
+  let p5: string = kB1.out in
+  let symB1: string = kB1.s in
+  let p6: string = push_lit(p5, b"\"}]") in
+  // param_names and symbols are ordered by SYMBOL HASH (unlike names, by display name):
+  // compare the two symbols and order the (sym, def, sig) triples here, then the tail emits
+  // them. Doing the compare/order in the head keeps both halves under the frame budget.
+  let cmp: CmpS = sym_le(symA1, symB1) in
+  let le: bool = cmp.le in
+  let sA2: string = cmp.a in
+  let sB2: string = cmp.b in
+  let six: Six = order_triples(le, sA2, defA, sigA, sB2, defB, sigB) in
+  build_root2_tail(p6, six)
+
+// The param_names and symbols arrays (and the closing brace) of the two-function
+// ProgramRoot, taking the partial buffer (names already closed) and the (sym, def, sig)
+// triples PRE-ORDERED by symbol hash. Split from the head to stay under the frame budget.
+fn build_root2_tail(buf: string, six: Six) -> string effects[alloc, state] =
+  let s0: string = six.s0 in
+  let d0: string = six.d0 in
+  let g0: string = six.g0 in
+  let s1: string = six.s1 in
+  let d1: string = six.d1 in
+  let g1: string = six.g1 in
+  let u0: string = push_lit(buf, b",\"param_names\":[{\"names\":[],\"symbol\":\"") in
+  let k0: OS = push_kept(u0, s0) in
+  let u1: string = k0.out in
+  let s0a: string = k0.s in
+  let u2: string = push_lit(u1, b"\"},{\"names\":[],\"symbol\":\"") in
+  let k1: OS = push_kept(u2, s1) in
+  let u3: string = k1.out in
+  let s1a: string = k1.s in
+  let u4: string = push_lit(u3, b"\"}],\"symbols\":[{\"definition\":\"") in
+  let t0: string = push_str(u4, d0) in
+  let t1: string = push_lit(t0, b"\",\"signature\":\"") in
+  let t2: string = push_str(t1, g0) in
+  let t3: string = push_lit(t2, b"\",\"symbol\":\"") in
+  let t4: string = push_str(t3, s0a) in
+  let t5: string = push_lit(t4, b"\"},{\"definition\":\"") in
+  let t6: string = push_str(t5, d1) in
+  let t7: string = push_lit(t6, b"\",\"signature\":\"") in
+  let t8: string = push_str(t7, g1) in
+  let t9: string = push_lit(t8, b"\",\"symbol\":\"") in
+  let t10: string = push_str(t9, s1a) in
+  let t11: string = push_lit(t10, b"\"}]}") in
+  hash_object(b"ProgramRoot", 1, t11)
 
 // Build a `literal_i64` Expression over the (decimal or hex) digits `mem`[start, end)
 // with type code `tyc` (an integer type, from the expected type or i64 by default),
@@ -1007,31 +1264,158 @@ fn parse_bitor(mem: string, pos: i64, len: i64, scope: Scope, np: i64, etyc: i64
   let r: Pr = { mem: done.mem, hash: done.hash, tyc: done.tyc, next: done.next } in r
 
 // ---------------------------------------------------------------------------
-// import: parse the header (return type + body start), parse the body, build the
-// objects, return the ProgramRoot hash
+// axis 2: the migration/history chain for a multi-function program
+// ---------------------------------------------------------------------------
+
+// Build the first migration's history hash for function `sl` (the first in canonical
+// order, ordinal 0, parent history = genesis). Assembles the canonical migration JSON
+// (operation = create_function with the RAW-AST body, plus the root_is_current/
+// name_is_available preconditions and root_exists/function_source_matches postconditions),
+// hashes it under MIGRATION_DOMAIN, then folds that into the history hash under
+// HISTORY_DOMAIN (preimage: "" + \0 + migration_hash + \0 + output_root). `genesis` and
+// `out1` are consumed; `mem` is threaded back. The result feeds the SECOND symbol's birth.
+// The payload assembly is split across two helpers (mig1_pay_a/_b) for the frame budget.
+fn build_mig1(genesis: string, out1: string, mem: string, sl: Sl) -> MH effects[alloc, state] =
+  let c: Pc = mig1_pay_a(genesis, out1, mem, sl) in
+  let b: MigB = mig1_pay_b(c) in
+  let pay: string = b.pay in
+  let o1: string = b.o1 in
+  let m2: string = b.mem in
+  let mig1: string = hash_domain(b"codedb/migration/v1\0", pay) in
+  // history preimage: parent("") + \0 + migration_hash + \0 + output_root
+  let h0: string = push_byte(string_with_capacity(192), to_u8(0)) in
+  let h1: string = push_str(h0, mig1) in
+  let h2: string = push_byte(h1, to_u8(0)) in
+  let h3: string = push_str(h2, o1) in
+  let hh1: string = hash_domain(b"codedb/history/v1\0", h3) in
+  let r: MH = { mem: m2, hash: hh1 } in r
+
+// First half of the migration payload: input_root_hash + operation + output_root_hash +
+// parent_history_hash. Extracts owned name/value copies and carries them (plus genesis and
+// out1, both still needed in the second half) forward via `Pc`.
+fn mig1_pay_a(genesis: string, out1: string, mem: string, sl: Sl) -> Pc effects[alloc, state] =
+  let nb: PRR = push_range(string_with_capacity(64), mem, sl.ns, sl.ne) in
+  let nameStr: string = nb.out in
+  let m1: string = nb.mem in
+  let vb: PRR = push_range(string_with_capacity(64), m1, sl.vs, sl.ve) in
+  let valStr: string = vb.out in
+  let m2: string = vb.mem in
+  let a0: string = push_lit(string_with_capacity(2048), b"{\"input_root_hash\":\"") in
+  let kg1: OS = push_kept(a0, genesis) in
+  let a1: string = kg1.out in
+  let g1: string = kg1.s in
+  let a2: string = push_lit(a1, b"\",\"operation\":{\"birth_seed\":\"import:main:") in
+  let kn1: OS = push_kept(a2, nameStr) in
+  let a3: string = kn1.out in
+  let n1: string = kn1.s in
+  let a4: string = push_lit(a3, b":0\",\"body\":{\"kind\":\"literal_i64\",\"value\":\"") in
+  let kv1: OS = push_kept(a4, valStr) in
+  let a5: string = kv1.out in
+  let v1: string = kv1.s in
+  let a6: string = push_lit(a5, b"\"},\"effects\":[],\"kind\":\"create_function\",\"module\":\"main\",\"name\":\"") in
+  let kn2: OS = push_kept(a6, n1) in
+  let a7: string = kn2.out in
+  let n2: string = kn2.s in
+  let a8: string = push_lit(a7, b"\",\"params\":[],\"region_params\":[],\"return_type\":\"i64\"},\"output_root_hash\":\"") in
+  let ko1: OS = push_kept(a8, out1) in
+  let a9: string = ko1.out in
+  let o1: string = ko1.s in
+  let a10: string = push_lit(a9, b"\",\"parent_history_hash\":null,") in
+  let r: Pc = { out: a10, mem: m2, name: n2, gen: g1, o1: o1, val: v1 } in r
+
+// Second half of the migration payload: postconditions + preconditions. Returns the full
+// payload, out1 (kept for the history preimage), and the threaded memory.
+fn mig1_pay_b(c: Pc) -> MigB effects[alloc, state] =
+  let buf: string = c.out in
+  let mem: string = c.mem in
+  let name: string = c.name in
+  let gen: string = c.gen in
+  let o1in: string = c.o1 in
+  let val: string = c.val in
+  let b0: string = push_lit(buf, b"\"postconditions\":[{\"kind\":\"root_exists\",\"root\":\"") in
+  let ko2: OS = push_kept(b0, o1in) in
+  let b1: string = ko2.out in
+  let o2: string = ko2.s in
+  let b2: string = push_lit(b1, b"\"},{\"body\":{\"kind\":\"literal_i64\",\"value\":\"") in
+  let b3: string = push_str(b2, val) in
+  let b4: string = push_lit(b3, b"\"},\"effects\":[],\"kind\":\"function_source_matches\",\"module\":\"main\",\"name\":\"") in
+  let kn3: OS = push_kept(b4, name) in
+  let b5: string = kn3.out in
+  let n3: string = kn3.s in
+  let b6: string = push_lit(b5, b"\",\"params\":[],\"region_params\":[],\"return_type\":\"i64\"}],\"preconditions\":[{\"kind\":\"root_is_current\",\"root\":\"") in
+  let b7: string = push_str(b6, gen) in
+  let b8: string = push_lit(b7, b"\"},{\"kind\":\"name_is_available\",\"module\":\"main\",\"name\":\"") in
+  let b9: string = push_str(b8, n3) in
+  let b10: string = push_lit(b9, b"\"}]}") in
+  let r: MigB = { pay: b10, o1: o2, mem: mem } in r
+
+// Build the ProgramRoot for a two-function program. Order the functions canonically
+// (alphabetical by name), build the first's single-symbol ProgramRoot (out1), fold it
+// through the first migration into the running history (hh1), then build the final
+// two-symbol ProgramRoot — the first symbol born at "genesis"/0, the second at hh1/1.
+fn build_two_root(mem: string, f0: Sl, f1: Sl) -> string effects[alloc, state] =
+  let cmp: REq = name_le(mem, f0.ns, f0.ne, f1.ns, f1.ne) in
+  let m: string = cmp.mem in
+  let le: bool = cmp.eq in
+  let first: Sl = if le then f0 else f1 in
+  let second: Sl = if le then f1 else f0 in
+  let r1: MH = build_root1(m, first) in
+  let m1: string = r1.mem in
+  let out1: string = r1.hash in
+  let genesis: string = build_genesis_root() in
+  let mh: MH = build_mig1(genesis, out1, m1, first) in
+  let m2: string = mh.mem in
+  let hh1: string = mh.hash in
+  build_root2(m2, first, second, hh1)
+
+// ---------------------------------------------------------------------------
+// import: parse the header(s), parse the body(ies), build the objects and (for a
+// multi-function program) the migration/history chain, return the ProgramRoot hash
 // ---------------------------------------------------------------------------
 
 fn import_root(mem: string) -> string effects[alloc, state] =
   let len: i64 = string_len(mem) in
-  let hdr: HdrR = parse_header(mem, len) in
-  let m1: string = hdr.mem in
-  let rettyc: i64 = hdr.rettyc in
+  let hdr0: HdrR = parse_header(mem, 0, len) in
+  let m0: string = hdr0.mem in
+  let rettyc: i64 = hdr0.rettyc in
   // The ONE combined scope starts as the parameter table (params at [0, np)); the body
   // parser pushes `let` bindings on top. `params` (a Copy) is reused after parsing to
   // build the signature's param list and the root's param_names.
-  let params: Scope = hdr.params in
+  let params: Scope = hdr0.params in
   let np: i64 = params.n in
-  let body: Pr = parse_bitor(m1, hdr.bodypos, len, params, np, rettyc) in
-  let bodyhash: string = body.hash in
-  // keep the source: build_root_obj copies each parameter name from its byte range
-  let srcmem: string = body.mem in
-  let sig: string = build_sig(rettyc, params) in
-  let sym: string = build_sym() in
-  let rd: DH = build_def(sig, sym, bodyhash) in
-  let def: string = rd.h in
-  let sig2: string = rd.sig in
-  let sym2: string = rd.sym in
-  build_root_obj(sym2, def, sig2, srcmem, params)
+  // Parse fn0's body (any expression); its end (skip_ws past body.next) tells us whether a
+  // second function follows. At EOF -> the single-function path (unchanged); otherwise the
+  // two-function keystone path (literal bodies).
+  let body: Pr = parse_bitor(m0, hdr0.bodypos, len, params, np, rettyc) in
+  let mb: string = body.mem in
+  let aw: MI = skip_ws(mb, body.next, len) in
+  let mc: string = aw.mem in
+  let pa: i64 = aw.i in
+  if pa >= len then
+    let sig: string = build_sig(rettyc, params) in
+    let sym: string = build_sym() in
+    let rd: DH = build_def(sig, sym, body.hash) in
+    build_root_obj(rd.sym, rd.h, rd.sig, mc, params)
+  else
+    // re-scan fn0's literal value span (the body was a literal in keystone scope), parse
+    // fn1 starting at the second `fn`, and delegate to the chain builder.
+    let rv0: MI = skip_ws(mc, hdr0.bodypos, len) in
+    let mc1: string = rv0.mem in
+    let vs0: i64 = rv0.i in
+    let re0: MI = scan_digits(mc1, vs0, len) in
+    let mc2: string = re0.mem in
+    let ve0: i64 = re0.i in
+    let hdr1: HdrR = parse_header(mc2, pa, len) in
+    let md: string = hdr1.mem in
+    let rv1: MI = skip_ws(md, hdr1.bodypos, len) in
+    let md1: string = rv1.mem in
+    let vs1: i64 = rv1.i in
+    let re1: MI = scan_digits(md1, vs1, len) in
+    let md2: string = re1.mem in
+    let ve1: i64 = re1.i in
+    let f0: Sl = { ns: hdr0.ns, ne: hdr0.ne, vs: vs0, ve: ve0 } in
+    let f1: Sl = { ns: hdr1.ns, ne: hdr1.ne, vs: vs1, ve: ve1 } in
+    build_two_root(md2, f0, f1)
 
 fn print_str<'r>(s: string) -> i64 effects[io, state, ffi, unsafe] =
   let n: i64 = string_len(s) in

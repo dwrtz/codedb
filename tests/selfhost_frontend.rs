@@ -870,6 +870,60 @@ fn importer_reproduces_the_root_hash_for_int_casts() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_two_functions() {
+    // 15a.4 (axis 2): a MULTI-FUNCTION program. For 2+ functions the ProgramRoot is no
+    // longer one symbol over genesis — each non-first symbol's SymbolBirth carries the
+    // running history hash at its creation, so reproducing the root means reproducing the
+    // migration/history chain: order the functions canonically (alphabetical by name),
+    // build the first's single-symbol ProgramRoot, fold it through the first migration
+    // (a create_function operation with a RAW-AST body plus root_is_current/
+    // name_is_available preconditions and root_exists/function_source_matches
+    // postconditions, hashed under MIGRATION_DOMAIN then HISTORY_DOMAIN) into the running
+    // history, then build the final two-symbol ProgramRoot with the second symbol born at
+    // that history. Root-hash equality is exact, so a wrong canonical order, ordinal,
+    // migration/history preimage, or birth-history chaining changes the root. Keystone
+    // scope: two no-param i64-returning functions with literal bodies. Covers source order
+    // both == and != the canonical (alphabetical) order, both-non-main names, and assorted
+    // literal values.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        // source order already canonical (helper < main)
+        "fn helper() -> i64 = 1\nfn main() -> i64 = 2\n",
+        // source order != canonical: the importer must sort to aaa(0), zzz(1)
+        "fn zzz() -> i64 = 1\nfn aaa() -> i64 = 2\n",
+        // `main` appears first in source but sorts after `helper`
+        "fn main() -> i64 = 9\nfn helper() -> i64 = 7\n",
+        // both names non-main, already alphabetical
+        "fn aaa() -> i64 = 3\nfn bbb() -> i64 = 4\n",
+        // larger / repeated literal values (value threads through both objects + the chain)
+        "fn helper() -> i64 = 123456\nfn main() -> i64 = 789\n",
+        "fn helper() -> i64 = 5\nfn main() -> i64 = 5\n",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        let db = temp.path().join(format!("ref-two-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-two-{i}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer two-function root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate
