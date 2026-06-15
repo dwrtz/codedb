@@ -90,8 +90,12 @@ record PRR { out: string  mem: string }
 // depth n-1-i (innermost = 0); a parameter at index i is `param_ref` index i. The array
 // is small (12) because the v0 backend gives each aggregate local its full byte size, so
 // the functions that juggle several Scope-typed locals must stay under the frame budget;
-// 12 combined params+bindings is ample for an axis-1 single function.
-record Scope { ids: array<i64, 12>  n: i64 }
+// 12 combined params+bindings is ample for an axis-1 single function. `rgord` rides along
+// (the scope is already threaded everywhere): -1 means "not a recursion-group member" (a
+// call resolves to a create_function symbol); >= 0 means this body IS a recursion-group
+// member of that ordinal, so a call (a self-call, in a single-member group) resolves to the
+// `recursion_group:<rgord>` symbol instead.
+record Scope { ids: array<i64, 12>  n: i64  rgord: i64 }
 // A header-parse result: the threaded memory, the declared return type code, the
 // body's start position (just past `=`), the parameter table, and the function
 // name's byte range [ns, ne) in the source (used by axis-2's canonical ordering
@@ -150,6 +154,9 @@ record Six { s0: string  d0: string  g0: string  s1: string  d1: string  g1: str
 record FScan { p: i64  prevfn: bool  found: bool  rtc: i64  mem: string }
 // The body-scan accumulator for `body_calls` (move-only): the cursor, a found flag, threaded mem.
 record BC { p: i64  found: bool  mem: string }
+// A RecursionGroup object's hash plus the (kept) member def/sig/symbol it references — they
+// reappear in the ProgramRoot's symbols/recursion_groups arrays, so they thread back out.
+record RGc { hash: string  def: string  sig: string  sym: string }
 
 // ---------------------------------------------------------------------------
 // byte classifiers (ASCII; + - * / and whitespace)
@@ -373,7 +380,7 @@ fn parse_header(mem: string, start: i64, len: i64) -> HdrR =
   // find the opening `(` (byte 40) of the parameter list, starting past the name
   let op: MI = find_byte(m_c, ne, len, 40) in
   let m_d: string = op.mem in
-  let emptyp: Scope = { ids: [0x0; 12], n: 0 } in
+  let emptyp: Scope = { ids: [0x0; 12], n: 0, rgord: 0 - 1 } in
   let pr: PpR = scan_params(m_d, op.i, len, emptyp) in
   let m0: string = pr.mem in
   let params: Scope = pr.ps in
@@ -402,7 +409,7 @@ fn parse_header(mem: string, start: i64, len: i64) -> HdrR =
 // Push a `let` binding (name `mem`[start,end), declared type code `btyc`) onto `scope`.
 fn push_scope(scope: Scope, start: i64, endd: i64, btyc: i64) -> Scope =
   let code: i64 = (start * 2000000 + endd) * 16 + btyc in
-  let r: Scope = { ids: array_set(scope.ids, scope.n, code), n: scope.n + 1 } in r
+  let r: Scope = { ids: array_set(scope.ids, scope.n, code), n: scope.n + 1, rgord: scope.rgord } in r
 
 // Compare `mem`[a, a+tlen) to `mem`[b, b+tlen) byte by byte; thread `mem` back (a
 // helper taking `mem` by value drops it, and string_get rejects `&string`, so the
@@ -694,6 +701,33 @@ fn build_sym_at(bh: string, mem: string, sl: Sl, ordv: i64) -> MH effects[alloc,
   let h: string = hash_object(b"SymbolBirth", 1, p6) in
   let r: MH = { mem: m1, hash: h } in r
 
+// A recursion-group MEMBER's SymbolBirth: birth genesis, local_nonce "recursion_group:<ord>"
+// (the member's ordinal in canonical order, NOT its name — unlike a create_function symbol).
+// `mem` is just threaded through (the nonce needs no source slice).
+fn build_sym_rg_mh(mem: string, ord: i64) -> MH effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(160), b"{\"birth_history_hash\":\"genesis\",\"local_nonce\":\"recursion_group:") in
+  let p1: string = push_dec(p0, ord) in
+  let p2: string = push_lit(p1, b"\",\"symbol_kind\":\"function\"}") in
+  let h: string = hash_object(b"SymbolBirth", 1, p2) in
+  let r: MH = { mem: mem, hash: h } in r
+
+// A non-recursive CALLEE's symbol (the cross-symbol-call case): genesis birth, nonce
+// import:main:<mem[p,e)>:0 (the canonical-first function of a two-function DAG). Wraps
+// build_sym_at so resolve_call_symbol can pick between this and the recursion-group form
+// as two whole function calls (a conditional of calls is safe; string-building inside a
+// record-returning conditional is the v0 SIGTRAP, so keep it out of the `if`).
+fn build_sym_fn_mh(mem: string, p: i64, e: i64) -> MH effects[alloc, state] =
+  let gstr: string = push_lit(string_with_capacity(16), b"genesis") in
+  let csl: Sl = { ns: p, ne: e, bs: 0, rtc: 0 } in
+  build_sym_at(gstr, mem, csl, 0)
+
+// Resolve a call's callee symbol: a recursion-group self-call (`rgord >= 0`) resolves to
+// the `recursion_group:<rgord>` symbol; otherwise to the create_function symbol named by
+// the call. A conditional of two whole calls (no string-building in the branch) — safe.
+fn resolve_call_symbol(rgord: i64, mem: string, p: i64, e: i64) -> MH effects[alloc, state] =
+  if rgord >= 0 then build_sym_rg_mh(mem, rgord)
+  else build_sym_fn_mh(mem, p, e)
+
 fn build_def(sig: string, sym: string, e: string) -> DH effects[alloc, state] =
   let p0: string = push_lit(string_with_capacity(320), b"{\"function_sig_hash\":\"") in
   let k1: OS = push_kept(p0, sig) in
@@ -748,6 +782,72 @@ fn build_root_obj(sym: string, def: string, sig: string, mem: string, params: Sc
   let p10: string = push_lit(p9, b"\"}]}") in
   hash_object(b"ProgramRoot", 1, p10)
 
+// Build a RecursionGroup object over a single member: {"members":[{"definition","signature",
+// "symbol"}],"module":"main"}. The member's def/sig/symbol are KEPT (they also appear in the
+// ProgramRoot's symbols/recursion_groups arrays) and threaded back via the `RGc` carrier.
+fn build_recursion_group(def: string, sig: string, sym: string) -> RGc effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(320), b"{\"members\":[{\"definition\":\"") in
+  let k0: OS = push_kept(p0, def) in
+  let p1: string = k0.out in
+  let def1: string = k0.s in
+  let p2: string = push_lit(p1, b"\",\"signature\":\"") in
+  let k1: OS = push_kept(p2, sig) in
+  let p3: string = k1.out in
+  let sig1: string = k1.s in
+  let p4: string = push_lit(p3, b"\",\"symbol\":\"") in
+  let k2: OS = push_kept(p4, sym) in
+  let p5: string = k2.out in
+  let sym1: string = k2.s in
+  let p6: string = push_lit(p5, b"\"}],\"module\":\"main\"}") in
+  let h: string = hash_object(b"RecursionGroup", 1, p6) in
+  let r: RGc = { hash: h, def: def1, sig: sig1, sym: sym1 } in r
+
+// Build the ProgramRoot for a single-member recursion group: like build_root1 but with a
+// `recursion_groups` array (key order metadata, names, param_names, recursion_groups,
+// symbols — alphabetical). The member's display name is mem[ns,ne); its symbol appears in
+// names/param_names/symbols (threaded via push_kept), the RecursionGroup hash in recursion_groups.
+fn build_rg_root_obj(mem: string, ns: i64, ne: i64, rgc: RGc) -> string effects[alloc, state] =
+  let sym: string = rgc.sym in
+  let def: string = rgc.def in
+  let sig: string = rgc.sig in
+  let rg: string = rgc.hash in
+  let p0: string = push_lit(string_with_capacity(1024), b"{\"metadata\":{},\"names\":[{\"display_name\":\"") in
+  let nb: PRR = push_range(p0, mem, ns, ne) in
+  let p1: string = push_lit(nb.out, b"\",\"is_preferred\":true,\"module\":\"main\",\"symbol\":\"") in
+  let k0: OS = push_kept(p1, sym) in
+  let p2: string = push_lit(k0.out, b"\"}],\"param_names\":[{\"names\":[],\"symbol\":\"") in
+  let k1: OS = push_kept(p2, k0.s) in
+  let p3: string = push_lit(k1.out, b"\"}],\"recursion_groups\":[\"") in
+  let p4: string = push_str(p3, rg) in
+  let p5: string = push_lit(p4, b"\"],\"symbols\":[{\"definition\":\"") in
+  let p6: string = push_str(p5, def) in
+  let p7: string = push_lit(p6, b"\",\"signature\":\"") in
+  let p8: string = push_str(p7, sig) in
+  let p9: string = push_lit(p8, b"\",\"symbol\":\"") in
+  let p10: string = push_str(p9, k1.s) in
+  let p11: string = push_lit(p10, b"\"}]}") in
+  hash_object(b"ProgramRoot", 1, p11)
+
+// Build the ProgramRoot for a single SELF-RECURSIVE function `fn <name>() -> <rettyc> = <body>`
+// (mem[ns,ne) the name, `bodypos` the body start). A self-recursive function is a one-member
+// recursion group: its symbol is `recursion_group:0` (genesis birth), its body is RE-PARSED
+// with the scope marked `rgord = 0` so the self-call resolves to that symbol, and the
+// ProgramRoot carries a RecursionGroup object. No migration/history chain is needed for the
+// root (the birth is genesis). No-param (a no-arg self-call requires a no-param function).
+fn build_rg_root(mem: string, ns: i64, ne: i64, bodypos: i64, rettyc: i64, len: i64) -> string effects[alloc, state] =
+  let s: MH = build_sym_rg_mh(mem, 0) in
+  let m1: string = s.mem in
+  let symf: string = s.hash in
+  let sc: Scope = { ids: [0x0; 12], n: 0, rgord: 0 } in
+  let e: Pr = parse_bitor(m1, bodypos, len, sc, 0, rettyc) in
+  let m2: string = e.mem in
+  let bodyh: string = e.hash in
+  let emptyp: Scope = { ids: [0x0; 12], n: 0, rgord: 0 - 1 } in
+  let sig: string = build_sig(rettyc, emptyp) in
+  let d: DH = build_def(sig, symf, bodyh) in
+  let rgc: RGc = build_recursion_group(d.h, d.sig, d.sym) in
+  build_rg_root_obj(m2, ns, ne, rgc)
+
 // Build the three content hashes for one no-param `fn <name>() -> <rtc> = <body>`: its
 // SymbolBirth (birth history `bh`, ordinal `ordv`), its body Expression (RE-PARSED from the
 // source span `sl.bs` with the typed parser, expecting the return type `sl.rtc` — bodies may
@@ -760,7 +860,7 @@ fn build_fn_objs(mem: string, sl: Sl, bh: string, ordv: i64) -> FObj effects[all
   let m1: string = s.mem in
   let symh: string = s.hash in
   let len: i64 = string_len(m1) in
-  let emptyp: Scope = { ids: [0x0; 12], n: 0 } in
+  let emptyp: Scope = { ids: [0x0; 12], n: 0, rgord: 0 - 1 } in
   let e: Pr = parse_bitor(m1, sl.bs, len, emptyp, 0, sl.rtc) in
   let m2: string = e.mem in
   let exprh: string = e.hash in
@@ -1248,7 +1348,7 @@ fn parse_atom(mem: string, pos: i64, len: i64, scope: Scope, np: i64, etyc: i64)
         else if kw == 2 then parse_let(m2, e, len, scope, np, etyc)
         else if kw == 3 then build_bool_atom(m2, p, e)
         else if kw == 4 then parse_cast(m2, p, e, len, scope, np)
-        else if kw == 5 then parse_call(m2, p, e, len)
+        else if kw == 5 then parse_call(m2, p, e, len, scope)
         else resolve_ident(scope, np, m2, p, e)))
   else build_literal(m1, p, p, ltyc)
 
@@ -1317,19 +1417,19 @@ fn parse_cast(mem: string, p: i64, e: i64, len: i64, scope: Scope, np: i64) -> P
   let h: string = build_int_cast(arg.tyc, target, arg.hash) in
   let res: Pr = { mem: sw.mem, hash: h, tyc: target, next: sw.i + 1 } in res
 
-// call := `<name>` `(` `)`  (no-argument cross-symbol call). At entry the call identifier is
-// `mem`[p,e) (the `(` at `e` was confirmed by the caller). The callee's return type is found
-// by re-scanning the source (find_callee_rtc) — the result type and the call node's `type`.
-// In a two-function DAG the callee is the canonical-FIRST function (birth genesis, ordinal
-// 0), so its symbol is re-derived directly from the call name (no symbol table threaded
-// through the parser). No-arg: skip whitespace from past `(` to the `)`; cursor lands past it.
-fn parse_call(mem: string, p: i64, e: i64, len: i64) -> Pr effects[alloc, state] =
+// call := `<name>` `(` `)`  (no-argument call). At entry the call identifier is `mem`[p,e)
+// (the `(` at `e` was confirmed by the caller). The callee's return type is found by re-scanning
+// the source (find_callee_rtc) — the result type and the call node's `type`. The callee SYMBOL
+// is resolved by `resolve_call_symbol` against the scope's `rgord`: a self-call inside a
+// recursion-group member (rgord >= 0) resolves to `recursion_group:<rgord>`; otherwise (a
+// cross-symbol call in a two-function DAG) the callee is the canonical-first function, so its
+// symbol is re-derived from the call name (genesis/0). No symbol table is threaded through the
+// parser. No-arg: skip whitespace from past `(` to the `)`; cursor lands past it.
+fn parse_call(mem: string, p: i64, e: i64, len: i64, scope: Scope) -> Pr effects[alloc, state] =
   let crc: TC = find_callee_rtc(mem, p, e, len) in
   let crtc: i64 = crc.code in
   let m0: string = crc.mem in
-  let gstr: string = push_lit(string_with_capacity(16), b"genesis") in
-  let csl: Sl = { ns: p, ne: e, bs: 0, rtc: crtc } in
-  let s: MH = build_sym_at(gstr, m0, csl, 0) in
+  let s: MH = resolve_call_symbol(scope.rgord, m0, p, e) in
   let m1: string = s.mem in
   let symh: string = s.hash in
   let h: string = build_call(symh, crtc) in
@@ -1939,34 +2039,48 @@ fn import_root(mem: string) -> string effects[alloc, state] =
   let mc: string = aw.mem in
   let pa: i64 = aw.i in
   if pa >= len then
-    let sig: string = build_sig(rettyc, params) in
-    let sym: string = build_sym() in
-    let rd: DH = build_def(sig, sym, body.hash) in
-    build_root_obj(rd.sym, rd.h, rd.sig, mc, params)
+    // One function. If its body calls its OWN name it is a one-member recursion group
+    // (create_recursion_group, symbol recursion_group:0, a `recursion_groups` array, no chain —
+    // the birth is genesis); build_rg_root re-parses the body with rgord = 0 so the self-call
+    // resolves to that symbol. Otherwise an ordinary create_function (the EOF-detection parse's
+    // body.hash is correct — rgord = -1, no self-call).
+    let srr: REq = body_calls(mc, hdr0.bodypos, len, hdr0.ns, hdr0.ne) in
+    let msr: string = srr.mem in
+    if srr.eq then
+      build_rg_root(msr, hdr0.ns, hdr0.ne, hdr0.bodypos, rettyc, len)
+    else
+      let sig: string = build_sig(rettyc, params) in
+      let sym: string = build_sym() in
+      let rd: DH = build_def(sig, sym, body.hash) in
+      build_root_obj(rd.sym, rd.h, rd.sig, msr, params)
   else
-    // Parse fn1's header (it begins at `pa`, just past fn0's body) and build a source span per
-    // function (name range + body start + return type code). Then apply the dependency-driven
-    // CANONICAL ORDER (a callee is created before its caller): detect the call-graph edges and
-    // put the callee first; the chain builder re-parses each body both typed (Expression) and
-    // raw (migration body), with the second function's calls resolving to the first's symbol.
-    let hdr1: HdrR = parse_header(mc, pa, len) in
-    let md: string = hdr1.mem in
-    // fn0's body is [hdr0.bodypos, pa) (pa = fn1's `fn`), fn1's is [hdr1.bodypos, len).
-    let c01r: REq = body_calls(md, hdr0.bodypos, pa, hdr1.ns, hdr1.ne) in
-    let c01: bool = c01r.eq in
-    let c10r: REq = body_calls(c01r.mem, hdr1.bodypos, len, hdr0.ns, hdr0.ne) in
-    let c10: bool = c10r.eq in
+    // Two functions: hand fn0's source span (f0) and fn1's start (`pa`) to the chain builder.
+    // Factored out so the two-function locals stay off import_root's stack frame.
     let f0: Sl = { ns: hdr0.ns, ne: hdr0.ne, bs: hdr0.bodypos, rtc: rettyc } in
-    let f1: Sl = { ns: hdr1.ns, ne: hdr1.ne, bs: hdr1.bodypos, rtc: hdr1.rettyc } in
-    // toposort: fn0 calls fn1 (only) -> fn1 first; fn1 calls fn0 (only) -> fn0 first; else
-    // (independent, or mutual = a recursion group, out of scope) alphabetical by name.
-    let alc: REq = name_le(c10r.mem, hdr0.ns, hdr0.ne, hdr1.ns, hdr1.ne) in
-    let mz: string = alc.mem in
-    let f0le: bool = alc.eq in
-    let f0first: bool = if c01 then (if c10 then f0le else false) else (if c10 then true else f0le) in
-    let first: Sl = if f0first then f0 else f1 in
-    let second: Sl = if f0first then f1 else f0 in
-    build_two_root(mz, first, second)
+    import_two(mc, pa, len, f0)
+
+// The two-function path: parse fn1's header (it begins at `pa`, just past fn0's body), apply
+// the dependency-driven CANONICAL ORDER (a callee is created before its caller — detect the
+// call-graph edges and put the callee first; independent functions fall back to alphabetical),
+// and hand the ordered pair to build_two_root (which re-parses each body typed + raw). `f0` is
+// fn0's source span. fn0's body is [f0.bs, pa) (pa = fn1's `fn`); fn1's is [hdr1.bodypos, len).
+fn import_two(mem: string, pa: i64, len: i64, f0: Sl) -> string effects[alloc, state] =
+  let hdr1: HdrR = parse_header(mem, pa, len) in
+  let md: string = hdr1.mem in
+  let c01r: REq = body_calls(md, f0.bs, pa, hdr1.ns, hdr1.ne) in
+  let c01: bool = c01r.eq in
+  let c10r: REq = body_calls(c01r.mem, hdr1.bodypos, len, f0.ns, f0.ne) in
+  let c10: bool = c10r.eq in
+  let f1: Sl = { ns: hdr1.ns, ne: hdr1.ne, bs: hdr1.bodypos, rtc: hdr1.rettyc } in
+  // toposort: fn0 calls fn1 (only) -> fn1 first; fn1 calls fn0 (only) -> fn0 first; else
+  // (independent, or mutual = a recursion group, out of scope) alphabetical by name.
+  let alc: REq = name_le(c10r.mem, f0.ns, f0.ne, hdr1.ns, hdr1.ne) in
+  let mz: string = alc.mem in
+  let f0le: bool = alc.eq in
+  let f0first: bool = if c01 then (if c10 then f0le else false) else (if c10 then true else f0le) in
+  let first: Sl = if f0first then f0 else f1 in
+  let second: Sl = if f0first then f1 else f0 in
+  build_two_root(mz, first, second)
 
 fn print_str<'r>(s: string) -> i64 effects[io, state, ffi, unsafe] =
   let n: i64 = string_len(s) in

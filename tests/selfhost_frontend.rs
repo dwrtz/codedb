@@ -1049,6 +1049,55 @@ fn importer_reproduces_the_root_hash_for_cross_symbol_calls() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_self_recursion() {
+    // 15a.4 (axis 2): a SELF-RECURSIVE function. A function whose body calls its own name is a
+    // one-member RECURSION GROUP — the importer emits `create_recursion_group` (not
+    // create_function): the member's SymbolBirth uses `local_nonce = "recursion_group:0"` (the
+    // member ordinal, NOT its name), there is a new `RecursionGroup` object, and the ProgramRoot
+    // carries a `recursion_groups` array alongside `symbols`. The self-call resolves to that
+    // `recursion_group:0` symbol (the importer marks the body's scope rgord = 0 so parse_call
+    // resolves the self-call there rather than to a create_function symbol). The birth is
+    // genesis, so the root needs no migration/history chain. Reproducing the root exercises the
+    // new object kind, the member nonce, the recursion_groups array, and the self-call
+    // resolution. Covers a bare self-call, a base case, the self-call in arithmetic/let, two
+    // self-calls, a bool result, and distinct names. Multi-member (mutual) recursion — which
+    // needs the canonical member ordering — is the next increment.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        "fn f() -> i64 = f()\n",
+        "fn fib() -> i64 = fib()\n",
+        "fn f() -> i64 = if 1 < 2 then 1 else f()\n",
+        "fn f() -> i64 = f() + 1\n",
+        "fn f() -> i64 = f() + f()\n",
+        "fn f() -> i64 = let x: i64 = f() in x + 1\n",
+        "fn g() -> bool = if true then true else g()\n",
+        "fn count() -> i64 = if 0 < 1 then count() else 0\n",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        let db = temp.path().join(format!("ref-rec-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-rec-{i}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer self-recursion root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate

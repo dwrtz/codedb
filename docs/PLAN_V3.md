@@ -1507,6 +1507,32 @@ regressions (`tests/selfhost_frontend.rs` 17/17). Remaining axis-2 surface: argu
 and params-in-multi-function (param refs in a multi-fn body), and recursion groups
 (`create_recursion_group` — self-recursive or mutually-recursive functions).
 
+Landed 2026-06-15: SELF-RECURSIVE functions — a single function whose body calls its own name
+is a one-member RECURSION GROUP, the first `create_recursion_group` increment. The importer
+emits `create_recursion_group` rather than `create_function`: the member's SymbolBirth uses
+`local_nonce = "recursion_group:0"` (the member's ordinal in canonical order, NOT its name); a
+new `RecursionGroup` object (`{"members":[{definition,signature,symbol}],"module":...}`) is
+created; and the ProgramRoot carries a `recursion_groups` array (key order metadata, names,
+param_names, recursion_groups, symbols) alongside `symbols`. The self-call resolves to that
+`recursion_group:0` symbol: the lexical `Scope` (already threaded through the parser) gained an
+`rgord` field (-1 = not a recursion-group member; >= 0 = this body is a member of that ordinal),
+and `parse_call` resolves a call through `resolve_call_symbol` — `rgord >= 0` gives the
+`recursion_group:<rgord>` symbol, otherwise the create_function symbol named by the call.
+`import_root` detects self-recursion (`body_calls` on the function's own name) and, on the
+single-function path, builds the recursion-group root (`build_rg_root`, which re-parses the body
+with `rgord = 0`) instead of `build_root_obj`. Because the member's birth is `genesis`, the root
+needs NO migration/history chain (simpler than the multi-function case) — it is reproduced from
+objects alone. Every shape was spiked against `codedb history --json` / `emit-objects` and the
+root reproduced byte-exactly in Python first. The symbol resolution was kept off the v0
+SIGTRAP path (`resolve_call_symbol` is a conditional of two whole symbol-builder calls, no
+string-building inside the `if`), and `import_root` — which overflowed the 4095-byte frame once
+the self-recursion detection joined the two-function toposort — was factored (the two-function
+branch moved into `import_two`). Root-hash equality holds across 8 self-recursion fixtures —
+bare self-call, base case, self-call in arithmetic / `let`, two self-calls, a bool result, and
+distinct names — plus all regressions (`tests/selfhost_frontend.rs` 18/18). Remaining axis-2
+surface: MUTUAL recursion (a multi-member recursion group, needing the canonical member ordering
+— Tarjan SCC), and call arguments / params-in-multi-function.
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text
