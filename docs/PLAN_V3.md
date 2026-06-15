@@ -1444,6 +1444,37 @@ bodies; growing the raw-AST serializer (operators/let/if/refs/casts), cross-symb
 params-in-multi-fn, and recursion groups (`create_recursion_group`) is the remaining axis-2
 surface.
 
+Landed 2026-06-15: the axis-2 raw-AST serializer grew to the FULL single-function grammar,
+so a two-function program's bodies may now be any expression, not just a literal. A
+multi-function program's migration body is the dual (RAW) serialization of the canonical-
+first function's body — distinct from the typed Expression objects (which reference children
+by content hash) — so reproducing the root for a first body that is any expression requires a
+byte-exact raw AST. A SECOND, type-free recursive-descent parser now produces it, mirroring
+the typed precedence ladder exactly (so the raw tree matches the typed tree) but far simpler:
+no expected type, no scope, no type codes; sized and hex literals all serialize as
+`literal_i64` with the raw source text, refs (let-locals or params) are `param_name` by name,
+and `to_*` casts are `call` nodes. It is its own mutual-recursion clique (a second recursion
+group alongside the typed parser's). The chain builders embed the raw body in BOTH the
+operation and the function_source_matches postcondition and emit the function's real
+return-type NAME (no longer hard-coded `i64`); the two-function path re-parses each body on
+demand — typed (for the Expression hash) and raw (for the migration) — so `Sl` now carries the
+body's source start plus the return-type code instead of a literal value span, and
+`build_fn_objs` re-derives the typed body via `parse_bitor`. Because a raw node embeds its
+children INLINE (unlike a typed node's fixed-length hash children), each node-builder sizes its
+buffer DYNAMICALLY from the child lengths — a fixed `string_with_capacity` would trap on deep
+nesting (and the migration payload, which holds the body twice, is sized from it too). Every
+raw form was spiked against `codedb history --json` first (binary/unary/if canonical key
+orders, `param_name` refs, `call` casts, bare-bool and raw-text literals) and the whole rich
+chain reproduced byte-exactly in Python before any `.cdb`; all 112 functions were validated
+under the v0 frame budget OFFLINE (`emit-ir` + the backend-formula replica) before the slow
+verify. Root-hash equality holds across 22 rich two-function fixtures — operators/precedence/
+associativity, bitwise/shift, comparison, logical, unary, bool, nested `if`, nested `let` +
+by-name refs, casts, hex, sized types, a rich SECOND body (the typed re-parse path), both
+rich, and canonical ordering with the rich body sorting second — plus all single-function and
+literal-keystone regressions (`tests/selfhost_frontend.rs` 16/16). Remaining axis-2 surface:
+cross-symbol calls, params-in-multi-function (param refs in a multi-fn body), and recursion
+groups (`create_recursion_group`).
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text

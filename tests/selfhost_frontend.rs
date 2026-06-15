@@ -924,6 +924,73 @@ fn importer_reproduces_the_root_hash_for_two_functions() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_two_function_rich_bodies() {
+    // 15a.4 (axis 2): the RAW-AST serializer. The two-function migration body is the dual
+    // (raw) serialization of the canonical-FIRST function's body, distinct from the typed
+    // Expression objects — so a multi-function program whose first body is ANY expression
+    // (not just a literal) only reproduces the root if that raw AST is byte-exact. A second,
+    // type-free recursive-descent parser produces it (mirroring the typed precedence ladder:
+    // operators, unary, bool, `if`, `let` + by-name refs, casts), and the chain builders
+    // embed it in the operation AND the function_source_matches postcondition with the
+    // function's real return-type name. The forms were spiked against `codedb history --json`
+    // first (binary/unary/if key orders, `param_name` refs, `call` casts, bare-bool/raw-text
+    // literals). Covers a rich first body across the whole grammar, a rich SECOND body (the
+    // typed re-parse path), both rich, and canonical ordering with the rich body sorting
+    // second — i64/bool/sized returns throughout. Root-hash equality is exact.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        // rich FIRST body (canonical-first => drives the raw serializer), trivial second
+        "fn aaa() -> i64 = 1 + 2 * 3 - 4\nfn zzz() -> i64 = 0\n",
+        "fn aaa() -> i64 = 100 / 5 % 7\nfn zzz() -> i64 = 0\n",
+        "fn aaa() -> i64 = 6 & 3 ^ 8 | 1\nfn zzz() -> i64 = 0\n",
+        "fn aaa() -> i64 = 1 << 3 | 4\nfn zzz() -> i64 = 0\n",
+        "fn aaa() -> bool = 1 + 1 == 2\nfn zzz() -> i64 = 0\n",
+        "fn aaa() -> bool = 1 < 2 && 3 < 4\nfn zzz() -> i64 = 0\n",
+        "fn aaa() -> bool = ! true\nfn zzz() -> i64 = 0\n",
+        "fn aaa() -> i64 = - 5 + 3\nfn zzz() -> i64 = 0\n",
+        "fn aaa() -> i64 = ~ 7\nfn zzz() -> i64 = 0\n",
+        "fn aaa() -> bool = false\nfn zzz() -> i64 = 0\n",
+        "fn aaa() -> i64 = if true then if false then 1 else 2 else 3\nfn zzz() -> i64 = 0\n",
+        "fn aaa() -> i64 = let a: i64 = 1 in let b: i64 = a + 2 in a * b\nfn zzz() -> i64 = 0\n",
+        "fn aaa() -> i64 = let x: i64 = 5 in if x < 3 then x else 9\nfn zzz() -> i64 = 0\n",
+        "fn aaa() -> u8 = to_u8(1 + 2)\nfn zzz() -> i64 = 0\n",
+        "fn aaa() -> i64 = 0xff & 0x0f\nfn zzz() -> i64 = 0\n",
+        "fn aaa() -> u8 = let x: u8 = 5 in x\nfn zzz() -> i64 = 0\n",
+        // rich SECOND body (typed-only re-parse path; trivial canonical-first migration)
+        "fn aaa() -> i64 = 0\nfn zzz() -> i64 = 1 + 2 * 3\n",
+        "fn aaa() -> i64 = 0\nfn zzz() -> i64 = let q: i64 = 1 in q + 2\n",
+        // both rich
+        "fn aaa() -> i64 = 1 + 2\nfn zzz() -> bool = 3 < 4\n",
+        "fn aaa() -> bool = ! false\nfn zzz() -> i64 = to_i64(5)\n",
+        // canonical ordering: the rich body is on the function that sorts SECOND
+        "fn zzz() -> i64 = 1 + 2 * 3\nfn aaa() -> i64 = 9\n",
+        "fn main() -> i64 = 7 + 8\nfn helper() -> i64 = 1 << 2\n",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        let db = temp.path().join(format!("ref-rich-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-rich-{i}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer rich two-function root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate

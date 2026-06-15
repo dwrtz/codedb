@@ -73,6 +73,12 @@ record MI { mem: string  i: i64 }
 // 1 = bool — the inferred result type, threaded so each node's `type` field and the
 // function's return type are correct), and the cursor past it.
 record Pr { mem: string  hash: string  tyc: i64  next: i64 }
+// A RAW-AST parse result (and every raw binary level's loop accumulator): the threaded
+// memory, the raw-AST JSON STRING built for the node (a complete canonical JSON object,
+// children embedded inline — NOT a content hash), and the cursor past it. The raw AST is
+// type-free (sized/hex literals all serialize as `literal_i64`, refs are by-name), so
+// there is no type code; it feeds the migration `operation.body` (the dual serialization).
+record Rr { mem: string  raw: string  next: i64 }
 // A push-range result: the string being built and the threaded source memory.
 record PRR { out: string  mem: string }
 // The lexical scope, holding BOTH a function's parameters and its enclosing `let`
@@ -110,11 +116,13 @@ record CCmp { j: i64  eq: bool }
 record MH { mem: string  hash: string }
 // A type-name classification result: the type code and the threaded source memory.
 record TC { code: i64  mem: string }
-// A parsed top-level function's source spans (all Copy): the name's byte range
-// [ns, ne) and the (literal) body value's byte range [vs, ve) in the source. Axis-2
-// carries two of these (one per function) to drive canonical ordering and the
-// migration/history chain without re-walking the source.
-record Sl { ns: i64  ne: i64  vs: i64  ve: i64 }
+// A parsed top-level function's source span (all Copy): the name's byte range [ns, ne),
+// the BODY's start byte `bs` in the source (just past `=`), and the declared return type
+// code `rtc`. Axis-2 carries two of these (one per function) to drive canonical ordering
+// and the migration/history chain; the body itself is RE-PARSED from `bs` on demand (both
+// typed — for the Expression hash — and raw — for the migration body), so no literal value
+// span is stored (bodies may now be any expression, not just a literal).
+record Sl { ns: i64  ne: i64  bs: i64  rtc: i64 }
 // A function's three content hashes (SymbolBirth, FunctionDef, FunctionSignature)
 // with the threaded source memory — the per-symbol inputs to a ProgramRoot.
 record FObj { mem: string  sym: string  def: string  sig: string }
@@ -122,8 +130,11 @@ record FObj { mem: string  sym: string  def: string  sig: string }
 // `c` (2 = still equal/continue, 0 = A<B, 1 = A>B, 3 = equal at exhaustion).
 record Lc { j: i64  c: i64 }
 // Carrier between build_mig1's two payload halves (also split for the frame budget): the
-// partial buffer, the threaded source memory, and the reused name/genesis/out1/value.
-record Pc { out: string  mem: string  name: string  gen: string  o1: string  val: string }
+// partial buffer, the threaded source memory, the reused name/genesis/out1, the raw-AST
+// body JSON (kept across both halves — it appears in the operation AND the
+// function_source_matches postcondition), and the function's return type code (for the
+// `return_type` name, which appears in both halves too).
+record Pc { out: string  mem: string  name: string  gen: string  o1: string  body: string  rtc: i64 }
 // build_mig1's second payload half returns the full payload, out1 (kept for the history
 // preimage), and the threaded memory.
 record MigB { pay: string  o1: string  mem: string }
@@ -525,6 +536,22 @@ fn type_hash(tyc: i64) -> string effects[alloc, state] =
 // arithmetic levels to type operands/results (expected if set, else the left operand's).
 fn eff(etyc: i64, lt: i64) -> i64 = if etyc >= 0 then etyc else lt
 
+// Append a type code's source NAME (i64/bool/u8/.../i32) to `out`. The migration
+// operation (and the function_source_matches postcondition) serialize the return type as
+// a raw type NAME string, NOT a Type-object hash (the dual serialization), so this is the
+// raw counterpart of type_hash. Codes match type_hash: 0 = i64, 1 = bool, 2 = u8, 3 = u16,
+// 4 = u32, 5 = u64, 6 = i8, 7 = i16, 8 = i32.
+fn push_type_name(out: string, rtc: i64) -> string effects[state] =
+  if rtc == 1 then push_lit(out, b"bool")
+  else if rtc == 2 then push_lit(out, b"u8")
+  else if rtc == 3 then push_lit(out, b"u16")
+  else if rtc == 4 then push_lit(out, b"u32")
+  else if rtc == 5 then push_lit(out, b"u64")
+  else if rtc == 6 then push_lit(out, b"i8")
+  else if rtc == 7 then push_lit(out, b"i16")
+  else if rtc == 8 then push_lit(out, b"i32")
+  else push_lit(out, b"i64")
+
 // Classify a type-name identifier `mem`[ts,te) into a type code (the inverse of the
 // type_kind in type_hash); threads `mem` back. Recognizes i8/i16/i32/i64 and u8/u16/u32/
 // u64 and bool; anything else (or an unknown name) reads as i64 (code 0).
@@ -648,20 +675,23 @@ fn build_root_obj(sym: string, def: string, sig: string, mem: string, params: Sc
   let p10: string = push_lit(p9, b"\"}]}") in
   hash_object(b"ProgramRoot", 1, p10)
 
-// Build the three content hashes for one function (a no-param `fn <name>() -> i64 =
-// <literal>`): its SymbolBirth (birth history `bh`, ordinal `ordv`), its literal-body
-// Expression (i64), and its FunctionSignature, combined into a FunctionDef. Returns the
-// SymbolBirth/FunctionDef/FunctionSignature hashes with `mem` threaded back. Rebuilt (it
-// is deterministic) rather than threaded across the two ProgramRoots that consume it.
+// Build the three content hashes for one no-param `fn <name>() -> <rtc> = <body>`: its
+// SymbolBirth (birth history `bh`, ordinal `ordv`), its body Expression (RE-PARSED from the
+// source span `sl.bs` with the typed parser, expecting the return type `sl.rtc` — bodies may
+// be any expression now, not just a literal), and its FunctionSignature (return `sl.rtc`),
+// combined into a FunctionDef. Returns the SymbolBirth/FunctionDef/FunctionSignature hashes
+// with `mem` threaded back. Rebuilt (deterministic) rather than threaded across the two
+// ProgramRoots that consume it. No-param ⇒ the typed parse uses an empty scope (np = 0).
 fn build_fn_objs(mem: string, sl: Sl, bh: string, ordv: i64) -> FObj effects[alloc, state] =
   let s: MH = build_sym_at(bh, mem, sl, ordv) in
   let m1: string = s.mem in
   let symh: string = s.hash in
-  let e: Pr = build_literal(m1, sl.vs, sl.ve, 0) in
+  let len: i64 = string_len(m1) in
+  let emptyp: Scope = { ids: [0x0; 12], n: 0 } in
+  let e: Pr = parse_bitor(m1, sl.bs, len, emptyp, 0, sl.rtc) in
   let m2: string = e.mem in
   let exprh: string = e.hash in
-  let emptyp: Scope = { ids: [0x0; 12], n: 0 } in
-  let sig: string = build_sig(0, emptyp) in
+  let sig: string = build_sig(sl.rtc, emptyp) in
   let d: DH = build_def(sig, symh, exprh) in
   let r: FObj = { mem: m2, sym: d.sym, def: d.h, sig: d.sig } in r
 
@@ -922,6 +952,116 @@ fn build_int_cast(srctyc: i64, tgttyc: i64, valh: string) -> string effects[allo
   let p5: string = push_str(p4, valh) in
   let p6: string = push_lit(p5, b"\"}") in
   hash_object(b"Expression", 1, p6)
+
+// ---------------------------------------------------------------------------
+// raw-AST node builders (the dual serialization for the migration body)
+//
+// Unlike the typed Expression objects above (which reference their children by content
+// HASH — a fixed 71-byte string — so each node payload is bounded), a raw-AST node embeds
+// its children's full JSON INLINE, so the serialized size grows with the subtree. Each
+// builder therefore sizes its buffer DYNAMICALLY from the child lengths (string_with_
+// capacity TRAPS if the capacity is exceeded — see the keystone gotchas), never a fixed
+// constant. The raw AST is type-free: every integer literal (decimal, hex, or sized) is a
+// `literal_i64` with the raw source text; refs (let-locals or params) are `param_name` by
+// name; casts are `call` nodes. Keys are emitted in canonical (alphabetical) order. The
+// child raw strings are CONSUMED (each used once); `string_len` borrows them first.
+// ---------------------------------------------------------------------------
+
+// {"kind":"literal_i64","value":"<raw source slice>"} — the raw text of mem[start,end)
+// (decimal "42" or hex "0xff"); sized literals use this too (type-free). Threads mem back.
+fn raw_literal_node(mem: string, start: i64, endd: i64) -> Rr effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(endd - start + 48), b"{\"kind\":\"literal_i64\",\"value\":\"") in
+  let pv: PRR = push_range(p0, mem, start, endd) in
+  let p1: string = pv.out in
+  let m1: string = pv.mem in
+  let p2: string = push_lit(p1, b"\"}") in
+  let r: Rr = { mem: m1, raw: p2, next: endd } in r
+
+// {"kind":"literal_bool","value":true|false} — the value is a BARE JSON boolean (not a
+// quoted string), selected by the first byte of the keyword ('t' = 116 = true). Threads mem.
+fn raw_bool_node(mem: string, start: i64, endd: i64) -> Rr effects[alloc, state] =
+  let v: bool = to_i64(string_get(mem, start)) == 116 in
+  let p0: string = push_lit(string_with_capacity(64), b"{\"kind\":\"literal_bool\",\"value\":") in
+  let p1: string = if v then push_lit(p0, b"true") else push_lit(p0, b"false") in
+  let p2: string = push_lit(p1, b"}") in
+  let r: Rr = { mem: mem, raw: p2, next: endd } in r
+
+// {"kind":"param_name","name":"<n>"} — a reference (let-local OR parameter) by NAME (the
+// raw AST has no scope/de-Bruijn/index). The name is mem[start,end); threads mem back.
+fn raw_ref_node(mem: string, start: i64, endd: i64) -> Rr effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(endd - start + 48), b"{\"kind\":\"param_name\",\"name\":\"") in
+  let pv: PRR = push_range(p0, mem, start, endd) in
+  let p1: string = pv.out in
+  let m1: string = pv.mem in
+  let p2: string = push_lit(p1, b"\"}") in
+  let r: Rr = { mem: m1, raw: p2, next: endd } in r
+
+// {"kind":"binary","left":<lraw>,"op":"<op>","right":<rraw>} — the op is its source
+// spelling (`ob1` plus `ob2`, or `ob2 = 0` for a single-char op). Children embedded inline.
+fn raw_binary_node(lraw: string, ob1: i64, ob2: i64, rraw: string) -> string effects[alloc, state] =
+  let cap: i64 = string_len(lraw) + string_len(rraw) + 64 in
+  let p0: string = push_lit(string_with_capacity(cap), b"{\"kind\":\"binary\",\"left\":") in
+  let p1: string = push_str(p0, lraw) in
+  let p2: string = push_lit(p1, b",\"op\":\"") in
+  let p3: string = push_byte(p2, to_u8(ob1)) in
+  let p3b: string = if ob2 == 0 then p3 else push_byte(p3, to_u8(ob2)) in
+  let p4: string = push_lit(p3b, b"\",\"right\":") in
+  let p5: string = push_str(p4, rraw) in
+  push_lit(p5, b"}")
+
+// {"expr":<eraw>,"kind":"unary","op":"<op>"} — prefix `- ! ~` (single byte `opb`).
+fn raw_unary_node(opb: i64, eraw: string) -> string effects[alloc, state] =
+  let cap: i64 = string_len(eraw) + 48 in
+  let p0: string = push_lit(string_with_capacity(cap), b"{\"expr\":") in
+  let p1: string = push_str(p0, eraw) in
+  let p2: string = push_lit(p1, b",\"kind\":\"unary\",\"op\":\"") in
+  let p3: string = push_byte(p2, to_u8(opb)) in
+  push_lit(p3, b"\"}")
+
+// {"cond":<craw>,"else":<eraw>,"kind":"if","then":<traw>} — note canonical key order puts
+// `else` before `then`. All three children embedded inline.
+fn raw_if_node(craw: string, traw: string, eraw: string) -> string effects[alloc, state] =
+  let cap: i64 = string_len(craw) + string_len(traw) + string_len(eraw) + 48 in
+  let p0: string = push_lit(string_with_capacity(cap), b"{\"cond\":") in
+  let p1: string = push_str(p0, craw) in
+  let p2: string = push_lit(p1, b",\"else\":") in
+  let p3: string = push_str(p2, eraw) in
+  let p4: string = push_lit(p3, b",\"kind\":\"if\",\"then\":") in
+  let p5: string = push_str(p4, traw) in
+  push_lit(p5, b"}")
+
+// {"body":<braw>,"kind":"let","name":"<n>","type":"<typename>","value":<vraw>} — the
+// binding name is mem[ns,ne) and the type is the raw type NAME slice mem[ts,te) (copied
+// straight from the source, e.g. "i64"/"u8"); body/value embedded inline. Threads mem back.
+fn raw_let_node(mem: string, ns: i64, ne: i64, ts: i64, te: i64, vraw: string, braw: string) -> Rr effects[alloc, state] =
+  let cap: i64 = string_len(braw) + string_len(vraw) + (ne - ns) + (te - ts) + 64 in
+  let p0: string = push_lit(string_with_capacity(cap), b"{\"body\":") in
+  let p1: string = push_str(p0, braw) in
+  let p2: string = push_lit(p1, b",\"kind\":\"let\",\"name\":\"") in
+  let nb: PRR = push_range(p2, mem, ns, ne) in
+  let p3: string = nb.out in
+  let m1: string = nb.mem in
+  let p4: string = push_lit(p3, b"\",\"type\":\"") in
+  let tb: PRR = push_range(p4, m1, ts, te) in
+  let p5: string = tb.out in
+  let m2: string = tb.mem in
+  let p6: string = push_lit(p5, b"\",\"value\":") in
+  let p7: string = push_str(p6, vraw) in
+  let p8: string = push_lit(p7, b"}") in
+  let r: Rr = { mem: m2, raw: p8, next: 0 } in r
+
+// {"args":[<araw>],"kind":"call","name":"<to_xxx>"} — a `to_<type>(...)` cast serializes
+// as a `call` node; the call name is the full source slice mem[p,e) ("to_u8"). One arg.
+fn raw_cast_node(mem: string, p: i64, e: i64, araw: string) -> Rr effects[alloc, state] =
+  let cap: i64 = string_len(araw) + (e - p) + 64 in
+  let p0: string = push_lit(string_with_capacity(cap), b"{\"args\":[") in
+  let p1: string = push_str(p0, araw) in
+  let p2: string = push_lit(p1, b"],\"kind\":\"call\",\"name\":\"") in
+  let nb: PRR = push_range(p2, mem, p, e) in
+  let p3: string = nb.out in
+  let m1: string = nb.mem in
+  let p4: string = push_lit(p3, b"\"}") in
+  let r: Rr = { mem: m1, raw: p4, next: 0 } in r
 
 // ---------------------------------------------------------------------------
 // the parser: precedence climbing, left-associative for the binary levels.
@@ -1264,6 +1404,260 @@ fn parse_bitor(mem: string, pos: i64, len: i64, scope: Scope, np: i64, etyc: i64
   let r: Pr = { mem: done.mem, hash: done.hash, tyc: done.tyc, next: done.next } in r
 
 // ---------------------------------------------------------------------------
+// the RAW parser: a SECOND, type-free recursive-descent parser producing the raw-AST
+// JSON string (the migration `operation.body`). It mirrors the typed ladder's precedence
+// and associativity EXACTLY (so the raw tree matches the typed tree), but is simpler:
+// no expected-type, no scope, no type code — refs are by-name, literals are type-free.
+// Each level returns an `Rr` (threaded mem + the raw JSON string + cursor); like the typed
+// levels, the move-only loop accumulator is rebuilt into a fresh record before return (the
+// v0-backend workaround). raw_atom/raw_if/raw_let/raw_cast and the binary ladder form one
+// mutual-recursion clique (a second recursion group alongside the typed parser's).
+// ---------------------------------------------------------------------------
+
+// raw atom := <decimal|hex int> | `true`|`false` | `if` ... | `let` ... | to_<t>(...) | IDENT
+fn raw_atom(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
+  let sw: MI = skip_ws(mem, pos, len) in
+  let m1: string = sw.mem in
+  let p: i64 = sw.i in
+  if p < len then
+    (if is_digit_b(to_i64(string_get(m1, p))) then
+       (if (if to_i64(string_get(m1, p)) == 48 then (if p + 1 < len then (let b1: i64 = to_i64(string_get(m1, p + 1)) in b1 == 120 || b1 == 88) else false) else false) then
+          let sh: MI = scan_hex(m1, p + 2, len) in
+          raw_literal_node(sh.mem, p, sh.i)
+        else
+          let sd: MI = scan_digits(m1, p, len) in
+          raw_literal_node(sd.mem, p, sd.i))
+     else
+       let se: MI = scan_ident(m1, p, len) in
+       let e: i64 = se.i in
+       let cl: TC = classify_kw(se.mem, p, e, len) in
+       let m2: string = cl.mem in
+       let kw: i64 = cl.code in
+       (if kw == 1 then raw_if(m2, e, len)
+        else if kw == 2 then raw_let(m2, e, len)
+        else if kw == 3 then raw_bool_node(m2, p, e)
+        else if kw == 4 then raw_cast(m2, p, e, len)
+        else raw_ref_node(m2, p, e)))
+  else raw_literal_node(m1, p, p)
+
+// raw if := `if` expr `then` expr `else` expr (then/else keyword tokens skipped).
+fn raw_if(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
+  let cond: Rr = raw_bitor(mem, pos, len) in
+  let sw1: MI = skip_ws(cond.mem, cond.next, len) in
+  let tk: MI = scan_ident(sw1.mem, sw1.i, len) in
+  let thn: Rr = raw_bitor(tk.mem, tk.i, len) in
+  let sw2: MI = skip_ws(thn.mem, thn.next, len) in
+  let ek: MI = scan_ident(sw2.mem, sw2.i, len) in
+  let els: Rr = raw_bitor(ek.mem, ek.i, len) in
+  let node: string = raw_if_node(cond.raw, thn.raw, els.raw) in
+  let r: Rr = { mem: els.mem, raw: node, next: els.next } in r
+
+// raw let := `let` IDENT `:` TYPE `=` expr `in` expr. The name [ns,ne) and type [ts,te)
+// are copied straight from the source (the raw type field is the type NAME, type-free).
+fn raw_let(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
+  let sw1: MI = skip_ws(mem, pos, len) in
+  let ns: i64 = sw1.i in
+  let nm: MI = scan_ident(sw1.mem, ns, len) in
+  let ne: i64 = nm.i in
+  let sw2: MI = skip_ws(nm.mem, ne, len) in
+  let sw3: MI = skip_ws(sw2.mem, sw2.i + 1, len) in
+  let ts: i64 = sw3.i in
+  let ty: MI = scan_ident(sw3.mem, ts, len) in
+  let te: i64 = ty.i in
+  let sw4: MI = skip_ws(ty.mem, te, len) in
+  let val: Rr = raw_bitor(sw4.mem, sw4.i + 1, len) in
+  let sw5: MI = skip_ws(val.mem, val.next, len) in
+  let ink: MI = scan_ident(sw5.mem, sw5.i, len) in
+  let body: Rr = raw_bitor(ink.mem, ink.i, len) in
+  let node: Rr = raw_let_node(body.mem, ns, ne, ts, te, val.raw, body.raw) in
+  let r: Rr = { mem: node.mem, raw: node.raw, next: body.next } in r
+
+// raw cast := `to_<type>` `(` expr `)`. The cast identifier is mem[p,e) (the `(` is at e).
+fn raw_cast(mem: string, p: i64, e: i64, len: i64) -> Rr effects[alloc, state] =
+  let arg: Rr = raw_bitor(mem, e + 1, len) in
+  let sw: MI = skip_ws(arg.mem, arg.next, len) in
+  let node: Rr = raw_cast_node(sw.mem, p, e, arg.raw) in
+  let r: Rr = { mem: node.mem, raw: node.raw, next: sw.i + 1 } in r
+
+// raw unary := ('-'|'~'|'!') unary | atom
+fn raw_unary(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
+  let sw: MI = skip_ws(mem, pos, len) in
+  let m1: string = sw.mem in
+  let p: i64 = sw.i in
+  if p < len then
+    (if is_unary_op(to_i64(string_get(m1, p))) then
+       let opb: i64 = to_i64(string_get(m1, p)) in
+       let inner: Rr = raw_unary(m1, p + 1, len) in
+       let node: string = raw_unary_node(opb, inner.raw) in
+       let r: Rr = { mem: inner.mem, raw: node, next: inner.next } in r
+     else raw_atom(m1, p, len))
+  else raw_atom(m1, p, len)
+
+// raw mul := unary (('*'|'/'|'%') unary)*
+fn raw_mul(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
+  let lft: Rr = raw_unary(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Rr = { mem: s0.mem, raw: lft.raw, next: s0.i } in
+  let done: Rr =
+    loop a = seed while (if a.next < len then is_mulop(to_i64(string_get(a.mem, a.next))) else false) do
+      let cur: Rr = a in
+      let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
+      let rgt: Rr = raw_unary(cur.mem, cur.next + 1, len) in
+      let node: string = raw_binary_node(cur.raw, opb, 0, rgt.raw) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Rr = { mem: s1.mem, raw: node, next: s1.i } in nx
+  in
+  let r: Rr = { mem: done.mem, raw: done.raw, next: done.next } in r
+
+// raw add := mul (('+'|'-') mul)*
+fn raw_add(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
+  let lft: Rr = raw_mul(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Rr = { mem: s0.mem, raw: lft.raw, next: s0.i } in
+  let done: Rr =
+    loop a = seed while (if a.next < len then is_addop(to_i64(string_get(a.mem, a.next))) else false) do
+      let cur: Rr = a in
+      let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
+      let rgt: Rr = raw_mul(cur.mem, cur.next + 1, len) in
+      let node: string = raw_binary_node(cur.raw, opb, 0, rgt.raw) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Rr = { mem: s1.mem, raw: node, next: s1.i } in nx
+  in
+  let r: Rr = { mem: done.mem, raw: done.raw, next: done.next } in r
+
+// raw shift := add (('<<'|'>>') add)*
+fn raw_shift(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
+  let lft: Rr = raw_add(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Rr = { mem: s0.mem, raw: lft.raw, next: s0.i } in
+  let done: Rr =
+    loop a = seed while (if a.next + 1 < len then is_shift_op(to_i64(string_get(a.mem, a.next)), to_i64(string_get(a.mem, a.next + 1))) else false) do
+      let cur: Rr = a in
+      let ob1: i64 = to_i64(string_get(cur.mem, cur.next)) in
+      let ob2: i64 = to_i64(string_get(cur.mem, cur.next + 1)) in
+      let rgt: Rr = raw_add(cur.mem, cur.next + 2, len) in
+      let node: string = raw_binary_node(cur.raw, ob1, ob2, rgt.raw) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Rr = { mem: s1.mem, raw: node, next: s1.i } in nx
+  in
+  let r: Rr = { mem: done.mem, raw: done.raw, next: done.next } in r
+
+// raw relational := shift (('<'|'>'|'<='|'>=') shift)*   (`<=`/`>=` are two-char)
+fn raw_relational(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
+  let lft: Rr = raw_shift(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Rr = { mem: s0.mem, raw: lft.raw, next: s0.i } in
+  let done: Rr =
+    loop a = seed while (if a.next < len then is_rel_start(to_i64(string_get(a.mem, a.next)), (if a.next + 1 < len then to_i64(string_get(a.mem, a.next + 1)) else 0)) else false) do
+      let cur: Rr = a in
+      let ob1: i64 = to_i64(string_get(cur.mem, cur.next)) in
+      let b2: i64 = if cur.next + 1 < len then to_i64(string_get(cur.mem, cur.next + 1)) else 0 in
+      let two: bool = b2 == 61 in
+      let ob2: i64 = if two then 61 else 0 in
+      let oplen: i64 = if two then 2 else 1 in
+      let rgt: Rr = raw_shift(cur.mem, cur.next + oplen, len) in
+      let node: string = raw_binary_node(cur.raw, ob1, ob2, rgt.raw) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Rr = { mem: s1.mem, raw: node, next: s1.i } in nx
+  in
+  let r: Rr = { mem: done.mem, raw: done.raw, next: done.next } in r
+
+// raw equality := relational (('=='|'!=') relational)*
+fn raw_equality(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
+  let lft: Rr = raw_relational(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Rr = { mem: s0.mem, raw: lft.raw, next: s0.i } in
+  let done: Rr =
+    loop a = seed while (if a.next + 1 < len then is_eq_start(to_i64(string_get(a.mem, a.next)), to_i64(string_get(a.mem, a.next + 1))) else false) do
+      let cur: Rr = a in
+      let ob1: i64 = to_i64(string_get(cur.mem, cur.next)) in
+      let ob2: i64 = to_i64(string_get(cur.mem, cur.next + 1)) in
+      let rgt: Rr = raw_relational(cur.mem, cur.next + 2, len) in
+      let node: string = raw_binary_node(cur.raw, ob1, ob2, rgt.raw) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Rr = { mem: s1.mem, raw: node, next: s1.i } in nx
+  in
+  let r: Rr = { mem: done.mem, raw: done.raw, next: done.next } in r
+
+// raw bitand := equality (('&' not '&&') equality)*
+fn raw_bitand(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
+  let lft: Rr = raw_equality(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Rr = { mem: s0.mem, raw: lft.raw, next: s0.i } in
+  let done: Rr =
+    loop a = seed while (if a.next < len then is_and_op(to_i64(string_get(a.mem, a.next)), (if a.next + 1 < len then to_i64(string_get(a.mem, a.next + 1)) else 0)) else false) do
+      let cur: Rr = a in
+      let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
+      let rgt: Rr = raw_equality(cur.mem, cur.next + 1, len) in
+      let node: string = raw_binary_node(cur.raw, opb, 0, rgt.raw) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Rr = { mem: s1.mem, raw: node, next: s1.i } in nx
+  in
+  let r: Rr = { mem: done.mem, raw: done.raw, next: done.next } in r
+
+// raw bitxor := bitand ('^' bitand)*
+fn raw_bitxor(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
+  let lft: Rr = raw_bitand(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Rr = { mem: s0.mem, raw: lft.raw, next: s0.i } in
+  let done: Rr =
+    loop a = seed while (if a.next < len then is_xor_op(to_i64(string_get(a.mem, a.next))) else false) do
+      let cur: Rr = a in
+      let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
+      let rgt: Rr = raw_bitand(cur.mem, cur.next + 1, len) in
+      let node: string = raw_binary_node(cur.raw, opb, 0, rgt.raw) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Rr = { mem: s1.mem, raw: node, next: s1.i } in nx
+  in
+  let r: Rr = { mem: done.mem, raw: done.raw, next: done.next } in r
+
+// raw logand := bitxor ('&&' bitxor)*   (op string is the two source bytes "&&")
+fn raw_logand(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
+  let lft: Rr = raw_bitxor(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Rr = { mem: s0.mem, raw: lft.raw, next: s0.i } in
+  let done: Rr =
+    loop a = seed while (if a.next + 1 < len then is_logand(to_i64(string_get(a.mem, a.next)), to_i64(string_get(a.mem, a.next + 1))) else false) do
+      let cur: Rr = a in
+      let rgt: Rr = raw_bitxor(cur.mem, cur.next + 2, len) in
+      let node: string = raw_binary_node(cur.raw, 38, 38, rgt.raw) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Rr = { mem: s1.mem, raw: node, next: s1.i } in nx
+  in
+  let r: Rr = { mem: done.mem, raw: done.raw, next: done.next } in r
+
+// raw logor := logand ('||' logand)*   (op string is the two source bytes "||")
+fn raw_logor(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
+  let lft: Rr = raw_logand(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Rr = { mem: s0.mem, raw: lft.raw, next: s0.i } in
+  let done: Rr =
+    loop a = seed while (if a.next + 1 < len then is_logor(to_i64(string_get(a.mem, a.next)), to_i64(string_get(a.mem, a.next + 1))) else false) do
+      let cur: Rr = a in
+      let rgt: Rr = raw_logand(cur.mem, cur.next + 2, len) in
+      let node: string = raw_binary_node(cur.raw, 124, 124, rgt.raw) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Rr = { mem: s1.mem, raw: node, next: s1.i } in nx
+  in
+  let r: Rr = { mem: done.mem, raw: done.raw, next: done.next } in r
+
+// raw bitor := logor (('|' not '||') logor)*   (the raw serializer's entry point)
+fn raw_bitor(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
+  let lft: Rr = raw_logor(mem, pos, len) in
+  let s0: MI = skip_ws(lft.mem, lft.next, len) in
+  let seed: Rr = { mem: s0.mem, raw: lft.raw, next: s0.i } in
+  let done: Rr =
+    loop a = seed while (if a.next < len then is_or_op(to_i64(string_get(a.mem, a.next)), (if a.next + 1 < len then to_i64(string_get(a.mem, a.next + 1)) else 0)) else false) do
+      let cur: Rr = a in
+      let opb: i64 = to_i64(string_get(cur.mem, cur.next)) in
+      let rgt: Rr = raw_logor(cur.mem, cur.next + 1, len) in
+      let node: string = raw_binary_node(cur.raw, opb, 0, rgt.raw) in
+      let s1: MI = skip_ws(rgt.mem, rgt.next, len) in
+      let nx: Rr = { mem: s1.mem, raw: node, next: s1.i } in nx
+  in
+  let r: Rr = { mem: done.mem, raw: done.raw, next: done.next } in r
+
+// ---------------------------------------------------------------------------
 // axis 2: the migration/history chain for a multi-function program
 // ---------------------------------------------------------------------------
 
@@ -1276,7 +1670,13 @@ fn parse_bitor(mem: string, pos: i64, len: i64, scope: Scope, np: i64, etyc: i64
 // `out1` are consumed; `mem` is threaded back. The result feeds the SECOND symbol's birth.
 // The payload assembly is split across two helpers (mig1_pay_a/_b) for the frame budget.
 fn build_mig1(genesis: string, out1: string, mem: string, sl: Sl) -> MH effects[alloc, state] =
-  let c: Pc = mig1_pay_a(genesis, out1, mem, sl) in
+  // Serialize the first function's body to the RAW AST (the migration body) once, here, so
+  // the parse's stack frame is raw_bitor's, not the already-tight payload builders'.
+  let len: i64 = string_len(mem) in
+  let bodyr: Rr = raw_bitor(mem, sl.bs, len) in
+  let rawBody: string = bodyr.raw in
+  let mem1: string = bodyr.mem in
+  let c: Pc = mig1_pay_a(genesis, out1, mem1, sl, rawBody) in
   let b: MigB = mig1_pay_b(c) in
   let pay: string = b.pay in
   let o1: string = b.o1 in
@@ -1291,16 +1691,17 @@ fn build_mig1(genesis: string, out1: string, mem: string, sl: Sl) -> MH effects[
   let r: MH = { mem: m2, hash: hh1 } in r
 
 // First half of the migration payload: input_root_hash + operation + output_root_hash +
-// parent_history_hash. Extracts owned name/value copies and carries them (plus genesis and
-// out1, both still needed in the second half) forward via `Pc`.
-fn mig1_pay_a(genesis: string, out1: string, mem: string, sl: Sl) -> Pc effects[alloc, state] =
+// parent_history_hash. The operation `body` is the raw-AST JSON `rawBody` (built by the
+// caller, embedded inline and KEPT for the postcondition); `return_type` is the type NAME.
+// Extracts the owned name copy and carries it (plus genesis, out1, the kept rawBody, and the
+// return type code) forward via `Pc`. The buffer is sized from `rawBody` (it appears here AND
+// in the postcondition half, so the full payload is ~2*len(rawBody) + the envelope).
+fn mig1_pay_a(genesis: string, out1: string, mem: string, sl: Sl, rawBody: string) -> Pc effects[alloc, state] =
   let nb: PRR = push_range(string_with_capacity(64), mem, sl.ns, sl.ne) in
   let nameStr: string = nb.out in
-  let m1: string = nb.mem in
-  let vb: PRR = push_range(string_with_capacity(64), m1, sl.vs, sl.ve) in
-  let valStr: string = vb.out in
-  let m2: string = vb.mem in
-  let a0: string = push_lit(string_with_capacity(2048), b"{\"input_root_hash\":\"") in
+  let m2: string = nb.mem in
+  let cap: i64 = string_len(rawBody) * 2 + 1024 in
+  let a0: string = push_lit(string_with_capacity(cap), b"{\"input_root_hash\":\"") in
   let kg1: OS = push_kept(a0, genesis) in
   let a1: string = kg1.out in
   let g1: string = kg1.s in
@@ -1308,20 +1709,22 @@ fn mig1_pay_a(genesis: string, out1: string, mem: string, sl: Sl) -> Pc effects[
   let kn1: OS = push_kept(a2, nameStr) in
   let a3: string = kn1.out in
   let n1: string = kn1.s in
-  let a4: string = push_lit(a3, b":0\",\"body\":{\"kind\":\"literal_i64\",\"value\":\"") in
-  let kv1: OS = push_kept(a4, valStr) in
-  let a5: string = kv1.out in
-  let v1: string = kv1.s in
-  let a6: string = push_lit(a5, b"\"},\"effects\":[],\"kind\":\"create_function\",\"module\":\"main\",\"name\":\"") in
+  let a4: string = push_lit(a3, b":0\",\"body\":") in
+  let kb1: OS = push_kept(a4, rawBody) in
+  let a5: string = kb1.out in
+  let body1: string = kb1.s in
+  let a6: string = push_lit(a5, b",\"effects\":[],\"kind\":\"create_function\",\"module\":\"main\",\"name\":\"") in
   let kn2: OS = push_kept(a6, n1) in
   let a7: string = kn2.out in
   let n2: string = kn2.s in
-  let a8: string = push_lit(a7, b"\",\"params\":[],\"region_params\":[],\"return_type\":\"i64\"},\"output_root_hash\":\"") in
+  let a7r: string = push_lit(a7, b"\",\"params\":[],\"region_params\":[],\"return_type\":\"") in
+  let a7t: string = push_type_name(a7r, sl.rtc) in
+  let a8: string = push_lit(a7t, b"\"},\"output_root_hash\":\"") in
   let ko1: OS = push_kept(a8, out1) in
   let a9: string = ko1.out in
   let o1: string = ko1.s in
   let a10: string = push_lit(a9, b"\",\"parent_history_hash\":null,") in
-  let r: Pc = { out: a10, mem: m2, name: n2, gen: g1, o1: o1, val: v1 } in r
+  let r: Pc = { out: a10, mem: m2, name: n2, gen: g1, o1: o1, body: body1, rtc: sl.rtc } in r
 
 // Second half of the migration payload: postconditions + preconditions. Returns the full
 // payload, out1 (kept for the history preimage), and the threaded memory.
@@ -1331,18 +1734,21 @@ fn mig1_pay_b(c: Pc) -> MigB effects[alloc, state] =
   let name: string = c.name in
   let gen: string = c.gen in
   let o1in: string = c.o1 in
-  let val: string = c.val in
+  let body: string = c.body in
+  let rtc: i64 = c.rtc in
   let b0: string = push_lit(buf, b"\"postconditions\":[{\"kind\":\"root_exists\",\"root\":\"") in
   let ko2: OS = push_kept(b0, o1in) in
   let b1: string = ko2.out in
   let o2: string = ko2.s in
-  let b2: string = push_lit(b1, b"\"},{\"body\":{\"kind\":\"literal_i64\",\"value\":\"") in
-  let b3: string = push_str(b2, val) in
-  let b4: string = push_lit(b3, b"\"},\"effects\":[],\"kind\":\"function_source_matches\",\"module\":\"main\",\"name\":\"") in
+  let b2: string = push_lit(b1, b"\"},{\"body\":") in
+  let b3: string = push_str(b2, body) in
+  let b4: string = push_lit(b3, b",\"effects\":[],\"kind\":\"function_source_matches\",\"module\":\"main\",\"name\":\"") in
   let kn3: OS = push_kept(b4, name) in
   let b5: string = kn3.out in
   let n3: string = kn3.s in
-  let b6: string = push_lit(b5, b"\",\"params\":[],\"region_params\":[],\"return_type\":\"i64\"}],\"preconditions\":[{\"kind\":\"root_is_current\",\"root\":\"") in
+  let b6r: string = push_lit(b5, b"\",\"params\":[],\"region_params\":[],\"return_type\":\"") in
+  let b6t: string = push_type_name(b6r, rtc) in
+  let b6: string = push_lit(b6t, b"\"}],\"preconditions\":[{\"kind\":\"root_is_current\",\"root\":\"") in
   let b7: string = push_str(b6, gen) in
   let b8: string = push_lit(b7, b"\"},{\"kind\":\"name_is_available\",\"module\":\"main\",\"name\":\"") in
   let b9: string = push_str(b8, n3) in
@@ -1385,7 +1791,8 @@ fn import_root(mem: string) -> string effects[alloc, state] =
   let np: i64 = params.n in
   // Parse fn0's body (any expression); its end (skip_ws past body.next) tells us whether a
   // second function follows. At EOF -> the single-function path (unchanged); otherwise the
-  // two-function keystone path (literal bodies).
+  // two-function path (each body re-parsed on demand from its source start, so it may be any
+  // expression — the typed parse already located fn0's body end, so no literal re-scan).
   let body: Pr = parse_bitor(m0, hdr0.bodypos, len, params, np, rettyc) in
   let mb: string = body.mem in
   let aw: MI = skip_ws(mb, body.next, len) in
@@ -1397,25 +1804,14 @@ fn import_root(mem: string) -> string effects[alloc, state] =
     let rd: DH = build_def(sig, sym, body.hash) in
     build_root_obj(rd.sym, rd.h, rd.sig, mc, params)
   else
-    // re-scan fn0's literal value span (the body was a literal in keystone scope), parse
-    // fn1 starting at the second `fn`, and delegate to the chain builder.
-    let rv0: MI = skip_ws(mc, hdr0.bodypos, len) in
-    let mc1: string = rv0.mem in
-    let vs0: i64 = rv0.i in
-    let re0: MI = scan_digits(mc1, vs0, len) in
-    let mc2: string = re0.mem in
-    let ve0: i64 = re0.i in
-    let hdr1: HdrR = parse_header(mc2, pa, len) in
+    // Parse fn1's header (it begins at `pa`, just past fn0's body); build a source span per
+    // function (name range + body start + return type code) and delegate to the chain
+    // builder, which re-parses each body both typed (Expression) and raw (migration body).
+    let hdr1: HdrR = parse_header(mc, pa, len) in
     let md: string = hdr1.mem in
-    let rv1: MI = skip_ws(md, hdr1.bodypos, len) in
-    let md1: string = rv1.mem in
-    let vs1: i64 = rv1.i in
-    let re1: MI = scan_digits(md1, vs1, len) in
-    let md2: string = re1.mem in
-    let ve1: i64 = re1.i in
-    let f0: Sl = { ns: hdr0.ns, ne: hdr0.ne, vs: vs0, ve: ve0 } in
-    let f1: Sl = { ns: hdr1.ns, ne: hdr1.ne, vs: vs1, ve: ve1 } in
-    build_two_root(md2, f0, f1)
+    let f0: Sl = { ns: hdr0.ns, ne: hdr0.ne, bs: hdr0.bodypos, rtc: rettyc } in
+    let f1: Sl = { ns: hdr1.ns, ne: hdr1.ne, bs: hdr1.bodypos, rtc: hdr1.rettyc } in
+    build_two_root(md, f0, f1)
 
 fn print_str<'r>(s: string) -> i64 effects[io, state, ffi, unsafe] =
   let n: i64 = string_len(s) in
