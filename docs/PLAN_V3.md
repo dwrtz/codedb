@@ -1533,6 +1533,36 @@ distinct names — plus all regressions (`tests/selfhost_frontend.rs` 18/18). Re
 surface: MUTUAL recursion (a multi-member recursion group, needing the canonical member ordering
 — Tarjan SCC), and call arguments / params-in-multi-function.
 
+Landed 2026-06-15: MUTUAL RECURSION — two functions that call each other are a TWO-member
+recursion group, the keystone surprise being that a clique's member order is NOT alphabetical but
+the Rust importer's `canonical_clique_order` (src/lib.rs): a 2-round Weisfeiler–Leman colour
+refinement reproduced in the `.cdb`. Each member's colour is `sha256("codedb/recursion-order/v1\0"
+| static_sig | erased_body)`, where the static sig is `{"effects":[],"params":[],"regions":[],
+"return":"<type>"}` and the erased body is the member's raw AST with every peer call `<name>`
+rewritten to `@recursion-peer:<peer's colour>`. Round 1 uses empty peer colours; if the two colours
+are equal the clique is symmetric (automorphic) and the order is the alphabetical name tie-break,
+otherwise round 2 recolours with the round-1 colours and the members sort by the converged colour.
+A blueprint proved round-1-only is wrong (110/208 synthetic asymmetric pairs disagree with round 2)
+— round 2 is mandatory. New `.cdb`: a recursive `recolor` (a loop form SIGTRAPs — the v0
+loop-accumulator-return bug), Copy `Color` bytes (branch-free colour selection + free threading),
+`member_color`/`order_clique`/`order_round2`. Because clique_rank gives the ALPHABETICAL rank but
+the symbol ordinal is the WL order, `Scope` gained `aord` (the alpha-first member's WL ordinal) and
+`parse_call` maps rank→ordinal through it. The ProgramRoot's `names` array is display-name-ordered
+while param_names/symbols are symbol-hash- (= ordinal-) ordered — these DIVERGE for asymmetric
+cliques (the same keystone as cross-symbol calls), handled by ordering the triples in display order
+for `names` (`build_mutrec_root_obj` → `build_mutrec_names`, mirroring `build_root2`) and by hash for
+the tail. Two non-obvious native SIGTRAPs were isolated by probe entries + Python blueprint: a
+loop-form recolor (→ recursion), and `member_color` overflowing `sig`'s fixed-capacity buffer when
+appending `| erased` (`string_with_capacity` traps past capacity — the payload now uses a fresh
+dynamically-sized buffer, and recolor's output buffer is sized `rawlen*4` for the round-2 colour
+expansion). Both members' births are genesis (one `create_recursion_group` migration), so the root
+needs no migration/history chain. NO Rust changed. Root-hash equality holds across 23 mutual-
+recursion fixtures — bare cliques, longer/bool/digit names, both source orders, AND asymmetric
+cliques whose WL order is opposite to alphabetical and whose round-1 order also differs (so round 2
+is exercised) — plus all regressions (`tests/selfhost_frontend.rs` 19/19). Remaining axis-2 surface:
+call arguments / params-in-multi-function; and a recursion clique of 3+ members (the WL refinement
+generalises, but the ordinal-resolution `aord` shortcut is two-member-specific).
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text

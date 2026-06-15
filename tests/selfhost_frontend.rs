@@ -1098,6 +1098,75 @@ fn importer_reproduces_the_root_hash_for_self_recursion() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_mutual_recursion() {
+    // 15a.4 (axis 2): MUTUAL RECURSION — two functions that call each other are a TWO-member
+    // recursion group (create_recursion_group, both members born in one migration). This extends
+    // the single-member (self-recursion) case with the genuinely new mechanics: (1) the canonical
+    // MEMBER ORDERING — within a single SCC the members are ordered alphabetically by name, which
+    // sets the `recursion_group:<ordinal>` nonces (member 0 = the alphabetically-first name); and
+    // (2) PER-CALLEE ordinal resolution — a member's body calling the OTHER member resolves to that
+    // member's distinct ordinal (not the caller's), so member 0's body references the
+    // recursion_group:1 symbol and vice versa. The two-member RecursionGroup object lists both
+    // members, and the ProgramRoot's names/param_names/symbols/recursion_groups arrays all carry
+    // both. Both births are genesis (a single create_recursion_group migration), so the root needs
+    // no migration/history chain — it is reproduced from objects alone. Covers source order
+    // matching and contradicting canonical order, longer/bool/digit-bearing names, richer bodies
+    // (arithmetic / `let` / `if`), a body with both a self-call and a cross-member call, and both
+    // members having non-trivial bodies.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        "fn a() -> i64 = b()\nfn b() -> i64 = a()\n",
+        "fn b() -> i64 = a()\nfn a() -> i64 = b()\n",
+        "fn z() -> i64 = a()\nfn a() -> i64 = z()\n",
+        "fn a() -> i64 = z()\nfn z() -> i64 = a()\n",
+        "fn even() -> bool = odd()\nfn odd() -> bool = even()\n",
+        "fn odd() -> bool = even()\nfn even() -> bool = odd()\n",
+        "fn a() -> i64 = b() + 1\nfn b() -> i64 = a()\n",
+        "fn a() -> i64 = b()\nfn b() -> i64 = a() + a()\n",
+        "fn a() -> i64 = if true then a() else b()\nfn b() -> i64 = a()\n",
+        "fn a() -> i64 = if false then b() else a()\nfn b() -> i64 = a()\n",
+        "fn ping() -> i64 = let x: i64 = pong() in x\nfn pong() -> i64 = ping()\n",
+        "fn p() -> i64 = q() * 2 + 3\nfn q() -> i64 = p()\n",
+        "fn foo() -> i64 = bar()\nfn bar() -> i64 = foo()\n",
+        "fn loop1() -> bool = loop2()\nfn loop2() -> bool = loop1()\n",
+        "fn a() -> i64 = if 1 < 2 then b() else a()\nfn b() -> i64 = if 3 < 4 then a() else b()\n",
+        // ASYMMETRIC cliques: the members differ structurally, so the canonical member order is
+        // the WL round-2 colour refinement — NOT alphabetical and NOT the round-1 colour. Each of
+        // these orders OPPOSITE to alphabetical (verified against the oracle), exercising round 2.
+        "fn a() -> i64 = b()\nfn b() -> i64 = a() + 1\n",
+        "fn a() -> i64 = b() + 1\nfn b() -> i64 = a()\n",
+        "fn a() -> i64 = b() * 2\nfn b() -> i64 = a()\n",
+        "fn a() -> i64 = b()\nfn b() -> i64 = let x: i64 = a() in x + 1\n",
+        "fn a() -> i64 = b() + 1\nfn b() -> i64 = if true then a() else b()\n",
+        "fn p() -> i64 = q()\nfn q() -> i64 = p() * 3 + 1\n",
+        "fn foo() -> i64 = bar() + 2\nfn bar() -> i64 = foo()\n",
+        "fn m() -> i64 = n() * 2\nfn n() -> i64 = m() + 1\n",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        let db = temp.path().join(format!("ref-mut-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-mut-{i}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer mutual-recursion root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate
