@@ -144,6 +144,12 @@ record CmpS { le: bool  a: string  b: string }
 // hash — the ProgramRoot's `symbols`/`param_names` arrays are symbol-hash-ordered (its
 // `names` array is display-name-ordered), so the two can disagree and must be sorted apart.
 record Six { s0: string  d0: string  g0: string  s1: string  d1: string  g1: string }
+// The call-graph scan accumulator for `find_callee_rtc` (move-only — it carries the threaded
+// memory): the cursor, whether the previous token was the `fn` keyword (so the next ident is a
+// function NAME), whether the named function was found, and its return type code.
+record FScan { p: i64  prevfn: bool  found: bool  rtc: i64  mem: string }
+// The body-scan accumulator for `body_calls` (move-only): the cursor, a found flag, threaded mem.
+record BC { p: i64  found: bool  mem: string }
 
 // ---------------------------------------------------------------------------
 // byte classifiers (ASCII; + - * / and whitespace)
@@ -432,6 +438,73 @@ fn name_le(mem: string, as_: i64, ae: i64, bs: i64, be: i64) -> REq =
   in
   let le: bool = done.c != 1 in
   let res: REq = { eq: le, mem: mem } in res
+
+// Scan the whole source for the top-level `fn <name>` declaration whose name equals
+// `mem`[callns, callne) and return its return-type code (the type of a call to it). Used
+// by parse_call to type a cross-symbol call: it self-resolves from the source rather than
+// threading a symbol table through the parser. The scan walks identifiers, tracking whether
+// the previous one was the `fn` keyword (102,110) so the next identifier is a function name;
+// a call SITE (`name(`) is never preceded by `fn`, so only declarations match. The move-only
+// `mem` is carried in the accumulator (range_eq/skip_to_arrow consume + return it). If the
+// name is not found (an invalid program — out of the oracle's domain) the code is 0 (i64).
+fn find_callee_rtc(mem: string, callns: i64, callne: i64, len: i64) -> TC =
+  let tlen: i64 = callne - callns in
+  let done: FScan =
+    loop a = { p: 0, prevfn: false, found: false, rtc: 0, mem: mem } while (if a.found then false else a.p < len) do
+      let cur: FScan = a in
+      let sw: MI = skip_ws(cur.mem, cur.p, len) in
+      let m1: string = sw.mem in
+      let p1: i64 = sw.i in
+      if p1 >= len then (let s: FScan = { p: len, prevfn: false, found: false, rtc: 0, mem: m1 } in s)
+      else
+        let idr: MI = scan_ident(m1, p1, len) in
+        let m2: string = idr.mem in
+        let ie: i64 = idr.i in
+        if ie > p1 then
+          let isfn: bool = if ie - p1 == 2 then (to_i64(string_get(m2, p1)) == 102 && to_i64(string_get(m2, p1 + 1)) == 110) else false in
+          if isfn then (let s: FScan = { p: ie, prevfn: true, found: false, rtc: 0, mem: m2 } in s)
+          else if cur.prevfn then
+            let er: REq = if ie - p1 == tlen then range_eq(m2, p1, callns, tlen) else (let rr: REq = { eq: false, mem: m2 } in rr) in
+            let m3: string = er.mem in
+            if er.eq then
+              let arrow: MI = skip_to_arrow(m3, ie, len) in
+              let sw2: MI = skip_ws(arrow.mem, arrow.i, len) in
+              let tr: MI = scan_ident(sw2.mem, sw2.i, len) in
+              let tc: TC = type_code_of(tr.mem, sw2.i, tr.i) in
+              (let s: FScan = { p: ie, prevfn: false, found: true, rtc: tc.code, mem: tc.mem } in s)
+            else (let s: FScan = { p: ie, prevfn: false, found: false, rtc: 0, mem: m3 } in s)
+          else (let s: FScan = { p: ie, prevfn: false, found: false, rtc: 0, mem: m2 } in s)
+        else (let s: FScan = { p: p1 + 1, prevfn: false, found: false, rtc: 0, mem: m2 } in s)
+  in
+  let res: TC = { code: done.rtc, mem: done.mem } in res
+
+// Does the body span `mem`[bs, be) contain a call `<name>(` where name == `mem`[ns,ne)?
+// The call-graph edge for axis-2's canonical ordering (a callee is created BEFORE its
+// caller). Matches the parser's call detection exactly: an identifier equal to the name and
+// IMMEDIATELY followed by `(` (no whitespace), so a bare reference does not count. Bounded by
+// `be` so a function's body never sees the next function's header. Threads `mem` back.
+fn body_calls(mem: string, bs: i64, be: i64, ns: i64, ne: i64) -> REq =
+  let tlen: i64 = ne - ns in
+  let done: BC =
+    loop a = { p: bs, found: false, mem: mem } while (if a.found then false else a.p < be) do
+      let cur: BC = a in
+      let sw: MI = skip_ws(cur.mem, cur.p, be) in
+      let m1: string = sw.mem in
+      let p1: i64 = sw.i in
+      if p1 >= be then (let s: BC = { p: be, found: false, mem: m1 } in s)
+      else
+        let idr: MI = scan_ident(m1, p1, be) in
+        let m2: string = idr.mem in
+        let ie: i64 = idr.i in
+        if ie > p1 then
+          let er: REq = if ie - p1 == tlen then range_eq(m2, p1, ns, tlen) else (let rr: REq = { eq: false, mem: m2 } in rr) in
+          let m3: string = er.mem in
+          let paren: bool = if ie < be then to_i64(string_get(m3, ie)) == 40 else false in
+          if (if er.eq then paren else false) then (let s: BC = { p: ie, found: true, mem: m3 } in s)
+          else (let s: BC = { p: ie, found: false, mem: m3 } in s)
+        else (let s: BC = { p: p1 + 1, found: false, mem: m2 } in s)
+  in
+  let res: REq = { eq: done.found, mem: done.mem } in res
 
 // Look up the name `mem`[start,end) among scope slots [lo, hi), keeping the highest
 // (innermost / last) match — so a shadowing let binding resolves to the nearest one —
@@ -753,10 +826,12 @@ fn order_triples(le: bool, sA: string, dA: string, gA: string, sB: string, dB: s
 // Build the final ProgramRoot over the two functions in canonical order (`first`,
 // `second`), the importer's output root. Each function's objects are rebuilt here (first
 // with birth history "genesis"/ordinal 0, second with `hh1`/ordinal 1); each symbol hash
-// appears three times (names, param_names, symbols) and is threaded via push_kept. The
-// ProgramRoot assembly is split into a head (metadata + names + param_names) and a tail
-// (the symbols array) so each function stays under the v0 4095-byte stack-frame budget;
-// the head hands the partial buffer and the six object hashes to the tail via `Rc`.
+// appears three times (names, param_names, symbols) and is threaded via push_kept. The TWO
+// arrays use DIFFERENT sort keys (src/model.rs normalize_root): `names` is ordered by display
+// name (via r2_names), while `param_names`/`symbols` are ordered by SYMBOL HASH (via sym_le +
+// order_triples). The two coincide only when canonical order matches alphabetical order, so
+// with cross-symbol calls (toposort ≠ alphabetical) they must be sorted independently. The
+// assembly is split into a head (names) and a tail (param_names + symbols) for the frame budget.
 fn build_root2(mem: string, first: Sl, second: Sl, hh1: string) -> string effects[alloc, state] =
   let gstr: string = push_lit(string_with_capacity(16), b"genesis") in
   let foA: FObj = build_fn_objs(mem, first, gstr, 0) in
@@ -769,30 +844,52 @@ fn build_root2(mem: string, first: Sl, second: Sl, hh1: string) -> string effect
   let symB: string = foB.sym in
   let defB: string = foB.def in
   let sigB: string = foB.sig in
+  // The `names` array is display-name-ordered, but param_names/symbols are symbol-hash-ordered
+  // (src/model.rs normalize_root) — they differ once canonical order (toposort) ≠ alphabetical.
+  // Reuse order_triples (the proven move-into-record helper) to put the (sym,def,sig) triples in
+  // DISPLAY order, emit the names array UNCONDITIONALLY in that order (string-building inside a
+  // record-returning conditional miscompiles to a v0 SIGTRAP — keep conditionals to pure moves),
+  // then re-order the same triples by symbol hash for the tail. Name ranges are Copy, so they are
+  // selected with plain `if`; the display-low name pairs with the display-low triple's symbol.
+  let nlec: REq = name_le(mB, first.ns, first.ne, second.ns, second.ne) in
+  let mC: string = nlec.mem in
+  let nle: bool = nlec.eq in
+  let dsix: Six = order_triples(nle, symA, defA, sigA, symB, defB, sigB) in
+  // display-low name pairs with dsix.s0, display-high with dsix.s1 (Copy selects).
+  let lns: i64 = if nle then first.ns else second.ns in
+  let lne: i64 = if nle then first.ne else second.ne in
+  let hns: i64 = if nle then second.ns else first.ns in
+  let hne: i64 = if nle then second.ne else first.ne in
+  // emit names + the hash-ordered tail in a helper (off build_root2's stack frame).
+  build_root2_names(mC, lns, lne, hns, hne, dsix)
+
+// Emit the two-function ProgramRoot's `names` array (DISPLAY order, the triples already so
+// ordered in `dsix`), then re-order the same (sym, def, sig) triples by SYMBOL HASH and hand
+// off to the tail for param_names/symbols. Split from build_root2 for the v0 frame budget; the
+// `names` emission is UNCONDITIONAL (the display ordering already happened, purely, in dsix).
+fn build_root2_names(mem: string, lns: i64, lne: i64, hns: i64, hne: i64, dsix: Six) -> string effects[alloc, state] =
+  let ds0: string = dsix.s0 in
+  let dd0: string = dsix.d0 in
+  let dg0: string = dsix.g0 in
+  let ds1: string = dsix.s1 in
+  let dd1: string = dsix.d1 in
+  let dg1: string = dsix.g1 in
   let p0: string = push_lit(string_with_capacity(2048), b"{\"metadata\":{},\"names\":[{\"display_name\":\"") in
-  let pnA: PRR = push_range(p0, mB, first.ns, first.ne) in
-  let q0: string = pnA.out in
-  let m1: string = pnA.mem in
-  let p1: string = push_lit(q0, b"\",\"is_preferred\":true,\"module\":\"main\",\"symbol\":\"") in
-  let kA1: OS = push_kept(p1, symA) in
-  let p2: string = kA1.out in
-  let symA1: string = kA1.s in
-  let p3: string = push_lit(p2, b"\"},{\"display_name\":\"") in
-  let pnB: PRR = push_range(p3, m1, second.ns, second.ne) in
-  let q1: string = pnB.out in
-  let p4: string = push_lit(q1, b"\",\"is_preferred\":true,\"module\":\"main\",\"symbol\":\"") in
-  let kB1: OS = push_kept(p4, symB) in
-  let p5: string = kB1.out in
-  let symB1: string = kB1.s in
-  let p6: string = push_lit(p5, b"\"}]") in
-  // param_names and symbols are ordered by SYMBOL HASH (unlike names, by display name):
-  // compare the two symbols and order the (sym, def, sig) triples here, then the tail emits
-  // them. Doing the compare/order in the head keeps both halves under the frame budget.
-  let cmp: CmpS = sym_le(symA1, symB1) in
+  let na: PRR = push_range(p0, mem, lns, lne) in
+  let p1: string = push_lit(na.out, b"\",\"is_preferred\":true,\"module\":\"main\",\"symbol\":\"") in
+  let k0: OS = push_kept(p1, ds0) in
+  let p2: string = push_lit(k0.out, b"\"},{\"display_name\":\"") in
+  let nb: PRR = push_range(p2, na.mem, hns, hne) in
+  let p3: string = push_lit(nb.out, b"\",\"is_preferred\":true,\"module\":\"main\",\"symbol\":\"") in
+  let k1: OS = push_kept(p3, ds1) in
+  let p6: string = push_lit(k1.out, b"\"}]") in
+  let s0k: string = k0.s in
+  let s1k: string = k1.s in
+  let cmp: CmpS = sym_le(s0k, s1k) in
   let le: bool = cmp.le in
   let sA2: string = cmp.a in
   let sB2: string = cmp.b in
-  let six: Six = order_triples(le, sA2, defA, sigA, sB2, defB, sigB) in
+  let six: Six = order_triples(le, sA2, dd0, dg0, sB2, dd1, dg1) in
   build_root2_tail(p6, six)
 
 // The param_names and symbols arrays (and the closing brace) of the two-function
@@ -953,6 +1050,17 @@ fn build_int_cast(srctyc: i64, tgttyc: i64, valh: string) -> string effects[allo
   let p6: string = push_lit(p5, b"\"}") in
   hash_object(b"Expression", 1, p6)
 
+// Build a (no-argument) `call` Expression to a user function: the callee's `symbol` hash
+// and the call's `type` (the callee's return type `crtc`). Canonical key order: args,
+// expr_kind, symbol, type. `symh` is consumed.
+fn build_call(symh: string, crtc: i64) -> string effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(256), b"{\"args\":[],\"expr_kind\":\"call\",\"symbol\":\"") in
+  let p1: string = push_str(p0, symh) in
+  let p2: string = push_lit(p1, b"\",\"type\":\"") in
+  let p3: string = push_str(p2, type_hash(crtc)) in
+  let p4: string = push_lit(p3, b"\"}") in
+  hash_object(b"Expression", 1, p4)
+
 // ---------------------------------------------------------------------------
 // raw-AST node builders (the dual serialization for the migration body)
 //
@@ -1083,11 +1191,12 @@ fn raw_cast_node(mem: string, p: i64, e: i64, araw: string) -> Rr effects[alloc,
 // ---------------------------------------------------------------------------
 
 // Classify the identifier `mem`[p,e) into a dispatch code: 1 = `if`, 2 = `let`,
-// 3 = `true`/`false` (bool literal), 4 = a `to_<type>(` cast, 0 = a plain variable.
-// Each keyword test is length-gated by a nested `if` so the inner string_get reads stay
-// in bounds (`&&` is strict). A cast is the `to_` prefix (t/o/_ = 116/111/95) followed
-// by a `(` (byte 40) at `e`. Threads `mem` back, so these temporaries stay in this
-// frame rather than inflating parse_atom's (which is near the v0 frame budget).
+// 3 = `true`/`false` (bool literal), 4 = a `to_<type>(` cast, 5 = a user-function call
+// (`<name>(`), 0 = a plain variable. Each keyword test is length-gated by a nested `if` so
+// the inner string_get reads stay in bounds (`&&` is strict). A cast is the `to_` prefix
+// (t/o/_ = 116/111/95) followed by a `(` (byte 40) at `e`; a user call is any OTHER
+// identifier immediately followed by `(`. Threads `mem` back, so these temporaries stay in
+// this frame rather than inflating parse_atom's (which is near the v0 frame budget).
 fn classify_kw(mem: string, p: i64, e: i64, len: i64) -> TC =
   let klen: i64 = e - p in
   let kw: i64 =
@@ -1097,14 +1206,15 @@ fn classify_kw(mem: string, p: i64, e: i64, len: i64) -> TC =
     else if klen == 5 then (if (to_i64(string_get(mem, p)) == 102 && to_i64(string_get(mem, p + 1)) == 97 && to_i64(string_get(mem, p + 2)) == 108 && to_i64(string_get(mem, p + 3)) == 115 && to_i64(string_get(mem, p + 4)) == 101) then 3 else 0)
     else 0
   in
+  // an identifier immediately followed by `(` is a call; a `to_<type>(` is a cast (4), any
+  // other name is a user-function call (5).
+  let hasparen: bool = if e < len then to_i64(string_get(mem, e)) == 40 else false in
   let iscast: bool =
     if klen >= 5 then
-      (if (to_i64(string_get(mem, p)) == 116 && to_i64(string_get(mem, p + 1)) == 111 && to_i64(string_get(mem, p + 2)) == 95) then
-         (if e < len then to_i64(string_get(mem, e)) == 40 else false)
-       else false)
+      (if (to_i64(string_get(mem, p)) == 116 && to_i64(string_get(mem, p + 1)) == 111 && to_i64(string_get(mem, p + 2)) == 95) then hasparen else false)
     else false
   in
-  let code: i64 = if kw != 0 then kw else (if iscast then 4 else 0) in
+  let code: i64 = if kw != 0 then kw else (if iscast then 4 else (if hasparen then 5 else 0)) in
   let res: TC = { code: code, mem: mem } in res
 
 // atom := <decimal int> (i64) | `true` | `false` (bool) | `if` ... ; ws-skipped.
@@ -1125,10 +1235,10 @@ fn parse_atom(mem: string, pos: i64, len: i64, scope: Scope, np: i64, etyc: i64)
           let sd: MI = scan_digits(m1, p, len) in
           build_literal(sd.mem, p, sd.i, ltyc))
      else
-       // An identifier: a keyword (`if`/`let`/`true`/`false`), a `to_<type>(` cast, or a
-       // variable. classify_kw returns the dispatch code (kept in a helper so its
-       // byte-test temporaries do not inflate parse_atom's near-budget stack frame); a
-       // variable (code 0) resolves to a local_ref / param_ref via resolve_ident.
+       // An identifier: a keyword (`if`/`let`/`true`/`false`), a `to_<type>(` cast, a
+       // user-function call (`<name>(`), or a variable. classify_kw returns the dispatch
+       // code (kept in a helper so its byte-test temporaries do not inflate parse_atom's
+       // near-budget stack frame); a variable (code 0) resolves to a local_ref / param_ref.
        let se: MI = scan_ident(m1, p, len) in
        let e: i64 = se.i in
        let cl: TC = classify_kw(se.mem, p, e, len) in
@@ -1138,6 +1248,7 @@ fn parse_atom(mem: string, pos: i64, len: i64, scope: Scope, np: i64, etyc: i64)
         else if kw == 2 then parse_let(m2, e, len, scope, np, etyc)
         else if kw == 3 then build_bool_atom(m2, p, e)
         else if kw == 4 then parse_cast(m2, p, e, len, scope, np)
+        else if kw == 5 then parse_call(m2, p, e, len)
         else resolve_ident(scope, np, m2, p, e)))
   else build_literal(m1, p, p, ltyc)
 
@@ -1205,6 +1316,25 @@ fn parse_cast(mem: string, p: i64, e: i64, len: i64, scope: Scope, np: i64) -> P
   let sw: MI = skip_ws(arg.mem, arg.next, len) in
   let h: string = build_int_cast(arg.tyc, target, arg.hash) in
   let res: Pr = { mem: sw.mem, hash: h, tyc: target, next: sw.i + 1 } in res
+
+// call := `<name>` `(` `)`  (no-argument cross-symbol call). At entry the call identifier is
+// `mem`[p,e) (the `(` at `e` was confirmed by the caller). The callee's return type is found
+// by re-scanning the source (find_callee_rtc) — the result type and the call node's `type`.
+// In a two-function DAG the callee is the canonical-FIRST function (birth genesis, ordinal
+// 0), so its symbol is re-derived directly from the call name (no symbol table threaded
+// through the parser). No-arg: skip whitespace from past `(` to the `)`; cursor lands past it.
+fn parse_call(mem: string, p: i64, e: i64, len: i64) -> Pr effects[alloc, state] =
+  let crc: TC = find_callee_rtc(mem, p, e, len) in
+  let crtc: i64 = crc.code in
+  let m0: string = crc.mem in
+  let gstr: string = push_lit(string_with_capacity(16), b"genesis") in
+  let csl: Sl = { ns: p, ne: e, bs: 0, rtc: crtc } in
+  let s: MH = build_sym_at(gstr, m0, csl, 0) in
+  let m1: string = s.mem in
+  let symh: string = s.hash in
+  let h: string = build_call(symh, crtc) in
+  let sw: MI = skip_ws(m1, e + 1, len) in
+  let res: Pr = { mem: sw.mem, hash: h, tyc: crtc, next: sw.i + 1 } in res
 
 // unary := ('-'|'~'|'!') unary | atom   (prefix; `- ~` -> i64, `!` -> bool)
 fn parse_unary(mem: string, pos: i64, len: i64, scope: Scope, np: i64, etyc: i64) -> Pr effects[alloc, state] =
@@ -1437,6 +1567,7 @@ fn raw_atom(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
         else if kw == 2 then raw_let(m2, e, len)
         else if kw == 3 then raw_bool_node(m2, p, e)
         else if kw == 4 then raw_cast(m2, p, e, len)
+        else if kw == 5 then raw_call(m2, p, e, len)
         else raw_ref_node(m2, p, e)))
   else raw_literal_node(m1, p, p)
 
@@ -1478,6 +1609,18 @@ fn raw_cast(mem: string, p: i64, e: i64, len: i64) -> Rr effects[alloc, state] =
   let sw: MI = skip_ws(arg.mem, arg.next, len) in
   let node: Rr = raw_cast_node(sw.mem, p, e, arg.raw) in
   let r: Rr = { mem: node.mem, raw: node.raw, next: sw.i + 1 } in r
+
+// raw call := `<name>` `(` `)`  (no-arg cross-symbol call) -> {"args":[],"kind":"call",
+// "name":"<name>"}. (Not reached in a two-function DAG — the canonical-first, whose body is
+// the migration's raw body, never calls — but present so the raw parser covers the grammar.)
+fn raw_call(mem: string, p: i64, e: i64, len: i64) -> Rr effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(e - p + 48), b"{\"args\":[],\"kind\":\"call\",\"name\":\"") in
+  let nb: PRR = push_range(p0, mem, p, e) in
+  let p1: string = nb.out in
+  let m1: string = nb.mem in
+  let p2: string = push_lit(p1, b"\"}") in
+  let sw: MI = skip_ws(m1, e + 1, len) in
+  let r: Rr = { mem: sw.mem, raw: p2, next: sw.i + 1 } in r
 
 // raw unary := ('-'|'~'|'!') unary | atom
 fn raw_unary(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
@@ -1755,17 +1898,14 @@ fn mig1_pay_b(c: Pc) -> MigB effects[alloc, state] =
   let b10: string = push_lit(b9, b"\"}]}") in
   let r: MigB = { pay: b10, o1: o2, mem: mem } in r
 
-// Build the ProgramRoot for a two-function program. Order the functions canonically
-// (alphabetical by name), build the first's single-symbol ProgramRoot (out1), fold it
-// through the first migration into the running history (hh1), then build the final
-// two-symbol ProgramRoot — the first symbol born at "genesis"/0, the second at hh1/1.
-fn build_two_root(mem: string, f0: Sl, f1: Sl) -> string effects[alloc, state] =
-  let cmp: REq = name_le(mem, f0.ns, f0.ne, f1.ns, f1.ne) in
-  let m: string = cmp.mem in
-  let le: bool = cmp.eq in
-  let first: Sl = if le then f0 else f1 in
-  let second: Sl = if le then f1 else f0 in
-  let r1: MH = build_root1(m, first) in
+// Build the ProgramRoot for a two-function program from the functions ALREADY in canonical
+// order (`first`, `second` — the caller, import_root, applies the dependency-driven toposort):
+// build the first's single-symbol ProgramRoot (out1), fold it through the first migration into
+// the running history (hh1), then build the final two-symbol ProgramRoot — the first symbol
+// born at "genesis"/0, the second at hh1/1. The second function's body may call the first
+// (resolved to its genesis/0 symbol by parse_call); the first, being the dependency, does not.
+fn build_two_root(mem: string, first: Sl, second: Sl) -> string effects[alloc, state] =
+  let r1: MH = build_root1(mem, first) in
   let m1: string = r1.mem in
   let out1: string = r1.hash in
   let genesis: string = build_genesis_root() in
@@ -1804,14 +1944,29 @@ fn import_root(mem: string) -> string effects[alloc, state] =
     let rd: DH = build_def(sig, sym, body.hash) in
     build_root_obj(rd.sym, rd.h, rd.sig, mc, params)
   else
-    // Parse fn1's header (it begins at `pa`, just past fn0's body); build a source span per
-    // function (name range + body start + return type code) and delegate to the chain
-    // builder, which re-parses each body both typed (Expression) and raw (migration body).
+    // Parse fn1's header (it begins at `pa`, just past fn0's body) and build a source span per
+    // function (name range + body start + return type code). Then apply the dependency-driven
+    // CANONICAL ORDER (a callee is created before its caller): detect the call-graph edges and
+    // put the callee first; the chain builder re-parses each body both typed (Expression) and
+    // raw (migration body), with the second function's calls resolving to the first's symbol.
     let hdr1: HdrR = parse_header(mc, pa, len) in
     let md: string = hdr1.mem in
+    // fn0's body is [hdr0.bodypos, pa) (pa = fn1's `fn`), fn1's is [hdr1.bodypos, len).
+    let c01r: REq = body_calls(md, hdr0.bodypos, pa, hdr1.ns, hdr1.ne) in
+    let c01: bool = c01r.eq in
+    let c10r: REq = body_calls(c01r.mem, hdr1.bodypos, len, hdr0.ns, hdr0.ne) in
+    let c10: bool = c10r.eq in
     let f0: Sl = { ns: hdr0.ns, ne: hdr0.ne, bs: hdr0.bodypos, rtc: rettyc } in
     let f1: Sl = { ns: hdr1.ns, ne: hdr1.ne, bs: hdr1.bodypos, rtc: hdr1.rettyc } in
-    build_two_root(md, f0, f1)
+    // toposort: fn0 calls fn1 (only) -> fn1 first; fn1 calls fn0 (only) -> fn0 first; else
+    // (independent, or mutual = a recursion group, out of scope) alphabetical by name.
+    let alc: REq = name_le(c10r.mem, hdr0.ns, hdr0.ne, hdr1.ns, hdr1.ne) in
+    let mz: string = alc.mem in
+    let f0le: bool = alc.eq in
+    let f0first: bool = if c01 then (if c10 then f0le else false) else (if c10 then true else f0le) in
+    let first: Sl = if f0first then f0 else f1 in
+    let second: Sl = if f0first then f1 else f0 in
+    build_two_root(mz, first, second)
 
 fn print_str<'r>(s: string) -> i64 effects[io, state, ffi, unsafe] =
   let n: i64 = string_len(s) in

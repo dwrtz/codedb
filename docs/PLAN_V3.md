@@ -1475,6 +1475,38 @@ literal-keystone regressions (`tests/selfhost_frontend.rs` 16/16). Remaining axi
 cross-symbol calls, params-in-multi-function (param refs in a multi-fn body), and recursion
 groups (`create_recursion_group`).
 
+Landed 2026-06-15: no-argument CROSS-SYMBOL calls in a two-function program — the first
+dependency-driven increment. A call (`<callee>()`) introduces a dependency edge, so the
+canonical order is no longer alphabetical but a TOPOSORT: the callee is created before its
+caller (ordinal 0/genesis vs ordinal 1/running-history), so the caller's typed body can
+reference the callee's already-determined symbol. `classify_kw` now distinguishes an identifier
+immediately followed by `(` as a user call (vs a `to_*` cast); the typed `parse_call` builds a
+`call` Expression `{args:[],expr_kind:call,symbol,type}` that references the callee by
+content-addressed symbol HASH (re-derived directly from the call name — in a two-function DAG
+the callee is always the canonical-first, born at genesis/0 — so no symbol table is threaded
+through the parser), typed by the callee's return type found by re-scanning the source headers
+(`find_callee_rtc`); the raw parser emits the matching `call` node (unexercised in two-function
+DAGs, where the canonical-first never calls, but kept for completeness). `import_root` detects
+the call edges (`body_calls`) and orders callee-first, falling back to alphabetical for
+independent functions (mutual recursion is a recursion group — out of scope). Every form was
+spiked against `codedb history --json` and the call-program root reproduced byte-exactly in
+Python before any `.cdb`. The keystone subtlety this increment EXPOSED (caught only in smoke,
+the whole point of it): a ProgramRoot's `names` array is display-name-ordered while its
+`param_names`/`symbols` arrays are symbol-hash-ordered — the two coincided for every prior test
+because canonical order was always alphabetical, but a call makes toposort ≠ alphabetical, so
+`build_root2` now orders the `names` array independently (reusing `order_triples` to put the
+(sym, def, sig) triples in display order for `names`, then re-ordering the same triples by
+symbol hash for the tail). Two v0-backend realities recurred: the names emission had to stay
+out of a record-returning conditional (string-building inside one miscompiles to a SIGTRAP — so
+the conditional only shuffles data and the emission is unconditional, the `order_triples` +
+`build_root2_tail` shape), and it was factored into `build_root2_names` to fit the 4095-byte
+frame. Root-hash equality holds across 11 cross-symbol-call fixtures — dependency order matching
+AND contradicting alphabetical, the call in arithmetic/`if`/`let`, a bool-returning callee, and a
+callee with a non-literal body (its migration body exercising the raw serializer) — plus all
+regressions (`tests/selfhost_frontend.rs` 17/17). Remaining axis-2 surface: arguments to calls
+and params-in-multi-function (param refs in a multi-fn body), and recursion groups
+(`create_recursion_group` — self-recursive or mutually-recursive functions).
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text

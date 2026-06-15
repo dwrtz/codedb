@@ -991,6 +991,64 @@ fn importer_reproduces_the_root_hash_for_two_function_rich_bodies() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_cross_symbol_calls() {
+    // 15a.4 (axis 2): a no-argument CROSS-SYMBOL call `<callee>()`. A call introduces a
+    // dependency edge, so the canonical order is no longer alphabetical but a TOPOSORT —
+    // the callee is created BEFORE its caller (so the caller's typed body can reference the
+    // callee's already-determined symbol). The typed `call` node references the callee by
+    // content-addressed symbol hash (re-derived: in a two-function DAG the callee is the
+    // canonical-first, born at genesis/ordinal 0), typed by the callee's return type (found
+    // by re-scanning the source). Reproducing the root exercises the whole chain: detecting
+    // the call edge, ordering callee-first, the call expression, AND — the keystone subtlety
+    // this first exposed — the ProgramRoot's `names` array being display-name-ordered while
+    // param_names/symbols are symbol-hash-ordered (they diverge once toposort != alphabetical).
+    // Covers the call when dependency order matches AND contradicts alphabetical, the call in
+    // richer expressions (arithmetic/if/let), a bool-returning callee, and a callee with a
+    // non-literal body (its migration body exercises the raw serializer). Mutual recursion is a
+    // recursion group (create_recursion_group), out of scope here.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        // caller `aaa` calls callee `zzz`: dependency order (zzz first) CONTRADICTS alphabetical
+        "fn aaa() -> i64 = zzz() + 1\nfn zzz() -> i64 = 5\n",
+        "fn aaa() -> i64 = zzz()\nfn zzz() -> i64 = 7\n",
+        "fn zzz() -> i64 = 5\nfn aaa() -> i64 = zzz() + 1\n",
+        // callee `helper` sorts before caller `main`: dependency order matches alphabetical
+        "fn main() -> i64 = helper() * 2\nfn helper() -> i64 = 21\n",
+        "fn helper() -> i64 = 21\nfn main() -> i64 = helper() * 2\n",
+        // call in richer expressions
+        "fn aaa() -> i64 = zzz() + zzz()\nfn zzz() -> i64 = 3\n",
+        "fn aaa() -> i64 = if zzz() < 5 then 1 else 2\nfn zzz() -> i64 = 3\n",
+        "fn aaa() -> i64 = let x: i64 = zzz() in x + 1\nfn zzz() -> i64 = 9\n",
+        // bool-returning callee; callee with a non-literal body (raw serializer in its migration)
+        "fn aaa() -> bool = chk() && true\nfn chk() -> bool = true\n",
+        "fn aaa() -> i64 = base() + 1\nfn base() -> i64 = 2 * 3 + 4\n",
+        "fn aaa() -> i64 = base()\nfn base() -> i64 = let q: i64 = 5 in q * 2\n",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        let db = temp.path().join(format!("ref-call-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-call-{i}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer cross-symbol-call root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate
