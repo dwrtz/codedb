@@ -147,6 +147,18 @@ record Pc { out: string  mem: string  name: string  gen: string  o1: string  bod
 // build_mig1's second payload half returns the full payload, out1 (kept for the history
 // preimage), and the threaded memory.
 record MigB { pay: string  o1: string  mem: string }
+// Migration context bundling the (already-built) `parent_history_hash` FIELD value (the
+// JSON `null` for the genesis migration, or `"<hash>"` for a later one) and the symbol's
+// canonical ordinal — passed as one record so mig1_pay_a stays under the 8-machine-param cap.
+record MigCtx { field: string  ord: i64 }
+// The parent_history_hash field value and the (kept) raw parent history hash — build_mig1
+// builds the field once while threading `par` back for the history-hash preimage prefix.
+record MigPar { field: string  par: string }
+// Carrier between mig1_pay_a's two halves (split for the v0 frame budget once the migration
+// became ordinal/parent-parameterized): the partial buffer (up to the operation `"name":"`),
+// the threaded memory, the kept function name, the kept input-root hash (for the precondition),
+// and the kept raw-AST body (for the function_source_matches postcondition).
+record PayMid { buf: string  mem: string  name: string  gen: string  body: string }
 // A symbol-hash comparison result, threading both (move-only) operands back out.
 record CmpS { le: bool  a: string  b: string }
 // Two functions' (SymbolBirth, FunctionDef, FunctionSignature) hashes ordered by symbol
@@ -2513,7 +2525,20 @@ fn build_op_params(mem: string, sl: Sl, len: i64) -> PRR effects[alloc, state] =
 // HISTORY_DOMAIN (preimage: "" + \0 + migration_hash + \0 + output_root). `genesis` and
 // `out1` are consumed; `mem` is threaded back. The result feeds the SECOND symbol's birth.
 // The payload assembly is split across two helpers (mig1_pay_a/_b) for the frame budget.
-fn build_mig1(genesis: string, out1: string, mem: string, sl: Sl) -> MH effects[alloc, state] =
+// Build the migration that creates function `sl` (canonical ordinal `ord`) and fold it into
+// the running history hash. `input_root` is the root BEFORE this migration (the genesis root
+// for ordinal 0, else the previous output root); `parent` is the parent HISTORY hash (the
+// EMPTY string for the genesis migration — serialized as JSON `null` and contributing nothing
+// to the history preimage — else the previous migration's history hash). `out1` is this
+// migration's output root. Assembles the canonical migration JSON (operation = create_function
+// with the RAW-AST body + parameter list, plus the root_is_current/name_is_available
+// preconditions and root_exists/function_source_matches postconditions), hashes it under
+// MIGRATION_DOMAIN, then folds that into the history hash under HISTORY_DOMAIN (preimage:
+// parent + \0 + migration_hash + \0 + output_root). The result feeds the NEXT symbol's birth.
+// Generalized from the two-function case (where it only ran for ordinal 0 / parent = genesis):
+// the parent-history field value is built here (threading the raw parent back for the preimage)
+// and the ordinal is rendered into the birth_seed, so a multi-function chain can call it per step.
+fn build_mig1(input_root: string, parent: string, out1: string, mem: string, sl: Sl, ord: i64) -> MH effects[alloc, state] =
   // Serialize the first function's body to the RAW AST (the migration body) and its parameter
   // list (the operation `params`) once, here, so the parse's stack frame is raw_bitor's /
   // build_op_params's, not the already-tight payload builders'.
@@ -2524,15 +2549,30 @@ fn build_mig1(genesis: string, out1: string, mem: string, sl: Sl) -> MH effects[
   let bodyr: Rr = raw_bitor(memo, sl.bs, len) in
   let rawBody: string = bodyr.raw in
   let mem1: string = bodyr.mem in
-  let c: Pc = mig1_pay_a(genesis, out1, mem1, sl, rawBody, opfrag) in
+  // parent_history_hash field value: JSON `null` (genesis migration, empty parent) or the
+  // quoted hash; push_kept keeps the raw parent for the history-hash preimage prefix.
+  let mp: MigPar =
+    if string_len(parent) == 0 then
+      (let r: MigPar = { field: push_lit(string_with_capacity(8), b"null"), par: parent } in r)
+    else
+      let q0: string = push_lit(string_with_capacity(80), b"\"") in
+      let kq: OS = push_kept(q0, parent) in
+      let q1: string = push_lit(kq.out, b"\"") in
+      (let r: MigPar = { field: q1, par: kq.s } in r)
+  in
+  let field: string = mp.field in
+  let par: string = mp.par in
+  let ctx: MigCtx = { field: field, ord: ord } in
+  let c: Pc = mig1_pay_a(input_root, out1, mem1, sl, rawBody, opfrag, ctx) in
   let b: MigB = mig1_pay_b(c) in
   let pay: string = b.pay in
   let o1: string = b.o1 in
   let m2: string = b.mem in
   let mig1: string = hash_domain(b"codedb/migration/v1\0", pay) in
-  // history preimage: parent("") + \0 + migration_hash + \0 + output_root
-  let h0: string = push_byte(string_with_capacity(192), to_u8(0)) in
-  let h1: string = push_str(h0, mig1) in
+  // history preimage: parent + \0 + migration_hash + \0 + output_root (parent empty for genesis)
+  let h0: string = push_str(string_with_capacity(192), par) in
+  let h0b: string = push_byte(h0, to_u8(0)) in
+  let h1: string = push_str(h0b, mig1) in
   let h2: string = push_byte(h1, to_u8(0)) in
   let h3: string = push_str(h2, o1) in
   let hh1: string = hash_domain(b"codedb/history/v1\0", h3) in
@@ -2544,7 +2584,7 @@ fn build_mig1(genesis: string, out1: string, mem: string, sl: Sl) -> MH effects[
 // Extracts the owned name copy and carries it (plus genesis, out1, the kept rawBody, and the
 // return type code) forward via `Pc`. The buffer is sized from `rawBody` (it appears here AND
 // in the postcondition half, so the full payload is ~2*len(rawBody) + the envelope).
-fn mig1_pay_a(genesis: string, out1: string, mem: string, sl: Sl, rawBody: string, opparams: string) -> Pc effects[alloc, state] =
+fn mig1_pay_a(input_root: string, out1: string, mem: string, sl: Sl, rawBody: string, opparams: string, ctx: MigCtx) -> Pc effects[alloc, state] =
   let nb: PRR = push_range(string_with_capacity(64), mem, sl.ns, sl.ne) in
   let nameStr: string = nb.out in
   let m2: string = nb.mem in
@@ -2552,19 +2592,32 @@ fn mig1_pay_a(genesis: string, out1: string, mem: string, sl: Sl, rawBody: strin
   // both built into this same continuation buffer), so size for two copies of each.
   let cap: i64 = string_len(rawBody) * 2 + string_len(opparams) * 2 + 1024 in
   let a0: string = push_lit(string_with_capacity(cap), b"{\"input_root_hash\":\"") in
-  let kg1: OS = push_kept(a0, genesis) in
+  let kg1: OS = push_kept(a0, input_root) in
   let a1: string = kg1.out in
   let g1: string = kg1.s in
   let a2: string = push_lit(a1, b"\",\"operation\":{\"birth_seed\":\"import:main:") in
   let kn1: OS = push_kept(a2, nameStr) in
   let a3: string = kn1.out in
   let n1: string = kn1.s in
-  let a4: string = push_lit(a3, b":0\",\"body\":") in
+  // birth_seed ends `:<ordinal>` (the canonical ordinal, was hard-coded 0 in the 2-fn case).
+  let a3c: string = push_byte(a3, to_u8(58)) in
+  let a3d: string = push_dec(a3c, ctx.ord) in
+  let a4: string = push_lit(a3d, b"\",\"body\":") in
   let kb1: OS = push_kept(a4, rawBody) in
   let a5: string = kb1.out in
   let body1: string = kb1.s in
   let a6: string = push_lit(a5, b",\"effects\":[],\"kind\":\"create_function\",\"module\":\"main\",\"name\":\"") in
-  let kn2: OS = push_kept(a6, n1) in
+  // Hand off to the continuation (the operation name onward) — split for the v0 frame budget,
+  // which the ordinal/parent-history parameterization pushed `mig1_pay_a` over.
+  let mid: PayMid = { buf: a6, mem: m2, name: n1, gen: g1, body: body1 } in
+  mig1_pay_a2(mid, out1, opparams, sl, ctx)
+
+// The continuation of the operation payload: the (second) name occurrence, params,
+// region_params, return_type, output_root_hash, and the parent_history_hash field — finishing
+// the `Pc` carrier for mig1_pay_b. `mid` carries the partial buffer plus the threaded name /
+// input-root / body that the postconditions reuse.
+fn mig1_pay_a2(mid: PayMid, out1: string, opparams: string, sl: Sl, ctx: MigCtx) -> Pc effects[alloc, state] =
+  let kn2: OS = push_kept(mid.buf, mid.name) in
   let a7: string = kn2.out in
   let n2: string = kn2.s in
   let a7p0: string = push_lit(a7, b"\",\"params\":[") in
@@ -2577,8 +2630,11 @@ fn mig1_pay_a(genesis: string, out1: string, mem: string, sl: Sl, rawBody: strin
   let ko1: OS = push_kept(a8, out1) in
   let a9: string = ko1.out in
   let o1: string = ko1.s in
-  let a10: string = push_lit(a9, b"\",\"parent_history_hash\":null,") in
-  let r: Pc = { out: a10, mem: m2, name: n2, gen: g1, o1: o1, body: body1, opparams: opp1, rtc: sl.rtc } in r
+  // parent_history_hash: the pre-built field value (JSON `null`, or the quoted parent hash).
+  let a9p: string = push_lit(a9, b"\",\"parent_history_hash\":") in
+  let a9f: string = push_str(a9p, ctx.field) in
+  let a10: string = push_lit(a9f, b",") in
+  let r: Pc = { out: a10, mem: mid.mem, name: n2, gen: mid.gen, o1: o1, body: mid.body, opparams: opp1, rtc: sl.rtc } in r
 
 // Second half of the migration payload: postconditions + preconditions. Returns the full
 // payload, out1 (kept for the history preimage), and the threaded memory.
@@ -2623,7 +2679,8 @@ fn build_two_root(mem: string, first: Sl, second: Sl) -> string effects[alloc, s
   let m1: string = r1.mem in
   let out1: string = r1.hash in
   let genesis: string = build_genesis_root() in
-  let mh: MH = build_mig1(genesis, out1, m1, first) in
+  let emptyp: string = string_with_capacity(8) in
+  let mh: MH = build_mig1(genesis, emptyp, out1, m1, first, 0) in
   let m2: string = mh.mem in
   let hh1: string = mh.hash in
   build_root2(m2, first, second, hh1)

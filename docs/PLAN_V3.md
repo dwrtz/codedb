@@ -1633,6 +1633,33 @@ order is opposite alphabetical, i64 and bool members) — plus all regressions
 WL refinement generalises, but the `aord` two-member ordinal shortcut and the ord0-symbol-hash-sorts-
 first assumption are two-member-specific).
 
+In progress 2026-06-15: 3+-member recursion cliques, taken all the way to the Rust importer's
+`clique_label_search` (the backtracking individualization-refinement graph canonicalisation that
+`canonical_clique_order` falls back to when 1-WL colour refinement does not discretise the clique —
+`src/lib.rs:1713`/`:1787`). Decomposed into a four-increment ladder: (1) the n-function
+`create_function` chain (independent + DAG — also a correctness fix, since the importer currently parses
+exactly two top-level functions and mis-parses a third; and the k-way root-array sort it builds is shared
+with the clique root); (2) a three-member clique whose 1-WL refinement discretises, plus the SCC
+detection that tells a clique from increment 1's DAG; (3) four-or-more-member discretising cliques (the
+real symbol-hash sort — for four or more members the recursion-group symbols are no longer in ordinal
+order); (4) `clique_label_search` itself, for the non-discretising and fully-symmetric cliques. The
+n-function chain mechanics were reproduced byte-exactly in Python for n = 2…5 (independent, chain,
+diamond, fan-in) before any `.cdb`: the canonical order is a Kahn topological sort (callee first) with an
+alphabetical tie-break, each symbol's birth history is the previous migration's running history (genesis
+for the first), the importer computes n−1 migrations and builds the final n-symbol root directly, and a
+migration's `parent_history_hash` is the previous history hash (verified non-null for the second
+migration onward — the null hypothesis fails the migration hash). A three-function DAG therefore finally
+exercises `raw_call` (the canonical-first-but-one function now carries a migration whose raw body
+contains a call). Landed as the first step (a transparent refactor, suite 21/21 + the local smoke 51/51
+unchanged): `build_mig1` is generalised with a parent-history argument (the empty string for the genesis
+migration → JSON `null`) and a canonical ordinal (rendered into the birth seed), via small `MigCtx` /
+`MigPar` carriers; the additions pushed `mig1_pay_a` over the v0 frame budget (4384 > 4095, caught
+offline by the frame sweep), so it was split into `mig1_pay_a` / `mig1_pay_a2` (a `PayMid` carrier),
+bringing the max frame back to 3952. Empty-parent + ordinal 0 reproduces the old payload exactly, so
+every two-function root is byte-identical. Next: the general-m `assemble_root` (display + hash selection
+sorts with Copy accumulators; byte-copy emission that reads the owned source/hash buffers via
+`string_get`) plus the unrolled three-function chain and the n-function top-level parse.
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text
