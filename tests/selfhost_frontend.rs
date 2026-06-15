@@ -1236,6 +1236,58 @@ fn importer_reproduces_the_root_hash_for_call_arguments_and_params() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_recursion_group_params_and_args() {
+    // 15a.4 (axis 2): PARAMETERS + ARGUMENTS in RECURSION GROUPS (self- and mutual-recursion).
+    // A recursion-group member may now have parameters and its self/cross-member call may pass
+    // arguments — extending the no-parameter recursion groups. The member's body resolves
+    // param_refs and the recursive call carries args (reusing the call-argument machinery); the
+    // signature/param_names carry the parameters; and — the genuinely new mechanic — the WL
+    // member-ordering colour's static signature now includes the member's parameter TYPE NAMES
+    // (src/lib.rs recursion_member_static_sigs), so member_color must emit them or the canonical
+    // member order (and hence the recursion_group:<ordinal> nonces and the symbols) can diverge.
+    // Because both births are genesis, the recursion-group root is reproduced from objects alone
+    // (no migration). Covers self-recursion (one/two parameters, i64/bool results) and mutual
+    // recursion (both source orders, asymmetric cliques whose WL order is opposite alphabetical,
+    // i64 and bool members) — all with parameters and argument-passing recursive calls.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        // self-recursion with parameters (one-member group; no member ordering)
+        "fn fact(n: i64) -> i64 = if n == 0 then 1 else n * fact(n - 1)\n",
+        "fn f(n: i64) -> i64 = if n == 0 then 0 else f(n - 1)\n",
+        "fn sum(a: i64, b: i64) -> i64 = if a == 0 then b else sum(a - 1, b + 1)\n",
+        "fn g(n: i64) -> bool = if n == 0 then true else g(n - 1)\n",
+        // mutual recursion with parameters (two-member group; static_sig now carries param types)
+        "fn is_even(n: i64) -> bool = if n == 0 then true else is_odd(n - 1)\nfn is_odd(n: i64) -> bool = if n == 0 then false else is_even(n - 1)\n",
+        "fn is_odd(n: i64) -> bool = if n == 0 then false else is_even(n - 1)\nfn is_even(n: i64) -> bool = if n == 0 then true else is_odd(n - 1)\n",
+        "fn ping(n: i64) -> i64 = pong(n - 1)\nfn pong(n: i64) -> i64 = ping(n - 1)\n",
+        "fn a(x: i64) -> i64 = b(x) + 1\nfn b(x: i64) -> i64 = a(x)\n",
+        "fn ev(n: i64) -> i64 = if n == 0 then 1 else od(n - 1)\nfn od(n: i64) -> i64 = if n == 0 then 0 else ev(n - 1)\n",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        let db = temp.path().join(format!("ref-recp-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-recp-{i}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer recursion-group params/args root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate

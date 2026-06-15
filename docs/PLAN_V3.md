@@ -1598,9 +1598,40 @@ argument using the caller's parameter, longer parameter names, and the toposort 
 divergence with a parameter-bearing callee — plus all regressions (`tests/selfhost_frontend.rs` 20/20).
 Remaining axis-2 surface: parameters + arguments in RECURSION GROUPS (self- and mutual-recursion —
 `build_rg_member` / `build_rg_root` still parse member bodies with an empty scope and emit empty
-param_names; the recursion-group root is built from objects alone, so no migration/raw body is
-involved); a recursion clique of 3+ members; and `raw_call` arguments (reachable only once a
-migration-bearing canonical-first function can itself call — i.e. 3+ functions).
+param_names); and a recursion clique of 3+ members.
+
+Landed 2026-06-15: PARAMETERS + ARGUMENTS in RECURSION GROUPS (self- and mutual-recursion),
+completing the call-arguments/params surface for two-function programs. A recursion-group member may
+now have parameters, and its self/cross-member call may pass arguments. Self-recursion (a one-member
+group): `build_rg_root` re-derives the member's parameter scope (the shared `derive_params` helper),
+re-parses the body with it (so param_refs and the argument-bearing recursive call resolve), builds the
+signature with the parameter types, and emits the parameter names into the ProgramRoot's param_names.
+Mutual recursion (a two-member group): `build_rg_member` does the same per member, and the parameter
+fragments thread into the hash-ordered param_names tail (a `PP` carrier, mirroring the two-function
+root). The genuinely new mechanic is the WL member-ordering colour: its static signature now carries
+the member's parameter TYPE NAMES (`src/lib.rs` `recursion_member_static_sigs`:
+`{"effects":[],"params":[<type names>],"regions":[],"return":"<type>"}`), so `member_color` /
+`build_rec_sig` emit them (via `push_ptypes_at`) — the recursion order can otherwise diverge from the
+Rust importer. Two corrections to the increment-A understanding surfaced (both reproduced byte-exactly
+in Python before fixing): (1) **`raw_call` arguments ARE required here** — a recursion-group root needs
+no migration, but each member's body is raw-serialized for its WL ordering colour (`member_color` →
+`raw_bitor` → `raw_call`), so a call with arguments must serialize them or the colour (and hence the
+member order and the symbols) diverges; the increment-A note that `raw_call` args were unreachable
+held only for the two-function DAG migration path, not the recursion-colour path. The fix is the raw
+counterpart of `parse_args` (`raw_args`, a loop). (2) The recolour's peer-call marker changed from the
+empty-`"args":[]` form (which assumed no-argument calls) to the argument-independent `"kind":"call"`
+(the arguments, emitted before it, are recoloured by the same logic if they nest a peer call). The
+member-order bug was localized by reproducing the importer's byte-level recolour in Python with
+argument-bearing vs argument-less bodies — only the latter mis-ordered the one asymmetric clique
+(`a(x)=b(x)+1`, `b(x)=a(x)`) whose order depends on the erased argument structure (the `if`-shaped
+cliques are ordered by their then-branch literal regardless). One v0 reality recurred: bundling the
+two display-name ranges into a record (`NR`) kept the two-member root assembler under the 8-machine-
+parameter cap. Root-hash equality holds across 9 recursion-group fixtures — self-recursion (one/two
+parameters, i64/bool results) and mutual recursion (both source orders, asymmetric cliques whose WL
+order is opposite alphabetical, i64 and bool members) — plus all regressions
+(`tests/selfhost_frontend.rs` 21/21). Remaining axis-2 surface: a recursion clique of 3+ members (the
+WL refinement generalises, but the `aord` two-member ordinal shortcut and the ord0-symbol-hash-sorts-
+first assumption are two-member-specific).
 
 Sub-stages (each independently oracle-checked at its artifact):
 

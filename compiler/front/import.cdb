@@ -191,6 +191,9 @@ record ArgsR { mem: string  frag: string  next: i64 }
 // A pair of (move-only) param-name fragments routed through one conditional (order_pp) — so
 // two fragments can be swapped into symbol-hash order without double-moving either.
 record PP { p0: string  p1: string }
+// The two display-ordered member name source ranges (low/high), bundled so the two-member
+// recursion-group root assembler stays under the v0 8-machine-parameter cap.
+record NR { lns: i64  lne: i64  hns: i64  hne: i64 }
 
 // ---------------------------------------------------------------------------
 // byte classifiers (ASCII; + - * / and whitespace)
@@ -655,6 +658,14 @@ fn scan_params(mem: string, pos: i64, len: i64, ps: Scope) -> PpR =
     let nextpos: i64 = if (if c3.i < len then to_i64(string_get(c3.mem, c3.i)) == 44 else false) then c3.i + 1 else c3.i in
     scan_params(c3.mem, nextpos, len, ps2)
 
+// Re-derive a function's parameter scope from source: find the `(` past the name (which ends at
+// `ne`) and scan the parameter list. The returned scope has rgord = -1 (callers that need a
+// recursion-group ordinal rebuild the scope with their `ord`). `mem` threaded back via PpR.
+fn derive_params(mem: string, ne: i64, len: i64) -> PpR =
+  let op: MI = find_byte(mem, ne, len, 40) in
+  let seed: Scope = { ids: [0x0; 12], n: 0, rgord: 0 - 1, aord: 0 } in
+  scan_params(op.mem, op.i, len, seed)
+
 // ---------------------------------------------------------------------------
 // the object builders (canonical payloads)
 // ---------------------------------------------------------------------------
@@ -733,6 +744,18 @@ fn push_sig_params_at(out: string, params: Scope, i: i64) -> string effects[allo
     let q2: string = push_str(q1, type_hash(params.ids[i] % 16)) in
     let q3: string = push_byte(q2, to_u8(34)) in
     push_sig_params_at(q3, params, i + 1)
+
+// Emit the WL static-sig `params` array body: the param TYPE NAMES, quoted + comma-separated
+// (`"i64","i64"`) — NOT type hashes (this feeds the recursion-order colour, src/lib.rs
+// recursion_member_static_sigs maps each param to its type name). Tail-recursion like push_sig_params_at.
+fn push_ptypes_at(out: string, params: Scope, i: i64) -> string effects[state] =
+  if i >= params.n then out
+  else
+    let pre: string = if i == 0 then out else push_byte(out, to_u8(44)) in
+    let q1: string = push_byte(pre, to_u8(34)) in
+    let q2: string = push_type_name(q1, params.ids[i] % 16) in
+    let q3: string = push_byte(q2, to_u8(34)) in
+    push_ptypes_at(q3, params, i + 1)
 
 fn build_sig(rettyc: i64, params: Scope) -> string effects[alloc, state] =
   let p0: string = push_lit(string_with_capacity(1024), b"{\"abi\":\"codedb-v0-internal\",\"effects\":[],\"params\":[") in
@@ -898,7 +921,7 @@ fn build_recursion_group(def: string, sig: string, sym: string) -> RGc effects[a
 // `recursion_groups` array (key order metadata, names, param_names, recursion_groups,
 // symbols — alphabetical). The member's display name is mem[ns,ne); its symbol appears in
 // names/param_names/symbols (threaded via push_kept), the RecursionGroup hash in recursion_groups.
-fn build_rg_root_obj(mem: string, ns: i64, ne: i64, rgc: RGc) -> string effects[alloc, state] =
+fn build_rg_root_obj(mem: string, ns: i64, ne: i64, rgc: RGc, pnf: string) -> string effects[alloc, state] =
   let sym: string = rgc.sym in
   let def: string = rgc.def in
   let sig: string = rgc.sig in
@@ -907,7 +930,9 @@ fn build_rg_root_obj(mem: string, ns: i64, ne: i64, rgc: RGc) -> string effects[
   let nb: PRR = push_range(p0, mem, ns, ne) in
   let p1: string = push_lit(nb.out, b"\",\"is_preferred\":true,\"module\":\"main\",\"symbol\":\"") in
   let k0: OS = push_kept(p1, sym) in
-  let p2: string = push_lit(k0.out, b"\"}],\"param_names\":[{\"names\":[],\"symbol\":\"") in
+  let p2a: string = push_lit(k0.out, b"\"}],\"param_names\":[{\"names\":[") in
+  let p2b: string = push_str(p2a, pnf) in
+  let p2: string = push_lit(p2b, b"],\"symbol\":\"") in
   let k1: OS = push_kept(p2, k0.s) in
   let p3: string = push_lit(k1.out, b"\"}],\"recursion_groups\":[\"") in
   let p4: string = push_str(p3, rg) in
@@ -930,15 +955,18 @@ fn build_rg_root(mem: string, ns: i64, ne: i64, bodypos: i64, rettyc: i64, len: 
   let s: MH = build_sym_rg_mh(mem, 0) in
   let m1: string = s.mem in
   let symf: string = s.hash in
-  let sc: Scope = { ids: [0x0; 12], n: 0, rgord: 0, aord: 0 } in
-  let e: Pr = parse_bitor(m1, bodypos, len, sc, 0, rettyc) in
+  let pr: PpR = derive_params(m1, ne, len) in
+  let params: Scope = pr.ps in
+  let np: i64 = params.n in
+  let sc: Scope = { ids: params.ids, n: np, rgord: 0, aord: 0 } in
+  let e: Pr = parse_bitor(pr.mem, bodypos, len, sc, np, rettyc) in
   let m2: string = e.mem in
   let bodyh: string = e.hash in
-  let emptyp: Scope = { ids: [0x0; 12], n: 0, rgord: 0 - 1, aord: 0 } in
-  let sig: string = build_sig(rettyc, emptyp) in
+  let sig: string = build_sig(rettyc, params) in
   let d: DH = build_def(sig, symf, bodyh) in
   let rgc: RGc = build_recursion_group(d.h, d.sig, d.sym) in
-  build_rg_root_obj(m2, ns, ne, rgc)
+  let pnr: PRR = push_pnames_at(string_with_capacity(bodypos - ne + 16), m2, params, 0) in
+  build_rg_root_obj(pnr.mem, ns, ne, rgc, pnr.out)
 
 // Build one member of a MULTI-member recursion group (the mutual-recursion case): its SymbolBirth
 // (genesis, `recursion_group:<ord>` — `ord` is the member's WL canonical ordinal), its body
@@ -951,15 +979,19 @@ fn build_rg_member(mem: string, sl: Sl, ord: i64, aord: i64, len: i64) -> FObj e
   let s: MH = build_sym_rg_mh(mem, ord) in
   let m1: string = s.mem in
   let symf: string = s.hash in
-  let sc: Scope = { ids: [0x0; 12], n: 0, rgord: ord, aord: aord } in
-  let e: Pr = parse_bitor(m1, sl.bs, len, sc, 0, sl.rtc) in
+  // re-derive the member's params; mark the body scope rgord = ord (so self/cross-member calls
+  // resolve to the right ordinal) and aord (the alpha-first member's WL ordinal).
+  let pr: PpR = derive_params(m1, sl.ne, len) in
+  let mp: string = pr.mem in
+  let params: Scope = pr.ps in
+  let np: i64 = params.n in
+  let sc: Scope = { ids: params.ids, n: np, rgord: ord, aord: aord } in
+  let e: Pr = parse_bitor(mp, sl.bs, len, sc, np, sl.rtc) in
   let m2: string = e.mem in
   let bodyh: string = e.hash in
-  let emptyp: Scope = { ids: [0x0; 12], n: 0, rgord: 0 - 1, aord: 0 } in
-  let sig: string = build_sig(sl.rtc, emptyp) in
+  let sig: string = build_sig(sl.rtc, params) in
   let d: DH = build_def(sig, symf, bodyh) in
-  // No-param recursion member (increment A): an empty param-name fragment for the ProgramRoot.
-  let pnr: PRR = push_pnames_at(string_with_capacity(4), m2, emptyp, 0) in
+  let pnr: PRR = push_pnames_at(string_with_capacity(sl.bs - sl.ne + 16), m2, params, 0) in
   let r: FObj = { mem: pnr.mem, sym: d.sym, def: d.h, sig: d.sig, pn: pnr.out } in r
 
 // A TWO-member RecursionGroup object: {"members":[{def,sig,sym}_0,{def,sig,sym}_1],"module":"main"}
@@ -989,10 +1021,16 @@ fn build_recursion_group2(def0: string, sig0: string, sym0: string, def1: string
 // ordinal order (ord 0's symbol always hash-sorts before ord 1's) which is the display-name order,
 // so all three arrays emit member 0 then member 1 — no reordering (unlike build_root2_tail). Split
 // from the head for the v0 frame budget.
-fn build_mutrec_tail(buf: string, c: RG2) -> string effects[alloc, state] =
-  let u0: string = push_lit(buf, b",\"param_names\":[{\"names\":[],\"symbol\":\"") in
+fn build_mutrec_tail(buf: string, c: RG2, pp: PP) -> string effects[alloc, state] =
+  let hp0: string = pp.p0 in
+  let hp1: string = pp.p1 in
+  let u0a: string = push_lit(buf, b",\"param_names\":[{\"names\":[") in
+  let u0b: string = push_str(u0a, hp0) in
+  let u0: string = push_lit(u0b, b"],\"symbol\":\"") in
   let k0: OS = push_kept(u0, c.s0) in
-  let u1: string = push_lit(k0.out, b"\"},{\"names\":[],\"symbol\":\"") in
+  let u1a: string = push_lit(k0.out, b"\"},{\"names\":[") in
+  let u1b: string = push_str(u1a, hp1) in
+  let u1: string = push_lit(u1b, b"],\"symbol\":\"") in
   let k1: OS = push_kept(u1, c.s1) in
   let u2: string = push_lit(k1.out, b"\"}],\"recursion_groups\":[\"") in
   let u3: string = push_str(u2, c.rg) in
@@ -1016,7 +1054,11 @@ fn build_mutrec_tail(buf: string, c: RG2) -> string effects[alloc, state] =
 // build_mutrec_tail for param_names/recursion_groups/symbols. Mirrors build_root2_names (the
 // two-function root) — `names` is display-name-ordered but param_names/symbols are symbol-hash-ordered
 // (src/model.rs normalize_root); they diverge once the WL ordinal != alphabetical (asymmetric clique).
-fn build_mutrec_names(mem: string, lns: i64, lne: i64, hns: i64, hne: i64, dsix: Six, rghash: string) -> string effects[alloc, state] =
+fn build_mutrec_names(mem: string, nr: NR, dsix: Six, rghash: string, pp: PP) -> string effects[alloc, state] =
+  let lns: i64 = nr.lns in
+  let lne: i64 = nr.lne in
+  let hns: i64 = nr.hns in
+  let hne: i64 = nr.hne in
   let ds0: string = dsix.s0 in
   let dd0: string = dsix.d0 in
   let dg0: string = dsix.g0 in
@@ -1040,7 +1082,9 @@ fn build_mutrec_names(mem: string, lns: i64, lne: i64, hns: i64, hne: i64, dsix:
   let sB2: string = cmp.b in
   let six: Six = order_triples(le, sA2, dd0, dg0, sB2, dd1, dg1) in
   let c: RG2 = { rg: rghash, d0: six.d0, g0: six.g0, s0: six.s0, d1: six.d1, g1: six.g1, s1: six.s1 } in
-  build_mutrec_tail(p6, c)
+  // `pp` is in ordinal order; for a two-member group hash order == ordinal order (ord 0's symbol
+  // always hash-sorts first), so the fragments already pair with the tail's hash-ordered symbols.
+  build_mutrec_tail(p6, c, pp)
 
 // Build the ProgramRoot for a two-member recursion group: key order metadata, names, param_names,
 // recursion_groups, symbols (alphabetical; recursion_groups skip-if-empty so non-group roots are
@@ -1049,7 +1093,7 @@ fn build_mutrec_names(mem: string, lns: i64, lne: i64, hns: i64, hne: i64, dsix:
 // first) order — these DIVERGE for asymmetric cliques (WL ordinal != alphabetical), so order the
 // (sym,def,sig) triples in display order here (order_triples — pure moves, no SIGTRAP) and emit names
 // in build_mutrec_names, which re-orders by hash for the tail.
-fn build_mutrec_root_obj(mem: string, m0: Sl, m1: Sl, rg: RG2) -> string effects[alloc, state] =
+fn build_mutrec_root_obj(mem: string, m0: Sl, m1: Sl, rg: RG2, pp: PP) -> string effects[alloc, state] =
   let alc: REq = name_le(mem, m0.ns, m0.ne, m1.ns, m1.ne) in
   let mm: string = alc.mem in
   let nle: bool = alc.eq in
@@ -1058,7 +1102,8 @@ fn build_mutrec_root_obj(mem: string, m0: Sl, m1: Sl, rg: RG2) -> string effects
   let lne: i64 = if nle then m0.ne else m1.ne in
   let hns: i64 = if nle then m1.ns else m0.ns in
   let hne: i64 = if nle then m1.ne else m0.ne in
-  build_mutrec_names(mm, lns, lne, hns, hne, dsix, rg.rg)
+  let nr: NR = { lns: lns, lne: lne, hns: hns, hne: hne } in
+  build_mutrec_names(mm, nr, dsix, rg.rg, pp)
 
 // ---------------------------------------------------------------------------
 // Canonical recursion-group member ordering (the WL refinement, src/lib.rs
@@ -1095,48 +1140,53 @@ fn push_color(out: string, c: Color, k: i64) -> string effects[state] =
   if k >= c.n then out
   else push_color(push_byte(out, c.b[k]), c, k + 1)
 
-// Recolour a raw body RECURSIVELY (one char / one call node per step): every two-member call node
-// `{"args":[],"kind":"call","name":"X"}` has its name rewritten to `@recursion-peer:<colour of X>`
-// (c0 if X equals member-0's name `name0`, else c1 — a branch-free Copy select). All other bytes
-// copy verbatim. Recursion (NOT a loop) so the move-only output accumulator avoids the v0 loop-
-// accumulator-return SIGTRAP (a loop form crashed natively here). `raw`/`name0` are borrowed for the
-// scans (string_get) then threaded down/back via RErase; `out` accumulates. The marker check, the
-// quote scan and the name match are INLINE (a helper taking `raw` would consume it — strings have no
-// borrow-passing). Depth = body length (small). The call-node marker is `"args":[]` (empty args — a
-// member call, not a cast); the rest of the 32-byte prefix is structurally fixed, name at i+32.
+// Recolour a raw body RECURSIVELY (one char / one call node per step): every call node's name is
+// rewritten to `@recursion-peer:<colour of X>` (c0 if X equals member-0's name `name0`, else c1 — a
+// branch-free Copy select; in a two-function clique every call is a peer, so the else branch is the
+// other member). All other bytes copy verbatim. Recursion (NOT a loop) so the move-only output
+// accumulator avoids the v0 loop-accumulator-return SIGTRAP (a loop form crashed natively here).
+// `raw`/`name0` are borrowed for the scans (string_get) then threaded down/back via RErase; `out`
+// accumulates. Depth = body length (small). The call-node marker is `"kind":"call"` (13 bytes,
+// args-INDEPENDENT — a call may now carry arguments, so the old empty-`"args":[]` marker no longer
+// identifies one; the args, emitted char-by-char before the marker, are recoloured by the same logic
+// if they nest a peer call); `,"name":"` follows it, so the name begins at i+22. NOTE: a cast
+// (`"kind":"call"`, name `to_*`) in a recursion-member body would be mis-recoloured — out of scope
+// (a two-function clique body calls only its peers; no recursion fixture casts).
 fn recolor_at(raw: string, name0: string, c0: Color, c1: Color, i: i64, rawlen: i64, out: string) -> RErase effects[state] =
   if i >= rawlen then (let r: RErase = { erased: out, name0: name0 } in r)
   else
     let iscall: bool =
-      if i + 32 <= rawlen then
-        (to_i64(string_get(raw, i)) == 34 && to_i64(string_get(raw, i + 1)) == 97
-         && to_i64(string_get(raw, i + 2)) == 114 && to_i64(string_get(raw, i + 3)) == 103
-         && to_i64(string_get(raw, i + 4)) == 115 && to_i64(string_get(raw, i + 5)) == 34
-         && to_i64(string_get(raw, i + 6)) == 58 && to_i64(string_get(raw, i + 7)) == 91
-         && to_i64(string_get(raw, i + 8)) == 93)
+      if i + 22 <= rawlen then
+        (to_i64(string_get(raw, i)) == 34 && to_i64(string_get(raw, i + 1)) == 107
+         && to_i64(string_get(raw, i + 2)) == 105 && to_i64(string_get(raw, i + 3)) == 110
+         && to_i64(string_get(raw, i + 4)) == 100 && to_i64(string_get(raw, i + 5)) == 34
+         && to_i64(string_get(raw, i + 6)) == 58 && to_i64(string_get(raw, i + 7)) == 34
+         && to_i64(string_get(raw, i + 8)) == 99 && to_i64(string_get(raw, i + 9)) == 97
+         && to_i64(string_get(raw, i + 10)) == 108 && to_i64(string_get(raw, i + 11)) == 108
+         && to_i64(string_get(raw, i + 12)) == 34)
       else false
     in
     if iscall then
-      // name at [i+32, jq); jq = the next `"`.
+      // name at [i+22, jq); jq = the next `"` (past `"kind":"call","name":"`).
       let fq: Lc =
-        loop k = { j: i + 32, c: 2 } while k.c == 2 do
+        loop k = { j: i + 22, c: 2 } while k.c == 2 do
           if k.j >= rawlen then (let s: Lc = { j: k.j, c: 0 } in s)
           else if to_i64(string_get(raw, k.j)) == 34 then (let s: Lc = { j: k.j, c: 1 } in s)
           else (let s: Lc = { j: k.j + 1, c: 2 } in s)
       in
       let jq: i64 = fq.j in
       let len0: i64 = string_len(name0) in
-      // does raw[i+32, jq) equal name0?
+      // does raw[i+22, jq) equal name0?
       let nmseed: Lc = { j: 0, c: 2 } in
       let nm: Lc =
-        if jq - (i + 32) == len0 then
+        if jq - (i + 22) == len0 then
           (loop k = nmseed while k.c == 2 do
              if k.j >= len0 then (let s: Lc = { j: k.j, c: 1 } in s)
-             else if to_i64(string_get(raw, i + 32 + k.j)) == to_i64(string_get(name0, k.j)) then (let s: Lc = { j: k.j + 1, c: 2 } in s)
+             else if to_i64(string_get(raw, i + 22 + k.j)) == to_i64(string_get(name0, k.j)) then (let s: Lc = { j: k.j + 1, c: 2 } in s)
              else (let s: Lc = { j: k.j, c: 0 } in s))
         else (let s: Lc = { j: 0, c: 0 } in s)
       in
-      let o1: string = push_lit(out, b"\"args\":[],\"kind\":\"call\",\"name\":\"@recursion-peer:") in
+      let o1: string = push_lit(out, b"\"kind\":\"call\",\"name\":\"@recursion-peer:") in
       let cc: Color = if nm.c == 1 then c0 else c1 in
       let o2: string = push_color(o1, cc, 0) in
       recolor_at(raw, name0, c0, c1, jq, rawlen, o2)
@@ -1151,12 +1201,14 @@ fn recolor(raw: string, name0: string, c0: Color, c1: Color) -> RErase effects[a
   let out: string = string_with_capacity(rawlen * 4 + 256) in
   recolor_at(raw, name0, c0, c1, 0, rawlen, out)
 
-// The static (body- and name-independent) signature of a clique member, per
-// recursion_member_static_sigs: {"effects":[],"params":[],"regions":[],"return":"<type name>"}.
-// (Our mutual-recursion members are no-param, no-effect; only the return type name varies.)
-fn build_rec_sig(rtc: i64) -> string effects[alloc, state] =
-  let p0: string = push_lit(string_with_capacity(96), b"{\"effects\":[],\"params\":[],\"regions\":[],\"return\":\"") in
-  let p1: string = push_type_name(p0, rtc) in
+// The WL static sig `{"effects":[],"params":[<type names>],"regions":[],"return":"<typeNAME>"}`
+// (src/lib.rs recursion_member_static_sigs). The `params` array is the member's parameter TYPE
+// NAMES (NOT type hashes) — so the recursion-order colour depends on the member's parameter types.
+fn build_rec_sig(rtc: i64, params: Scope) -> string effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(params.n * 8 + 96), b"{\"effects\":[],\"params\":[") in
+  let pp: string = push_ptypes_at(p0, params, 0) in
+  let p0b: string = push_lit(pp, b"],\"regions\":[],\"return\":\"") in
+  let p1: string = push_type_name(p0b, rtc) in
   let p2: string = push_lit(p1, b"\"}") in
   p2
 
@@ -1166,8 +1218,10 @@ fn build_rec_sig(rtc: i64) -> string effects[alloc, state] =
 // back; mem threaded back. Round 1 passes empty colours; round 2 passes the round-1 colours.
 fn member_color(mem: string, sl: Sl, name0: string, c0: Color, c1: Color, len: i64) -> MCol effects[alloc, state] =
   let rb: Rr = raw_bitor(mem, sl.bs, len) in
+  let pr: PpR = derive_params(rb.mem, sl.ne, len) in
+  let mp: string = pr.mem in
   let er: RErase = recolor(rb.raw, name0, c0, c1) in
-  let sig: string = build_rec_sig(sl.rtc) in
+  let sig: string = build_rec_sig(sl.rtc, pr.ps) in
   // payload = sig | erased, in a FRESH buffer sized to fit (appending onto sig's fixed-capacity
   // buffer would overflow it — string_with_capacity TRAPS past its capacity; the erased body is
   // unbounded, growing with the colour bytes in round 2).
@@ -1178,7 +1232,7 @@ fn member_color(mem: string, sl: Sl, name0: string, c0: Color, c1: Color, len: i
   let p2: string = push_byte(p1, to_u8(124)) in
   let p3: string = push_str(p2, er.erased) in
   let h: string = hash_domain(b"codedb/recursion-order/v1\0", p3) in
-  let r: MCol = { mem: rb.mem, name0: er.name0, color: h } in r
+  let r: MCol = { mem: mp, name0: er.name0, color: h } in r
 
 // Compare two 71-char colour-hash strings for equality, threading both back.
 fn streq71(a: string, b: string) -> Eq2 =
@@ -1256,13 +1310,18 @@ fn build_mutrec_root(mem: string, f0: Sl, f1: Sl, len: i64) -> string effects[al
   let sym0: string = fa.sym in
   let def0: string = fa.def in
   let sig0: string = fa.sig in
+  let pn0: string = fa.pn in
   let fb: FObj = build_rg_member(m0m, m1, 1, aord, len) in
   let m1m: string = fb.mem in
   let sym1: string = fb.sym in
   let def1: string = fb.def in
   let sig1: string = fb.sig in
+  let pn1: string = fb.pn in
   let rg: RG2 = build_recursion_group2(def0, sig0, sym0, def1, sig1, sym1) in
-  build_mutrec_root_obj(m1m, m0, m1, rg)
+  // param-name fragments in ORDINAL order (ord 0, ord 1); for a two-member group the symbol-hash
+  // order coincides with the ordinal order, so they pair with the hash-ordered param_names tail.
+  let pp: PP = { p0: pn0, p1: pn1 } in
+  build_mutrec_root_obj(m1m, m0, m1, rg, pp)
 
 // Build the three content hashes for one no-param `fn <name>() -> <rtc> = <body>`: its
 // SymbolBirth (birth history `bh`, ordinal `ordv`), its body Expression (RE-PARSED from the
@@ -2210,17 +2269,45 @@ fn raw_cast(mem: string, p: i64, e: i64, len: i64) -> Rr effects[alloc, state] =
   let node: Rr = raw_cast_node(sw.mem, p, e, arg.raw) in
   let r: Rr = { mem: node.mem, raw: node.raw, next: sw.i + 1 } in r
 
-// raw call := `<name>` `(` `)`  (no-arg cross-symbol call) -> {"args":[],"kind":"call",
-// "name":"<name>"}. (Not reached in a two-function DAG — the canonical-first, whose body is
-// the migration's raw body, never calls — but present so the raw parser covers the grammar.)
+// Parse a call's argument list (raw serialization) starting just past `(`; returns the args
+// fragment — the argument RAW nodes comma-separated (`<r0>,<r1>`; empty for no args) — the position
+// past the `)`, and the threaded memory. The raw counterpart of parse_args: a LOOP (not
+// self-recursion) with a fresh-record accumulator (the parse_add/raw_add shape), each iteration
+// parsing one argument via raw_bitor and appending it into a fresh buffer.
+fn raw_args(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
+  let sw0: MI = skip_ws(mem, pos, len) in
+  let seed: Rr = { mem: sw0.mem, raw: string_with_capacity(1), next: sw0.i } in
+  let done: Rr =
+    loop a = seed while (if a.next < len then to_i64(string_get(a.mem, a.next)) != 41 else false) do
+      let cur: Rr = a in
+      let arg: Rr = raw_bitor(cur.mem, cur.next, len) in
+      let cap: i64 = string_len(cur.raw) + string_len(arg.raw) + 4 in
+      let base: string = push_str(string_with_capacity(cap), cur.raw) in
+      let s0: string = if string_len(base) == 0 then base else push_byte(base, to_u8(44)) in
+      let s1: string = push_str(s0, arg.raw) in
+      let sw: MI = skip_ws(arg.mem, arg.next, len) in
+      let nextpos: i64 = if (if sw.i < len then to_i64(string_get(sw.mem, sw.i)) == 44 else false) then sw.i + 1 else sw.i in
+      let nx: Rr = { mem: sw.mem, raw: s1, next: nextpos } in nx
+  in
+  let r: Rr = { mem: done.mem, raw: done.raw, next: done.next + 1 } in r
+
+// raw call := `<name>` `(` args `)` -> {"args":[<raw arg nodes>],"kind":"call","name":"<name>"}.
+// The argument raw nodes are embedded INLINE (the dual serialization). Exercised by mutual recursion:
+// a clique member's body is raw-serialized for the WL ordering colour (member_color -> raw_bitor),
+// so a cross-member/self call WITH arguments must serialize them or the colour (and member order)
+// diverges from the Rust importer. (No migration is built for a recursion group, so this is the only
+// path that reaches it; a two-function DAG's canonical-first never calls, so it is unexercised there.)
 fn raw_call(mem: string, p: i64, e: i64, len: i64) -> Rr effects[alloc, state] =
-  let p0: string = push_lit(string_with_capacity(e - p + 48), b"{\"args\":[],\"kind\":\"call\",\"name\":\"") in
-  let nb: PRR = push_range(p0, mem, p, e) in
-  let p1: string = nb.out in
-  let m1: string = nb.mem in
-  let p2: string = push_lit(p1, b"\"}") in
-  let sw: MI = skip_ws(m1, e + 1, len) in
-  let r: Rr = { mem: sw.mem, raw: p2, next: sw.i + 1 } in r
+  let ar: Rr = raw_args(mem, e + 1, len) in
+  let argsfrag: string = ar.raw in
+  let m1: string = ar.mem in
+  let cap: i64 = string_len(argsfrag) + (e - p) + 48 in
+  let p0: string = push_lit(string_with_capacity(cap), b"{\"args\":[") in
+  let pa: string = push_str(p0, argsfrag) in
+  let p1: string = push_lit(pa, b"],\"kind\":\"call\",\"name\":\"") in
+  let nb: PRR = push_range(p1, m1, p, e) in
+  let p2: string = push_lit(nb.out, b"\"}") in
+  let r: Rr = { mem: nb.mem, raw: p2, next: ar.next } in r
 
 // raw unary := ('-'|'~'|'!') unary | atom
 fn raw_unary(mem: string, pos: i64, len: i64) -> Rr effects[alloc, state] =
