@@ -1167,6 +1167,75 @@ fn importer_reproduces_the_root_hash_for_mutual_recursion() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_call_arguments_and_params() {
+    // 15a.4 (axis 2): function PARAMETERS in a multi-function program + call ARGUMENTS. Until now
+    // every cross-symbol/recursive call was no-argument and every multi-function callee no-param.
+    // This adds (1) parameters on a function in a TWO-function program — the callee's typed body
+    // resolves param_refs, its FunctionSignature lists the parameter types, the ProgramRoot's
+    // param_names carries the names (still symbol-hash-ordered, so they diverge from the
+    // display-name-ordered names array — exercised by the toposort != alphabetical case), and the
+    // create_function migration's operation/postcondition `params` array lists {name, type} pairs;
+    // and (2) actual call arguments — the typed `call` node's `args` array holds the argument
+    // expressions' hashes, parsed in the CALLER's scope (so an argument may reference the caller's
+    // own parameters). Scope: i64/bool parameters (a sized-parameter argument would need the
+    // callee's parameter type pushed down as the argument's expected type — deferred). Reproducing
+    // the root exercises the parameter scope re-derivation, the signature/param_names/operation
+    // parameter lists, and the argument list (single/multiple/nested/zero arguments, the call in
+    // arithmetic / `if` / `let`, an argument using the caller's parameter, and the divergence case).
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        // --- parameters in a multi-function program (independent functions, no calls) ---
+        "fn helper(x: i64) -> i64 = x + 1\nfn main() -> i64 = 42\n",
+        "fn main() -> i64 = 42\nfn helper(x: i64) -> i64 = x + 1\n", // reversed source order
+        "fn f(x: i64) -> i64 = x\nfn g(y: i64) -> i64 = y\n",        // both have parameters
+        "fn f(a: i64, b: i64) -> i64 = a + b\nfn main() -> i64 = 7\n", // canonical-first, two params
+        "fn p(a: bool) -> bool = a\nfn q() -> bool = true\n",        // bool parameter
+        "fn s(a: u8) -> u8 = a\nfn t() -> u8 = 1\n",                 // sized parameter (sig/op-params/param_ref u8)
+        // --- call arguments (two-function DAG) ---
+        "fn add(a: i64, b: i64) -> i64 = a + b\nfn main() -> i64 = add(2, 3)\n",
+        "fn main() -> i64 = add(2, 3)\nfn add(a: i64, b: i64) -> i64 = a + b\n", // reversed source
+        "fn one(a: i64) -> i64 = a\nfn main() -> i64 = one(99)\n",   // single argument
+        "fn k(a: i64, b: i64, c: i64) -> i64 = a + b + c\nfn main() -> i64 = k(1, 2, 3)\n", // three args/params
+        "fn k4(a: i64, b: i64, c: i64, d: i64) -> i64 = a + b + c + d\nfn main() -> i64 = k4(1, 2, 3, 4)\n", // four
+        "fn wide(alpha: i64, beta: i64, gamma: i64) -> i64 = alpha + beta\nfn main() -> i64 = wide(7, 8, 9)\n", // longer names
+        "fn k3(a: i64, b: i64, c: i64) -> i64 = a + b + c\nfn zz() -> i64 = 0\n", // 3-param canonical-first, uncalled
+        "fn add(a: i64, b: i64) -> i64 = a + b\nfn main() -> i64 = add(add(1, 2), 3)\n",    // nested call arg
+        "fn g(a: i64) -> i64 = a\nfn main(x: i64) -> i64 = g(x + 1)\n",      // arg uses caller's parameter
+        "fn h(a: i64) -> i64 = a + a\nfn main(p: i64) -> i64 = h(p) + h(p)\n", // two calls, caller has param
+        "fn add(a: i64, b: i64) -> i64 = a + b\nfn main() -> i64 = add(2, 3) + 1\n",        // call in arithmetic
+        "fn dbl(a: i64) -> i64 = a + a\nfn main() -> i64 = if 1 < 2 then dbl(5) else 0\n",  // call in if
+        "fn dbl(a: i64) -> i64 = a + a\nfn main() -> i64 = let y: i64 = dbl(7) in y + 1\n", // call in let
+        "fn f(a: bool) -> bool = a\nfn main() -> bool = f(true)\n",  // bool parameter + bool argument
+        "fn f(a: i64, b: i64) -> i64 = a * b + a\nfn main() -> i64 = f(3, 4)\n", // deeper param-using body
+        // dependency order (callee `zzz` first) CONTRADICTS alphabetical, AND the callee has params,
+        // so param_names (symbol-hash-ordered) diverges from names (display-ordered).
+        "fn zzz(a: i64) -> i64 = a\nfn aaa() -> i64 = zzz(5)\n",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        let db = temp.path().join(format!("ref-arg-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-arg-{i}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer call-arguments/params root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate

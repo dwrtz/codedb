@@ -1563,6 +1563,45 @@ is exercised) — plus all regressions (`tests/selfhost_frontend.rs` 19/19). Rem
 call arguments / params-in-multi-function; and a recursion clique of 3+ members (the WL refinement
 generalises, but the ordinal-resolution `aord` shortcut is two-member-specific).
 
+Landed 2026-06-15: CALL ARGUMENTS + function PARAMETERS in a multi-function program (the
+create_function / two-function-DAG path). Until now every multi-function callee was no-parameter and
+every cross-symbol/recursive call no-argument; this adds both. (1) Parameters on a function in a
+two-function program: the callee's typed body resolves `param_ref`s, its FunctionSignature lists the
+parameter type hashes, the ProgramRoot's `param_names` carries the names (still symbol-hash-ordered,
+so they diverge from the display-name-ordered `names` array — exercised when the dependency toposort
+contradicts alphabetical), and the create_function migration's operation/postcondition `params`
+array lists `{name, type}` pairs (name = source slice, type = the raw type NAME — the dual
+serialization). (2) Call arguments: the typed `call` node's `args` array holds the argument
+expressions' content hashes, parsed in the CALLER's scope (so an argument may reference the caller's
+own parameters). The parameter scope is RE-DERIVED from source where needed (`build_fn_objs` and the
+new `build_op_params` find the `(` past the name and run `scan_params`), rather than widening the
+already-large `Sl` carrier with a 120-byte `Scope`. Argument lists are parsed by a LOOP
+(`parse_args`, the proven `parse_add`/`raw_add` shape — fresh-record accumulator, fresh-record
+return) because a self-recursive parser that ALSO calls the clique-member `parse_bitor` through an
+aggregate return miscompiles to a v0 SIGTRAP at depth >= 2. The param-name fragments are threaded
+into the two-symbol ProgramRoot's hash-ordered `param_names` via a small `order_pp` helper (paralleling
+`order_triples`, so each fragment stays paired with its symbol across the display->hash re-sort). Scope:
+i64/bool parameters (a sized-parameter argument would need the callee's parameter type pushed down as
+the argument's expected type — deferred, like the documented axis-1 unification gaps); `raw_call`
+arguments are NOT yet emitted (in any two-function program the canonical-first function — the only one
+whose body the raw serializer touches — never contains a call, so they are not root-reachable; needed
+once a canonical-first function can call, i.e. 3+ functions). Every form was spiked against
+`codedb history --json` / `emit-objects` and the whole increment reproduced byte-exactly in Python
+before any `.cdb`; all 147 functions stayed under the v0 frame budget (validated offline via
+`emit-ir` + the backend-formula replica). One v0 buffer-sizing bug surfaced and was fixed: the
+op-params builder sized its buffer from the SOURCE span, but the `{"name":...,"type":...}` envelope
+makes the output ~4x larger, so a 3-parameter callee overflowed `string_with_capacity` (a SIGTRAP) —
+now sized from the parameter count. Root-hash equality holds across 24 fixtures — parameters on
+independent functions (both source orders, both having parameters, bool/sized parameters), call
+arguments (single / two / three / four / nested / zero), the call in arithmetic / `if` / `let`, an
+argument using the caller's parameter, longer parameter names, and the toposort != alphabetical
+divergence with a parameter-bearing callee — plus all regressions (`tests/selfhost_frontend.rs` 20/20).
+Remaining axis-2 surface: parameters + arguments in RECURSION GROUPS (self- and mutual-recursion —
+`build_rg_member` / `build_rg_root` still parse member bodies with an empty scope and emit empty
+param_names; the recursion-group root is built from objects alone, so no migration/raw body is
+involved); a recursion clique of 3+ members; and `raw_call` arguments (reachable only once a
+migration-bearing canonical-first function can itself call — i.e. 3+ functions).
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text
