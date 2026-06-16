@@ -297,6 +297,60 @@ record WCtx { spans: array<i64, 32>  n: i64  empty: bool  len: i64 }
 record CDAcc { cnt: i64  k: i64 }
 // count_distinct's inner "is there an earlier equal colour" loop accumulator (Copy).
 record DJ { j: i64  dup: bool }
+// ---- Inc 4: clique_label_search (NON-discretizing / symmetric cliques) ----
+// When 1-WL does NOT discretize, the canonical order comes from individualization-refinement
+// (src/lib.rs clique_label_search): a backtracking search that refines (preserve_own = TRUE), and
+// at a discrete leaf scores the labeling by its canonical FORM (each member's body recoloured to
+// peer ORDINALS), breaking automorphism-orbit ties by the member names. The colours are now
+// VARIABLE-LENGTH (the individualization marker "\0ind:<depth>\0<hash>" and clique_form's ordinal
+// colours are not 71 bytes), so a colour concat carries an OFFSET table (colour k = cols[off[k],
+// off[k+1])). The form and key sequence are \0-joined flat strings (form elements and member names
+// are \0-free, so a flat lexicographic compare == Rust's element-wise Vec<String> compare).
+// Fixed (Copy) source context for the search refinement (spans + member count + length).
+record GCtx { spans: array<i64, 32>  n: i64  len: i64 }
+// Variable-length-colour recolour context (Copy): the source spans + count (for peer matching), the
+// colour OFFSET table (colour k = cols[coff[k], coff[k+1])), and the source length.
+record SCtx { spans: array<i64, 32>  n: i64  coff: array<i64, 9>  len: i64 }
+// recolor_vl's result: the recoloured (erased) body + threaded mem + colour concat.
+record RvlN { erased: string  mem: string  cols: string }
+// esc_at's result: the buffer with a colour slice appended JSON-ESCAPED + the threaded colour concat.
+record EscR { out: string  cols: string }
+// member_colour_vl's result: one member's WL colour (71-char hash) + threaded mem + colour concat.
+record MColV { mem: string  cols: string  col: string }
+// round_vl's result: the new 71-char colour concat (uniform offsets) + distinct count + mem.
+record RoundV { mem: string  cols: string  nd: i64 }
+// The individualization-refinement search's best (lex-min) labeling: whether one is set, the
+// \0-joined canonical FORM, the \0-joined member-name sequence (the orbit tie-break), and the order.
+record Best { has: bool  form: string  keyseq: string  order: array<i64, 8> }
+// clique_form's / build_keyseq's results: the \0-joined form / key sequence + threaded mem.
+record FormR { mem: string  form: string }
+record KeyR { mem: string  keyseq: string }
+// build_ordinal_colours's result: the ordinal-colour concat (one digit per member, stride 1) + its
+// offset table.
+record OCol { ocols: string  ocoff: array<i64, 9> }
+// A target cell (Copy): the member local indices sharing the lowest non-singleton colour + the count.
+record Cell { members: array<i64, 8>  cnt: i64 }
+// target_cell's result: the cell + the threaded colour concat (reused to individualize each member).
+record TCR { cell: Cell  cols: string }
+// individualize's result: the individualized colour concat (one colour marked) + its offset table +
+// the threaded ORIGINAL colour concat (reused for the cell's other members).
+record IndR { ind: string  indoff: array<i64, 9>  cols: string }
+// str_cmp's result: a 3-way lexicographic comparison (-1/0/1) with both operands threaded back.
+record CmpR { cmp: i64  a: string  b: string }
+// search / over_cell's result: the threaded mem + the running best labeling.
+record SR { mem: string  best: Best }
+// individualize's fixed (Copy) parameters bundled so ind_at stays under the v0 8-machine-param cap.
+record IndCtx { member: i64  depth: i64  n: i64 }
+// find_run_start / find_run_end's result: a position in the colour-sorted order + threaded colours
+// (the scans are factored out of target_cell so each nested 71-byte compare lives in its own frame).
+record RunR { pos: i64  cols: string }
+// refine_search's result: the converged colours + mem + the distinct-colour count (and whether it
+// discretizes = count == n). The count threads so a child individualization knows its seed's
+// distinct (= parent count + 1) — matching Rust's `classes = distinct(seed)` break condition.
+record RefV { mem: string  colours: string  nd: i64 }
+// The search's per-node Copy context: the individualization depth (for the marker) + the seed's
+// distinct-colour count (the refinement breaks when round 1 does not raise it).
+record DSeed { depth: i64  seedd: i64 }
 
 // ===========================================================================
 // General-m ProgramRoot assembler (Inc 1: the n-function create_function path).
@@ -2099,11 +2153,25 @@ fn refine_n(mem: string, spans: array<i64, 32>, n: i64, len: i64) -> RefN effect
   let ctxf: WCtx = { spans: spans, n: n, empty: false, len: len } in
   let empty0: string = string_with_capacity(8) in
   let r1: RoundN = round_n(mem, empty0, ctxt) in
-  refine_loop(r1.mem, r1.newcols, ctxf, r1.nd, 1)
+  // Rust's refine_clique_colors breaks when a round does NOT raise the distinct count above the prior
+  // (the initial colouring is all-empty -> distinct 1). If round 1 did not differentiate any member
+  // (nd == 1), the partition is already stable: a FULLY-SYMMETRIC clique stays all-one-colour forever
+  // (every member then has the same static_sig AND the same erased body, so every later round re-hashes
+  // them identically). Returning round 1 here — instead of running a further round whose re-hash would
+  // change the (all-same) colour VALUE and so the entire individualization search seeded from it — is
+  // what makes the non-discretizing seed byte-match the Rust importer. (refine_search already guards
+  // its round 1 with `r1.nd == seedd`; this is the preserve_own=false counterpart for the 1-WL seed.)
+  // A discretizing clique raises the count at round 1 (nd > 1), so it still runs the full refine_loop.
+  if r1.nd == 1 then
+    (let r: RefN = { mem: r1.mem, colours: r1.newcols, disc: r1.nd == n } in r)
+  else
+    refine_loop(r1.mem, r1.newcols, ctxf, r1.nd, 1)
 
-// Determine the n-member clique's canonical (WL) order: refine, and if discretizing derive the
-// colour-sorted permutation (colperm = src index at each WL ordinal, via hash_perm over the colour
-// concat) and the base-8 packed aord (using the alphabetical disp_perm). disc = false -> defer.
+// Determine the n-member clique's canonical order: 1-WL refine, and if it DISCRETIZES derive the
+// colour-sorted permutation (colperm = src index at each WL ordinal, via hash_perm) + the base-8
+// packed aord. Otherwise (the symmetric / non-discretizing case) run individualization-refinement
+// (the search) to a canonical order, seeded with the non-discretizing colours; either way disc = true
+// (a single SCC always yields an order — non-single-SCC cliques are deferred before this is called).
 fn clique_order_n(mem: string, spans: array<i64, 32>, n: i64, len: i64) -> CliqN effects[alloc, state] =
   let rf: RefN = refine_n(mem, spans, n, len) in
   if rf.disc then
@@ -2112,7 +2180,15 @@ fn clique_order_n(mem: string, spans: array<i64, 32>, n: i64, len: i64) -> CliqN
     let aord: i64 = clique_aord(cp.perm, dp.perm, n) in
     (let r: CliqN = { mem: dp.mem, disc: true, aord: aord, colperm: cp.perm } in r)
   else
-    (let r: CliqN = { mem: rf.mem, disc: false, aord: 0, colperm: [0x0; 8] } in r)
+    let gctx: GCtx = { spans: spans, n: n, len: len } in
+    let b0: Best = { has: false, form: string_with_capacity(8), keyseq: string_with_capacity(8), order: [0x0; 8] } in
+    let dn: DistN = count_distinct(rf.colours, n) in
+    let ds0: DSeed = { depth: 0, seedd: dn.count } in
+    let sr: SR = search(rf.mem, dn.concat, uniform_coff(n), ds0, b0, gctx) in
+    let order: array<i64, 8> = sr.best.order in
+    let dp: PermM = disp_perm(sr.mem, spans, n) in
+    let aord: i64 = clique_aord(order, dp.perm, n) in
+    (let r: CliqN = { mem: dp.mem, disc: true, aord: aord, colperm: order } in r)
 
 // --- the n-member RecursionGroup object + the root assembly ---
 // Emit the RecursionGroup members in SYMBOL-HASH order (hperm) — recursion over members, reading
@@ -2175,6 +2251,319 @@ fn build_clique_root_n(mem: string, spans: array<i64, 32>, n: i64, len: i64) -> 
     assemble_clique_root(rin, cspans, cm.pnoff, n, cm.rg)
   else
     import_one_or_two(co.mem, len)
+
+// ===========================================================================
+// Inc 4: clique_label_search — the NON-discretizing / symmetric clique case
+// (src/lib.rs:1713). Individualization-refinement: refine (preserve_own = true);
+// at a discrete leaf score the labeling by its canonical FORM (peer calls ->
+// ORDINALS) + the member-name tie-break; else individualize the lowest-coloured
+// non-singleton cell and recurse. Colours are VARIABLE-LENGTH here (the marker /
+// ordinal colours), so a colour concat carries an offset table. The label search
+// produces only the ORDER; the root then reuses the Inc-3 machinery unchanged.
+// ===========================================================================
+
+// The uniform offset table for n 71-char colours: coff[k] = k*71 (k = 0..n).
+fn uc_at(arr: array<i64, 9>, k: i64, n: i64) -> array<i64, 9> =
+  if k > n then arr else uc_at(array_set(arr, k, k * 71), k + 1, n)
+fn uniform_coff(n: i64) -> array<i64, 9> =
+  uc_at([0x0; 9], 0, n)
+
+// Append the colour slice cols[p, e) to `out`, JSON-ESCAPED (a NUL byte -> the 6 chars  ) — the
+// recoloured peer colour is the VALUE of a "name" string in the erased body, which is CANONICAL JSON,
+// so the marker's NUL bytes must serialize as   (matching Rust's serde_json), NOT as a raw NUL.
+// (71-char hash and ordinal colours contain no NUL, so they pass through byte-for-byte.) cols threaded.
+fn esc_at(out: string, cols: string, p: i64, e: i64) -> EscR effects[alloc, state] =
+  if p >= e then (let r: EscR = { out: out, cols: cols } in r)
+  else
+    let b: u8 = string_get(cols, p) in
+    let o2: string = if to_i64(b) == 0 then push_lit(out, b"\\u0000") else push_byte(out, b) in
+    esc_at(o2, cols, p + 1, e)
+
+// Recolour a raw body for VARIABLE-LENGTH colours: each peer call's name -> `@recursion-peer:` +
+// the matched member's colour SLICE cols[coff[k], coff[k+1]) (JSON-escaped via esc_at). Generalizes
+// recolor_at_n (no empty flag — the search always reads real colours; slice bounds from sctx's offsets).
+fn recolor_at_vl(raw: string, mem: string, cols: string, sctx: SCtx, i: i64, rawlen: i64, out: string) -> RvlN effects[alloc, state] =
+  if i >= rawlen then (let r: RvlN = { erased: out, mem: mem, cols: cols } in r)
+  else
+    let iscall: bool =
+      if i + 22 <= rawlen then
+        (to_i64(string_get(raw, i)) == 34 && to_i64(string_get(raw, i + 1)) == 107
+         && to_i64(string_get(raw, i + 2)) == 105 && to_i64(string_get(raw, i + 3)) == 110
+         && to_i64(string_get(raw, i + 4)) == 100 && to_i64(string_get(raw, i + 5)) == 34
+         && to_i64(string_get(raw, i + 6)) == 58 && to_i64(string_get(raw, i + 7)) == 34
+         && to_i64(string_get(raw, i + 8)) == 99 && to_i64(string_get(raw, i + 9)) == 97
+         && to_i64(string_get(raw, i + 10)) == 108 && to_i64(string_get(raw, i + 11)) == 108
+         && to_i64(string_get(raw, i + 12)) == 34)
+      else false
+    in
+    if iscall then
+      let fq: Lc =
+        loop k = { j: i + 22, c: 2 } while k.c == 2 do
+          if k.j >= rawlen then (let s: Lc = { j: k.j, c: 0 } in s)
+          else if to_i64(string_get(raw, k.j)) == 34 then (let s: Lc = { j: k.j, c: 1 } in s)
+          else (let s: Lc = { j: k.j + 1, c: 2 } in s)
+      in
+      let jq: i64 = fq.j in
+      let wm: WMemN = which_member_n(raw, mem, sctx.spans, sctx.n, i + 22, jq, 0) in
+      let o1: string = push_lit(out, b"\"kind\":\"call\",\"name\":\"@recursion-peer:") in
+      let pr: EscR = esc_at(o1, cols, sctx.coff[wm.k], sctx.coff[wm.k + 1]) in
+      recolor_at_vl(wm.raw, wm.mem, pr.cols, sctx, jq, rawlen, pr.out)
+    else
+      let byte: u8 = string_get(raw, i) in
+      recolor_at_vl(raw, mem, cols, sctx, i + 1, rawlen, push_byte(out, byte))
+
+fn recolor_vl(raw: string, mem: string, cols: string, sctx: SCtx) -> RvlN effects[alloc, state] =
+  let rawlen: i64 = string_len(raw) in
+  let out: string = string_with_capacity(rawlen * 4 + 512) in
+  recolor_at_vl(raw, mem, cols, sctx, 0, rawlen, out)
+
+// One member's WL colour for the search refinement (preserve_own = TRUE): hash(domain | own_colour |
+// static_sig | erased), the own colour read as the member's slice of the seed colours.
+fn member_colour_vl(mem: string, k: i64, cols: string, sctx: SCtx) -> MColV effects[alloc, state] =
+  let sl: Sl = sl_at(sctx.spans, k) in
+  let rb: Rr = raw_bitor(mem, sl.bs, sctx.len) in
+  let rc: RvlN = recolor_vl(rb.raw, rb.mem, cols, sctx) in
+  let pr: PpR = derive_params(rc.mem, sl.ne, sctx.len) in
+  let sig: string = build_rec_sig(sl.rtc, pr.ps) in
+  let ownlen: i64 = sctx.coff[k + 1] - sctx.coff[k] in
+  let siglen: i64 = string_len(sig) in
+  let erlen: i64 = string_len(rc.erased) in
+  let p0: string = string_with_capacity(ownlen + siglen + erlen + 16) in
+  let pa: PRR = push_range(p0, rc.cols, sctx.coff[k], sctx.coff[k + 1]) in
+  let p1: string = push_byte(pa.out, to_u8(124)) in
+  let p2: string = push_str(p1, sig) in
+  let p3: string = push_byte(p2, to_u8(124)) in
+  let p4: string = push_str(p3, rc.erased) in
+  let h: string = hash_domain(b"codedb/recursion-order/v1\0", p4) in
+  let r: MColV = { mem: pr.mem, cols: pa.mem, col: h } in r
+
+// One search refinement round: build the new 71-char colour concat (recursion over members), then
+// count its distinct colours. Mirrors round_n but with preserve_own colours via member_colour_vl.
+fn round_build_vl(mem: string, cols: string, sctx: SCtx, k: i64, acc: string) -> RB2 effects[alloc, state] =
+  if k >= sctx.n then (let r: RB2 = { mem: mem, acc: acc } in r)
+  else
+    let mc: MColV = member_colour_vl(mem, k, cols, sctx) in
+    let acc2: string = push_str(acc, mc.col) in
+    round_build_vl(mc.mem, mc.cols, sctx, k + 1, acc2)
+
+fn round_vl(mem: string, cols: string, sctx: SCtx) -> RoundV effects[alloc, state] =
+  let acc0: string = string_with_capacity(sctx.n * 71 + 16) in
+  let rb: RB2 = round_build_vl(mem, cols, sctx, 0, acc0) in
+  let dn: DistN = count_distinct(rb.acc, sctx.n) in
+  let r: RoundV = { mem: rb.mem, cols: dn.concat, nd: dn.count } in r
+
+// The search refinement driver (rounds 2+, uniform 71-char offsets): refine until the distinct
+// count stabilizes or the n-round limit. (Round 1 — with the variable-length seed — is in refine_search.)
+fn refine_search_loop(mem: string, cols: string, sctxu: SCtx, prevd: i64, round: i64) -> RefV effects[alloc, state] =
+  if round >= sctxu.n then (let r: RefV = { mem: mem, colours: cols, nd: prevd } in r)
+  else
+    let rk: RoundV = round_vl(mem, cols, sctxu) in
+    if rk.nd == prevd then (let r: RefV = { mem: rk.mem, colours: rk.cols, nd: rk.nd } in r)
+    else refine_search_loop(rk.mem, rk.cols, sctxu, rk.nd, round + 1)
+
+// Run the search refinement to stability (preserve_own): round 1 with the VARIABLE-LENGTH seed
+// (scols/scoff). Per Rust's refine_clique_colors, the colour count starts at the SEED's distinct
+// count (`seedd`): if round 1 does NOT raise it, refinement has already converged — return round 1
+// (NOT a further round, whose re-hash would change the colour values and so the order). Otherwise
+// run the uniform-offset driver. Returns the converged colours + their distinct count + mem.
+fn refine_search(mem: string, scols: string, scoff: array<i64, 9>, seedd: i64, gctx: GCtx) -> RefV effects[alloc, state] =
+  let sctx1: SCtx = { spans: gctx.spans, n: gctx.n, coff: scoff, len: gctx.len } in
+  let r1: RoundV = round_vl(mem, scols, sctx1) in
+  if r1.nd == seedd then (let r: RefV = { mem: r1.mem, colours: r1.cols, nd: r1.nd } in r)
+  else
+    let sctxu: SCtx = { spans: gctx.spans, n: gctx.n, coff: uniform_coff(gctx.n), len: gctx.len } in
+    refine_search_loop(r1.mem, r1.cols, sctxu, r1.nd, 1)
+
+// The inverse of an order: inv[order[ordinal]] = ordinal (so member `local`'s ordinal is inv[local]).
+fn build_inv(order: array<i64, 8>, n: i64) -> array<i64, 8> =
+  inv_at([0x0; 8], order, 0, n)
+fn inv_at(inv: array<i64, 8>, order: array<i64, 8>, ord: i64, n: i64) -> array<i64, 8> =
+  if ord >= n then inv else inv_at(array_set(inv, order[ord], ord), order, ord + 1, n)
+
+// The ordinal colours for clique_form: colour of member `local` = its ordinal (a single digit, since
+// n <= 8), so the concat is n digits (stride 1) and coff[k] = k.
+fn build_ordinal_colours(inv: array<i64, 8>, n: i64) -> OCol effects[alloc, state] =
+  let cols: string = boc_at(string_with_capacity(16), inv, 0, n) in
+  let r: OCol = { ocols: cols, ocoff: uc_at1([0x0; 9], 0, n) } in r
+fn boc_at(acc: string, inv: array<i64, 8>, local: i64, n: i64) -> string effects[alloc, state] =
+  if local >= n then acc
+  else boc_at(push_byte(acc, to_u8(48 + inv[local])), inv, local + 1, n)
+fn uc_at1(arr: array<i64, 9>, k: i64, n: i64) -> array<i64, 9> =
+  if k > n then arr else uc_at1(array_set(arr, k, k), k + 1, n)
+
+// Build the clique's canonical FORM for `order` as a \0-joined string: for each member in ORDINAL
+// order, `static_sig | (body recoloured to peer ORDINALS)`, then a \0 separator. (Form elements are
+// \0-free, so a flat lexicographic compare reproduces Rust's element-wise Vec<String> compare.)
+fn form_at(mem: string, order: array<i64, 8>, ocols: string, ocoff: array<i64, 9>, gctx: GCtx, ordinal: i64, acc: string) -> FormR effects[alloc, state] =
+  if ordinal >= gctx.n then (let r: FormR = { mem: mem, form: acc } in r)
+  else
+    let local: i64 = order[ordinal] in
+    let sl: Sl = sl_at(gctx.spans, local) in
+    let rb: Rr = raw_bitor(mem, sl.bs, gctx.len) in
+    let sctxo: SCtx = { spans: gctx.spans, n: gctx.n, coff: ocoff, len: gctx.len } in
+    let rc: RvlN = recolor_vl(rb.raw, rb.mem, ocols, sctxo) in
+    let pr: PpR = derive_params(rc.mem, sl.ne, gctx.len) in
+    let sig: string = build_rec_sig(sl.rtc, pr.ps) in
+    let a1: string = push_str(acc, sig) in
+    let a2: string = push_byte(a1, to_u8(124)) in
+    let a3: string = push_str(a2, rc.erased) in
+    let a4: string = push_byte(a3, to_u8(0)) in
+    form_at(pr.mem, order, rc.cols, ocoff, gctx, ordinal + 1, a4)
+
+fn clique_form(mem: string, order: array<i64, 8>, gctx: GCtx) -> FormR effects[alloc, state] =
+  let inv: array<i64, 8> = build_inv(order, gctx.n) in
+  let oc: OCol = build_ordinal_colours(inv, gctx.n) in
+  form_at(mem, order, oc.ocols, oc.ocoff, gctx, 0, string_with_capacity(gctx.n * 256 + 16))
+
+// The \0-joined member-name sequence in ordinal order (the orbit tie-break = the names, since every
+// member_key shares the `main\0` module prefix). Names are \0-free, so a flat compare suffices.
+fn build_keyseq(mem: string, order: array<i64, 8>, gctx: GCtx, ordinal: i64, acc: string) -> KeyR effects[alloc, state] =
+  if ordinal >= gctx.n then (let r: KeyR = { mem: mem, keyseq: acc } in r)
+  else
+    let sl: Sl = sl_at(gctx.spans, order[ordinal]) in
+    let pr: PRR = push_range(acc, mem, sl.ns, sl.ne) in
+    let a2: string = push_byte(pr.out, to_u8(0)) in
+    build_keyseq(pr.mem, order, gctx, ordinal + 1, a2)
+
+// The first position p in the colour-sorted order where slice perm[p] == slice perm[p+1] (the
+// smallest repeated colour). Colours read INLINE via string_get (no move-only loop accumulator);
+// cols threaded back. Factored out of target_cell so its nested 71-byte compare has its own frame.
+fn find_run_start(cols: string, perm: array<i64, 8>, n: i64) -> RunR effects[state] =
+  let fr: Lc =
+    loop a = { j: 0, c: 2 } while a.c == 2 do
+      if a.j + 1 >= n then (let s: Lc = { j: a.j, c: 0 } in s)
+      else
+        let eqp: Lc =
+          loop b = { j: 0, c: 2 } while b.c == 2 do
+            if b.j >= 71 then (let s: Lc = { j: b.j, c: 1 } in s)
+            else if to_i64(string_get(cols, perm[a.j] * 71 + b.j)) == to_i64(string_get(cols, perm[a.j + 1] * 71 + b.j)) then (let s: Lc = { j: b.j + 1, c: 2 } in s)
+            else (let s: Lc = { j: b.j, c: 0 } in s)
+        in
+        if eqp.c == 1 then (let s: Lc = { j: a.j, c: 1 } in s)
+        else (let s: Lc = { j: a.j + 1, c: 2 } in s)
+  in
+  let r: RunR = { pos: fr.j, cols: cols } in r
+
+// The first position k >= start whose colour differs from perm[start]'s (the run end), or n. Same
+// inline-compare structure; cols threaded back.
+fn find_run_end(cols: string, perm: array<i64, 8>, n: i64, start: i64) -> RunR effects[state] =
+  let endf: Lc =
+    loop a = { j: start, c: 2 } while a.c == 2 do
+      if a.j >= n then (let s: Lc = { j: a.j, c: 1 } in s)
+      else
+        let eqp: Lc =
+          loop b = { j: 0, c: 2 } while b.c == 2 do
+            if b.j >= 71 then (let s: Lc = { j: b.j, c: 1 } in s)
+            else if to_i64(string_get(cols, perm[a.j] * 71 + b.j)) == to_i64(string_get(cols, perm[start] * 71 + b.j)) then (let s: Lc = { j: b.j + 1, c: 2 } in s)
+            else (let s: Lc = { j: b.j, c: 0 } in s)
+        in
+        if eqp.c == 1 then (let s: Lc = { j: a.j + 1, c: 2 } in s)
+        else (let s: Lc = { j: a.j, c: 1 } in s)
+  in
+  let r: RunR = { pos: endf.j, cols: cols } in r
+
+// The target cell: the lowest-coloured class with > 1 member. hash_perm sorts the 71-char colours;
+// find the first >= 2 run (find_run_start..find_run_end) and collect its members (the collect loop
+// reads only the Copy permutation). cols threaded back for individualizing the cell's members.
+fn target_cell(cols: string, n: i64) -> TCR effects[alloc, state] =
+  let hp: PermS = hash_perm(cols, n) in
+  let rs: RunR = find_run_start(hp.s, hp.perm, n) in
+  let re: RunR = find_run_end(rs.cols, hp.perm, n, rs.pos) in
+  let coll: Cell =
+    loop a = { members: [0x0; 8], cnt: 0 } while a.cnt < re.pos - rs.pos do
+      let cur: Cell = a in
+      let nm: array<i64, 8> = array_set(cur.members, cur.cnt, hp.perm[rs.pos + cur.cnt]) in
+      (let s: Cell = { members: nm, cnt: cur.cnt + 1 } in s)
+  in
+  let r: TCR = { cell: coll, cols: re.cols } in r
+
+// Individualize member `member`: rebuild the colour concat with that member's colour prefixed by the
+// marker "\0ind:<depth>\0" (depth <= 7 for n <= 8, so a single digit), recomputing the offset table;
+// the ORIGINAL concat threads back for the cell's other members. Mirrors the Rust individualization.
+fn individualize(cols: string, member: i64, depth: i64, n: i64) -> IndR effects[alloc, state] =
+  let ic: IndCtx = { member: member, depth: depth, n: n } in
+  ind_at(cols, ic, 0, string_with_capacity(n * 71 + 32), [0x0; 9], 0)
+fn ind_at(cols: string, ic: IndCtx, k: i64, acc: string, off: array<i64, 9>, pos: i64) -> IndR effects[alloc, state] =
+  if k >= ic.n then (let r: IndR = { ind: acc, indoff: array_set(off, ic.n, pos), cols: cols } in r)
+  else
+    let off2: array<i64, 9> = array_set(off, k, pos) in
+    if k == ic.member then
+      let m0: string = push_byte(acc, to_u8(0)) in
+      let m1: string = push_lit(m0, b"ind:") in
+      let m2: string = push_dec(m1, ic.depth) in
+      let m3: string = push_byte(m2, to_u8(0)) in
+      let pr: PRR = push_range(m3, cols, k * 71, k * 71 + 71) in
+      ind_at(pr.mem, ic, k + 1, pr.out, off2, pos + 78)
+    else
+      let pr: PRR = push_range(acc, cols, k * 71, k * 71 + 71) in
+      ind_at(pr.mem, ic, k + 1, pr.out, off2, pos + 71)
+
+// A 3-way lexicographic comparison of two flat strings (-1 = a<b, 0 = equal, 1 = a>b; shorter-is-
+// smaller on a prefix), threading both operands back. Used for the (form, keyseq) lex-min selection.
+fn str_cmp(a: string, b: string) -> CmpR effects[state] =
+  let la: i64 = string_len(a) in
+  let lb: i64 = string_len(b) in
+  let done: Lc =
+    loop k = { j: 0, c: 2 } while k.c == 2 do
+      let ad: bool = k.j >= la in
+      let bd: bool = k.j >= lb in
+      if ad then (if bd then (let s: Lc = { j: k.j, c: 3 } in s) else (let s: Lc = { j: k.j, c: 0 } in s))
+      else if bd then (let s: Lc = { j: k.j, c: 1 } in s)
+      else
+        let x: i64 = to_i64(string_get(a, k.j)) in
+        let y: i64 = to_i64(string_get(b, k.j)) in
+        if x < y then (let s: Lc = { j: k.j, c: 0 } in s)
+        else if x > y then (let s: Lc = { j: k.j, c: 1 } in s)
+        else (let s: Lc = { j: k.j + 1, c: 2 } in s)
+  in
+  let cmp: i64 = if done.c == 0 then 0 - 1 else if done.c == 1 then 1 else 0 in
+  let r: CmpR = { cmp: cmp, a: a, b: b } in r
+
+// Update the search best with a discrete leaf's (form, keyseq, order): keep the lex-min (form, keyseq).
+// best's strings are fully consumed (moved out or dropped) so there is no partial-move ambiguity.
+fn update_best(best: Best, form: string, keyseq: string, order: array<i64, 8>) -> Best effects[state] =
+  let bh: bool = best.has in
+  let bf: string = best.form in
+  let bk: string = best.keyseq in
+  let bo: array<i64, 8> = best.order in
+  if bh then
+    let fc: CmpR = str_cmp(form, bf) in
+    if fc.cmp < 0 then
+      (let r: Best = { has: true, form: fc.a, keyseq: keyseq, order: order } in r)
+    else if fc.cmp > 0 then
+      (let r: Best = { has: true, form: fc.b, keyseq: bk, order: bo } in r)
+    else
+      let kc: CmpR = str_cmp(keyseq, bk) in
+      if kc.cmp < 0 then (let r: Best = { has: true, form: fc.a, keyseq: kc.a, order: order } in r)
+      else (let r: Best = { has: true, form: fc.b, keyseq: kc.b, order: bo } in r)
+  else
+    (let r: Best = { has: true, form: form, keyseq: keyseq, order: order } in r)
+
+// One node of the individualization-refinement search: refine (preserve_own); at a discrete leaf
+// score the labeling (sort by colour -> order; form + keyseq; update best); else individualize the
+// target cell's members and recurse. Threads mem + the running best.
+fn search(mem: string, scols: string, scoff: array<i64, 9>, ds: DSeed, best: Best, gctx: GCtx) -> SR effects[alloc, state] =
+  let rf: RefV = refine_search(mem, scols, scoff, ds.seedd, gctx) in
+  if rf.nd == gctx.n then
+    let hp: PermS = hash_perm(rf.colours, gctx.n) in
+    let fr: FormR = clique_form(rf.mem, hp.perm, gctx) in
+    let ks: KeyR = build_keyseq(fr.mem, hp.perm, gctx, 0, string_with_capacity(gctx.n * 16 + 8)) in
+    let nb: Best = update_best(best, fr.form, ks.keyseq, hp.perm) in
+    (let r: SR = { mem: ks.mem, best: nb } in r)
+  else
+    let tcr: TCR = target_cell(rf.colours, gctx.n) in
+    // a child individualizes a member of the (multi-member) target cell, splitting its class -> the
+    // child's seed has exactly one more distinct colour than this node's (rf.nd + 1).
+    let cds: DSeed = { depth: ds.depth, seedd: rf.nd + 1 } in
+    over_cell(rf.mem, tcr.cols, tcr.cell, cds, best, gctx, 0)
+
+fn over_cell(mem: string, cols: string, cell: Cell, ds: DSeed, best: Best, gctx: GCtx, idx: i64) -> SR effects[alloc, state] =
+  if idx >= cell.cnt then (let r: SR = { mem: mem, best: best } in r)
+  else
+    let ind: IndR = individualize(cols, cell.members[idx], ds.depth, gctx.n) in
+    let cds: DSeed = { depth: ds.depth + 1, seedd: ds.seedd } in
+    let sr: SR = search(mem, ind.ind, ind.indoff, cds, best, gctx) in
+    over_cell(sr.mem, ind.cols, cell, ds, sr.best, gctx, idx + 1)
 
 // Build the three content hashes for one no-param `fn <name>() -> <rtc> = <body>`: its
 // SymbolBirth (birth history `bh`, ordinal `ordv`), its body Expression (RE-PARSED from the
@@ -4065,6 +4454,9 @@ fn single3scc(mask: i64) -> bool =
 // cyclic functions) are routed away as a defined — if not yet correct — fallback (Inc 4). One or
 // two functions take the original path (which detects self/mutual recursion). Eight is the current
 // ceiling (the packed spans hold eight functions).
+// TEMP PROBE (Inc 4 debugging): individualize member `member` on the seed colours, run the full
+// preserve_own refine to convergence, sort -> leaf order, and append " L<member>=<p0><p1><p2> c=<
+// last12 of converged colour for local 0,1,2>" to `out`. Threads mem + the (unconsumed) seed cols.
 fn import_root(mem: string) -> string effects[alloc, state] =
   let len: i64 = string_len(mem) in
   let prog: Prog = parse_all(mem, len) in
@@ -4074,20 +4466,15 @@ fn import_root(mem: string) -> string effects[alloc, state] =
       let cspans: array<i64, 32> = reorder_spans(prog.spans, topo.perm, prog.n) in
       build_chain_root(topo.mem, cspans, prog.n)
     else
-      // cyclic: a recursion group. A SINGLE n-member SCC whose 1-WL refinement discretizes is a
-      // create_recursion_group; n == 3 (Inc 2) and 4 <= n <= 8 (Inc 3) build the clique root, the
-      // latter with the real symbol-hash member ordering. Other cyclic shapes (non-discretizing /
-      // symmetric, or multiple SCCs) defer to the one/two-function fallback (Inc 4).
-      if prog.n == 3 then
-        let adj: Adj = adjN(topo.mem, prog.spans, 3, len) in
-        let mok: string = adj.mem in
-        if single3scc(adj.mask) then build_clique3_root(mok, prog.spans, len)
-        else import_one_or_two(mok, len)
-      else
-        let adjn: Adj = adjN(topo.mem, prog.spans, prog.n, len) in
-        let mokn: string = adjn.mem in
-        if single_scc_n(adjn.mask, prog.n) then build_clique_root_n(mokn, prog.spans, prog.n, len)
-        else import_one_or_two(mokn, len)
+      // cyclic: a recursion group. A SINGLE n-member SCC (3 <= n <= 8) is a create_recursion_group,
+      // ordered by the canonical clique order — 1-WL refinement when it discretizes (Inc 2/3), else
+      // individualization-refinement (Inc 4). build_clique_root_n handles BOTH regimes for any n >= 3
+      // (for n = 3 the symbol-hash member order coincides with the ordinal order, reproducing the
+      // earlier n = 3 path). Multiple-SCC cliques (not a single recursion group) defer to the fallback.
+      let adjn: Adj = adjN(topo.mem, prog.spans, prog.n, len) in
+      let mokn: string = adjn.mem in
+      if single_scc_n(adjn.mask, prog.n) then build_clique_root_n(mokn, prog.spans, prog.n, len)
+      else import_one_or_two(mokn, len)
   else
     import_one_or_two(prog.mem, len)
 

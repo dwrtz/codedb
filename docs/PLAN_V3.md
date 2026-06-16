@@ -1795,9 +1795,41 @@ cap (10 and 9) — fixed by bundling the (spans, n, empty, len) context into one
 Every function stayed under the v0 frame budget first try (max `parse_all` 4048). The n=2 and n=3
 clique paths are untouched (save the transparent base-8 `aord`).
 
-Remaining (increment 4): `clique_label_search` — the non-discretizing / fully-symmetric cliques (the
-backtracking individualization-refinement graph canonicalisation that `canonical_clique_order` falls
-back to when 1-WL does not discretise), currently routed to the defined fallback.
+Landed 2026-06-16 (increment 4): the NON-DISCRETISING / vertex-symmetric recursion clique —
+`clique_label_search`, the backtracking individualization-refinement that `canonical_clique_order`
+falls back to when 1-WL leaves members sharing a colour (a pure directed n-cycle, or the complete
+clique K_n). At each search node: refine to stability with the own colour folded in (`refine_search` →
+`round_vl` → `member_colour_vl`, preserve_own); at a discrete leaf sort members by colour into a
+labeling, score it by its canonical FORM — each body with peer calls recoloured to the peer's ORDINAL
+(`clique_form`/`form_at`/`build_ordinal_colours`) — with the member-name sequence (`build_keyseq`) as
+the automorphism-orbit tie-break, and keep the lex-min (form, key) over EVERY branch
+(`update_best`/`str_cmp`); else individualize each member of the lowest-coloured non-singleton cell
+(`target_cell`/`over_cell`/`individualize`), pinning it with a depth-tagged marker
+`\0ind:<depth>\0<colour>` and recursing. Colours are VARIABLE-LENGTH here (the marker, and the
+single-digit ordinal colours of the form), so a colour concat carries an offset table (`SCtx.coff`);
+the recoloured peer colour is the value of a "name" string in the erased body, which is canonical JSON,
+so its NUL bytes serialise as `\u0000` (`esc_at`) while the own colour in the `|`-joined hash preimage
+stays raw — matching Rust's serde_json-vs-format! split exactly. The search produces only the ORDER;
+the root reuses the increment-3 machinery (`build_clique_root_n`/`assemble_clique_root`) unchanged. The
+whole label search was reproduced byte-exactly in Python against the Rust oracle for n = 3…8 cycles and
+K3 before any `.cdb`. The KEYSTONE defect lived not in the new Inc-4 code (all logic-correct) but in
+the SHARED 1-WL seed `refine_n` (preserve_own=false): Rust's `refine_clique_colors` breaks the moment a
+round fails to RAISE the distinct count above the prior (the initial colouring is all-empty → distinct
+1), so a symmetric clique's seed is ROUND 1; `refine_n` always ran one further round and returned its
+re-hash, changing the all-same colour VALUE and thus the rotation the search seeded from it chooses.
+Invisible to the discretising cliques (they raise the count at round 1, so the extra round never fires —
+increments 2/3 stayed green), it corrupted every symmetric clique (bool-3-cycle passed by luck, the
+wrong seed still sorting into the right rotation; i64-3-/5-/6-cycle and K3 failed). It was found by
+routing the n=3 case to a temporary probe that dumped the `.cdb`'s intermediate WL colours and
+bisecting against the Python model — the very first preserve_own colour already diverged → the seed.
+The fix mirrors `refine_search`'s existing `r1.nd == seedd` round-1 guard. (A probe gotcha recurred:
+`print_str` has a fixed 96-byte output buffer sized for the 71-char root, so a long debug string
+overflows `array_set` and SIGTRAPs with no output — keep probe output ≤ 95 bytes.) All 21
+`selfhost_frontend` importer-root tests green (incl. the new
+`importer_reproduces_the_root_hash_for_symmetric_cliques` — n = 3/4/5/6/8 cycles, K3, bool members,
+source-order permutations), local smoke 24/24, every function under the v0 frame budget (max
+`parse_all` 4048). With increment 4 the recursion-clique surface — any single n-member SCC, n in
+[1, 8], discretising OR fully-symmetric — is COMPLETE.
 
 Sub-stages (each independently oracle-checked at its artifact):
 

@@ -1554,6 +1554,66 @@ fn importer_reproduces_the_root_hash_for_n_member_cliques() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_symmetric_cliques() {
+    // 15a.4 (Inc 4): a NON-DISCRETIZING (vertex-symmetric) recursion clique — one whose 1-WL colour
+    // refinement does NOT separate the members (every member is structurally identical: a pure directed
+    // n-cycle, or the complete clique K_n). The importer falls back from the colour sort to
+    // individualization-refinement (clique_label_search): refine to stability (preserve_own), and at a
+    // discrete leaf score the labeling by its canonical FORM (peer calls -> ordinals) with the member-
+    // name sequence as the automorphism-orbit tie-break; the lex-min (form, key) over every branch is
+    // the order. The keystone is that the 1-WL SEED must byte-match the Rust importer:
+    // refine_clique_colors stops the moment a round fails to RAISE the distinct count, so a symmetric
+    // clique's seed is round 1 (all-one-colour), NOT a re-hashed later round — and the whole search is
+    // seeded from it, so an off-by-one round there changes the colour VALUES and the chosen rotation.
+    // Covers pure cycles n = 3/4/5/6/8, the fully-symmetric K3, bool members, and source-order
+    // permutations (the canonical order is order-independent).
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        // n = 3 pure cycle (i64) — 1-WL stays one colour; individualization picks the reverse rotation
+        "fn a() -> i64 = b()\nfn b() -> i64 = c()\nfn c() -> i64 = a()\n",
+        // n = 3 pure cycle, source-order permuted (canonical order is order-independent)
+        "fn c() -> i64 = a()\nfn a() -> i64 = b()\nfn b() -> i64 = c()\n",
+        // n = 3 pure cycle, bool members (same structure, different colours -> a different rotation)
+        "fn a() -> bool = b()\nfn b() -> bool = c()\nfn c() -> bool = a()\n",
+        // the fully-symmetric K3: each member calls BOTH others (automorphism group S3, so the search
+        // individualizes more than once before the partition discretizes)
+        "fn a() -> i64 = b() + c()\nfn b() -> i64 = c() + a()\nfn c() -> i64 = a() + b()\n",
+        // n = 4 pure cycle
+        "fn a() -> i64 = b()\nfn b() -> i64 = c()\nfn c() -> i64 = d()\nfn d() -> i64 = a()\n",
+        // n = 5 pure cycle
+        "fn a() -> i64 = b()\nfn b() -> i64 = c()\nfn c() -> i64 = d()\nfn d() -> i64 = e()\nfn e() -> i64 = a()\n",
+        // n = 6 pure cycle
+        "fn a() -> i64 = b()\nfn b() -> i64 = c()\nfn c() -> i64 = d()\nfn d() -> i64 = e()\nfn e() -> i64 = f()\nfn f() -> i64 = a()\n",
+        // n = 8 pure cycle (the packed-spans / base-8-aord ceiling)
+        "fn a() -> i64 = b()\nfn b() -> i64 = c()\nfn c() -> i64 = d()\nfn d() -> i64 = e()\nfn e() -> i64 = f()\nfn f() -> i64 = g()\nfn g() -> i64 = h()\nfn h() -> i64 = a()\n",
+        // n = 4 pure cycle, bool members
+        "fn a() -> bool = b()\nfn b() -> bool = c()\nfn c() -> bool = d()\nfn d() -> bool = a()\n",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        let db = temp.path().join(format!("ref-symclq-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-symclq-{i}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer symmetric-clique root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate
