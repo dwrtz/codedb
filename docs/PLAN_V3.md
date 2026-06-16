@@ -1764,9 +1764,40 @@ again the dominant cost: `clique3_colours` first lowered to a 6400-byte frame (3
 seven 272-byte record locals), fixed offline (the frame sweep, never the slow build) by factoring the
 name-building (`build_names3`), rounds 1+2 (`wl_two`), and the member/accumulator construction
 (`build_clique3_members`) into their own frames — every function back under 4095 (max `parse_all`
-4048). Remaining (increment 3 onward): four-or-more-member discretizing cliques (the real symbol-hash
-sort — for four or more the recursion-group symbols are no longer in ordinal order) and
-`clique_label_search` (the non-discretizing / fully-symmetric cliques).
+4048). 
+
+Landed 2026-06-16 (increment 3): the GENERAL n-member discretizing recursion clique (n in [4, 8]).
+A cyclic program forming a single n-member SCC whose 1-WL refinement discretizes is now reproduced
+exactly for any n up to eight (`selfhost_frontend` 26/26, local smoke 27/27). The WL refinement
+generalizes from the n=3 unrolled form to a RECURSION over n members with the n colours held as a
+concat of 71-char hashes (the "syms accumulator" pattern): each round (`round_n` → `round_build` →
+`member_colour_n`) appends each member's colour, the recolour (`recolor_at_n`) matches a peer call's
+name against the source member name ranges and emits that member's colour SLICE, and the round
+driver (`refine_n`/`refine_loop`) recurses until the distinct-colour count stabilizes (≤ n rounds) —
+recursion throughout, so the move-only colour concat never forms a loop accumulator. The single SCC
+is detected by `single_scc_n` (node 0 reaches everyone AND everyone reaches node 0, via a forward and
+a transposed reachability closure). The genuinely new wrinkle versus n=3 is the REAL symbol-hash
+member ordering: the `recursion_group:<ordinal>` symbol hashes are no longer in ordinal order for
+n ≥ 4 (they coincide only at n=3), so BOTH the RecursionGroup object's members and the ProgramRoot's
+param_names/symbols arrays are sorted by symbol hash (reusing `hash_perm`), while names stays
+display-ordered (`disp_perm`); the root assembly reuses the n-function `assemble_clique_root`
+unchanged. A latent n=3 detail surfaced: the n=3 `build_recursion_group3` emits its members in
+ordinal order, which is correct only because ordinal order = hash order at n=3 — the general
+`build_recursion_group_n` sorts by hash, the right rule for all n. The packed alpha-rank → ordinal
+`aord` widened from base 4 to base 8 (3 bits per ordinal, up to eight members; `parse_call` decodes
+`(aord >> 3·rank) & 7`), a transparent re-encoding of the two-member and n=3 producers verified
+against every regression. The whole algorithm — the refinement data flow modelled exactly as the
+`.cdb` computes it, the base-8 `aord`, the n-node SCC, and the full root — was reproduced byte-exactly
+in Python (n = 3…8) before any `.cdb`. Two v0 realities recurred, both caught offline before a slow
+build: the `build_recursion_group_n` buffer was sized from the wrong worst case (n·240 → n·300, since
+each member entry is ~257 bytes), and `recolor_at_n` / `round_build` exceeded the 8-machine-parameter
+cap (10 and 9) — fixed by bundling the (spans, n, empty, len) context into one Copy `WCtx` record.
+Every function stayed under the v0 frame budget first try (max `parse_all` 4048). The n=2 and n=3
+clique paths are untouched (save the transparent base-8 `aord`).
+
+Remaining (increment 4): `clique_label_search` — the non-discretizing / fully-symmetric cliques (the
+backtracking individualization-refinement graph canonicalisation that `canonical_clique_order` falls
+back to when 1-WL does not discretise), currently routed to the defined fallback.
 
 Sub-stages (each independently oracle-checked at its artifact):
 

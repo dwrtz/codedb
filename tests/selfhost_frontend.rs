@@ -1499,6 +1499,61 @@ fn importer_reproduces_the_root_hash_for_three_member_cliques() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_n_member_cliques() {
+    // 15a.4 (Inc 3): a DISCRETIZING recursion clique of FOUR OR MORE members (n in [4, 8]). The WL
+    // refinement generalizes from the n=3 unrolled form to a RECURSION over n members with the n
+    // colours held as a concat of 71-char hashes (each round recoloured by reading a peer's colour
+    // slice). A single n-member SCC is detected by `single_scc_n` (node 0 reaches everyone and
+    // everyone reaches node 0). The genuinely new wrinkle versus n = 3 is the REAL symbol-hash
+    // member ordering: the recursion_group:<ordinal> symbol hashes are no longer in ordinal order
+    // for n >= 4 (they coincide only at n = 3), so the RecursionGroup object's members AND the
+    // ProgramRoot's param_names / symbols arrays are sorted by SYMBOL HASH (via hash_perm) while
+    // names stays display-ordered. A peer call resolves to its ordinal through the base-8 packed
+    // alpha-rank -> ordinal map (3 bits per ordinal, up to eight members). Both births are genesis,
+    // so the root is built from objects alone (no migration chain). Covers n = 4/5/6/8, source-order
+    // permutations, parameters called with arguments, bool members, and if / arithmetic bodies.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        // n = 4 four-cycle (arithmetic bodies)
+        "fn a() -> i64 = b() + 1\nfn b() -> i64 = c() * 2\nfn c() -> i64 = d()\nfn d() -> i64 = a()\n",
+        // n = 4 with parameters, if, and cross-member calls with arguments
+        "fn a(n: i64) -> i64 = if n == 0 then 1 else b(n - 1)\nfn b(n: i64) -> i64 = if n == 0 then 2 else c(n - 1)\nfn c(n: i64) -> i64 = if n == 0 then 3 else d(n - 1)\nfn d(n: i64) -> i64 = if n == 0 then 4 else a(n - 1)\n",
+        // n = 4 source-order permutation of the four-cycle (canonical order is order-independent)
+        "fn c() -> i64 = d()\nfn d() -> i64 = a()\nfn a() -> i64 = b() + 1\nfn b() -> i64 = c() * 2\n",
+        // n = 5
+        "fn a() -> i64 = b() + 1\nfn b() -> i64 = c() + 2\nfn c() -> i64 = d() + 3\nfn d() -> i64 = e() + 4\nfn e() -> i64 = a()\n",
+        // n = 6
+        "fn a() -> i64 = b() + 1\nfn b() -> i64 = c() + 2\nfn c() -> i64 = d() + 3\nfn d() -> i64 = e() + 4\nfn e() -> i64 = f() + 5\nfn f() -> i64 = a()\n",
+        // n = 8 (the packed-spans / base-8-aord ceiling)
+        "fn a() -> i64 = b() + 1\nfn b() -> i64 = c() + 2\nfn c() -> i64 = d() + 3\nfn d() -> i64 = e() + 4\nfn e() -> i64 = f() + 5\nfn f() -> i64 = g() + 6\nfn g() -> i64 = h() + 7\nfn h() -> i64 = a()\n",
+        // n = 4 bool members, longer names, an if with a bool-literal condition
+        "fn first() -> bool = if true then second() else first()\nfn second() -> bool = third()\nfn third() -> bool = fourth()\nfn fourth() -> bool = first()\n",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        let db = temp.path().join(format!("ref-clqn-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-clqn-{i}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer n-member-clique root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate
