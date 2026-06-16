@@ -1735,9 +1735,38 @@ v0 backend traps when a move-only parameter is borrowed before it is moved), so 
 covering the eight-function worst case. The toposort, the loop-fold chain, the assembler, and the
 n−1-migration chain are now general in the function count.
 
-Remaining (increment 2 onward): three-or-more-member recursion-group cliques (currently routed
-away from the chain as a defined fallback) — SCC detection plus the Weisfeiler–Leman / clique-
-label-search member ordering.
+Landed 2026-06-16 (increment 2): the three-member DISCRETIZING recursion clique. A cyclic
+three-function program forming a SINGLE three-member strongly-connected component whose 1-WL colour
+refinement discretizes (gives three distinct colours) is now reproduced exactly — one
+`create_recursion_group` with the three members in Weisfeiler–Leman ordinal order
+(`selfhost_frontend` 25/25, local smoke 35/35). The importer recomputes the three-function
+call-adjacency mask and tests for a single SCC (`single3scc`/`reach3` — exact via paths of length ≤2
+in a three-node graph), distinguishing a clique from a DAG, a two-member SCC plus a singleton, or a
+self-loop plus independents (all routed to the defined fallback, since they form multiple groups — a
+later increment). The WL refinement (`clique3_order`) is the genuinely new mechanic generalized from
+two members: an n-round colour refinement where member i's colour is
+`hash("codedb/recursion-order/v1\0" | static_sig_i | erased_body_i)`, `static_sig` carrying the
+member's parameter type names and `erased_body` the member's raw AST with every in-clique peer call
+recoloured to `@recursion-peer:<that peer's current colour>` (a three-name Copy bundle drives the
+branch-free match; the three current colours ride as a Copy `Cols3`). The rounds are UNROLLED (rounds
+1+2 in `wl_two`, an optional third — the refinement converges in ≤3 rounds for three members) so the
+move-only colour threading never forms a loop accumulator (the v0-hazardous construct); discretizing
+→ sort the members by colour into their `recursion_group:<ordinal>` nonces. The root reuses the
+n-function assembler's display/hash selection sorts and byte-copy emitters via `assemble_clique_root`
+(the only structural difference from a create_function root is the one-entry `recursion_groups`
+array). A member's call to a peer resolves to that peer's ordinal through a generalized `aord`: the
+two-member "alpha-first member's ordinal" became a base-4 PACKED alpha-rank → ordinal permutation
+(`parse_call` decodes bits [2r, 2r+1) for rank r), a transparent change to the two-member producers
+(verified against every two-member regression). The full WL ordering, the packed `aord`, and the
+single-SCC detection were reproduced byte-exactly in Python before any `.cdb`. Both members' births
+are genesis, so the root is built from objects alone (no migration chain). The v0 frame budget was
+again the dominant cost: `clique3_colours` first lowered to a 6400-byte frame (342 operation ids +
+seven 272-byte record locals), fixed offline (the frame sweep, never the slow build) by factoring the
+name-building (`build_names3`), rounds 1+2 (`wl_two`), and the member/accumulator construction
+(`build_clique3_members`) into their own frames — every function back under 4095 (max `parse_all`
+4048). Remaining (increment 3 onward): four-or-more-member discretizing cliques (the real symbol-hash
+sort — for four or more the recursion-group symbols are no longer in ordinal order) and
+`clique_label_search` (the non-discretizing / fully-symmetric cliques).
 
 Sub-stages (each independently oracle-checked at its artifact):
 

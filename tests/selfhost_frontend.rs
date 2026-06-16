@@ -1437,6 +1437,68 @@ fn importer_reproduces_the_root_hash_for_four_plus_function_programs() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_three_member_cliques() {
+    // 15a.4 (Inc 2): a THREE-member DISCRETIZING recursion clique — three mutually-recursive
+    // functions forming a SINGLE 3-SCC whose 1-WL colour refinement gives three distinct colours.
+    // The importer detects the single 3-SCC (single3scc over the call-adjacency mask, distinguishing
+    // it from a DAG, a 2-SCC + singleton, or a self-loop + independents), runs the Weisfeiler-Leman
+    // refinement (clique3_order: each round colours a member by hash("codedb/recursion-order/v1\0" |
+    // static_sig | its raw body with peer calls recoloured to "@recursion-peer:<peer colour>", until
+    // the distinct-colour count stabilizes), sorts the members by their converged colour into their
+    // recursion_group:<ordinal> nonces, and emits ONE create_recursion_group with the three members
+    // in WL-ordinal order (names display-ordered, param_names/symbols symbol-hash-ordered). Both
+    // births are genesis, so the root is reproduced from objects alone (no migration chain). A
+    // member's call to a peer resolves to that peer's ordinal via the packed alpha-rank -> ordinal
+    // map (parse_call's base-4 `aord` decode, generalizing the two-member shortcut). Non-discretizing
+    // (symmetric) cliques and mixed SCCs are out of scope (clique_label_search, a later increment).
+    // Covers asymmetric cliques whose WL order differs from BOTH alphabetical and source order,
+    // parameter-bearing members called with arguments, bool members, if / arithmetic / comparison
+    // bodies, and source-order permutations (the canonical order is order-independent).
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        // parameters + if + cross-member calls with arguments; WL order [c, a, b]
+        "fn a(n: i64) -> i64 = if n == 0 then 1 else b(n - 1)\nfn b(n: i64) -> i64 = if n == 0 then 2 else c(n - 1)\nfn c(n: i64) -> i64 = if n == 0 then 3 else a(n - 1)\n",
+        // arithmetic bodies; WL order [a, b, c]
+        "fn a() -> i64 = b() + 1\nfn b() -> i64 = c() * 2\nfn c() -> i64 = a()\n",
+        // WL order [y, z, x] (none of source, alphabetical)
+        "fn x() -> i64 = y() + 10\nfn y() -> i64 = z() + 20\nfn z() -> i64 = x()\n",
+        // an if with a comparison whose operand is a peer call; WL order [c, a, b]
+        "fn a() -> i64 = if b() == 0 then 0 else 1\nfn b() -> i64 = c()\nfn c() -> i64 = a()\n",
+        // repeated peer calls (a calls b twice, c calls a twice); WL order [c, b, a]
+        "fn a() -> i64 = b() + b()\nfn b() -> i64 = c()\nfn c() -> i64 = a() + a()\n",
+        // a member whose body compares two distinct peers; WL order [p, q, r]
+        "fn p() -> i64 = q()\nfn q() -> i64 = r() + 1\nfn r() -> i64 = if p() == q() then 0 else 1\n",
+        // SOURCE-ORDER PERMUTATIONS of one clique — canonical (WL) order is order-independent
+        "fn c() -> i64 = a()\nfn a() -> i64 = b() + 1\nfn b() -> i64 = c() * 2\n",
+        "fn b() -> i64 = c() * 2\nfn c() -> i64 = a()\nfn a() -> i64 = b() + 1\n",
+        // bool members, longer names, an if with a bool-literal condition
+        "fn first() -> bool = second()\nfn second() -> bool = if true then third() else first()\nfn third() -> bool = first()\n",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        let db = temp.path().join(format!("ref-clq3-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-clq3-{i}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer three-member-clique root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate
