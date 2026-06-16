@@ -1288,6 +1288,55 @@ fn importer_reproduces_the_root_hash_for_recursion_group_params_and_args() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_three_function_programs() {
+    // 15a.4: the n-function create_function chain at n = 3. The importer parses THREE top-level
+    // functions (the previous path parsed exactly two and mis-parsed a third), orders them
+    // canonically (alphabetical for independent functions), runs the TWO-migration history
+    // chain (each non-first symbol born at the previous migration's running history — the
+    // second migration is the first to carry a non-empty parent history), and assembles the
+    // three-symbol ProgramRoot with the general-m assembler (names display-ordered,
+    // symbols/param_names symbol-hash-ordered, the two orders diverging in general). Scope:
+    // three INDEPENDENT functions (the DAG toposort is the next increment); covers parameters,
+    // a bool return, source order != canonical order, and assorted/larger literal values.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        "fn a() -> i64 = 1\nfn b() -> i64 = 2\nfn c() -> i64 = 3\n",
+        // source order != canonical (the importer must sort to a(0), b(1), c(2))
+        "fn c() -> i64 = 3\nfn a() -> i64 = 1\nfn b() -> i64 = 2\n",
+        "fn b() -> i64 = 2\nfn c() -> i64 = 3\nfn a() -> i64 = 1\n",
+        // a parameter-bearing function, a bool return, mixed
+        "fn a(x: i64) -> i64 = x + 1\nfn b() -> bool = true\nfn c() -> i64 = 99\n",
+        "fn p(a: i64, b: i64) -> i64 = a + b\nfn q() -> i64 = 7\nfn r() -> i64 = 8\n",
+        // reverse-alphabetical source order
+        "fn z() -> i64 = 100\nfn y() -> i64 = 200\nfn x() -> i64 = 300\n",
+        // longer names + a larger literal value
+        "fn alpha() -> i64 = 1000000\nfn beta() -> i64 = 2\nfn gamma() -> i64 = 3\n",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        let db = temp.path().join(format!("ref-three-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-three-{i}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer three-function root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate

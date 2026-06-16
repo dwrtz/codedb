@@ -207,6 +207,63 @@ record PP { p0: string  p1: string }
 // recursion-group root assembler stays under the v0 8-machine-parameter cap.
 record NR { lns: i64  lne: i64  hns: i64  hne: i64 }
 
+// ===========================================================================
+// General-m ProgramRoot assembler (Inc 1: the n-function create_function path).
+// The arrays sort independently of canonical order — `names` by DISPLAY name, and
+// `param_names`/`symbols` by SYMBOL HASH (src/model.rs normalize_root) — so the
+// assembler is canonical-order-agnostic: it takes the m functions' 71-char hashes
+// concatenated (syms/defs/sigs) plus the source `mem` + packed name/param spans, and
+// emits each array in its own sorted order. The two selection sorts use COPY
+// accumulators (a permutation array + a `used` bitmask), so there is no move-only loop
+// accumulator; the emitters read the owned source/hash buffers with `string_get`
+// (never moving them — the lex.cdb borrow discipline) and thread them back out.
+// ===========================================================================
+// A selection-sort permutation result threading the (move-only) hash buffer back.
+record PermS { perm: array<i64, 8>  s: string }
+// A selection-sort permutation result threading the (move-only) source memory back.
+record PermM { perm: array<i64, 8>  mem: string }
+// The selection sort's outer accumulator (Copy): the permutation so far, a `used`
+// bitmask (bit i set once index i has been placed), and the output position.
+record SortA { perm: array<i64, 8>  used: i64  p: i64 }
+// The selection sort's inner min-scan accumulator (Copy): the best index so far and cursor.
+record BestA { best: i64  i: i64 }
+// disp_perm's outer / inner accumulators thread the move-only `mem` (its compare reuses
+// name_le, which consumes and returns mem), so both loops carry it (the resolve-loop pattern).
+record DOut { perm: array<i64, 8>  used: i64  p: i64  mem: string }
+record DMin { best: i64  i: i64  mem: string }
+// emit_names threads the buffer plus the (owned, borrowed) source mem and symbol hashes back.
+record EmitN { buf: string  mem: string  syms: string }
+// emit_pnames threads the buffer plus the symbol hashes and concatenated param-name fragments.
+record EmitP { buf: string  syms: string  pns: string }
+// emit_symbols threads the buffer plus the symbol/definition/signature hashes.
+record EmitS { buf: string  syms: string  defs: string  sigs: string }
+// assemble_root's inputs bundled (under the 8-param cap): the source memory and the m
+// functions' concatenated 71-char symbol/definition/signature hashes + concatenated
+// param-name fragments (sliced by `pnoff`), all in canonical order.
+record RootStr { mem: string  syms: string  defs: string  sigs: string  pns: string }
+// assemble_root's result: the ProgramRoot hash plus every move-only buffer threaded back
+// (so the caller's chain can keep accumulating across the m = 1, 2, 3 intermediate roots).
+record AsmOut { hash: string  mem: string  syms: string  defs: string  sigs: string  pns: string }
+// parse_all's result: the threaded memory, the packed per-function spans (ns, ne, bs, rtc for
+// function k at [4k, 4k+4)), and the function count.
+record Prog { mem: string  spans: array<i64, 32>  n: i64 }
+// parse_all's loop accumulator (move-only — carries the threaded memory): memory, the spans
+// built so far, the count, and the scan cursor.
+record PAcc { mem: string  spans: array<i64, 32>  n: i64  pos: i64 }
+// One parsed top-level function (factored out of parse_all's loop so the HdrR/Pr locals live
+// in parse_one's frame, not the loop's): threaded memory, the name range, body start, return
+// type, and the position past the body (the next function or EOF).
+record POne { mem: string  ns: i64  ne: i64  bs: i64  rtc: i64  next: i64 }
+// reorder_spans' loop accumulator (Copy): the canonically-ordered spans built so far + cursor.
+record RA { arr: array<i64, 32>  k: i64 }
+// The three-function chain state after step 0 -> step 1: the threaded memory, the concatenated
+// symbol/def/sig hashes + param-name fragments accumulated so far, the first function's
+// param-name fragment length, and the previous output root + history hash (for the 2nd migration).
+record ChainS1 { mem: string  syms: string  defs: string  sigs: string  pns: string  l0: i64  prevroot: string  prevhist: string }
+// The chain state after step 1 -> step 2 (the final function has no migration, so only the
+// running history is carried for its birth; the previous root is no longer needed).
+record ChainS2 { mem: string  syms: string  defs: string  sigs: string  pns: string  l0: i64  l1: i64  prevhist: string }
+
 // ---------------------------------------------------------------------------
 // byte classifiers (ASCII; + - * / and whitespace)
 // ---------------------------------------------------------------------------
@@ -1550,6 +1607,203 @@ fn build_root2_tail(buf: string, six: Six, hpp: PP) -> string effects[alloc, sta
   let t11: string = push_lit(t10, b"\"}]}") in
   hash_object(b"ProgramRoot", 1, t11)
 
+// Selection sort of [0, m) by the 71-char `syms`-slice ascending -> the HASH-order
+// permutation (for the symbols/param_names arrays). Copy accumulators throughout; `syms`
+// is owned and read by `string_get` (never moved) and threaded back out.
+fn hash_perm(syms: string, m: i64) -> PermS effects[alloc, state] =
+  let oseed: SortA = { perm: [0x0; 8], used: 0, p: 0 } in
+  let done: SortA =
+    loop o = oseed while o.p < m do
+      let cur: SortA = o in
+      let bseed: BestA = { best: 0 - 1, i: 0 } in
+      let br: BestA =
+        loop a = bseed while a.i < m do
+          let inner: BestA = a in
+          let isused: bool = ((cur.used >> inner.i) & 1) == 1 in
+          if isused then (let r: BestA = { best: inner.best, i: inner.i + 1 } in r)
+          else if inner.best < 0 then (let r: BestA = { best: inner.i, i: inner.i + 1 } in r)
+          else
+            let aoff: i64 = inner.i * 71 in
+            let boff: i64 = inner.best * 71 in
+            let cseed: Lc = { j: 0, c: 2 } in
+            let cmp: Lc =
+              loop c = cseed while c.c == 2 do
+                if c.j >= 71 then (let s: Lc = { j: c.j, c: 3 } in s)
+                else
+                  let ca: i64 = to_i64(string_get(syms, aoff + c.j)) in
+                  let cb: i64 = to_i64(string_get(syms, boff + c.j)) in
+                  if ca < cb then (let s: Lc = { j: c.j, c: 0 } in s)
+                  else if ca > cb then (let s: Lc = { j: c.j, c: 1 } in s)
+                  else (let s: Lc = { j: c.j + 1, c: 2 } in s)
+            in
+            let nb: i64 = if cmp.c == 0 then inner.i else inner.best in
+            (let r: BestA = { best: nb, i: inner.i + 1 } in r)
+      in
+      let np: array<i64, 8> = array_set(cur.perm, cur.p, br.best) in
+      let nu: i64 = cur.used | (1 << br.best) in
+      (let r: SortA = { perm: np, used: nu, p: cur.p + 1 } in r)
+  in
+  let res: PermS = { perm: done.perm, s: syms } in res
+
+// Selection sort of [0, m) by display name `mem`[ns, ne) ascending -> the DISPLAY-order
+// permutation (for the names array). Same shape as hash_perm; the compare is name_le's
+// (prefix-is-smaller). `spans` packs (ns, ne, bs, rtc) for index k at spans[4k..4k+3].
+fn disp_perm(mem: string, spans: array<i64, 32>, m: i64) -> PermM effects[alloc, state] =
+  let oseed: DOut = { perm: [0x0; 8], used: 0, p: 0, mem: mem } in
+  let done: DOut =
+    loop o = oseed while o.p < m do
+      let cur: DOut = o in
+      let iseed: DMin = { best: 0 - 1, i: 0, mem: cur.mem } in
+      let br: DMin =
+        loop a = iseed while a.i < m do
+          let inner: DMin = a in
+          let isused: bool = ((cur.used >> inner.i) & 1) == 1 in
+          if isused then (let r: DMin = { best: inner.best, i: inner.i + 1, mem: inner.mem } in r)
+          else if inner.best < 0 then (let r: DMin = { best: inner.i, i: inner.i + 1, mem: inner.mem } in r)
+          else
+            // reuse name_le (prefix-is-smaller, threads mem) so the byte-compare frame lives
+            // in name_le, not here; le = (name[i] <= name[best]) keeps the smaller index.
+            let ab: i64 = inner.i * 4 in
+            let bb: i64 = inner.best * 4 in
+            let le: REq = name_le(inner.mem, spans[ab], spans[ab + 1], spans[bb], spans[bb + 1]) in
+            let nb: i64 = if le.eq then inner.i else inner.best in
+            (let r: DMin = { best: nb, i: inner.i + 1, mem: le.mem } in r)
+      in
+      let np: array<i64, 8> = array_set(cur.perm, cur.p, br.best) in
+      let nu: i64 = cur.used | (1 << br.best) in
+      (let r: DOut = { perm: np, used: nu, p: cur.p + 1, mem: br.mem } in r)
+  in
+  let res: PermM = { perm: done.perm, mem: done.mem } in res
+
+// Emit the `names` array entries (DISPLAY order via `dperm`) into `buf` (which already holds
+// the `{"metadata":{},"names":[` prefix). Each entry is {"display_name":"<mem[ns,ne)>",
+// "is_preferred":true,"module":"main","symbol":"<71-char syms slice>"}, comma-separated.
+// Inner byte loops copy the name / symbol bytes from the OWNED mem / syms via string_get
+// (never moving them); mem and syms thread back out for the later arrays.
+fn emit_names(buf: string, mem: string, syms: string, spans: array<i64, 32>, dperm: array<i64, 8>, m: i64) -> EmitN effects[alloc, state] =
+  let oseed: PBi = { p: buf, i: 0 } in
+  let done: PBi =
+    loop o = oseed while o.i < m do
+      let cur: PBi = o in
+      let idx: i64 = dperm[cur.i] in
+      let base: i64 = idx * 4 in
+      let ns: i64 = spans[base] in
+      let ne: i64 = spans[base + 1] in
+      let b0: string = if cur.i > 0 then push_byte(cur.p, to_u8(44)) else cur.p in
+      let b1: string = push_lit(b0, b"{\"display_name\":\"") in
+      let nseed: PBi = { p: b1, i: ns } in
+      let nd: PBi =
+        loop nn = nseed while nn.i < ne do
+          let nc: PBi = nn in
+          let np: string = push_byte(nc.p, string_get(mem, nc.i)) in
+          (let r: PBi = { p: np, i: nc.i + 1 } in r)
+      in
+      let b2: string = push_lit(nd.p, b"\",\"is_preferred\":true,\"module\":\"main\",\"symbol\":\"") in
+      let soff: i64 = idx * 71 in
+      let sseed: PBi = { p: b2, i: 0 } in
+      let sd: PBi =
+        loop ss = sseed while ss.i < 71 do
+          let sc: PBi = ss in
+          let np: string = push_byte(sc.p, string_get(syms, soff + sc.i)) in
+          (let r: PBi = { p: np, i: sc.i + 1 } in r)
+      in
+      let b3: string = push_lit(sd.p, b"\"}") in
+      (let r: PBi = { p: b3, i: cur.i + 1 } in r)
+  in
+  let res: EmitN = { buf: done.p, mem: mem, syms: syms } in res
+
+// Emit the `param_names` array entries (HASH order via `hperm`) into `buf` (which holds
+// `...],"param_names":[`). Each entry is {"names":[<frag>],"symbol":"<sym>"}, the fragment
+// `pns`[pnoff[idx], pnoff[idx+1]). pns and syms thread back out.
+fn emit_pnames(buf: string, syms: string, pns: string, pnoff: array<i64, 8>, hperm: array<i64, 8>, m: i64) -> EmitP effects[alloc, state] =
+  let oseed: PBi = { p: buf, i: 0 } in
+  let done: PBi =
+    loop o = oseed while o.i < m do
+      let cur: PBi = o in
+      let idx: i64 = hperm[cur.i] in
+      let fs: i64 = pnoff[idx] in
+      let fe: i64 = pnoff[idx + 1] in
+      let b0: string = if cur.i > 0 then push_byte(cur.p, to_u8(44)) else cur.p in
+      let b1: string = push_lit(b0, b"{\"names\":[") in
+      let fseed: PBi = { p: b1, i: fs } in
+      let fd: PBi =
+        loop ff = fseed while ff.i < fe do
+          let fc: PBi = ff in
+          let np: string = push_byte(fc.p, string_get(pns, fc.i)) in
+          (let r: PBi = { p: np, i: fc.i + 1 } in r)
+      in
+      let b2: string = push_lit(fd.p, b"],\"symbol\":\"") in
+      let soff: i64 = idx * 71 in
+      let sseed: PBi = { p: b2, i: 0 } in
+      let sd: PBi =
+        loop ss = sseed while ss.i < 71 do
+          let sc: PBi = ss in
+          let np: string = push_byte(sc.p, string_get(syms, soff + sc.i)) in
+          (let r: PBi = { p: np, i: sc.i + 1 } in r)
+      in
+      let b3: string = push_lit(sd.p, b"\"}") in
+      (let r: PBi = { p: b3, i: cur.i + 1 } in r)
+  in
+  let res: EmitP = { buf: done.p, syms: syms, pns: pns } in res
+
+// Emit the `symbols` array entries (HASH order via `hperm`) into `buf` (which holds
+// `...],"symbols":[`) and close with `]}`. Each entry is {"definition":"<def>",
+// "signature":"<sig>","symbol":"<sym>"}. syms/defs/sigs thread back out.
+fn emit_symbols(buf: string, syms: string, defs: string, sigs: string, hperm: array<i64, 8>, m: i64) -> EmitS effects[alloc, state] =
+  let oseed: PBi = { p: buf, i: 0 } in
+  let done: PBi =
+    loop o = oseed while o.i < m do
+      let cur: PBi = o in
+      let idx: i64 = hperm[cur.i] in
+      let off: i64 = idx * 71 in
+      let b0: string = if cur.i > 0 then push_byte(cur.p, to_u8(44)) else cur.p in
+      let b1: string = push_lit(b0, b"{\"definition\":\"") in
+      let dseed: PBi = { p: b1, i: 0 } in
+      let dd: PBi =
+        loop d = dseed while d.i < 71 do
+          let dc: PBi = d in
+          let np: string = push_byte(dc.p, string_get(defs, off + dc.i)) in
+          (let r: PBi = { p: np, i: dc.i + 1 } in r)
+      in
+      let b2: string = push_lit(dd.p, b"\",\"signature\":\"") in
+      let gseed: PBi = { p: b2, i: 0 } in
+      let gd: PBi =
+        loop g = gseed while g.i < 71 do
+          let gc: PBi = g in
+          let np: string = push_byte(gc.p, string_get(sigs, off + gc.i)) in
+          (let r: PBi = { p: np, i: gc.i + 1 } in r)
+      in
+      let b3: string = push_lit(gd.p, b"\",\"symbol\":\"") in
+      let sseed: PBi = { p: b3, i: 0 } in
+      let sd: PBi =
+        loop s = sseed while s.i < 71 do
+          let sc: PBi = s in
+          let np: string = push_byte(sc.p, string_get(syms, off + sc.i)) in
+          (let r: PBi = { p: np, i: sc.i + 1 } in r)
+      in
+      let b4: string = push_lit(sd.p, b"\"}") in
+      (let r: PBi = { p: b4, i: cur.i + 1 } in r)
+  in
+  let res: EmitS = { buf: done.p, syms: syms, defs: defs, sigs: sigs } in res
+
+// Build the m-symbol ProgramRoot from the m functions' concatenated 71-char hashes
+// (canonical order) + source spans: names DISPLAY-ordered, param_names/symbols
+// SYMBOL-HASH-ordered. Every move-only buffer threads back out (AsmOut) so the chain can
+// keep accumulating across the m = 1, 2, 3 intermediate roots. Capacity sized from m.
+fn assemble_root(rin: RootStr, spans: array<i64, 32>, pnoff: array<i64, 8>, m: i64) -> AsmOut effects[alloc, state] =
+  let dp: PermM = disp_perm(rin.mem, spans, m) in
+  let hp: PermS = hash_perm(rin.syms, m) in
+  let cap: i64 = m * 700 + 512 in
+  let buf0: string = push_lit(string_with_capacity(cap), b"{\"metadata\":{},\"names\":[") in
+  let en: EmitN = emit_names(buf0, dp.mem, hp.s, spans, dp.perm, m) in
+  let buf1: string = push_lit(en.buf, b"],\"param_names\":[") in
+  let ep: EmitP = emit_pnames(buf1, en.syms, rin.pns, pnoff, hp.perm, m) in
+  let buf2: string = push_lit(ep.buf, b"],\"symbols\":[") in
+  let es: EmitS = emit_symbols(buf2, ep.syms, rin.defs, rin.sigs, hp.perm, m) in
+  let buf3: string = push_lit(es.buf, b"]}") in
+  let h: string = hash_object(b"ProgramRoot", 1, buf3) in
+  let r: AsmOut = { hash: h, mem: en.mem, syms: es.syms, defs: es.defs, sigs: es.sigs, pns: ep.pns } in r
+
 // Build a `literal_i64` Expression over the (decimal or hex) digits `mem`[start, end)
 // with type code `tyc` (an integer type, from the expected type or i64 by default),
 // returning its content hash with the memory threaded back. The canonical `value` is
@@ -2538,7 +2792,29 @@ fn build_op_params(mem: string, sl: Sl, len: i64) -> PRR effects[alloc, state] =
 // Generalized from the two-function case (where it only ran for ordinal 0 / parent = genesis):
 // the parent-history field value is built here (threading the raw parent back for the preimage)
 // and the ordinal is rendered into the birth_seed, so a multi-function chain can call it per step.
-fn build_mig1(input_root: string, parent: string, out1: string, mem: string, sl: Sl, ord: i64) -> MH effects[alloc, state] =
+// The parent_history_hash field + preimage parent for the GENESIS migration: JSON `null` and
+// an empty preimage prefix. Straight-line (no conditional), so safe to return a record after
+// building the literal.
+fn null_field() -> MigPar effects[alloc, state] =
+  let r: MigPar = { field: push_lit(string_with_capacity(8), b"null"), par: string_with_capacity(0) } in r
+
+// The parent_history_hash field + preimage parent for a NON-genesis migration: the parent hash
+// quoted (`"<hash>"`) for the field, and the raw hash threaded back as `par`. Straight-line (a
+// helper, NOT a branch), so the string-building does not miscompile — building the quoted field
+// inside build_mig1's old record-returning conditional did (the aggregate-return v0 SIGTRAP).
+fn quote_field(parent: string) -> MigPar effects[alloc, state] =
+  let q0: string = push_lit(string_with_capacity(80), b"\"") in
+  let kq: OS = push_kept(q0, parent) in
+  let q1: string = push_lit(kq.out, b"\"") in
+  let r: MigPar = { field: q1, par: kq.s } in r
+
+// `field` is the pre-built parent_history_hash JSON field value (the literal `null` for the
+// genesis migration, else the quoted parent hash) and `par` the raw parent history hash (empty
+// for genesis) for the history preimage. They are built by the CALLER, NOT chosen here by a
+// conditional: building the quoted field inside a record-returning `if` (the non-genesis branch)
+// miscompiles to a v0 SIGTRAP (the aggregate-return bug — keep conditionals to pure moves), and
+// the caller's site is straight-line. `field` and `par` derive from the same parent hash there.
+fn build_mig1(input_root: string, field: string, par: string, out1: string, mem: string, sl: Sl, ord: i64) -> MH effects[alloc, state] =
   // Serialize the first function's body to the RAW AST (the migration body) and its parameter
   // list (the operation `params`) once, here, so the parse's stack frame is raw_bitor's /
   // build_op_params's, not the already-tight payload builders'.
@@ -2549,19 +2825,6 @@ fn build_mig1(input_root: string, parent: string, out1: string, mem: string, sl:
   let bodyr: Rr = raw_bitor(memo, sl.bs, len) in
   let rawBody: string = bodyr.raw in
   let mem1: string = bodyr.mem in
-  // parent_history_hash field value: JSON `null` (genesis migration, empty parent) or the
-  // quoted hash; push_kept keeps the raw parent for the history-hash preimage prefix.
-  let mp: MigPar =
-    if string_len(parent) == 0 then
-      (let r: MigPar = { field: push_lit(string_with_capacity(8), b"null"), par: parent } in r)
-    else
-      let q0: string = push_lit(string_with_capacity(80), b"\"") in
-      let kq: OS = push_kept(q0, parent) in
-      let q1: string = push_lit(kq.out, b"\"") in
-      (let r: MigPar = { field: q1, par: kq.s } in r)
-  in
-  let field: string = mp.field in
-  let par: string = mp.par in
   let ctx: MigCtx = { field: field, ord: ord } in
   let c: Pc = mig1_pay_a(input_root, out1, mem1, sl, rawBody, opfrag, ctx) in
   let b: MigB = mig1_pay_b(c) in
@@ -2569,8 +2832,10 @@ fn build_mig1(input_root: string, parent: string, out1: string, mem: string, sl:
   let o1: string = b.o1 in
   let m2: string = b.mem in
   let mig1: string = hash_domain(b"codedb/migration/v1\0", pay) in
-  // history preimage: parent + \0 + migration_hash + \0 + output_root (parent empty for genesis)
-  let h0: string = push_str(string_with_capacity(192), par) in
+  // history preimage: parent + \0 + migration_hash + \0 + output_root. Sized for a NON-empty
+  // parent (71) + the two hashes (71 each) + separators = up to ~215; the 2-fn case had an empty
+  // parent (~144) so 192 sufficed, but a 2nd+ migration's parent is a full hash and overflowed.
+  let h0: string = push_str(string_with_capacity(256), par) in
   let h0b: string = push_byte(h0, to_u8(0)) in
   let h1: string = push_str(h0b, mig1) in
   let h2: string = push_byte(h1, to_u8(0)) in
@@ -2679,19 +2944,165 @@ fn build_two_root(mem: string, first: Sl, second: Sl) -> string effects[alloc, s
   let m1: string = r1.mem in
   let out1: string = r1.hash in
   let genesis: string = build_genesis_root() in
-  let emptyp: string = string_with_capacity(8) in
-  let mh: MH = build_mig1(genesis, emptyp, out1, m1, first, 0) in
+  let mp: MigPar = null_field() in
+  let mh: MH = build_mig1(genesis, mp.field, mp.par, out1, m1, first, 0) in
   let m2: string = mh.mem in
   let hh1: string = mh.hash in
   build_root2(m2, first, second, hh1)
+
+// Concatenate two move-only strings into a FRESH buffer sized for both. Used to grow the
+// chain's symbol/def/sig/param-name accumulators: appending into `a`'s own buffer would overflow
+// it (a symbol hash is allocated at ~71-byte capacity, so push_str-ing a second hash traps).
+fn concat2(a: string, b: string) -> string effects[alloc, state] =
+  let cap: i64 = string_len(a) + string_len(b) + 16 in
+  push_str(push_str(string_with_capacity(cap), a), b)
+
+// Extract function `idx`'s source span from the packed spans array.
+fn sl_at(spans: array<i64, 32>, idx: i64) -> Sl =
+  let b: i64 = idx * 4 in
+  let r: Sl = { ns: spans[b], ne: spans[b + 1], bs: spans[b + 2], rtc: spans[b + 3] } in r
+
+// Build the param_names offset table: pnoff[k] is the start of function k's param-name
+// fragment in the concatenated `pns` (so its fragment is pns[pnoff[k], pnoff[k+1])).
+fn mk_pnoff(l0: i64, l1: i64, l2: i64) -> array<i64, 8> =
+  let a0: array<i64, 8> = [0x0; 8] in
+  let a1: array<i64, 8> = array_set(a0, 1, l0) in
+  let a2: array<i64, 8> = array_set(a1, 2, l0 + l1) in
+  array_set(a2, 3, l0 + l1 + l2)
+
+// Write function `n`'s four span fields into the packed array (its own frame, so the four
+// chained array<i64,32> values don't blow the caller's loop frame). Shared by parse_all +
+// reorder_spans.
+fn set_span(spans: array<i64, 32>, n: i64, ns: i64, ne: i64, bs: i64, rtc: i64) -> array<i64, 32> =
+  let b: i64 = n * 4 in
+  let a1: array<i64, 32> = array_set(spans, b, ns) in
+  let a2: array<i64, 32> = array_set(a1, b + 1, ne) in
+  let a3: array<i64, 32> = array_set(a2, b + 2, bs) in
+  array_set(a3, b + 3, rtc)
+
+// Reorder the packed `src` spans into canonical order given `perm` (perm[k] = the source index
+// placed at canonical position k). A Copy loop with the per-row writes in set_span's frame.
+fn reorder_spans(src: array<i64, 32>, perm: array<i64, 8>, n: i64) -> array<i64, 32> =
+  let seed: RA = { arr: [0x0; 32], k: 0 } in
+  let done: RA =
+    loop a = seed while a.k < n do
+      let cur: RA = a in
+      let si: i64 = perm[cur.k] * 4 in
+      let nx: array<i64, 32> = set_span(cur.arr, cur.k, src[si], src[si + 1], src[si + 2], src[si + 3]) in
+      (let r: RA = { arr: nx, k: cur.k + 1 } in r)
+  in done.arr
+
+// Parse one top-level function at `pos`: its header then its body (only to locate the body's
+// END, so the next `fn` or EOF is found — the body is re-parsed on demand later). Factored out
+// of parse_all's loop so the HdrR / Pr / parameter-scope locals stay off the loop's frame.
+fn parse_one(mem: string, pos: i64, len: i64) -> POne effects[alloc, state] =
+  let hdr: HdrR = parse_header(mem, pos, len) in
+  let np: i64 = hdr.params.n in
+  let body: Pr = parse_bitor(hdr.mem, hdr.bodypos, len, hdr.params, np, hdr.rettyc) in
+  let aw: MI = skip_ws(body.mem, body.next, len) in
+  let r: POne = { mem: aw.mem, ns: hdr.ns, ne: hdr.ne, bs: hdr.bodypos, rtc: hdr.rettyc, next: aw.i } in r
+
+// Scan every top-level `fn` declaration, recording each one's name range, body start, and
+// return type into the packed spans array. Generalizes import_root's one-vs-two detection.
+fn parse_all(mem: string, len: i64) -> Prog effects[alloc, state] =
+  let seed: PAcc = { mem: mem, spans: [0x0; 32], n: 0, pos: 0 } in
+  let done: PAcc =
+    loop a = seed while a.pos < len do
+      let cur: PAcc = a in
+      let one: POne = parse_one(cur.mem, cur.pos, len) in
+      let nx: array<i64, 32> = set_span(cur.spans, cur.n, one.ns, one.ne, one.bs, one.rtc) in
+      (let r: PAcc = { mem: one.mem, spans: nx, n: cur.n + 1, pos: one.next } in r)
+  in
+  let r: Prog = { mem: done.mem, spans: done.spans, n: done.n } in r
+
+// Three-function create_function chain, step 0: build fn0's objects (birth = genesis,
+// ordinal 0), assemble its single-symbol root (out0), and run the first migration to the
+// running history hh0. out0 is needed twice (this migration's output AND the next migration's
+// input), so it is copied. `spans` is canonical-ordered; the body/sig/sym are accumulated for
+// the later roots via the threaded AsmOut.
+fn bt0(mem: string, sl0: Sl, spans: array<i64, 32>) -> ChainS1 effects[alloc, state] =
+  let genstr: string = push_lit(string_with_capacity(16), b"genesis") in
+  let foA: FObj = build_fn_objs(mem, sl0, genstr, 0) in
+  let l0: i64 = string_len(foA.pn) in
+  let pnoff: array<i64, 8> = mk_pnoff(l0, 0, 0) in
+  let rin: RootStr = { mem: foA.mem, syms: foA.sym, defs: foA.def, sigs: foA.sig, pns: foA.pn } in
+  let a1: AsmOut = assemble_root(rin, spans, pnoff, 1) in
+  let genroot: string = build_genesis_root() in
+  let mp: MigPar = null_field() in
+  let ko: OS = push_kept(string_with_capacity(80), a1.hash) in
+  let out0copy: string = ko.out in
+  let out0orig: string = ko.s in
+  let mig0: MH = build_mig1(genroot, mp.field, mp.par, out0orig, a1.mem, sl0, 0) in
+  let r: ChainS1 = { mem: mig0.mem, syms: a1.syms, defs: a1.defs, sigs: a1.sigs, pns: a1.pns, l0: l0, prevroot: out0copy, prevhist: mig0.hash } in r
+
+// Step 1: build fn1's objects (birth = hh0, ordinal 1), assemble the two-symbol root (out1),
+// run the second migration to hh1. hh0 (= s.prevhist) is used twice (fn1's birth AND this
+// migration's parent), so it is copied; out1 is the migration output only.
+fn bt1(s: ChainS1, sl1: Sl, spans: array<i64, 32>) -> ChainS2 effects[alloc, state] =
+  let kh: OS = push_kept(string_with_capacity(80), s.prevhist) in
+  let hh0copy: string = kh.out in
+  let hh0orig: string = kh.s in
+  let foB: FObj = build_fn_objs(s.mem, sl1, hh0copy, 1) in
+  let l1: i64 = string_len(foB.pn) in
+  let syms2: string = concat2(s.syms, foB.sym) in
+  let defs2: string = concat2(s.defs, foB.def) in
+  let sigs2: string = concat2(s.sigs, foB.sig) in
+  let pns2: string = concat2(s.pns, foB.pn) in
+  let pnoff: array<i64, 8> = mk_pnoff(s.l0, l1, 0) in
+  let rin: RootStr = { mem: foB.mem, syms: syms2, defs: defs2, sigs: sigs2, pns: pns2 } in
+  let a2: AsmOut = assemble_root(rin, spans, pnoff, 2) in
+  // parent_history field for the 2nd migration: quote hh0 in a straight-line helper (NOT a
+  // conditional) to dodge the aggregate-return SIGTRAP that the old in-build_mig1 `if` hit.
+  let mp: MigPar = quote_field(hh0orig) in
+  let mig1: MH = build_mig1(s.prevroot, mp.field, mp.par, a2.hash, a2.mem, sl1, 1) in
+  let r: ChainS2 = { mem: mig1.mem, syms: a2.syms, defs: a2.defs, sigs: a2.sigs, pns: a2.pns, l0: s.l0, l1: l1, prevhist: mig1.hash } in r
+
+// Step 2: build fn2's objects (birth = hh1, ordinal 2) and assemble the final three-symbol
+// root (no third migration is needed — nothing references its history). Returns the root hash.
+fn bt2(s: ChainS2, sl2: Sl, spans: array<i64, 32>) -> string effects[alloc, state] =
+  let foC: FObj = build_fn_objs(s.mem, sl2, s.prevhist, 2) in
+  let l2: i64 = string_len(foC.pn) in
+  let syms3: string = concat2(s.syms, foC.sym) in
+  let defs3: string = concat2(s.defs, foC.def) in
+  let sigs3: string = concat2(s.sigs, foC.sig) in
+  let pns3: string = concat2(s.pns, foC.pn) in
+  let pnoff: array<i64, 8> = mk_pnoff(s.l0, s.l1, l2) in
+  let rin: RootStr = { mem: foC.mem, syms: syms3, defs: defs3, sigs: sigs3, pns: pns3 } in
+  let a3: AsmOut = assemble_root(rin, spans, pnoff, 3) in
+  a3.hash
+
+// Build the ProgramRoot for a THREE-function program whose functions are already in canonical
+// order (sl0, sl1, sl2; `spans` the matching canonical packed spans). Runs the chain through
+// three steps (split for the v0 frame budget): two create_function migrations seeding the
+// second and third symbols' births, then the final three-symbol root.
+fn build_three_root(mem: string, spans: array<i64, 32>, sl0: Sl, sl1: Sl, sl2: Sl) -> string effects[alloc, state] =
+  let s1: ChainS1 = bt0(mem, sl0, spans) in
+  let s2: ChainS2 = bt1(s1, sl1, spans) in
+  bt2(s2, sl2, spans)
 
 // ---------------------------------------------------------------------------
 // import: parse the header(s), parse the body(ies), build the objects and (for a
 // multi-function program) the migration/history chain, return the ProgramRoot hash
 // ---------------------------------------------------------------------------
 
+// Route by function count: a three-function program (independent or DAG; canonical order is
+// the alphabetical display order for independent functions — the toposort comes with the DAG
+// increment) goes to build_three_root; one or two functions take the original path. (Four or
+// more functions are a later increment.)
 fn import_root(mem: string) -> string effects[alloc, state] =
   let len: i64 = string_len(mem) in
+  let prog: Prog = parse_all(mem, len) in
+  if prog.n == 3 then
+    let dp: PermM = disp_perm(prog.mem, prog.spans, 3) in
+    let cspans: array<i64, 32> = reorder_spans(prog.spans, dp.perm, 3) in
+    let sl0: Sl = sl_at(cspans, 0) in
+    let sl1: Sl = sl_at(cspans, 1) in
+    let sl2: Sl = sl_at(cspans, 2) in
+    build_three_root(dp.mem, cspans, sl0, sl1, sl2)
+  else
+    import_one_or_two(prog.mem, len)
+
+fn import_one_or_two(mem: string, len: i64) -> string effects[alloc, state] =
   let hdr0: HdrR = parse_header(mem, 0, len) in
   let m0: string = hdr0.mem in
   let rettyc: i64 = hdr0.rettyc in

@@ -1660,6 +1660,30 @@ every two-function root is byte-identical. Next: the general-m `assemble_root` (
 sorts with Copy accumulators; byte-copy emission that reads the owned source/hash buffers via
 `string_get`) plus the unrolled three-function chain and the n-function top-level parse.
 
+Landed 2026-06-16 (increment 1, step 1): the three-function `create_function` chain. The
+importer parses an arbitrary number of top-level functions (`parse_all`, fixing the latent
+three-function mis-parse), and for three independent functions builds the two-migration history
+chain and the three-symbol ProgramRoot, reproducing the Rust importer's root exactly
+(`selfhost_frontend` 22/22, with a seven-source three-function test; local smoke 12/12 including
+parameters, a bool return, source order != canonical, and 1-/2-function and recursion
+regressions). The general-m root assembler (`assemble_root`) sorts the function set two ways —
+display name for `names`, symbol hash for `param_names`/`symbols` — with selection sorts over
+Copy accumulators (a permutation array plus a `used` bitmask) and byte-copy emitters that read
+the owned source/hash buffers through `string_get` (the lexer's borrow discipline), validated in
+isolation by a probe before being wired into the chain. The chain is unrolled into three steps
+for the v0 frame budget. Four v0 realities surfaced and were fixed, all runtime- or frame-only
+(`verify` stayed clean throughout): three frame overflows (the parameterized `mig1_pay_a`, and
+`disp_perm`/`parse_all`/`reorder_spans`), each resolved by factoring a helper so the chained
+array writes or the byte-compare live in their own frame; and the keystone, a `string_with_
+capacity(192)` history-preimage buffer that fit the two-function case (empty parent history,
+~144 bytes) but overflowed once a second migration's parent is a full hash (~215 bytes) — a
+SIGTRAP isolated with depth-staged probe entries and fixed by sizing for the worst case. The
+assembler, the parser, and the n−1-migration chain are already general in the number of
+functions; only the three-step chain unroll and the `n == 3` route are specific to three.
+Remaining in increment 1: the n-way topological sort for dependency (DAG) ordering — where the
+canonical order diverges from the display order and a migration's raw body first contains a call
+— then four-or-more-function programs.
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text
