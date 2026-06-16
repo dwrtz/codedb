@@ -1710,8 +1710,34 @@ source orders, fan-out, fan-in, mid + tail, call-with-arguments, bool callee); l
 including the cyclic-deferral no-crash cases. A single extra-callee slot suffices for three
 functions; four-plus need a multi-entry table.
 
-Remaining in increment 1: four-or-more-function programs (which also need the general loop-fold
-chain to replace the three-step unroll, and a multi-entry callee table).
+Landed 2026-06-16 (increment 1, step 3): the create_function chain GENERALIZED to any number of
+functions (n up to eight, the packed-spans ceiling) — completing increment 1. The three-step
+unroll became a loop-fold: `bt0` (the genesis-born first function + its migration), `chain_mid`
+(a self-recursive driver folding `bt_mid` over the middle functions, each a migration seeding the
+next symbol's birth), and `bt_last` (the final function + the n-symbol root). The chain state is
+one threaded `ChainAcc` record (source, running history, running root, the four concatenated hash
+accumulators, and a cumulative param-name offset table). The toposort generalized (`adjN`/`kahnN`,
+an n×n adjacency bitmask in one i64, n rounds), and the extra-callee table became multi-entry
+(`build_augN` appends `name\0symbol` for every earlier non-first ordinal; `xc_scan` scans them) so
+a diamond's last function — which calls two earlier non-first functions — resolves both. The
+general assembler already handled any symbol count. `selfhost_frontend` 24/24 (a seven-source test:
+4/5/6 independent in both source orders, a 4-chain, a diamond, a 3-way fan-in, and a 5-function
+mixed chain with call arguments); local smoke 29/29. Three v0 realities surfaced, each isolated
+before the next slow build: (1) the offline frame sweep's lowercase-only regex silently skipped the
+capital-N functions, hiding that `kahnN` (4160) was over budget — fixed the regex and factored
+`kahn_pick` (the inner min-scan) into its own frame; (2) `find_byte` returns the index PAST the
+match, so `xc_scan` was off by one — misreading the name length (a wrong-hash for three functions)
+and walking a multi-entry scan into the symbol bytes (an out-of-bounds SIGTRAP for four), one root
+cause for both, found by depth-staged print markers; (3) the keystone — `hash_object`'s preimage
+buffer was a fixed `string_with_capacity(2048)` that fit roots up to three symbols but overflowed
+at four (a 2030-byte payload), and sizing it from `string_len(payload)` instead MISCOMPILED (the
+v0 backend traps when a move-only parameter is borrowed before it is moved), so it is a fixed 8192
+covering the eight-function worst case. The toposort, the loop-fold chain, the assembler, and the
+n−1-migration chain are now general in the function count.
+
+Remaining (increment 2 onward): three-or-more-member recursion-group cliques (currently routed
+away from the chain as a defined fallback) — SCC detection plus the Weisfeiler–Leman / clique-
+label-search member ordering.
 
 Sub-stages (each independently oracle-checked at its artifact):
 

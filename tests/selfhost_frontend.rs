@@ -1389,6 +1389,54 @@ fn importer_reproduces_the_root_hash_for_three_function_dags() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_four_plus_function_programs() {
+    // 15a.4 (Inc 1.3): the n-function create_function chain GENERALIZED beyond three. The chain is
+    // a loop-fold (bt0 + chain_mid recursion over the middle functions + bt_last) over the
+    // toposort-canonical order, building n-1 migrations; the extra-callee table is multi-entry (a
+    // diamond's last function calls TWO earlier non-first functions, each born at its own running
+    // history). The general toposort (adjN/kahnN, n up to 8) and the general assembler drive it.
+    // Covers independent programs (4, 5, 6 functions; forward and reverse source order) and DAGs
+    // (a 4-chain, a diamond, a 3-way fan-in, and a 5-function mixed chain with call arguments).
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        // independent
+        "fn a() -> i64 = 1\nfn b() -> i64 = 2\nfn c() -> i64 = 3\nfn d() -> i64 = 4\n",
+        "fn e() -> i64 = 5\nfn d() -> i64 = 4\nfn c() -> i64 = 3\nfn b() -> i64 = 2\nfn a() -> i64 = 1\n",
+        "fn a() -> i64 = 1\nfn b() -> i64 = 2\nfn c() -> i64 = 3\nfn d() -> i64 = 4\nfn e() -> i64 = 5\nfn f() -> i64 = 6\n",
+        // DAG: a 4-function linear chain (canonical order d, c, b, a)
+        "fn d() -> i64 = 1\nfn c() -> i64 = d()\nfn b() -> i64 = c()\nfn a() -> i64 = b()\n",
+        // DAG: a diamond — `a` calls BOTH `b` and `c` (two non-first callees -> multi-entry table)
+        "fn d() -> i64 = 1\nfn b() -> i64 = d()\nfn c() -> i64 = d()\nfn a() -> i64 = b() + c()\n",
+        // DAG: a 3-way fan-in (main calls a, b, c)
+        "fn a() -> i64 = 1\nfn b() -> i64 = 2\nfn c() -> i64 = 3\nfn main() -> i64 = a() + b() + c()\n",
+        // DAG: a 5-function mixed chain with call arguments
+        "fn inc(n: i64) -> i64 = n + 1\nfn base() -> i64 = 10\nfn mid() -> i64 = inc(base())\nfn hi() -> i64 = inc(mid())\nfn top() -> i64 = hi() + mid()\n",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        let db = temp.path().join(format!("ref-nfn-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-nfn-{i}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer n-function root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate
