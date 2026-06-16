@@ -1337,6 +1337,58 @@ fn importer_reproduces_the_root_hash_for_three_function_programs() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_three_function_dags() {
+    // 15a.4 (Inc 1.2): the n-function chain at n = 3 with DEPENDENCY EDGES. A call adds an edge,
+    // so the canonical (creation) order is a Kahn toposort — a callee is created BEFORE its caller,
+    // with an alphabetical tie-break — which in general DIVERGES from the alphabetical display
+    // order. The importer must build the call graph (body_calls over each function's body span),
+    // toposort it, run the two-migration chain in toposort order (the second migration is the first
+    // to RAW-serialize a call body, exercising raw_call), and assemble the three-symbol root with
+    // names display-ordered but symbols/param_names symbol-hash-ordered. Covers a linear chain
+    // (both source orders), fan-out, fan-in, a mixed mid+tail caller, call arguments using a
+    // callee, and a bool-returning callee.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        // linear chain: c is created first, then b (calls c), then a (calls b)
+        "fn c() -> i64 = 1\nfn b() -> i64 = c()\nfn a() -> i64 = b()\n",
+        // same chain written in reverse source order (a, b, c) -> same canonical order (c, b, a)
+        "fn a() -> i64 = b()\nfn b() -> i64 = c()\nfn c() -> i64 = 1\n",
+        // fan-out: both a and b call c -> c first, then a, b (alphabetical among the ready)
+        "fn c() -> i64 = 7\nfn a() -> i64 = c()\nfn b() -> i64 = c()\n",
+        // fan-in: main calls both a and b -> a, b first (alphabetical), then main
+        "fn a() -> i64 = 1\nfn b() -> i64 = 2\nfn main() -> i64 = a() + b()\n",
+        // mid + tail call: x first, then y (calls x), then z (calls y and x)
+        "fn x() -> i64 = 5\nfn y() -> i64 = x()\nfn z() -> i64 = y() + x()\n",
+        // a call with arguments + a callee with a parameter (the raw_call body carries args)
+        "fn inc(n: i64) -> i64 = n + 1\nfn base() -> i64 = 10\nfn top() -> i64 = inc(base())\n",
+        // a bool-returning callee used by two callers
+        "fn flag() -> bool = true\nfn use1() -> bool = flag()\nfn use2() -> bool = flag()\n",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        let db = temp.path().join(format!("ref-dag3-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-dag3-{i}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer three-function DAG root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate

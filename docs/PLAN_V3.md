@@ -1680,9 +1680,38 @@ capacity(192)` history-preimage buffer that fit the two-function case (empty par
 SIGTRAP isolated with depth-staged probe entries and fixed by sizing for the worst case. The
 assembler, the parser, and the n−1-migration chain are already general in the number of
 functions; only the three-step chain unroll and the `n == 3` route are specific to three.
-Remaining in increment 1: the n-way topological sort for dependency (DAG) ordering — where the
-canonical order diverges from the display order and a migration's raw body first contains a call
-— then four-or-more-function programs.
+
+Landed 2026-06-16 (increment 1, step 2): the n-way topological-sort (DAG) ordering for
+three-function programs. A call adds a dependency edge, so the canonical creation order is a Kahn
+toposort — a callee is created before its caller, with an alphabetical tie-break — which in general
+diverges from the alphabetical display order. The importer builds the 3×3 call-adjacency bitmask
+(`adj3`, via `body_calls` over each function's body span, self-calls included), Kahn-toposorts it
+(`kahn3`, Copy accumulators, the name tie-break reusing `name_le`), and routes the result: an
+acyclic order drives `build_three_root`; a cycle (a 3-clique, a 2-member SCC plus a singleton, or a
+self-recursive function — all recursion groups) is detected and routed away rather than mis-built as
+a DAG (a later increment handles it). The chain then runs in toposort order: the second migration is
+the first to RAW-serialize a call body (`raw_call`), and — the keystone of this step — the third
+function's TYPED body may call the SECOND (canonical ordinal 1), whose symbol was born at the
+running history hh0, not genesis. `build_sym_fn_mh`'s genesis/ordinal-0 default is correct only for
+the canonical-first callee, so calls to ordinal 1 were mis-resolved (the symbol hash, hence the def,
+hence the root, diverged — the only DAG cases that failed were those where a function calls a
+non-first function). The fix re-resolves such calls against the ALREADY-COMPUTED ordinal-1 symbol:
+`bt2` appends a small extra-callee table (sym1 + ordinal 1's name) to the source past the parse
+bound, and `build_fn_objs_xc` parses the augmented buffer with the SOURCE length as the bound, so
+the table is invisible to the parser at large — only `parse_call` peeks past `len` (signalled by
+`string_len(mem) > len`), matching a call's name against the table and taking sym1 directly (a
+conditional of two whole calls, never string-building inside the `if` — the v0 aggregate-return
+rule). Calls to ordinal 0 still take the genesis default; every non-augmented parse (one/two
+functions, recursion groups, the first two functions of a DAG) is untouched, since the table is
+absent. The Python blueprint (`/tmp/inc1/blueprint3.py`, n = 2…5, independent / chain / fan-out /
+fan-in / diamond) reproduced every DAG root byte-exactly first; frames stayed under the v0 budget
+(max `kahn3` 4048). `selfhost_frontend` 23/23 (a seven-source three-function DAG test: chain in both
+source orders, fan-out, fan-in, mid + tail, call-with-arguments, bool callee); local smoke 22/22
+including the cyclic-deferral no-crash cases. A single extra-callee slot suffices for three
+functions; four-plus need a multi-entry table.
+
+Remaining in increment 1: four-or-more-function programs (which also need the general loop-fold
+chain to replace the three-step unroll, and a multi-entry callee table).
 
 Sub-stages (each independently oracle-checked at its artifact):
 

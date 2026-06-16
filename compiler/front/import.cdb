@@ -231,6 +231,21 @@ record BestA { best: i64  i: i64 }
 // name_le, which consumes and returns mem), so both loops carry it (the resolve-loop pattern).
 record DOut { perm: array<i64, 8>  used: i64  p: i64  mem: string }
 record DMin { best: i64  i: i64  mem: string }
+// toposort3's result: the canonical (Kahn toposort) permutation (perm[k] = the source index
+// placed at canonical position k), the threaded memory, and `ok` (false if the call graph has a
+// cycle — a 3-clique or any SCC, which is a recursion group, deferred to a later increment).
+record Topo3 { perm: array<i64, 8>  mem: string  ok: bool }
+// adj3's result: the 3x3 call-adjacency bitmask (bit i*3+j set iff function i calls function j,
+// self-calls included) plus the threaded memory.
+record Adj { mask: i64  mem: string }
+// adj3's loop accumulator (move-only — body_calls consumes/returns mem): the mask so far, the
+// flat (i,j) cursor k in [0, 9), and the memory.
+record AdjAcc { mask: i64  k: i64  mem: string }
+// kahn3's outer accumulator (move-only — name_le carries mem): the permutation so far, a `done`
+// bitmask (bit i set once source function i has been emitted), the output position, and memory.
+record KOut { perm: array<i64, 8>  done: i64  p: i64  mem: string }
+// kahn3's inner min-scan accumulator (Copy + threaded mem): the best ready index so far and cursor.
+record KMin { best: i64  i: i64  mem: string }
 // emit_names threads the buffer plus the (owned, borrowed) source mem and symbol hashes back.
 record EmitN { buf: string  mem: string  syms: string }
 // emit_pnames threads the buffer plus the symbol hashes and concatenated param-name fragments.
@@ -263,6 +278,9 @@ record ChainS1 { mem: string  syms: string  defs: string  sigs: string  pns: str
 // The chain state after step 1 -> step 2 (the final function has no migration, so only the
 // running history is carried for its birth; the previous root is no longer needed).
 record ChainS2 { mem: string  syms: string  defs: string  sigs: string  pns: string  l0: i64  l1: i64  prevhist: string }
+// bt2's extra-callee augmentation result: the source with the ordinal-1 callee table appended
+// (sym1 + ord1 name), the threaded symbol accumulator, and the SOURCE length (the parse bound).
+record Aug2 { aug: string  syms: string  slen: i64 }
 
 // ---------------------------------------------------------------------------
 // byte classifiers (ASCII; + - * / and whitespace)
@@ -893,6 +911,35 @@ fn resolve_call_symbol(rgord: i64, ord: i64, mem: string, p: i64, e: i64) -> MH 
   if rgord >= 0 then build_sym_rg_mh(mem, ord)
   else build_sym_fn_mh(mem, p, e)
 
+// Extra-callee resolution (the n-function DAG case). build_sym_fn_mh resolves a callee to the
+// GENESIS / ordinal-0 symbol, which is correct only when the callee is the canonical-first
+// function. In a three-function DAG the last function (canonical ordinal 2) may call the MIDDLE
+// function (ordinal 1), whose symbol was born at the running history hh0 (not genesis). Re-running
+// the chain inside the parser is intractable; instead the already-computed ordinal-1 symbol is
+// appended to the source as a small table — sym1 (71 chars) then ord1's name — past the parse
+// bound `len` (so the table is invisible to the parser at large; only build_fn_objs_xc parses an
+// augmented buffer, signalled by string_len(mem) > len). Calls to ordinal 0 still take the
+// genesis default. The table holds a single extra callee (enough for three functions); four-plus
+// functions need a multi-entry table (a later increment).
+
+// Does the call name mem[p, e) equal the augmented extra callee's name (mem[len + 71, end))?
+// The table is present iff string_len(mem) > len. A pure comparison (no string building) so the
+// caller can pick the symbol as a conditional of two whole calls (the v0 aggregate-return rule).
+fn xc_match(mem: string, p: i64, e: i64, len: i64) -> REq =
+  let full: i64 = string_len(mem) in
+  if full > len then
+    let nlen: i64 = full - len - 71 in
+    let clen: i64 = e - p in
+    if clen == nlen then range_eq(mem, p, len + 71, nlen)
+    else (let r: REq = { eq: false, mem: mem } in r)
+  else (let r: REq = { eq: false, mem: mem } in r)
+
+// The precomputed extra-callee symbol: the 71-char hash stored at mem[len, len + 71) (built
+// earlier in the chain at its real birth history and ordinal). A straight-line extractor.
+fn build_sym_xc(mem: string, len: i64) -> MH effects[alloc, state] =
+  let pr: PRR = push_range(string_with_capacity(80), mem, len, len + 71) in
+  let r: MH = { mem: pr.mem, hash: pr.out } in r
+
 fn build_def(sig: string, sym: string, e: string) -> DH effects[alloc, state] =
   let p0: string = push_lit(string_with_capacity(320), b"{\"function_sig_hash\":\"") in
   let k1: OS = push_kept(p0, sig) in
@@ -1407,6 +1454,31 @@ fn build_fn_objs(mem: string, sl: Sl, bh: string, ordv: i64) -> FObj effects[all
   let m1: string = s.mem in
   let symh: string = s.hash in
   let len: i64 = string_len(m1) in
+  let op: MI = find_byte(m1, sl.ne, len, 40) in
+  let seed: Scope = { ids: [0x0; 12], n: 0, rgord: 0 - 1, aord: 0 } in
+  let pr: PpR = scan_params(op.mem, op.i, len, seed) in
+  let mp: string = pr.mem in
+  let params: Scope = pr.ps in
+  let np: i64 = params.n in
+  let e: Pr = parse_bitor(mp, sl.bs, len, params, np, sl.rtc) in
+  let m2: string = e.mem in
+  let exprh: string = e.hash in
+  let sig: string = build_sig(sl.rtc, params) in
+  let pnr: PRR = push_pnames_at(string_with_capacity(sl.bs - op.i + 16), m2, params, 0) in
+  let m3: string = pnr.mem in
+  let d: DH = build_def(sig, symh, exprh) in
+  let r: FObj = { mem: m3, sym: d.sym, def: d.h, sig: d.sig, pn: pnr.out } in r
+
+// Like build_fn_objs but for a function whose body may reference an EXTRA callee (a non-first
+// canonical function in a DAG). `aug` is the source with a small extra-callee table appended
+// (sym1 + ord1 name); `slen` is the SOURCE length, used as the parse bound everywhere (so the
+// parser never reads the table — only parse_call peeks past `slen` via string_len(aug) > slen).
+// Identical to build_fn_objs except `len` is the passed `slen` rather than string_len(aug).
+fn build_fn_objs_xc(aug: string, slen: i64, sl: Sl, bh: string, ordv: i64) -> FObj effects[alloc, state] =
+  let s: MH = build_sym_at(bh, aug, sl, ordv) in
+  let m1: string = s.mem in
+  let symh: string = s.hash in
+  let len: i64 = slen in
   let op: MI = find_byte(m1, sl.ne, len, 40) in
   let seed: Scope = { ids: [0x0; 12], n: 0, rgord: 0 - 1, aord: 0 } in
   let pr: PpR = scan_params(op.mem, op.i, len, seed) in
@@ -2254,7 +2326,12 @@ fn parse_call(mem: string, p: i64, e: i64, len: i64, scope: Scope, np: i64) -> P
   // Computed unconditionally so resolve_call_symbol stays a pure conditional of two whole calls.
   let rk: TC = clique_rank(m0, p, e, len) in
   let ord: i64 = if rk.code == 0 then scope.aord else 1 - scope.aord in
-  let s: MH = resolve_call_symbol(scope.rgord, ord, rk.mem, p, e) in
+  // A call to the augmented extra callee (a non-first canonical function in a DAG) takes its
+  // precomputed symbol; otherwise resolve a recursion-group member or a genesis create_function.
+  // A conditional of two whole calls (no string building inside the `if`) — the v0 SIGTRAP rule.
+  let xm: REq = xc_match(rk.mem, p, e, len) in
+  let mxc: string = xm.mem in
+  let s: MH = if xm.eq then build_sym_xc(mxc, len) else resolve_call_symbol(scope.rgord, ord, mxc, p, e) in
   let m1: string = s.mem in
   let symh: string = s.hash in
   let ar: ArgsR = parse_args(m1, e + 1, len, scope, np) in
@@ -2992,6 +3069,76 @@ fn reorder_spans(src: array<i64, 32>, perm: array<i64, 8>, n: i64) -> array<i64,
       (let r: RA = { arr: nx, k: cur.k + 1 } in r)
   in done.arr
 
+// Build the 3x3 call-adjacency bitmask for a THREE-function program (source-order spans): bit
+// (i*3 + j) is set iff function i's body calls function j by name. Self-calls (i == j) are
+// included so a self-recursive function reads as a 1-cycle (rejected by kahn3). Function i's
+// body span is [bs_i, be_i) where be_i is the NEXT function's name start (its `fn ` keyword plus
+// whitespace contains no `identifier(` pattern, so it never matches a call) or `len` for the last
+// function. body_calls matches the parser exactly (an identifier == the name IMMEDIATELY followed
+// by `(`); it consumes and returns the move-only `mem`, so the loop accumulator carries it.
+fn adj3(mem: string, spans: array<i64, 32>, len: i64) -> Adj effects[alloc, state] =
+  let seed: AdjAcc = { mask: 0, k: 0, mem: mem } in
+  let done: AdjAcc =
+    loop a = seed while a.k < 9 do
+      let cur: AdjAcc = a in
+      let i: i64 = cur.k / 3 in
+      let j: i64 = cur.k - i * 3 in
+      let bj: i64 = j * 4 in
+      let bs: i64 = spans[i * 4 + 2] in
+      let be: i64 = if i < 2 then spans[(i + 1) * 4] else len in
+      let bc: REq = body_calls(cur.mem, bs, be, spans[bj], spans[bj + 1]) in
+      let nbit: i64 = if bc.eq then (1 << cur.k) else 0 in
+      (let r: AdjAcc = { mask: cur.mask | nbit, k: cur.k + 1, mem: bc.mem } in r)
+  in
+  let res: Adj = { mask: done.mask, mem: done.mem } in res
+
+// Kahn toposort of a THREE-function call graph (the `mask` from adj3): repeatedly emit the
+// alphabetically-smallest function whose callees are ALL already emitted (a callee is created
+// before its caller). perm[k] = the source index emitted at canonical position k. `ok` is false
+// when some round has no ready function — the graph has a cycle (a 3-clique, a smaller SCC plus a
+// singleton, or a self-recursive function), which forms a recursion group and is deferred. Copy
+// accumulators throughout; the name tie-break reuses name_le (which threads the owned `mem`).
+fn kahn3(mem: string, spans: array<i64, 32>, mask: i64) -> Topo3 effects[alloc, state] =
+  let oseed: KOut = { perm: [0x0; 8], done: 0, p: 0, mem: mem } in
+  let fin: KOut =
+    loop o = oseed while o.p < 3 do
+      let cur: KOut = o in
+      let iseed: KMin = { best: 0 - 1, i: 0, mem: cur.mem } in
+      let br: KMin =
+        loop a = iseed while a.i < 3 do
+          let inner: KMin = a in
+          let isdone: bool = ((cur.done >> inner.i) & 1) == 1 in
+          let deps: i64 = (mask >> (inner.i * 3)) & 7 in
+          // ready: not yet emitted AND every callee already emitted (deps is a subset of done,
+          // i.e. deps AND the complement-within-3-bits of done is empty).
+          let ready: bool = if isdone then false else (deps & (cur.done ^ 7)) == 0 in
+          if ready then
+            if inner.best < 0 then (let r: KMin = { best: inner.i, i: inner.i + 1, mem: inner.mem } in r)
+            else
+              let ab: i64 = inner.i * 4 in
+              let bb: i64 = inner.best * 4 in
+              let le: REq = name_le(inner.mem, spans[ab], spans[ab + 1], spans[bb], spans[bb + 1]) in
+              let nb: i64 = if le.eq then inner.i else inner.best in
+              (let r: KMin = { best: nb, i: inner.i + 1, mem: le.mem } in r)
+          else (let r: KMin = { best: inner.best, i: inner.i + 1, mem: inner.mem } in r)
+      in
+      let chosen: i64 = br.best in
+      // chosen < 0 means a cycle (no ready node); leave perm/done unchanged so `done` never
+      // reaches 7 and `ok` ends false. The `1 << chosen` is guarded by the `if` (never shifts
+      // by a negative amount, since `if` is control flow, not the strict `&` operator).
+      let np: array<i64, 8> = if chosen < 0 then cur.perm else array_set(cur.perm, cur.p, chosen) in
+      let ndone: i64 = if chosen < 0 then cur.done else (cur.done | (1 << chosen)) in
+      (let r: KOut = { perm: np, done: ndone, p: cur.p + 1, mem: br.mem } in r)
+  in
+  let res: Topo3 = { perm: fin.perm, mem: fin.mem, ok: fin.done == 7 } in res
+
+// Canonical ordering of a THREE-function program: build the call graph then Kahn-toposort it.
+// For independent functions this is the alphabetical (display) order; a dependency edge forces
+// the callee earlier, so canonical order diverges from display order (as the chain requires).
+fn toposort3(mem: string, spans: array<i64, 32>, len: i64) -> Topo3 effects[alloc, state] =
+  let a: Adj = adj3(mem, spans, len) in
+  kahn3(a.mem, spans, a.mask)
+
 // Parse one top-level function at `pos`: its header then its body (only to locate the body's
 // END, so the next `fn` or EOF is found — the body is re-parsed on demand later). Factored out
 // of parse_all's loop so the HdrR / Pr / parameter-scope locals stay off the loop's frame.
@@ -3057,12 +3204,33 @@ fn bt1(s: ChainS1, sl1: Sl, spans: array<i64, 32>) -> ChainS2 effects[alloc, sta
   let mig1: MH = build_mig1(s.prevroot, mp.field, mp.par, a2.hash, a2.mem, sl1, 1) in
   let r: ChainS2 = { mem: mig1.mem, syms: a2.syms, defs: a2.defs, sigs: a2.sigs, pns: a2.pns, l0: s.l0, l1: l1, prevhist: mig1.hash } in r
 
-// Step 2: build fn2's objects (birth = hh1, ordinal 2) and assemble the final three-symbol
-// root (no third migration is needed — nothing references its history). Returns the root hash.
+// Append the extra-callee table for fn2's body parse: the already-computed ordinal-1 symbol
+// (sym1 = the second 71-char slice of the canonical `syms` accumulator) followed by ordinal 1's
+// name (source [n1s, n1e)). build_fn_objs_xc parses with the SOURCE length as the bound, so the
+// table is read only by parse_call (when a call names ordinal 1). Factored out of bt2 so its
+// extraction/concat locals live in their own frame. `src` (= s.mem) is consumed into the result.
+fn build_aug2(src: string, syms: string, n1s: i64, n1e: i64) -> Aug2 effects[alloc, state] =
+  let slen: i64 = string_len(src) in
+  let nm: PRR = push_range(string_with_capacity(64), src, n1s, n1e) in
+  let ord1name: string = nm.out in
+  let src2: string = nm.mem in
+  let sx: PRR = push_range(string_with_capacity(80), syms, 71, 142) in
+  let sym1: string = sx.out in
+  let symsback: string = sx.mem in
+  let aug0: string = concat2(src2, sym1) in
+  let aug: string = concat2(aug0, ord1name) in
+  let r: Aug2 = { aug: aug, syms: symsback, slen: slen } in r
+
+// Step 2: build fn2's objects (birth = hh1, ordinal 2) and assemble the final three-symbol root
+// (no third migration is needed — nothing references its history). fn2's body may call fn1
+// (ordinal 1, born at hh0, not genesis), so its parse is fed an extra-callee table (build_aug2);
+// calls to fn0 (ordinal 0 = genesis) still resolve by parse_call's default. Returns the root hash.
 fn bt2(s: ChainS2, sl2: Sl, spans: array<i64, 32>) -> string effects[alloc, state] =
-  let foC: FObj = build_fn_objs(s.mem, sl2, s.prevhist, 2) in
+  let sl1: Sl = sl_at(spans, 1) in
+  let ag: Aug2 = build_aug2(s.mem, s.syms, sl1.ns, sl1.ne) in
+  let foC: FObj = build_fn_objs_xc(ag.aug, ag.slen, sl2, s.prevhist, 2) in
   let l2: i64 = string_len(foC.pn) in
-  let syms3: string = concat2(s.syms, foC.sym) in
+  let syms3: string = concat2(ag.syms, foC.sym) in
   let defs3: string = concat2(s.defs, foC.def) in
   let sigs3: string = concat2(s.sigs, foC.sig) in
   let pns3: string = concat2(s.pns, foC.pn) in
@@ -3085,20 +3253,26 @@ fn build_three_root(mem: string, spans: array<i64, 32>, sl0: Sl, sl1: Sl, sl2: S
 // multi-function program) the migration/history chain, return the ProgramRoot hash
 // ---------------------------------------------------------------------------
 
-// Route by function count: a three-function program (independent or DAG; canonical order is
-// the alphabetical display order for independent functions — the toposort comes with the DAG
-// increment) goes to build_three_root; one or two functions take the original path. (Four or
-// more functions are a later increment.)
+// Route by function count: a three-function program goes to build_three_root, ordered by a Kahn
+// toposort (a callee is created before its caller; alphabetical tie-break — which collapses to the
+// display order when the functions are independent). A toposort cycle means the three functions
+// form a recursion group (a 3-clique, a 2-member SCC plus a singleton, or a self-recursive
+// function); that is a later increment, so it is routed away from build_three_root rather than
+// mis-built as a DAG (the one/two-function path handles it as a defined — if not yet correct —
+// fallback). One or two functions take the original path; four or more are a later increment.
 fn import_root(mem: string) -> string effects[alloc, state] =
   let len: i64 = string_len(mem) in
   let prog: Prog = parse_all(mem, len) in
   if prog.n == 3 then
-    let dp: PermM = disp_perm(prog.mem, prog.spans, 3) in
-    let cspans: array<i64, 32> = reorder_spans(prog.spans, dp.perm, 3) in
-    let sl0: Sl = sl_at(cspans, 0) in
-    let sl1: Sl = sl_at(cspans, 1) in
-    let sl2: Sl = sl_at(cspans, 2) in
-    build_three_root(dp.mem, cspans, sl0, sl1, sl2)
+    let topo: Topo3 = toposort3(prog.mem, prog.spans, len) in
+    if topo.ok then
+      let cspans: array<i64, 32> = reorder_spans(prog.spans, topo.perm, 3) in
+      let sl0: Sl = sl_at(cspans, 0) in
+      let sl1: Sl = sl_at(cspans, 1) in
+      let sl2: Sl = sl_at(cspans, 2) in
+      build_three_root(topo.mem, cspans, sl0, sl1, sl2)
+    else
+      import_one_or_two(topo.mem, len)
   else
     import_one_or_two(prog.mem, len)
 
