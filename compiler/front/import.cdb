@@ -1,23 +1,33 @@
 // compiler/front/import.cdb - the self-hosted importer toward root-hash equality
-// (ladder rung A, stage 15a.2 — the real expression parser, axis 1).
+// (ladder rung A, Phase 15; milestone V3.4).
 //
-// Reads a source `fn main(<params>) -> <i64|bool> = <expr>` from stdin and prints the
-// program ROOT HASH the Rust importer would compute for it (`codedb import` ->
-// `root ...`). `<expr>` is a real expression over the full i64 operator set, the
-// comparison and logical operators, bool literals, `if`, `let` bindings, and identifier
-// references to either a `let` binding or a function parameter — parsed by a scannerless recursive-descent
-// parser that builds the TYPED Expression object tree bottom-up: each parse function
-// returns the content hash of the Expression object it just built (children referenced
-// by hash) AND its inferred TYPE CODE (`tyc`: 0 = i64, 1 = bool), so no explicit AST
-// tree is needed and objects are emitted in dependency order. Type inference threads
-// up through `Pr.tyc` into each node's `type` field, and the declared return type
-// (parsed from the header, `i64` or `bool`) sets the signature's return. For a single
-// non-recursive `main` the body's birth is genesis, so there is no migration/history
-// chain yet (axis 2, the multi-symbol step) — only the typed objects, gated by
-// root-hash equality (tests/selfhost_frontend.rs). The parser does NOT type-check, so
-// the oracle only applies to type-valid programs.
+// Reads CodeDB source on stdin and prints the program ROOT HASH the Rust importer would
+// assign it (`codedb import <db> <src>` -> `root <hash>`). The oracle is root-hash
+// equality (tests/selfhost_frontend.rs): the hash matches only if the parse, the
+// canonical item ordering, the canonical JSON of every object, the SHA-256, and the
+// migration/birth identity are ALL byte-exact. The importer does NOT type-check, so the
+// oracle is defined only on programs the Rust importer accepts.
 //
-// Grammar (this increment), in loosest-to-tightest precedence:
+// SUPPORTED SURFACE (landed incrementally; per-increment history in the
+// codedb-v3-phase15 memory):
+//   * Expressions (single function): the full i64 operator set (arithmetic / bitwise /
+//     shifts), comparisons and logical operators, unary `- ~ !`, bool literals, `if`,
+//     `let` + identifier references, hex literals, sized integers (u8..u64 / i8..i64)
+//     with top-down expectation propagation, and `to_*` cast builtins.
+//   * Multi-function programs: `create_function` migration/history chains for n
+//     functions (n <= 8), independent or call-dependent (Kahn toposort: callee created
+//     before caller, alphabetical tie-break), with cross-symbol calls, call arguments,
+//     and parameters used across functions.
+//   * Recursion groups: self- and mutual recursion as `create_recursion_group`, for any
+//     single n-member strongly-connected clique (n = 1..8). Canonical member order
+//     reproduces the Rust `canonical_clique_order`: 1-WL colour refinement when it
+//     discretizes, else `clique_label_search` individualization-refinement for symmetric
+//     (automorphic) cliques.
+//   * Type definitions: single and N record/enum definitions via the `create_type`
+//     migration/history chain (type-only roots).
+//
+// Expression grammar, loosest-to-tightest precedence (left-associative; `<<`/`>>`
+// distinguished from lone `<`/`>`, `&&`/`||` from single `&`/`|`):
 //   expr       := bitor
 //   bitor      := logor (('|' not '||') logor)*             i64
 //   logor      := logand ('||' logand)*                     bool
@@ -29,35 +39,68 @@
 //   shift      := add (('<<'|'>>') add)*                    i64
 //   add        := mul (('+'|'-') mul)*                      i64
 //   mul        := unary (('*'|'/'|'%') unary)*              i64
-//   unary      := ('-'|'~'|'!') unary | atom                i64/bool
-//   atom       := <decimal int>                  i64
-//               | `true` | `false`               bool
+//   unary      := ('-'|'~'|'!') unary | atom
+//   atom       := <decimal/hex int> | `true` | `false`
 //               | `if` expr `then` expr `else` expr
 //               | `let` IDENT `:` TYPE `=` expr `in` expr
+//               | `to_<TYPE>` `(` expr `)`        (int cast)
+//               | IDENT `(` args `)`              (call)
 //               | IDENT                           (local_ref / param_ref)
-// The header is `fn main ( IDENT: TYPE , ... ) -> TYPE =` — the parameters feed the
-// signature's `params` (a list of Type hashes) and the root's `param_names`, and an
-// in-body reference to one becomes a `param_ref` by its positional index. Binary levels
-// are left-associative; `<<`/`>>` are distinguished from lone `<`/`>`, and `&&`/`||`
-// from single `&`/`|`. `let`/`if` make the parser mutually recursive (atom <-> the
-// binary ladder), so import.cdb imports + compiles as one recursion group. An
-// identifier resolves first against the `let` scope — a `local_ref` by de-Bruijn depth
-// (innermost binding = 0) — and, failing that, against the parameter table — a
-// `param_ref` by index; so a `let` shadows a same-named parameter, the two are separate
-// namespaces (a let's depth does not count parameters), and the node is typed by the
-// binding/param it names. Both the let scope and the parameter table are Copy `Scope`
-// values threaded as input params down the ladder (the let scope is extended only into
-// a `let` body). No parens yet, and binding/param types are i64/bool only. No-new-symbol
-// builtins and the other object kinds are later increments.
+// An identifier resolves first against the `let` scope (local_ref by de-Bruijn depth,
+// innermost = 0), then the parameter table (param_ref by index): a `let` shadows a
+// same-named parameter, and the two are separate namespaces (a let's depth does not
+// count parameters). Binding/param types are i64/bool/sized-int; no parens, strings, or
+// record values in expression position yet.
 //
-// The objects for `fn main(<params>) -> <ret> = E` are, in order: the result Type(s) (i64
-// and/or bool); the body Expression tree; the FunctionSignature; the SymbolBirth;
-// the FunctionDef; the ProgramRoot. The SHA-256 core, stdin pump, padding, the
-// multi-block driver, the hex word emitter, and mem_cap live in
-// compiler/front/lib.cdb (imported first). The move-only memory string threads by
-// MOVE across helper calls (returned inside a record); within a function it stays
-// owned and `string_get` borrows it. Every bounds check is a nested `if p < len`
-// because the language's `&&` is strict (it evaluates both operands).
+// ARCHITECTURE.
+//   * The move-only source buffer threads by MOVE across helper calls (returned inside a
+//     record, the eval.cdb `St.mem` discipline); within a function it stays owned and
+//     `string_get` / `string_len` BORROW it (they reject a `&string`, so it cannot be
+//     borrowed into a helper — thread it back instead).
+//   * DUAL serialization (SPEC_V3 design principle 16): a TYPED recursive-descent parser
+//     builds Expression objects bottom-up — each parse function returns the content HASH
+//     of the object it built (children by hash), so objects emit in dependency order with
+//     no AST struct — and a parallel TYPE-FREE raw-AST parser emits the raw
+//     `operation.body` JSON that feeds migration_hash. (Phase 15a.5 collapses these two
+//     parsers onto one shared AST.)
+//   * Type inference threads up through `Pr.tyc` (0 = i64, 1 = bool, plus sized codes);
+//     sized literals are typed top-down via an expected-type code threaded down the
+//     parser.
+//   * Multi-item programs compute the canonical item order (Kahn toposort for a function
+//     DAG; `canonical_clique_order` for a recursion clique; alphabetical for independent
+//     items), then chain `create_function` / `create_type` migrations: each non-first
+//     symbol's SymbolBirth carries the running `history_hash`. In the ProgramRoot the
+//     `names` array is DISPLAY-name-ordered while `param_names` / `symbols` are
+//     SYMBOL-HASH-ordered (normalize_root) — they diverge whenever canonical order is not
+//     alphabetical, so the importer orders each array independently.
+//   * SHA-256, object-domain framing, hex output, the stdin pump, and `mem_cap` live in
+//     compiler/front/lib.cdb (imported first).
+//
+// v0 BACKEND GOTCHAS (load-bearing — do not "simplify" these away; each cost real debug
+// cycles; full list in the codedb-v3-phase15 memory):
+//   * `&&` / `||` are STRICT registry ops (both operands evaluated) — guard every byte
+//     read with a nested `if p < len then ... else ...`, never `p < len && get(p)`.
+//   * Size every `string_with_capacity` from the WORST CASE, never the current/2-fn case
+//     nor the source-slice length: it TRAPS past capacity, and a builder whose output is
+//     longer than its source slice (raw-AST nodes, op-params, full-hash history preimages)
+//     overflows a too-small buffer.
+//   * Never `string_len(param)` then move that same `param` into a builder: borrow-before-
+//     move runtime-traps (verify stays clean). Use a fixed worst-case size.
+//   * A record literal in `if`/`case`-branch or return position, and a loop seed inside an
+//     `if` branch, must be bound to a typed `let r: T = {..} in r` — else it gets a
+//     STRUCTURAL type whose native layout mismatches the nominal record.
+//   * A conditional that BUILDS a string inside a record-returning `if` SIGTRAPs — make it
+//     a conditional of two WHOLE calls, with the string-building outside the `if`.
+//   * A function that returns a move-only loop accumulator directly can SIGTRAP — rebuild
+//     it into a fresh record before returning.
+//   * Frame budget is 4095 bytes on arm64 (each value id costs 8 frame bytes, each
+//     aggregate local its full size); machine-param cap is 8 (arm64) / 6 (x86_64). Both
+//     are clean build-time bails — validate offline with `codedb frame-report` (Phase
+//     15a.5.2) before the slow build, and split frame-heavy functions into routers.
+//
+// NOTE: Phase 15a.5 (Draft 1.1) is extracting this monolith into
+// json/object/ast/graph/migration libraries; see compiler/front/README.md and
+// docs/PLAN_V3.md "Draft 1.1 continuation".
 
 record PBi { p: string  i: i64 }
 record OS { out: string  s: string }
