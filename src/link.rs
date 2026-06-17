@@ -8,7 +8,9 @@ use serde_json::{Value as JsonValue, json};
 use crate::abi::{export_map, internal_abi_symbol, validate_exported_abi_name};
 use crate::artifact::CacheKeyInput;
 use crate::backend::ArtifactKind;
-use crate::backend::native::{NativeObjectArtifact, backend_id_for_target};
+use crate::backend::native::{
+    FrameStats, NativeObjectArtifact, backend_id_for_target, frame_stats, target_frame_limits,
+};
 use crate::expr::Value;
 use crate::jobs::{ArtifactJobClaim, artifact_job_error, new_worker_id};
 use crate::lowering::{LoweredFunctionIr, LoweredOp};
@@ -1877,4 +1879,171 @@ fn link_options(target_triple: &str) -> Result<JsonValue> {
         })),
         other => bail!("unsupported native link target {other}"),
     }
+}
+
+impl CodeDb {
+    /// Per-function native stack-frame report for the main-branch closure of `entry`
+    /// (default `main`), targeting `target` (default the host arm64 target). The offline,
+    /// per-function mirror of the v0 backend's frame-size and machine-parameter `bail!`s
+    /// (Phase 15a.5.2): functions are listed largest-frame first, with near-limit and
+    /// over-limit flags, so a frame or param-cap overflow is caught before the slow native
+    /// build instead of one function at a time during it. Returns a text table, or pretty
+    /// JSON when `json` is set. Frame sizes reuse the target's real `StackLayout`, so the
+    /// report cannot drift from the backend; non-function and external symbols (no frame)
+    /// are skipped.
+    pub fn frame_report_main_branch(
+        &mut self,
+        entry: &str,
+        target: Option<&str>,
+        near: u32,
+        json: bool,
+    ) -> Result<String> {
+        self.ensure_initialized()?;
+        let target = target.unwrap_or(DEFAULT_NATIVE_TARGET);
+        let (frame_limit, param_cap) = target_frame_limits(target)?;
+        let branch = self.branch(MAIN_BRANCH)?;
+        let root_hash = branch.root_hash.clone();
+        let entry_symbol = self
+            .resolve_symbol_or_name(&root_hash, entry)
+            .map_err(|err| anyhow!("unknown entry function {entry}: {err}"))?;
+        let root = self.load_root(&root_hash)?;
+        let symbols = self.reachable_symbols(&root_hash, &entry_symbol)?;
+
+        let mut reports = Vec::new();
+        for symbol in symbols {
+            let root_entry = self
+                .root_symbol(&root, &symbol)
+                .ok_or_else(|| anyhow!("frame report symbol missing from root {symbol}"))?
+                .clone();
+            if !self.definition_is_internal_function(&root_entry.definition)? {
+                continue;
+            }
+            let ir = self.build_lowered_function_ir(&root, &root_entry, target)?;
+            let stats = frame_stats(&ir, target)?;
+            let name = qualified_symbol_display(&root, &symbol).unwrap_or_else(|| symbol.clone());
+            reports.push((name, symbol, stats));
+        }
+        reports.sort_by(|a, b| {
+            b.2.stack_size
+                .cmp(&a.2.stack_size)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+
+        Ok(if json {
+            render_frame_report_json(entry, target, near, frame_limit, param_cap, &reports)
+        } else {
+            render_frame_report_text(entry, target, near, frame_limit, param_cap, &reports)
+        })
+    }
+}
+
+/// True when `stats` is within `near` bytes of (or over) the target frame limit.
+fn frame_is_near_limit(stats: &FrameStats, near: u32) -> bool {
+    stats
+        .frame_limit
+        .is_some_and(|limit| stats.stack_size.saturating_add(near) >= limit)
+}
+
+fn render_frame_report_json(
+    entry: &str,
+    target: &str,
+    near: u32,
+    frame_limit: Option<u32>,
+    param_cap: usize,
+    reports: &[(String, String, FrameStats)],
+) -> String {
+    let functions = reports
+        .iter()
+        .map(|(name, symbol, s)| {
+            json!({
+                "name": name,
+                "symbol": symbol,
+                "stack_size": s.stack_size,
+                "near_limit": frame_is_near_limit(s, near),
+                "over_frame_limit": s.over_frame_limit,
+                "machine_params": s.machine_params,
+                "machine_param_cap": s.machine_param_cap,
+                "over_param_cap": s.over_param_cap,
+                "hidden_return_slot": s.hidden_return_slot,
+                "aggregate_local_count": s.aggregate_local_count,
+                "aggregate_local_bytes": s.aggregate_local_bytes,
+                "indirect_param_count": s.indirect_param_count,
+                "indirect_param_bytes": s.indirect_param_bytes,
+                "value_id_count": s.value_id_count,
+            })
+        })
+        .collect::<Vec<_>>();
+    let report = json!({
+        "schema": "codedb/frame-report/v1",
+        "entry": entry,
+        "target": target,
+        "frame_limit": frame_limit,
+        "param_cap": param_cap,
+        "near_threshold": near,
+        "function_count": reports.len(),
+        "max_stack_size": reports.iter().map(|(_, _, s)| s.stack_size).max().unwrap_or(0),
+        "over_frame_limit_count": reports.iter().filter(|(_, _, s)| s.over_frame_limit).count(),
+        "over_param_cap_count": reports.iter().filter(|(_, _, s)| s.over_param_cap).count(),
+        "near_limit_count": reports
+            .iter()
+            .filter(|(_, _, s)| frame_is_near_limit(s, near))
+            .count(),
+        "functions": functions,
+    });
+    format!("{}\n", serde_json::to_string_pretty(&report).unwrap_or_default())
+}
+
+fn render_frame_report_text(
+    entry: &str,
+    target: &str,
+    near: u32,
+    frame_limit: Option<u32>,
+    param_cap: usize,
+    reports: &[(String, String, FrameStats)],
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let limit_str = frame_limit.map_or_else(|| "none".to_string(), |limit| limit.to_string());
+    let max_frame = reports.iter().map(|(_, _, s)| s.stack_size).max().unwrap_or(0);
+    let over_frame = reports.iter().filter(|(_, _, s)| s.over_frame_limit).count();
+    let over_param = reports.iter().filter(|(_, _, s)| s.over_param_cap).count();
+    let near_count = reports
+        .iter()
+        .filter(|(_, _, s)| frame_is_near_limit(s, near))
+        .count();
+    let _ = writeln!(
+        out,
+        "frame-report  entry={entry}  target={target}  frame_limit={limit_str}  param_cap={param_cap}  near={near}"
+    );
+    let _ = writeln!(
+        out,
+        "{} functions  max_frame={max_frame}  over_frame={over_frame}  over_param={over_param}  near_limit={near_count}",
+        reports.len()
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "  {:>6}  {:>7}  {:>12}  {:>7}  {:<10}  FUNCTION",
+        "FRAME", "PARAMS", "AGG_LOCALS", "VALUES", "FLAGS"
+    );
+    for (name, _symbol, s) in reports {
+        let flag = if s.over_frame_limit {
+            "OVER-FRAME"
+        } else if s.over_param_cap {
+            "OVER-PARAM"
+        } else if frame_is_near_limit(s, near) {
+            "NEAR"
+        } else {
+            "ok"
+        };
+        let params = format!("{}/{}", s.machine_params, s.machine_param_cap);
+        let agg = format!("{}/{}", s.aggregate_local_count, s.aggregate_local_bytes);
+        let _ = writeln!(
+            out,
+            "  {:>6}  {:>7}  {:>12}  {:>7}  {:<10}  {name}",
+            s.stack_size, params, agg, s.value_id_count, flag
+        );
+    }
+    out
 }

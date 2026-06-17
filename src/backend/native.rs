@@ -138,7 +138,7 @@ impl ObjectBackend for ElfObjectBackend {
             bail!("{ELF_BACKEND_ID} only supports target {LINUX_X86_64_TARGET}");
         }
 
-        validate_native_ir(input.ir, 6)?;
+        validate_native_ir(input.ir, native_max_machine_params(input.target_triple)?)?;
         let function_symbol = internal_abi_symbol(&input.ir.symbol_hash)?;
         let compiled = compile_x86_64_function(input.ir, &function_symbol)?;
         let object = write_elf_object(
@@ -214,7 +214,7 @@ impl ObjectBackend for MachOArm64ObjectBackend {
             bail!("{MACHO_BACKEND_ID} only supports target {APPLE_ARM64_TARGET}");
         }
 
-        validate_native_ir(input.ir, 8)?;
+        validate_native_ir(input.ir, native_max_machine_params(input.target_triple)?)?;
         let function_symbol = internal_abi_symbol(&input.ir.symbol_hash)?;
         let object_symbol = macho_symbol_name(&function_symbol);
         let compiled = compile_arm64_function(input.ir, &object_symbol)?;
@@ -655,6 +655,35 @@ pub(crate) fn backend_id_for_target(target_triple: &str) -> Result<&'static str>
             "unsupported native object target {other}; supported targets: {LINUX_X86_64_TARGET}, {APPLE_ARM64_TARGET}"
         ),
     }
+}
+
+/// The v0 backend's machine-parameter cap for `target_triple`: arm64 passes up to 8
+/// integer arguments in registers (x0-x7), x86_64 SysV up to 6 (rdi..r9). A hidden
+/// aggregate-return slot counts against the cap. Single source for both
+/// `validate_native_ir` (the build-time check) and `frame_stats` (the offline report).
+fn native_max_machine_params(target_triple: &str) -> Result<usize> {
+    match target_triple {
+        LINUX_X86_64_TARGET => Ok(6),
+        APPLE_ARM64_TARGET => Ok(8),
+        other => bail!(
+            "unsupported native object target {other}; supported targets: {LINUX_X86_64_TARGET}, {APPLE_ARM64_TARGET}"
+        ),
+    }
+}
+
+/// The two v0 backend caps `frame-report` checks for `target_triple`: the stack-frame
+/// size limit (arm64 = `ARM64_MAX_STACK_FRAME_BYTES`; x86_64 = none) and the
+/// machine-parameter cap. Lets the report header describe the limits independently of how
+/// many functions it found.
+pub(crate) fn target_frame_limits(target_triple: &str) -> Result<(Option<u32>, usize)> {
+    let frame_limit = match target_triple {
+        APPLE_ARM64_TARGET => Some(ARM64_MAX_STACK_FRAME_BYTES),
+        LINUX_X86_64_TARGET => None,
+        other => bail!(
+            "unsupported native object target {other}; supported targets: {LINUX_X86_64_TARGET}, {APPLE_ARM64_TARGET}"
+        ),
+    };
+    Ok((frame_limit, native_max_machine_params(target_triple)?))
 }
 
 fn collect_called_symbols(operations: &[LoweredOp], out: &mut BTreeSet<String>) {
@@ -4685,6 +4714,11 @@ impl FunctionEmitter {
     }
 }
 
+/// The v0 arm64 backend addresses stack slots with a 12-bit scaled immediate, so a
+/// function whose frame exceeds this many bytes cannot be encoded; `compile_arm64_function`
+/// rejects it, and `frame_stats` / `frame-report` flag it offline before the native build.
+const ARM64_MAX_STACK_FRAME_BYTES: u32 = 4095;
+
 #[derive(Debug)]
 struct Arm64StackLayout {
     hidden_return_offset: Option<u32>,
@@ -4701,6 +4735,9 @@ fn compile_arm64_function(
 ) -> Result<CompiledFunction> {
     let type_layouts = native_type_layouts(ir)?;
     let layout = Arm64StackLayout::new(ir)?;
+    if layout.stack_size > ARM64_MAX_STACK_FRAME_BYTES {
+        bail!("native arm64 backend v0 stack frame is too large");
+    }
     let mut emitter = Arm64Emitter {
         layout,
         type_layouts,
@@ -4750,6 +4787,87 @@ fn compile_arm64_function(
         relocations: emitter.relocations,
         static_data,
         debug_ranges: emitter.debug_ranges,
+    })
+}
+
+/// Per-function native stack-frame metrics for `frame-report` (Phase 15a.5.2).
+///
+/// `stack_size` is taken from the target's real `StackLayout` / `Arm64StackLayout`, so
+/// the report cannot drift from the backend. The v0 arm64 frame limit
+/// (`ARM64_MAX_STACK_FRAME_BYTES`) and the machine-parameter cap
+/// (`native_max_machine_params`: 8 arm64 / 6 x86_64) are the two build-time `bail!`s this
+/// report mirrors offline, per function, with proximity warnings.
+#[derive(Debug, Clone)]
+pub(crate) struct FrameStats {
+    pub(crate) stack_size: u32,
+    pub(crate) frame_limit: Option<u32>,
+    pub(crate) over_frame_limit: bool,
+    pub(crate) machine_params: usize,
+    pub(crate) machine_param_cap: usize,
+    pub(crate) over_param_cap: bool,
+    pub(crate) hidden_return_slot: bool,
+    pub(crate) indirect_param_count: usize,
+    pub(crate) indirect_param_bytes: u32,
+    pub(crate) aggregate_local_count: usize,
+    pub(crate) aggregate_local_bytes: u32,
+    pub(crate) value_id_count: usize,
+}
+
+/// Compute the native stack-frame metrics of a lowered function for `target_triple`.
+/// Unlike the build path this never rejects an over-limit frame — it reports the size so
+/// `frame-report` can show how far over (or under) the limit each function is. The frame
+/// size reuses the target's real `StackLayout` (single source of truth, no formula replica).
+pub(crate) fn frame_stats(ir: &LoweredFunctionIr, target_triple: &str) -> Result<FrameStats> {
+    let type_layouts = native_type_layouts(ir)?;
+    let hidden_return_slot = native_returns_indirect(&type_layouts, &ir.return_type_hash)?;
+    let machine_params = ir.params.len() + usize::from(hidden_return_slot);
+
+    let mut indirect_param_count = 0usize;
+    let mut indirect_param_bytes = 0u32;
+    for param in &ir.params {
+        if native_passes_indirect(&type_layouts, &param.type_hash)? {
+            indirect_param_count += 1;
+            indirect_param_bytes += u32::try_from(native_stack_slot_size_bytes(
+                native_type_size(&type_layouts, &param.type_hash)?,
+            ))?;
+        }
+    }
+
+    let aggregate_local_count = ir.locals.len();
+    let mut aggregate_local_bytes = 0u32;
+    for local in &ir.locals {
+        aggregate_local_bytes += u32::try_from(local.size_bytes)?.div_ceil(8) * 8;
+    }
+
+    let mut ids = Vec::new();
+    collect_value_ids(&ir.operations, &mut ids)?;
+    let value_id_count = ids.len();
+
+    let (stack_size, frame_limit) = match target_triple {
+        APPLE_ARM64_TARGET => (
+            Arm64StackLayout::new(ir)?.stack_size,
+            Some(ARM64_MAX_STACK_FRAME_BYTES),
+        ),
+        LINUX_X86_64_TARGET => (u32::try_from(StackLayout::new(ir)?.stack_size)?, None),
+        other => bail!(
+            "unsupported native object target {other}; supported targets: {LINUX_X86_64_TARGET}, {APPLE_ARM64_TARGET}"
+        ),
+    };
+    let machine_param_cap = native_max_machine_params(target_triple)?;
+
+    Ok(FrameStats {
+        stack_size,
+        frame_limit,
+        over_frame_limit: frame_limit.is_some_and(|limit| stack_size > limit),
+        machine_params,
+        machine_param_cap,
+        over_param_cap: machine_params > machine_param_cap,
+        hidden_return_slot,
+        indirect_param_count,
+        indirect_param_bytes,
+        aggregate_local_count,
+        aggregate_local_bytes,
+        value_id_count,
     })
 }
 
@@ -4807,9 +4925,8 @@ impl Arm64StackLayout {
         } else {
             raw_size.div_ceil(16) * 16
         };
-        if stack_size > 4095 {
-            bail!("native arm64 backend v0 stack frame is too large");
-        }
+        // The frame-size limit is enforced by the sole caller, `compile_arm64_function`,
+        // so `frame_stats` can reuse this layout to report an over-limit frame's size.
         Ok(Self {
             hidden_return_offset,
             param_offsets,

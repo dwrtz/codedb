@@ -179,6 +179,24 @@ enum Command {
     )]
     EmitTokens { file: PathBuf },
     #[command(
+        about = "Per-function native stack-frame report (size, params, aggregate locals) — offline frame and machine-param-cap check before the native build (Phase 15a.5.2)"
+    )]
+    FrameReport {
+        db: PathBuf,
+        #[arg(default_value = "main")]
+        entry: String,
+        #[arg(long, help = "target triple (default: host arm64)")]
+        target: Option<String>,
+        #[arg(
+            long,
+            default_value_t = 256,
+            help = "warn when a frame is within this many bytes of the limit"
+        )]
+        near: u32,
+        #[arg(long, help = "emit JSON instead of a text table")]
+        json: bool,
+    },
+    #[command(
         about = "Emit the flat binary CIR artifact (the lowered-IR closure of an entry, for the CodeDB-hosted evaluator)"
     )]
     EmitCir {
@@ -910,6 +928,17 @@ fn main() -> Result<()> {
         Command::EmitTokens { file } => {
             let source = std::fs::read_to_string(&file)?;
             println!("{}", codedb::token_probe(&source)?);
+        }
+        Command::FrameReport {
+            db,
+            entry,
+            target,
+            near,
+            json,
+        } => {
+            let mut codedb = codedb::CodeDb::open(db)?;
+            let report = codedb.frame_report_main_branch(&entry, target.as_deref(), near, json)?;
+            print!("{report}");
         }
         Command::EmitCir {
             db,

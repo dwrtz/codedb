@@ -312,24 +312,33 @@ fn obj_hash_reproduces_hash_object_canonical_for_real_objects() {
     );
 }
 
-/// Import + verify + build the self-hosted importer (the minimal-grammar
-/// source -> root-hash program) — once per test process.
+/// Import + verify + build the self-hosted importer (lib.cdb + import.cdb) once per
+/// test process; the shared `(TempDir, db, exe)` is reused by `importer()` (the native
+/// binary) and `importer_db()` (the database, for inspecting the importer's compiled form).
+fn importer_artifacts() -> &'static (TempDir, PathBuf, PathBuf) {
+    static IMPORTER: OnceLock<(TempDir, PathBuf, PathBuf)> = OnceLock::new();
+    IMPORTER.get_or_init(|| {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("selfhost-import.sqlite");
+        run(&["init", path(&db)]);
+        run(&["import", path(&db), "compiler/front/lib.cdb"]);
+        run(&["import", path(&db), "compiler/front/import.cdb"]);
+        run(&["verify", path(&db)]);
+        let exe = temp.path().join("import-bin");
+        run(&["build", path(&db), "main", "--out", path(&exe)]);
+        (temp, db, exe)
+    })
+}
+
+/// The native importer binary (minimal-grammar source -> root hash).
 fn importer() -> &'static Path {
-    static IMPORTER: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
-    IMPORTER
-        .get_or_init(|| {
-            let temp = tempdir().unwrap();
-            let db = temp.path().join("selfhost-import.sqlite");
-            run(&["init", path(&db)]);
-            run(&["import", path(&db), "compiler/front/lib.cdb"]);
-            run(&["import", path(&db), "compiler/front/import.cdb"]);
-            run(&["verify", path(&db)]);
-            let exe = temp.path().join("import-bin");
-            run(&["build", path(&db), "main", "--out", path(&exe)]);
-            (temp, exe)
-        })
-        .1
-        .as_path()
+    importer_artifacts().2.as_path()
+}
+
+/// The database the importer was built from (lib.cdb + import.cdb imported), for
+/// inspecting the importer's own compiled form — e.g. its per-function stack frames.
+fn importer_db() -> &'static Path {
+    importer_artifacts().1.as_path()
 }
 
 #[test]
@@ -1855,4 +1864,108 @@ fn emit_objects_is_a_deterministic_canonical_dump() {
         format!("root {new_root}"),
         "emit-objects root pin equals the importer's reported root"
     );
+}
+
+#[test]
+fn frame_report_keeps_importer_functions_within_the_arm64_frame_limit() {
+    // frame-report (Phase 15a.5.2) is the offline, per-function mirror of the v0 arm64
+    // frame-size bail: every function in the self-hosted importer's own closure must fit
+    // the 4095-byte v0 arm64 stack frame, or `build` would reject it. Reuses the importer
+    // database so no second import of import.cdb is paid.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let out = run(&["frame-report", path(importer_db()), "main", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&out).expect("frame-report json");
+
+    assert_eq!(report["target"], "aarch64-apple-darwin");
+    assert_eq!(report["frame_limit"], 4095);
+    assert_eq!(report["param_cap"], 8);
+
+    let functions = report["functions"].as_array().expect("functions array");
+    assert!(
+        functions.len() > 50,
+        "expected the importer's many functions, got {}",
+        functions.len()
+    );
+
+    // The gate: nothing over the frame limit or the machine-parameter cap. On failure the
+    // JSON names the offending functions and their sizes.
+    assert_eq!(
+        report["over_frame_limit_count"], 0,
+        "an importer function exceeds the v0 arm64 frame limit:\n{out}"
+    );
+    assert_eq!(
+        report["over_param_cap_count"], 0,
+        "an importer function exceeds the v0 arm64 machine-parameter cap:\n{out}"
+    );
+
+    let max = report["max_stack_size"].as_u64().expect("max_stack_size");
+    assert!(
+        (1..=4095).contains(&max),
+        "max importer frame {max} is outside the expected (0, 4095] range"
+    );
+
+    // Functions are listed largest-frame first.
+    let sizes: Vec<u64> = functions
+        .iter()
+        .map(|f| f["stack_size"].as_u64().expect("stack_size"))
+        .collect();
+    assert!(
+        sizes.windows(2).all(|w| w[0] >= w[1]),
+        "frame-report functions should be sorted by descending frame size"
+    );
+}
+
+#[test]
+fn frame_report_flags_an_over_limit_frame_before_the_native_build_rejects_it() {
+    // A function with a large aggregate local overflows the v0 arm64 stack frame.
+    // frame-report flags it offline with an actionable diagnostic, and the native build
+    // genuinely rejects the same frame — so the report mirrors a real build-time bail, not
+    // a guessed threshold.
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("over.sqlite");
+    let src = temp.path().join("over.cdb");
+    std::fs::write(
+        &src,
+        "fn main() -> i64 = let a: array<i64, 600> = [0; 600] in a[0]\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+
+    let out = run(&["frame-report", path(&db), "main", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&out).expect("frame-report json");
+    assert_eq!(
+        report["over_frame_limit_count"], 1,
+        "frame-report should flag the oversized frame:\n{out}"
+    );
+    let main_fn = report["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .find(|f| f["name"] == "main.main")
+        .expect("main.main in the report");
+    assert_eq!(main_fn["over_frame_limit"], true);
+    assert!(
+        main_fn["stack_size"].as_u64().expect("stack_size") > 4095,
+        "the oversized frame should report a stack_size over the limit"
+    );
+
+    // The native arm64 build rejects the very same frame today, with the diagnostic the
+    // report mirrors.
+    if can_build_default_native_target() {
+        let exe = temp.path().join("over-bin");
+        let output = bin()
+            .args(["build", path(&db), "main", "--out", path(&exe)])
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("stack frame is too large"),
+            "build should fail with the frame diagnostic, got:\n{stderr}"
+        );
+    }
 }
