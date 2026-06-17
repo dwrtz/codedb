@@ -1863,6 +1863,34 @@ chain), then named-type references in signatures / record construction / `case`,
 mutually-recursive type cliques (reusing `canonical_clique_order`, already self-hosted for
 function cliques).
 
+Landed 2026-06-17 (step 4, object-kind breadth — N type definitions via the create_type chain):
+the analog of the n-function `create_function` chain, for N independent (scalar-field) record/enum
+type definitions. `import_root` routes a multi-type program through `import_types` -> `parse_all_types`
+(scan each `record|enum <Name> { ... }` into the packed spans, kind in `rtc`, reusing `Sl`) ->
+canonical ordering by `disp_perm` (alphabetical; independent scalar-field types have no dependency
+edges) -> `build_type_chain_root`, a fold mirroring the n-fn chain: `bt0_type` (the genesis-born
+first type + its migration) / `bt_mid_type` (the middle migrations, by self-recursion) / `bt_last_type`
+(the final type + the n-type root). Each NON-first type's type symbol AND its field/variant symbols
+are born at the RUNNING history (`build_type_objs` is now parameterized by birth-history + ordinal;
+the single-type `build_typedef_root` reuses it at genesis/0). The `create_type` migration
+(`build_type_mig`, split into `type_mig_a`/`type_mig_b` for the v0 frame budget) is SIMPLER than
+`create_function` — no params/return/effects: operation `{birth_seed, definition, kind:"create_type",
+module, name, region_params}` with the raw `definition` (`raw_def`, KIND-LAYOUT-dependent like
+RecordDef/EnumDef: record `{"fields":[…],"kind":"record"}` vs enum `{"kind":"enum","variants":[…]}`)
+embedded twice (operation + `type_source_matches` postcondition); pre/post `type_name_is_available`/
+`type_source_matches`. The multi-type ProgramRoot (`assemble_type_root` + `emit_type_names` +
+`emit_types`, mirroring `assemble_root`) has `type_names` DISPLAY(name)-ordered but `types`
+type_symbol-HASH-ordered — they diverge, the same names-vs-hash split as the function root. Reuses
+`Sl`/`disp_perm`/`hash_perm`/`concat2`/`null_field`/`quote_field` and the record/enum object builders.
+De-risked in Python (`bp_typechain.py`, every migration_hash/history_hash + the root byte-exact for
+2/3/4/5-type programs) before authoring; the v0 work was a `typedef`-reserved-word rename, two
+move-only fixes (an out_root double-move in the migration, a `prevhist` double-move + wrong-source
+parse in `bt_mid_type`), and two frame splits (`build_type_mig`, `import_root`->`import_types`).
+Gate: `importer_reproduces_the_root_hash_for_n_type_definitions` (2..5 types, records/enums/mixed,
+both source orders, sized fields); local smoke 10/10 (+ record/enum 16/16, cliques 24/24 regressions);
+every function under the v0 frame budget (max `parse_all` 4048). Next object-kind-breadth steps:
+named-type references in signatures / record construction / `case`, then mutually-recursive type cliques.
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text

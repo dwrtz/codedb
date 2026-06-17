@@ -1704,6 +1704,59 @@ fn importer_reproduces_the_root_hash_for_single_enum() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_n_type_definitions() {
+    // 15a (object-kind breadth): N >= 2 independent record/enum type definitions, the create_type
+    // migration/history CHAIN — the analog of the n-function create_function chain. The types are
+    // ordered canonically (alphabetical, since independent scalar-field types have no dependency
+    // edges), and each NON-first type's type symbol AND its field/variant symbols are born at the
+    // RUNNING history (genesis for the alpha-first), seeded by a chain of create_type migrations.
+    // The multi-type ProgramRoot's `type_names` is display(name)-ordered but `types` is
+    // type_symbol-HASH-ordered — they diverge, the same names-vs-hash split as the function root —
+    // so the dual ordering is genuinely exercised. Root-hash equality is an exact gate over the
+    // whole chain: any migration_hash/history_hash/birth-seed/canonical-order/key-order error
+    // changes a downstream birth -> symbol -> the root. Covers 2..5 types, records + enums + mixed,
+    // both source orders (the root is order-independent), and sized field types.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        // two records (independent) -> two create_type migrations
+        "record Alpha {\n  x: i64\n}\nrecord Beta {\n  y: bool\n}\n",
+        // reversed source order -> the SAME root (canonical ordering is order-independent)
+        "record Beta {\n  y: bool\n}\nrecord Alpha {\n  x: i64\n}\n",
+        // record + enum mixed
+        "record A {\n  a: i64\n  b: i64\n}\nenum B {\n  ok: i64\n  err: bool\n}\n",
+        // three types, alphabetical order != source order
+        "record Zeta {\n  z: u8\n}\nrecord Mid {\n  m: i64\n}\nrecord Apex {\n  a: bool\n}\n",
+        // three mixed (the type_names-display vs types-hash divergence)
+        "enum Color {\n  r: u8\n  g: u8\n  b: u8\n}\nrecord Point {\n  x: i64\n  y: i64\n}\nenum Flag {\n  on: bool\n}\n",
+        // four records in reverse-alphabetical source order
+        "record D {\n  d: i64\n}\nrecord C {\n  c: i64\n}\nrecord B {\n  b: i64\n}\nrecord A {\n  a: i64\n}\n",
+        // five records (a longer chain)
+        "record R0 {\n  f: i64\n}\nrecord R1 {\n  f: i64\n}\nrecord R2 {\n  f: i64\n}\nrecord R3 {\n  f: i64\n}\nrecord R4 {\n  f: i64\n}\n",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        let db = temp.path().join(format!("ref-ntype-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-ntype-{i}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer n-type-chain root mismatch for:\n{source}"
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate

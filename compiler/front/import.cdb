@@ -402,20 +402,46 @@ record MAcc { mem: string  ids: array<i64, 16>  nf: i64  pos: i64  go: bool }
 // One scanned member: the threaded memory, its packed (name range + type code), and the
 // cursor just past its type name.
 record MemR { mem: string  packed: i64  next: i64 }
-// A type symbol birth result: the threaded memory and the type SymbolBirth hash (= the
-// type_symbol referenced by every member birth, the RecordDef/EnumDef, the TypeDef, the root).
-record TB { mem: string  hash: string }
+// A type symbol birth result: the threaded memory, the type SymbolBirth hash (= the type_symbol
+// referenced by every member birth, the RecordDef/EnumDef, the TypeDef, the root), and the KEPT
+// birth-history string (reused by every member birth — genesis for a lone/first type, else the
+// running history hash for a chained non-first type).
+record TB { mem: string  hash: string  bh: string }
 // The Copy context threaded through the member-defs recursion (bundled to stay under the
-// 8-machine-param cap): the packed member table, the member count, the type name's byte
-// range [ns, ne), and the kind (0 = record, 1 = enum).
-record TdCtx { ids: array<i64, 16>  nf: i64  ns: i64  ne: i64  kind: i64 }
-// A single member's genesis SymbolBirth: its hash, the threaded memory, and the kept type_symbol.
-record MBirth { hash: string  mem: string  ts: string }
-// The member-defs builder result: the fields/variants array BODY, the threaded memory, and the
-// kept type_symbol (reused by the RecordDef/EnumDef, the TypeDef, and the root).
-record TdMemOut { out: string  mem: string  ts: string }
+// 8-machine-param cap): the packed member table, the member count, the type name's byte range
+// [ns, ne), the kind (0 = record, 1 = enum), and the canonical ordinal `ord` (the local_nonce
+// `import:type:main:<name>:<ord>` — 0 for a lone type, the chain position otherwise).
+record TdCtx { ids: array<i64, 16>  nf: i64  ns: i64  ne: i64  kind: i64  ord: i64 }
+// A single member's SymbolBirth: its hash, the threaded memory, the kept type_symbol, and the
+// kept birth-history (threaded on to the next member).
+record MBirth { hash: string  mem: string  ts: string  bh: string }
+// The member-defs builder result: the fields/variants array BODY, the threaded memory, the kept
+// type_symbol (reused by the RecordDef/EnumDef, the TypeDef, the root), and the kept birth-history.
+record TdMemOut { out: string  mem: string  ts: string  bh: string }
 // A def-wrap result: the built object hash (RecordDef/EnumDef, then TypeDef) and the kept type_symbol.
 record DW { hash: string  ts: string }
+// One type's built objects (at a given birth-history + ordinal): the threaded memory, the type
+// SymbolBirth hash, and the TypeDef hash. The shared building block of the single-type root AND
+// every step of the multi-type create_type chain.
+record TObj { mem: string  typesym: string  tdef: string }
+// The create_type CHAIN accumulator (mirrors ChainAcc for functions): the threaded memory, the
+// running history + intermediate root, and the concatenated 71-char type symbols + TypeDef hashes
+// (in canonical/chain order; the root assembler sorts them — type_names by name, types by hash).
+record ChainAccT { mem: string  prevhist: string  prevroot: string  typesyms: string  typedefs: string }
+// The inputs to assemble_type_root: the threaded memory and the canonical-order type-symbol /
+// TypeDef concats. (Mirror of RootStr for the type root.)
+record RootStrT { mem: string  typesyms: string  typedefs: string }
+// assemble_type_root's result: the root hash plus the threaded memory + concats (so the chain can
+// reuse them in the next step). (Mirror of AsmOut.)
+record AsmOutT { hash: string  mem: string  typesyms: string  typedefs: string }
+// emit_type_names' result: the buffer + threaded memory + kept type-symbol concat.
+record EmitNT { buf: string  mem: string  typesyms: string }
+// emit_types' result: the buffer + kept type-symbol + TypeDef concats.
+record EmitTY { buf: string  typesyms: string  typedefs: string }
+// Carrier between build_type_mig's two payload halves (split for the v0 frame budget): the partial
+// buffer (through parent_history_hash) + threaded memory + the kept in_root / out_root / rawdef that
+// the postconditions/preconditions reuse.
+record PcT { buf: string  mem: string  in_root: string  out_root: string  rawdef: string }
 
 // ---------------------------------------------------------------------------
 // byte classifiers (ASCII; + - * / and whitespace)
@@ -4149,20 +4175,28 @@ fn parse_members(mem: string, pos: i64, len: i64) -> MAcc effects[alloc, state] 
   let r: MAcc = { mem: done.mem, ids: done.ids, nf: done.nf, pos: done.pos, go: done.go } in r
 
 // The type symbol's genesis SymbolBirth: local_nonce "import:type:main:<Name>:0", kind "type".
-fn build_type_birth(mem: string, ns: i64, ne: i64) -> TB effects[alloc, state] =
-  let p0: string = push_lit(string_with_capacity(256), b"{\"birth_history_hash\":\"genesis\",\"local_nonce\":\"import:type:main:") in
-  let pr: PRR = push_range(p0, mem, ns, ne) in
-  let p1: string = push_lit(pr.out, b":0\",\"symbol_kind\":\"type\"}") in
-  let h: string = hash_object(b"SymbolBirth", 1, p1) in
-  let r: TB = { mem: pr.mem, hash: h } in r
+fn build_type_birth(mem: string, ns: i64, ne: i64, bh: string, ord: i64) -> TB effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(256), b"{\"birth_history_hash\":\"") in
+  let kb: OS = push_kept(p0, bh) in
+  let p0b: string = push_lit(kb.out, b"\",\"local_nonce\":\"import:type:main:") in
+  let pr: PRR = push_range(p0b, mem, ns, ne) in
+  let p1: string = push_byte(pr.out, to_u8(58)) in
+  let p1d: string = push_dec(p1, ord) in
+  let p2: string = push_lit(p1d, b"\",\"symbol_kind\":\"type\"}") in
+  let h: string = hash_object(b"SymbolBirth", 1, p2) in
+  let r: TB = { mem: pr.mem, hash: h, bh: kb.s } in r
 
 // One member's genesis SymbolBirth: local_nonce "import:type:main:<Name>:0:<tag>:<idx>:<member>"
 // (tag = field/variant), owner_type_symbol the type symbol, kind record_field/enum_variant.
 // Threads the memory and keeps `typesym` (reused by every member + the def/typedef/root).
-fn build_member_birth(mem: string, ctx: TdCtx, idx: i64, ms: i64, me: i64, typesym: string) -> MBirth effects[alloc, state] =
-  let p0: string = push_lit(string_with_capacity(384), b"{\"birth_history_hash\":\"genesis\",\"local_nonce\":\"import:type:main:") in
-  let r1: PRR = push_range(p0, mem, ctx.ns, ctx.ne) in
-  let p1: string = push_lit(r1.out, b":0:") in
+fn build_member_birth(mem: string, ctx: TdCtx, idx: i64, ms: i64, me: i64, typesym: string, bh: string) -> MBirth effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(384), b"{\"birth_history_hash\":\"") in
+  let kb: OS = push_kept(p0, bh) in
+  let p0b: string = push_lit(kb.out, b"\",\"local_nonce\":\"import:type:main:") in
+  let r1: PRR = push_range(p0b, mem, ctx.ns, ctx.ne) in
+  let p0o: string = push_byte(r1.out, to_u8(58)) in
+  let p0d: string = push_dec(p0o, ctx.ord) in
+  let p1: string = push_byte(p0d, to_u8(58)) in
   let p2: string = push_mtag(p1, ctx.kind) in
   let p3: string = push_byte(p2, to_u8(58)) in
   let p4: string = push_dec(p3, idx) in
@@ -4174,7 +4208,7 @@ fn build_member_birth(mem: string, ctx: TdCtx, idx: i64, ms: i64, me: i64, types
   let p8: string = push_mkind(p7, ctx.kind) in
   let p9: string = push_lit(p8, b"\"}") in
   let h: string = hash_object(b"SymbolBirth", 1, p9) in
-  let r: MBirth = { hash: h, mem: r2.mem, ts: k0.s } in r
+  let r: MBirth = { hash: h, mem: r2.mem, ts: k0.s, bh: kb.s } in r
 
 // One record FIELD entry: {"field_symbol":"<msym>","name":"<name>","type":"<typehash>"} — keys
 // field_symbol/name/type (alphabetical, since `field_symbol` sorts first). Threads memory; the
@@ -4208,8 +4242,8 @@ fn emit_enum_entry(buf: string, mem: string, msym: string, th: string, ms: i64, 
 // member idx: build its birth -> member symbol; emit its record/enum entry (kind selects the
 // distinct key LAYOUT — a conditional of two whole calls, never string-building inside the `if`).
 // Members stay in SOURCE (declaration) order; their type objects (type_hash) dedup by content hash.
-fn push_member_defs(buf: string, mem: string, typesym: string, ctx: TdCtx, idx: i64) -> TdMemOut effects[alloc, state] =
-  if idx >= ctx.nf then (let r: TdMemOut = { out: buf, mem: mem, ts: typesym } in r)
+fn push_member_defs(buf: string, mem: string, typesym: string, ctx: TdCtx, bh: string, idx: i64) -> TdMemOut effects[alloc, state] =
+  if idx >= ctx.nf then (let r: TdMemOut = { out: buf, mem: mem, ts: typesym, bh: bh } in r)
   else
     let packed: i64 = ctx.ids[idx] in
     let tc: i64 = packed % 16 in
@@ -4217,11 +4251,11 @@ fn push_member_defs(buf: string, mem: string, typesym: string, ctx: TdCtx, idx: 
     let me: i64 = rest % 2000000 in
     let ms: i64 = rest / 2000000 in
     let th: string = type_hash(tc) in
-    let mb: MBirth = build_member_birth(mem, ctx, idx, ms, me, typesym) in
+    let mb: MBirth = build_member_birth(mem, ctx, idx, ms, me, typesym, bh) in
     let pre: string = if idx == 0 then buf else push_byte(buf, to_u8(44)) in
     let ent: PRR = if ctx.kind == 0 then emit_record_entry(pre, mb.mem, mb.hash, th, ms, me)
                    else emit_enum_entry(pre, mb.mem, mb.hash, th, ms, me) in
-    push_member_defs(ent.out, ent.mem, mb.ts, ctx, idx + 1)
+    push_member_defs(ent.out, ent.mem, mb.ts, ctx, mb.bh, idx + 1)
 
 // Wrap the fields/variants array body into a RecordDef/EnumDef object; keep type_symbol. Record
 // and enum have DIFFERENT canonical key LAYOUTS — `fields` sorts FIRST (f < region_params <
@@ -4284,6 +4318,22 @@ fn build_td_root_obj(mem: string, ns: i64, ne: i64, typesym: string, tdhash: str
 // its scalar Type, the RecordDef/EnumDef, the TypeDef — and the type-only ProgramRoot, returning
 // its hash. Genesis births => the root is built from objects ALONE (no migration/history chain),
 // exactly like a single function or a single-member recursion group. `kind`: 0 = record, 1 = enum.
+// Build ONE type's content-addressed objects (type SymbolBirth + each member SymbolBirth + its
+// scalar Type + RecordDef/EnumDef + TypeDef) at the given birth-history `bh` and canonical ordinal
+// `ord`, given the type's source span `sl` (ns/ne = name, bs = body start past `{`, rtc = kind).
+// Returns the threaded memory + the type_symbol + the TypeDef hash (the two the root references).
+// Shared by the single-type root (bh = "genesis", ord = 0) and every step of the create_type chain.
+fn build_type_objs(mem: string, sl: Sl, bh: string, ord: i64) -> TObj effects[alloc, state] =
+  let kind: i64 = sl.rtc in
+  let len: i64 = string_len(mem) in
+  let parsed: MAcc = parse_members(mem, sl.bs, len) in
+  let tb: TB = build_type_birth(parsed.mem, sl.ns, sl.ne, bh, ord) in
+  let ctx: TdCtx = { ids: parsed.ids, nf: parsed.nf, ns: sl.ns, ne: sl.ne, kind: kind, ord: ord } in
+  let md: TdMemOut = push_member_defs(string_with_capacity(8192), tb.mem, tb.hash, ctx, tb.bh, 0) in
+  let dw: DW = wrap_def(md.out, kind, md.ts) in
+  let tw: DW = wrap_typedef(dw.hash, kind, dw.ts) in
+  let r: TObj = { mem: md.mem, typesym: tw.ts, tdef: tw.hash } in r
+
 fn build_typedef_root(mem: string, len: i64, kind: i64) -> string effects[alloc, state] =
   let sk0: MI = skip_ws(mem, 0, len) in
   let kwe: MI = scan_ident(sk0.mem, sk0.i, len) in
@@ -4292,24 +4342,299 @@ fn build_typedef_root(mem: string, len: i64, kind: i64) -> string effects[alloc,
   let nm: MI = scan_ident(sk1.mem, ns, len) in
   let ne: i64 = nm.i in
   let sk2: MI = skip_ws(nm.mem, ne, len) in
-  let parsed: MAcc = parse_members(sk2.mem, sk2.i + 1, len) in
-  let tb: TB = build_type_birth(parsed.mem, ns, ne) in
-  let ctx: TdCtx = { ids: parsed.ids, nf: parsed.nf, ns: ns, ne: ne, kind: kind } in
-  let md: TdMemOut = push_member_defs(string_with_capacity(8192), tb.mem, tb.hash, ctx, 0) in
-  let dw: DW = wrap_def(md.out, kind, md.ts) in
-  let tw: DW = wrap_typedef(dw.hash, kind, dw.ts) in
-  build_td_root_obj(md.mem, ns, ne, tw.ts, tw.hash)
+  let sl: Sl = { ns: ns, ne: ne, bs: sk2.i + 1, rtc: kind } in
+  let genstr: string = push_lit(string_with_capacity(16), b"genesis") in
+  let tobj: TObj = build_type_objs(sk2.mem, sl, genstr, 0) in
+  build_td_root_obj(tobj.mem, ns, ne, tobj.typesym, tobj.tdef)
+
+// ---- n type definitions: the create_type migration/history chain (analog of the n-fn chain) ----
+
+// Emit the RAW-definition member entries (the migration's `definition`, the DUAL serialization):
+// {"name":"<name>","type":"<typeNAME>"} per member, comma-separated, in declaration order. The
+// type is the source NAME (push_type_name), NOT a hash; keys name/type are kind-independent.
+fn push_raw_members(buf: string, mem: string, ids: array<i64, 16>, nf: i64, idx: i64) -> PRR effects[state] =
+  if idx >= nf then (let r: PRR = { out: buf, mem: mem } in r)
+  else
+    let packed: i64 = ids[idx] in
+    let tc: i64 = packed % 16 in
+    let rest: i64 = packed / 16 in
+    let me: i64 = rest % 2000000 in
+    let ms: i64 = rest / 2000000 in
+    let pre: string = if idx == 0 then buf else push_byte(buf, to_u8(44)) in
+    let e0: string = push_lit(pre, b"{\"name\":\"") in
+    let r1: PRR = push_range(e0, mem, ms, me) in
+    let e1: string = push_lit(r1.out, b"\",\"type\":\"") in
+    let e2: string = push_type_name(e1, tc) in
+    let e3: string = push_lit(e2, b"\"}") in
+    push_raw_members(e3, r1.mem, ids, nf, idx + 1)
+
+// The raw definition object embedded in the create_type operation (+ the type_source_matches
+// postcondition). KIND-LAYOUT-DEPENDENT, like RecordDef/EnumDef: record `{"fields":[...],
+// "kind":"record"}` (fields FIRST) vs enum `{"kind":"enum","variants":[...]}` (kind FIRST). A
+// conditional of two whole calls (the v0 record-returning-`if` rule), each its own builder.
+fn raw_def(buf: string, mem: string, ids: array<i64, 16>, nf: i64, kind: i64) -> PRR effects[alloc, state] =
+  if kind == 0 then raw_record_def(buf, mem, ids, nf) else raw_enum_def(buf, mem, ids, nf)
+fn raw_record_def(buf: string, mem: string, ids: array<i64, 16>, nf: i64) -> PRR effects[alloc, state] =
+  let a0: string = push_lit(buf, b"{\"fields\":[") in
+  let r: PRR = push_raw_members(a0, mem, ids, nf, 0) in
+  let a1: string = push_lit(r.out, b"],\"kind\":\"record\"}") in
+  let res: PRR = { out: a1, mem: r.mem } in res
+fn raw_enum_def(buf: string, mem: string, ids: array<i64, 16>, nf: i64) -> PRR effects[alloc, state] =
+  let a0: string = push_lit(buf, b"{\"kind\":\"enum\",\"variants\":[") in
+  let r: PRR = push_raw_members(a0, mem, ids, nf, 0) in
+  let a1: string = push_lit(r.out, b"]}") in
+  let res: PRR = { out: a1, mem: r.mem } in res
+
+// Build the create_type MIGRATION for the type named mem[sl.ns, sl.ne) and its running history.
+// migration_hash = hash_domain(MIGRATION_DOMAIN, canonical{input_root_hash, operation,
+// output_root_hash, parent_history_hash, postconditions, preconditions}); history_hash =
+// hash_domain(HISTORY_DOMAIN, par + \0 + migration_hash + \0 + output_root). `rawdef` (the raw
+// definition) appears TWICE (operation + type_source_matches postcondition). Simpler than the
+// create_function migration: no params/return_type/effects. `ctx` bundles {parent-field, ordinal}
+// to stay under the 8-machine-param cap; buffers are FIXED-size (never string_len -> no v0
+// borrow-before-move trap). Returns the history hash with mem threaded.
+// First payload half: input_root_hash + the operation object + output_root_hash +
+// parent_history_hash. Keeps in_root / out_root / rawdef (each reused by the conditions half) and
+// threads memory; carried via PcT. (Split from build_type_mig for the v0 frame budget, like mig1_pay_a.)
+fn type_mig_a(in_root: string, out_root: string, mem: string, sl: Sl, rawdef: string, ctx: MigCtx) -> PcT effects[alloc, state] =
+  let a0: string = push_lit(string_with_capacity(8192), b"{\"input_root_hash\":\"") in
+  let ki: OS = push_kept(a0, in_root) in
+  let a1: string = push_lit(ki.out, b"\",\"operation\":{\"birth_seed\":\"import:type:main:") in
+  let r1: PRR = push_range(a1, mem, sl.ns, sl.ne) in
+  let a2: string = push_byte(r1.out, to_u8(58)) in
+  let a2d: string = push_dec(a2, ctx.ord) in
+  let a3: string = push_lit(a2d, b"\",\"definition\":") in
+  let kd: OS = push_kept(a3, rawdef) in
+  let a4: string = push_lit(kd.out, b",\"kind\":\"create_type\",\"module\":\"main\",\"name\":\"") in
+  let r2: PRR = push_range(a4, r1.mem, sl.ns, sl.ne) in
+  let a5: string = push_lit(r2.out, b"\",\"region_params\":[]},\"output_root_hash\":\"") in
+  let ko: OS = push_kept(a5, out_root) in
+  let a6: string = push_lit(ko.out, b"\",\"parent_history_hash\":") in
+  let a7: string = push_str(a6, ctx.field) in
+  let r: PcT = { buf: a7, mem: r2.mem, in_root: ki.s, out_root: ko.s, rawdef: kd.s } in r
+
+// Second payload half: postconditions (root_exists + type_source_matches) + preconditions
+// (root_is_current + type_name_is_available). Returns the FULL payload + out_root (kept for the
+// history preimage) + threaded memory via MigB. (Like mig1_pay_b.)
+fn type_mig_b(c: PcT, sl: Sl) -> MigB effects[alloc, state] =
+  let b0: string = push_lit(c.buf, b",\"postconditions\":[{\"kind\":\"root_exists\",\"root\":\"") in
+  let kp: OS = push_kept(b0, c.out_root) in
+  let b1: string = push_lit(kp.out, b"\"},{\"definition\":") in
+  let b2: string = push_str(b1, c.rawdef) in
+  let b3: string = push_lit(b2, b",\"kind\":\"type_source_matches\",\"module\":\"main\",\"name\":\"") in
+  let r3: PRR = push_range(b3, c.mem, sl.ns, sl.ne) in
+  let b4: string = push_lit(r3.out, b"\",\"region_params\":[]}],\"preconditions\":[{\"kind\":\"root_is_current\",\"root\":\"") in
+  let b5: string = push_str(b4, c.in_root) in
+  let b6: string = push_lit(b5, b"\"},{\"kind\":\"type_name_is_available\",\"module\":\"main\",\"name\":\"") in
+  let r4: PRR = push_range(b6, r3.mem, sl.ns, sl.ne) in
+  let b7: string = push_lit(r4.out, b"\"}]}") in
+  let r: MigB = { pay: b7, o1: kp.s, mem: r4.mem } in r
+
+fn build_type_mig(in_root: string, par: string, out_root: string, mem: string, sl: Sl, rawdef: string, ctx: MigCtx) -> MH effects[alloc, state] =
+  let c: PcT = type_mig_a(in_root, out_root, mem, sl, rawdef, ctx) in
+  let b: MigB = type_mig_b(c, sl) in
+  let mig: string = hash_domain(b"codedb/migration/v1\0", b.pay) in
+  let h0: string = push_str(string_with_capacity(256), par) in
+  let h1: string = push_byte(h0, to_u8(0)) in
+  let h2: string = push_str(h1, mig) in
+  let h3: string = push_byte(h2, to_u8(0)) in
+  let h4: string = push_str(h3, b.o1) in
+  let hh: string = hash_domain(b"codedb/history/v1\0", h4) in
+  let r: MH = { mem: b.mem, hash: hh } in r
+
+// Emit the `type_names` array entries (DISPLAY order via `dperm`) into `buf`: per type
+// {"display_name":"<name>","is_preferred":true,"module":"main","type_symbol":"<sym>"}, the name
+// from spans[idx*4..]+mem and the type_symbol the idx-th 71-char slice of `typesyms`. Mirror of
+// emit_names; both mem and typesyms thread back.
+fn emit_type_names(buf: string, mem: string, typesyms: string, spans: array<i64, 32>, dperm: array<i64, 8>, m: i64) -> EmitNT effects[alloc, state] =
+  let oseed: PBi = { p: buf, i: 0 } in
+  let done: PBi =
+    loop o = oseed while o.i < m do
+      let cur: PBi = o in
+      let idx: i64 = dperm[cur.i] in
+      let base: i64 = idx * 4 in
+      let ns: i64 = spans[base] in
+      let ne: i64 = spans[base + 1] in
+      let b0: string = if cur.i > 0 then push_byte(cur.p, to_u8(44)) else cur.p in
+      let b1: string = push_lit(b0, b"{\"display_name\":\"") in
+      let nd: PBi =
+        loop nn = { p: b1, i: ns } while nn.i < ne do
+          let nc: PBi = nn in
+          (let r: PBi = { p: push_byte(nc.p, string_get(mem, nc.i)), i: nc.i + 1 } in r)
+      in
+      let b2: string = push_lit(nd.p, b"\",\"is_preferred\":true,\"module\":\"main\",\"type_symbol\":\"") in
+      let sd: PBi =
+        loop ss = { p: b2, i: 0 } while ss.i < 71 do
+          let sc: PBi = ss in
+          (let r: PBi = { p: push_byte(sc.p, string_get(typesyms, idx * 71 + sc.i)), i: sc.i + 1 } in r)
+      in
+      let b3: string = push_lit(sd.p, b"\"}") in
+      (let r: PBi = { p: b3, i: cur.i + 1 } in r)
+  in
+  let res: EmitNT = { buf: done.p, mem: mem, typesyms: typesyms } in res
+
+// Emit the `types` array entries (HASH order via `hperm`) into `buf`: per type
+// {"type_def":"<td>","type_symbol":"<sym>"}, both the idx-th 71-char slices of `typedefs` /
+// `typesyms`. Mirror of emit_symbols; typesyms and typedefs thread back.
+fn emit_types(buf: string, typesyms: string, typedefs: string, hperm: array<i64, 8>, m: i64) -> EmitTY effects[alloc, state] =
+  let oseed: PBi = { p: buf, i: 0 } in
+  let done: PBi =
+    loop o = oseed while o.i < m do
+      let cur: PBi = o in
+      let idx: i64 = hperm[cur.i] in
+      let b0: string = if cur.i > 0 then push_byte(cur.p, to_u8(44)) else cur.p in
+      let b1: string = push_lit(b0, b"{\"type_def\":\"") in
+      let dd: PBi =
+        loop ss = { p: b1, i: 0 } while ss.i < 71 do
+          let sc: PBi = ss in
+          (let r: PBi = { p: push_byte(sc.p, string_get(typedefs, idx * 71 + sc.i)), i: sc.i + 1 } in r)
+      in
+      let b2: string = push_lit(dd.p, b"\",\"type_symbol\":\"") in
+      let sd: PBi =
+        loop ss = { p: b2, i: 0 } while ss.i < 71 do
+          let sc: PBi = ss in
+          (let r: PBi = { p: push_byte(sc.p, string_get(typesyms, idx * 71 + sc.i)), i: sc.i + 1 } in r)
+      in
+      let b3: string = push_lit(sd.p, b"\"}") in
+      (let r: PBi = { p: b3, i: cur.i + 1 } in r)
+  in
+  let res: EmitTY = { buf: done.p, typesyms: typesyms, typedefs: typedefs } in res
+
+// Assemble the m-type ProgramRoot: empty symbols/names/param_names; type_names DISPLAY-ordered
+// (disp_perm, by name) and types TYPE_SYMBOL-HASH-ordered (hash_perm) — they diverge, the same
+// names-vs-hash split as the function root. Mirror of assemble_root; threads mem + the concats.
+fn assemble_type_root(rin: RootStrT, spans: array<i64, 32>, m: i64) -> AsmOutT effects[alloc, state] =
+  let dp: PermM = disp_perm(rin.mem, spans, m) in
+  let hp: PermS = hash_perm(rin.typesyms, m) in
+  let cap: i64 = m * 400 + 512 in
+  let buf0: string = push_lit(string_with_capacity(cap), b"{\"metadata\":{},\"names\":[],\"param_names\":[],\"symbols\":[],\"type_names\":[") in
+  let etn: EmitNT = emit_type_names(buf0, dp.mem, hp.s, spans, dp.perm, m) in
+  let buf1: string = push_lit(etn.buf, b"],\"types\":[") in
+  let ety: EmitTY = emit_types(buf1, etn.typesyms, rin.typedefs, hp.perm, m) in
+  let buf2: string = push_lit(ety.buf, b"]}") in
+  let h: string = hash_object(b"ProgramRoot", 1, buf2) in
+  let r: AsmOutT = { hash: h, mem: etn.mem, typesyms: ety.typesyms, typedefs: ety.typedefs } in r
+
+// Scan one top-level `record|enum <Name> { f: T ... }` from `pos`; return its name range, body
+// start (past `{`), kind (in rtc), and the cursor past `}`. Reuses parse_members to find the body
+// end. (Mirror of parse_one; POne.rtc carries the kind.)
+fn parse_one_type(mem: string, pos: i64, len: i64) -> POne effects[alloc, state] =
+  let sk0: MI = skip_ws(mem, pos, len) in
+  let kb: i64 = to_i64(string_get(sk0.mem, sk0.i)) in
+  let kind: i64 = if kb == 101 then 1 else 0 in
+  let kwe: MI = scan_ident(sk0.mem, sk0.i, len) in
+  let sk1: MI = skip_ws(kwe.mem, kwe.i, len) in
+  let ns: i64 = sk1.i in
+  let nm: MI = scan_ident(sk1.mem, ns, len) in
+  let ne: i64 = nm.i in
+  let sk2: MI = skip_ws(nm.mem, ne, len) in
+  let bs: i64 = sk2.i + 1 in
+  let pm: MAcc = parse_members(sk2.mem, bs, len) in
+  let aw: MI = skip_ws(pm.mem, pm.pos, len) in
+  let r: POne = { mem: aw.mem, ns: ns, ne: ne, bs: bs, rtc: kind, next: aw.i } in r
+
+// Scan every top-level type definition into the packed spans (ns, ne, bs, kind). Mirror of parse_all.
+fn parse_all_types(mem: string, len: i64) -> Prog effects[alloc, state] =
+  let seed: PAcc = { mem: mem, spans: [0x0; 32], n: 0, pos: 0 } in
+  let done: PAcc =
+    loop a = seed while a.pos < len do
+      let cur: PAcc = a in
+      let one: POne = parse_one_type(cur.mem, cur.pos, len) in
+      let nx: array<i64, 32> = set_span(cur.spans, cur.n, one.ns, one.ne, one.bs, one.rtc) in
+      (let r: PAcc = { mem: one.mem, spans: nx, n: cur.n + 1, pos: one.next } in r)
+  in
+  let r: Prog = { mem: done.mem, spans: done.spans, n: done.n } in r
+
+// Chain step 0 (canonical-first type, alphabetical): build its objects at genesis, assemble the
+// 1-type root, and run the genesis create_type migration to hh_0. Mirror of bt0.
+fn bt0_type(mem: string, spans: array<i64, 32>) -> ChainAccT effects[alloc, state] =
+  let sl0: Sl = sl_at(spans, 0) in
+  let len: i64 = string_len(mem) in
+  let pm: MAcc = parse_members(mem, sl0.bs, len) in
+  let rd: PRR = raw_def(string_with_capacity(2048), pm.mem, pm.ids, pm.nf, sl0.rtc) in
+  let genstr: string = push_lit(string_with_capacity(16), b"genesis") in
+  let tobj: TObj = build_type_objs(rd.mem, sl0, genstr, 0) in
+  let rin: RootStrT = { mem: tobj.mem, typesyms: tobj.typesym, typedefs: tobj.tdef } in
+  let a: AsmOutT = assemble_type_root(rin, spans, 1) in
+  let genroot: string = build_genesis_root() in
+  let mp: MigPar = null_field() in
+  let ko: OS = push_kept(string_with_capacity(80), a.hash) in
+  let ctx: MigCtx = { field: mp.field, ord: 0 } in
+  let mig: MH = build_type_mig(genroot, mp.par, ko.s, a.mem, sl0, rd.out, ctx) in
+  let r: ChainAccT = { mem: mig.mem, prevhist: mig.hash, prevroot: ko.out, typesyms: a.typesyms, typedefs: a.typedefs } in r
+
+// A middle chain step (canonical ordinal 1 <= k <= n-2): build type k's objects at the running
+// history hh_{k-1} (copied — birth AND migration parent), accumulate, assemble out_k, run
+// migration k to hh_k. Mirror of bt_mid.
+fn bt_mid_type(acc: ChainAccT, spans: array<i64, 32>, k: i64) -> ChainAccT effects[alloc, state] =
+  let sl_k: Sl = sl_at(spans, k) in
+  // Duplicate the running history once: kh.out is consumed as the birth-history, kh.s as the
+  // migration's parent_history (the n-fn bt_mid pattern — never re-move acc.prevhist).
+  let kh: OS = push_kept(string_with_capacity(80), acc.prevhist) in
+  let len: i64 = string_len(acc.mem) in
+  let pm: MAcc = parse_members(acc.mem, sl_k.bs, len) in
+  let rd: PRR = raw_def(string_with_capacity(2048), pm.mem, pm.ids, pm.nf, sl_k.rtc) in
+  let tobj: TObj = build_type_objs(rd.mem, sl_k, kh.out, k) in
+  let typesyms2: string = concat2(acc.typesyms, tobj.typesym) in
+  let typedefs2: string = concat2(acc.typedefs, tobj.tdef) in
+  let rin: RootStrT = { mem: tobj.mem, typesyms: typesyms2, typedefs: typedefs2 } in
+  let a: AsmOutT = assemble_type_root(rin, spans, k + 1) in
+  let ko: OS = push_kept(string_with_capacity(80), a.hash) in
+  let mp: MigPar = quote_field(kh.s) in
+  let ctx: MigCtx = { field: mp.field, ord: k } in
+  let mig: MH = build_type_mig(acc.prevroot, mp.par, ko.s, a.mem, sl_k, rd.out, ctx) in
+  let r: ChainAccT = { mem: mig.mem, prevhist: mig.hash, prevroot: ko.out, typesyms: a.typesyms, typedefs: a.typedefs } in r
+
+// The last chain step (canonical ordinal n-1): build type k's objects at hh_{k-1} (no copy, no
+// migration references it) and assemble the final n-type root. Mirror of bt_last.
+fn bt_last_type(acc: ChainAccT, spans: array<i64, 32>, k: i64) -> string effects[alloc, state] =
+  let sl_k: Sl = sl_at(spans, k) in
+  let tobj: TObj = build_type_objs(acc.mem, sl_k, acc.prevhist, k) in
+  let typesyms2: string = concat2(acc.typesyms, tobj.typesym) in
+  let typedefs2: string = concat2(acc.typedefs, tobj.tdef) in
+  let rin: RootStrT = { mem: tobj.mem, typesyms: typesyms2, typedefs: typedefs2 } in
+  let a: AsmOutT = assemble_type_root(rin, spans, k + 1) in
+  a.hash
+
+// Fold the middle chain steps (canonical ordinals 1..n-2) by self-recursion. Mirror of chain_mid.
+fn chain_mid_type(acc: ChainAccT, k: i64, n: i64, spans: array<i64, 32>) -> ChainAccT effects[alloc, state] =
+  if k >= n - 1 then acc
+  else
+    let ns: ChainAccT = bt_mid_type(acc, spans, k) in
+    chain_mid_type(ns, k + 1, n, spans)
+
+// Build the ProgramRoot for an n-type program (n >= 2) whose types are already in canonical
+// (alphabetical) order in `spans`: bt0_type (genesis-born first type + migration), chain_mid_type
+// (the middle migrations), bt_last_type (the final type + the n-type root). Mirror of build_chain_root.
+fn build_type_chain_root(mem: string, spans: array<i64, 32>, n: i64) -> string effects[alloc, state] =
+  let s0: ChainAccT = bt0_type(mem, spans) in
+  let smid: ChainAccT = chain_mid_type(s0, 1, n, spans) in
+  bt_last_type(smid, spans, n - 1)
+
+// A TYPE-definition program (first non-ws byte was `record`/`enum`): parse all the type defs; ONE
+// takes the genesis-born single-type path, N >= 2 the create_type chain over the types in canonical
+// (alphabetical, independent) order — a disp_perm reordering of the source spans. Factored out of
+// import_root so its parse/sort locals stay off import_root's frame (the v0 budget).
+fn import_types(mem: string, len: i64, kind0: i64) -> string effects[alloc, state] =
+  let tprog: Prog = parse_all_types(mem, len) in
+  if tprog.n <= 1 then build_typedef_root(tprog.mem, len, kind0)
+  else
+    let dp: PermM = disp_perm(tprog.mem, tprog.spans, tprog.n) in
+    let cspans: array<i64, 32> = reorder_spans(tprog.spans, dp.perm, tprog.n) in
+    build_type_chain_root(dp.mem, cspans, tprog.n)
 
 fn import_root(mem: string) -> string effects[alloc, state] =
   let len: i64 = string_len(mem) in
   // Top-level dispatch: peek the first non-whitespace byte. A program that begins with the
-  // `record` (114) or `enum` (101) keyword is a single type definition (this increment);
-  // anything else (a `fn`, 102) takes the existing function path. Reading via string_get
-  // borrows `mem` (skip_ws threads it back), so the chosen branch still owns it.
+  // `record` (114) or `enum` (101) keyword is a TYPE-definition program; anything else (a `fn`,
+  // 102) takes the function path. Reading via string_get borrows `mem` (skip_ws threads it back),
+  // so the chosen branch still owns it. A type program is parsed into spans; ONE type takes the
+  // genesis-born single-type path (build_typedef_root), N >= 2 the create_type migration/history
+  // chain (build_type_chain_root) over the types in canonical (alphabetical, independent) order —
+  // a disp_perm reordering of the source spans, exactly as the n-function chain canonicalizes.
   let pk: MI = skip_ws(mem, 0, len) in
   let b0: i64 = if pk.i < len then to_i64(string_get(pk.mem, pk.i)) else 0 in
-  if b0 == 114 then build_typedef_root(pk.mem, len, 0)
-  else if b0 == 101 then build_typedef_root(pk.mem, len, 1)
+  if b0 == 114 || b0 == 101 then import_types(pk.mem, len, if b0 == 101 then 1 else 0)
   else
   let prog: Prog = parse_all(pk.mem, len) in
   if prog.n >= 3 then
