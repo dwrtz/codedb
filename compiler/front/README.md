@@ -13,7 +13,7 @@ Landed so far:
 | `sha256.cdb` | general multi-block SHA-256 of stdin to hex; `obj_hash` entry frames `OBJECT_DOMAIN \|\| kind \|\| schema \|\| payload` | `codedb::sha256_hex` and real `emit-objects` object hashes |
 | `lib.cdb` | shared SHA-256 core, object-hash framing, hex + stdin plumbing (imported first) | (composed into the others) |
 | `import.cdb` | the importer: source to the ProgramRoot hash CodeDB would assign it | `codedb import` to `root`, byte-equal |
-| `json.cdb` | the canonical JSON writer (front-end spine): measure/emit for the JSON value leaves — serde-faithful string escaping plus bare integers, bools, and null — with array/object framing, per-kind key layout, and importer integration to follow | `serde_json::to_string` (= `canonical_json` of the value), byte-equal |
+| `json.cdb` | the canonical JSON writer (front-end spine): measure/emit for the JSON value leaves (serde-faithful string escaping, bare integers, bools, null) plus literal-skeleton object framing (`push_lit` + exact measure for `{"k":v,...}`) — array element splices and the per-kind builders (object.cdb) + importer integration to follow | `serde_json::to_string` / canonical object form, byte-equal |
 
 `import.cdb` is the largest piece and reproduces the Rust importer's root hash across
 a wide surface:
@@ -58,9 +58,9 @@ into reusable compiler infrastructure (see docs/PLAN_V3.md "Draft 1.1 continuati
 SPEC_V3 §5A / §13A / design principles 14-19):
 
 - `json.cdb` — canonical writer (measure / emit / escape, explicit key layout); the
-  JSON value leaves (serde-faithful string escaping + bare int / bool / null, all
-  exact-measure/emit) have landed, with array/object framing + per-kind key layout
-  and importer integration next
+  JSON value leaves (string escaping + bare int / bool / null) and literal-skeleton
+  object framing (`push_lit` + exact measure) have landed; array element splices and
+  the per-kind builders (object.cdb) + importer integration come next
 - `object.cdb` — per-object-kind builders (Type, SymbolBirth, Expression, signatures,
   defs, record/enum/type defs, RecursionGroup, ProgramRoot, Migration, History)
 - `ast.cdb` — shared parsed item table / AST, one representation behind both serializers

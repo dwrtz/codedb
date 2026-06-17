@@ -263,6 +263,31 @@ fn json_null() -> string effects[alloc, state] =
   push_null_bytes(buf)
 
 // ---------------------------------------------------------------------------
+// composite framing: literal skeletons + the measure/emit discipline
+//
+// A canonical object is byte-sorted-key compact `{"k":v,...}`; object.cdb builds
+// each kind as a fixed literal SKELETON with its keys baked in sorted order
+// (push_lit) interleaved with value emitters (json_str / json_int / ...). The
+// payload's exact length is the sum of the piece lengths — literal slice lengths
+// plus value measures (esc_str_len / json_int_len / ...) — so the buffer is sized
+// EXACTLY, replacing the fixed `string_with_capacity` guesses that SIGTRAP when a
+// payload outgrows them. (Arrays — comma-separated elements in brackets — and the
+// push_str/push_range element splices arrive with the object kinds that need them.)
+// ---------------------------------------------------------------------------
+
+// Append a static byte slice to `out` (the literal-skeleton workhorse).
+fn push_lit(out: string, s: slice<'static, u8>) -> string effects[state] =
+  let n: i64 = len(s) in
+  let seed: EmAcc = { out: out, i: 0 } in
+  let done: EmAcc =
+    loop a = seed while a.i < n do
+      let cur: EmAcc = a in
+      let pp: string = cur.out in
+      let pushed: unit = string_push(pp, s[cur.i]) in
+      let r: EmAcc = { out: pp, i: cur.i + 1 } in r
+  in done.out
+
+// ---------------------------------------------------------------------------
 // standalone `esc` entry: read stdin, print its canonical JSON string encoding
 // (the byte-for-byte gate against codedb's canonical_json — tests/selfhost_frontend.rs)
 // ---------------------------------------------------------------------------
@@ -321,4 +346,24 @@ fn jbool<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
 fn jnull<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
   let out: string = json_null() in
   let printed: i64 = write_str(out) in
+  0
+
+// `jobj`: build {"depth":<string_len(stdin)>,"name":"<stdin, escaped>"} with an
+// EXACT measure (9 + int + 8 + escaped-name + 1), proving push_lit skeletons +
+// json_int + json_str compose to canonical_json with keys byte-sorted (depth < name).
+fn jobj<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let namelen: i64 = string_len(raw) in
+  let ml: EscLen = esc_str_len(raw, 0, namelen) in
+  let slen: i64 = ml.n in
+  let m1: string = ml.mem in
+  let total: i64 = 9 + json_int_len(namelen) + 8 + slen + 1 in
+  let buf0: string = string_with_capacity(total) in
+  let buf1: string = push_lit(buf0, b"{\"depth\":") in
+  let buf2: string = json_int_emit(buf1, namelen) in
+  let buf3: string = push_lit(buf2, b",\"name\":") in
+  let em: EscR = esc_str_emit(buf3, m1, 0, namelen) in
+  let buf4: string = em.out in
+  let buf5: string = push_lit(buf4, b"}") in
+  let printed: i64 = write_str(buf5) in
   0

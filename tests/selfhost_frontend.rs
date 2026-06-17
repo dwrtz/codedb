@@ -469,6 +469,53 @@ fn json_scalars_match_canonical_json() {
     );
 }
 
+/// Import + verify + build json.cdb's `jobj` composite-object gate entry.
+fn json_object_bin() -> &'static Path {
+    static JSON_OBJECT: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    JSON_OBJECT
+        .get_or_init(|| {
+            let temp = tempdir().unwrap();
+            let db = temp.path().join("selfhost-json-object.sqlite");
+            run(&["init", path(&db)]);
+            run(&["import", path(&db), "compiler/front/lib.cdb"]);
+            run(&["import", path(&db), "compiler/front/json.cdb"]);
+            run(&["verify", path(&db)]);
+            let exe = temp.path().join("jobj-bin");
+            run(&["build", path(&db), "jobj", "--out", path(&exe)]);
+            (temp, exe)
+        })
+        .1
+        .as_path()
+}
+
+#[test]
+fn json_object_framing_matches_canonical_json() {
+    // A 2-field object {"depth":int,"name":string} built through json.cdb's push_lit
+    // skeleton + json_int + json_str with an EXACT measure must equal canonical_json
+    // (keys byte-sorted: depth < name). The .cdb sets depth = string_len(stdin) and
+    // name = stdin, so this exercises the composite measure across escaped / UTF-8 /
+    // control-byte names and proves the skeleton-plus-leaves discipline.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = json_object_bin();
+    let big = "x".repeat(50);
+    let names: [&str; 10] = [
+        "", "hi", "main", "café", big.as_str(), "a\"b", "tab\there",
+        "a\nb\\c", "sha256:deadbeef", "\u{0}\u{1}\u{1f}",
+    ];
+    for name in names {
+        let depth = name.len(); // byte length == string_len(stdin)
+        let want = format!(
+            "{{\"depth\":{},\"name\":{}}}",
+            depth,
+            serde_json::to_string(name).unwrap()
+        );
+        let got = run_esc(exe, name.as_bytes());
+        assert_eq!(got.as_slice(), want.as_bytes(), "jobj mismatch for {name:?}");
+    }
+}
+
 /// Import + verify + build the self-hosted importer (lib.cdb + import.cdb) once per
 /// test process; the shared `(TempDir, db, exe)` is reused by `importer()` (the native
 /// binary) and `importer_db()` (the database, for inspecting the importer's compiled form).
