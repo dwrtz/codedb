@@ -516,6 +516,80 @@ fn json_object_framing_matches_canonical_json() {
     }
 }
 
+/// Import + verify + build object.cdb's `tobj` Type-object gate entry
+/// (lib.cdb + json.cdb + object.cdb) — once per test process.
+fn type_object_builder() -> &'static Path {
+    static TYPE_OBJ: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    TYPE_OBJ
+        .get_or_init(|| {
+            let temp = tempdir().unwrap();
+            let db = temp.path().join("selfhost-object.sqlite");
+            run(&["init", path(&db)]);
+            run(&["import", path(&db), "compiler/front/lib.cdb"]);
+            run(&["import", path(&db), "compiler/front/json.cdb"]);
+            run(&["import", path(&db), "compiler/front/object.cdb"]);
+            run(&["verify", path(&db)]);
+            let exe = temp.path().join("tobj-bin");
+            run(&["build", path(&db), "tobj", "--out", path(&exe)]);
+            (temp, exe)
+        })
+        .1
+        .as_path()
+}
+
+#[test]
+fn object_build_type_matches_emit_objects() {
+    // object.cdb's build_type must reproduce the REAL Type object hashes CodeDB
+    // assigns — built through json.cdb's measure/emit writer + an exactly-sized
+    // hash_object preimage. Oracle: emit-objects on a program using all 9 scalar
+    // types, mapping each {"type_kind":...} payload to its content hash. The .cdb
+    // sets tyc = string_len(stdin), so feeding 0..8 bytes selects
+    // i64/bool/u8/u16/u32/u64/i8/i16/i32.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("types.sqlite");
+    let src = temp.path().join("types.cdb");
+    std::fs::write(
+        &src,
+        "fn f(a: i64, b: bool, c: u8, d: u16, e: u32, g: u64, h: i8, i: i16, j: i32) -> i64 = a\n\
+         fn main() -> i64 = 0\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+    let dump_path = temp.path().join("dump.txt");
+    run(&["emit-objects", path(&db), "--out", path(&dump_path)]);
+    let dump = std::fs::read_to_string(&dump_path).unwrap();
+    let mut payload_to_hash: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for line in dump.lines() {
+        let cols: Vec<&str> = line.splitn(4, '\t').collect();
+        if cols.len() == 4 && cols[1] == "Type" {
+            payload_to_hash.insert(cols[3].to_string(), cols[0].to_string());
+        }
+    }
+
+    let exe = type_object_builder();
+    let kinds = [
+        (0usize, "I64"), (1, "Bool"), (2, "U8"), (3, "U16"), (4, "U32"),
+        (5, "U64"), (6, "I8"), (7, "I16"), (8, "I32"),
+    ];
+    for (tyc, kind) in kinds {
+        let payload = format!("{{\"type_kind\":\"{kind}\"}}");
+        let want = payload_to_hash
+            .get(&payload)
+            .unwrap_or_else(|| panic!("emit-objects had no Type {payload}"));
+        let got = run_esc(exe, &vec![b'x'; tyc]);
+        assert_eq!(
+            got.as_slice(),
+            want.as_bytes(),
+            "build_type({tyc}) {kind} mismatch"
+        );
+    }
+}
+
 /// Import + verify + build the self-hosted importer (lib.cdb + import.cdb) once per
 /// test process; the shared `(TempDir, db, exe)` is reused by `importer()` (the native
 /// binary) and `importer_db()` (the database, for inspecting the importer's compiled form).

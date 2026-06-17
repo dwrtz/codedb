@@ -13,7 +13,8 @@ Landed so far:
 | `sha256.cdb` | general multi-block SHA-256 of stdin to hex; `obj_hash` entry frames `OBJECT_DOMAIN \|\| kind \|\| schema \|\| payload` | `codedb::sha256_hex` and real `emit-objects` object hashes |
 | `lib.cdb` | shared SHA-256 core, object-hash framing, hex + stdin plumbing (imported first) | (composed into the others) |
 | `import.cdb` | the importer: source to the ProgramRoot hash CodeDB would assign it | `codedb import` to `root`, byte-equal |
-| `json.cdb` | the canonical JSON writer (front-end spine): measure/emit for the JSON value leaves (serde-faithful string escaping, bare integers, bools, null) plus literal-skeleton object framing (`push_lit` + exact measure for `{"k":v,...}`) — array element splices and the per-kind builders (object.cdb) + importer integration to follow | `serde_json::to_string` / canonical object form, byte-equal |
+| `json.cdb` | the canonical JSON writer (front-end spine): measure/emit for the JSON value leaves (serde-faithful string escaping, bare integers, bools, null) plus literal-skeleton object framing (`push_lit`/`push_byte`/`push_str` + exact measure for `{"k":v,...}`) — array element splices to follow | `serde_json::to_string` / canonical object form, byte-equal |
+| `object.cdb` | per-object-kind builders on `json.cdb` + `lib.cdb`'s SHA-256: the Type kind (9 scalar kinds) so far — exact-measured `{"type_kind":...}` payload and an exactly-sized `hash_object` preimage; more kinds + importer integration to follow | real `emit-objects` Type hashes, byte-equal |
 
 `import.cdb` is the largest piece and reproduces the Rust importer's root hash across
 a wide surface:
@@ -61,8 +62,10 @@ SPEC_V3 §5A / §13A / design principles 14-19):
   JSON value leaves (string escaping + bare int / bool / null) and literal-skeleton
   object framing (`push_lit` + exact measure) have landed; array element splices and
   the per-kind builders (object.cdb) + importer integration come next
-- `object.cdb` — per-object-kind builders (Type, SymbolBirth, Expression, signatures,
-  defs, record/enum/type defs, RecursionGroup, ProgramRoot, Migration, History)
+- `object.cdb` — per-object-kind builders; the Type kind (9 scalar kinds, content-hash
+  byte-equal to `emit-objects`) and the content-addressing `hash_object` (exactly-sized
+  preimage) have landed, then SymbolBirth, Expression, signatures, defs,
+  record/enum/type defs, RecursionGroup, ProgramRoot, Migration, History
 - `ast.cdb` — shared parsed item table / AST, one representation behind both serializers
 - `graph.cdb` — Kahn ordering, SCC detection, canonical recursion-group ordering
 - `migration.cdb` — birth seeds, pre/post templates, migration + history hashing

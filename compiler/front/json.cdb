@@ -287,6 +287,24 @@ fn push_lit(out: string, s: slice<'static, u8>) -> string effects[state] =
       let r: EmAcc = { out: pp, i: cur.i + 1 } in r
   in done.out
 
+// Append one byte to `out`.
+fn push_byte(out: string, b: u8) -> string effects[state] =
+  let pushed: unit = string_push(out, b) in out
+
+// Append the string `s` to `out`, CONSUMING s (the element/value splice — e.g. a
+// pre-built object hash, or a payload into a hash preimage). Reads the owned `s`
+// directly (the accumulator carries only the move-only `out`).
+fn push_str(out: string, s: string) -> string effects[state] =
+  let n: i64 = string_len(s) in
+  let seed: EmAcc = { out: out, i: 0 } in
+  let done: EmAcc =
+    loop a = seed while a.i < n do
+      let cur: EmAcc = a in
+      let pp: string = cur.out in
+      let pushed: unit = string_push(pp, string_get(s, cur.i)) in
+      let r: EmAcc = { out: pp, i: cur.i + 1 } in r
+  in done.out
+
 // ---------------------------------------------------------------------------
 // standalone `esc` entry: read stdin, print its canonical JSON string encoding
 // (the byte-for-byte gate against codedb's canonical_json — tests/selfhost_frontend.rs)

@@ -1,0 +1,121 @@
+// compiler/front/object.cdb - per-object-kind builders for the self-hosted front
+// end (Phase 15a.5.4, the front-end spine). Imported after lib.cdb + json.cdb.
+//
+// Each object kind CodeDB content-addresses (Type, SymbolBirth, FunctionSignature,
+// FunctionDef, Expression, RecordDef/EnumDef/TypeDef, RecursionGroup, ProgramRoot)
+// gets ONE builder here that lays down its canonical payload through json.cdb's
+// measure/emit writer — keys baked in byte-sorted order, the buffer sized EXACTLY
+// from the summed piece lengths — and hashes it. This replaces import.cdb's hand
+// coded payload builders, whose fixed `string_with_capacity(64/256/1024/8192)`
+// guesses are the recurring SIGTRAP / key-order bug class.
+//
+// CONTENT-ADDRESSING (src/store.rs hash_object_canonical, reproduced here on lib's
+// SHA-256 core): an object's hash = "sha256:" + hex(SHA-256(
+//   OBJECT_DOMAIN || kind || \0 || schema || \0 || payload)),
+// OBJECT_DOMAIN = b"codedb/object/v1\0". The preimage buffer is sized EXACTLY: its
+// padded SHA length is computed from the (passed) payload length, so we neither
+// guess (the import.cdb 8192) nor borrow `payload` before push_str moves it (the
+// v0 borrow-before-move trap — the caller measured the payload, so it passes the
+// length in).
+//
+// THIS INCREMENT (15a.5.4, first object kind) = Type: the 9 scalar kinds
+// {"type_kind":"I64"|"Bool"|"U8"|"U16"|"U32"|"U64"|"I8"|"I16"|"I32"}, schema 1.
+// No arrays yet — Type proves the per-kind object pattern end to end against real
+// `emit-objects` Type hashes. SymbolBirth / signatures / defs / ProgramRoot (and
+// the array element splices they need) follow.
+//
+// hash_object / state_to_hash are replicated from import.cdb for now (object.cdb
+// imports only lib.cdb + json.cdb); the import.cdb integration unifies them into
+// the spine. Type codes match import.cdb's type_hash: 0 = i64, 1 = bool, 2 = u8,
+// 3 = u16, 4 = u32, 5 = u64, 6 = i8, 7 = i16, 8 = i32.
+
+// A built payload paired with its exact byte length (so hash_object never borrows
+// the move-only payload to measure it).
+record KP {
+  payload: string
+  len: i64
+}
+
+// ---------------------------------------------------------------------------
+// content-addressing: hash_object_canonical on lib.cdb's SHA-256 core
+// ---------------------------------------------------------------------------
+
+// The padded SHA-256 message length for a `msglen`-byte preimage: the smallest
+// multiple of 64 that is >= msglen + 9 (the 0x80 marker byte + the 8-byte length).
+// Sizes the preimage buffer EXACTLY so `pad` fills it to capacity without overrun.
+fn sha_padded_len(msglen: i64) -> i64 = ((msglen + 72) / 64) * 64
+
+// Render the eight-word SHA-256 state as "sha256:" + 64 lowercase hex chars (71
+// bytes, sized exactly). Uses lib.cdb's push_word_hex.
+fn state_to_hash(st: State) -> string effects[alloc, state] =
+  let h0: string = push_lit(string_with_capacity(71), b"sha256:") in
+  let h1: string = push_word_hex(h0, st.a) in
+  let h2: string = push_word_hex(h1, st.b) in
+  let h3: string = push_word_hex(h2, st.c) in
+  let h4: string = push_word_hex(h3, st.d) in
+  let h5: string = push_word_hex(h4, st.e) in
+  let h6: string = push_word_hex(h5, st.f) in
+  let h7: string = push_word_hex(h6, st.g) in
+  let h8: string = push_word_hex(h7, st.h) in
+  h8
+
+// "sha256:" + hex(SHA-256(OBJECT_DOMAIN || kind || \0 || schema-digit || \0 ||
+// payload)). `payload` is consumed; `paylen` is its (already-known) length, so the
+// preimage buffer is sized exactly without borrowing payload before moving it.
+fn hash_object(kind: slice<'static, u8>, schema: i64, payload: string, paylen: i64) -> string effects[alloc, state] =
+  let dom: slice<'static, u8> = b"codedb/object/v1\0" in
+  let total: i64 = len(dom) + len(kind) + 3 + paylen in
+  let p0: string = string_with_capacity(sha_padded_len(total)) in
+  let p1: string = push_lit(p0, dom) in
+  let p2: string = push_lit(p1, kind) in
+  let p3: string = push_byte(p2, to_u8(0)) in
+  let p4: string = push_byte(p3, to_u8(48 + schema)) in
+  let p5: string = push_byte(p4, to_u8(0)) in
+  let p6: string = push_str(p5, payload) in
+  let msglen: i64 = string_len(p6) in
+  let padded: string = pad(p6, msglen) in
+  let nblocks: i64 = string_len(padded) / 64 in
+  let st: State = hash_blocks(padded, nblocks) in
+  state_to_hash(st)
+
+// ---------------------------------------------------------------------------
+// Type objects: {"type_kind":"<KIND>"}, schema 1
+// ---------------------------------------------------------------------------
+
+// Build a scalar Type's canonical payload into an EXACTLY sized buffer (the whole
+// payload is a constant literal, so its length is len(s)).
+fn mk_kp(s: slice<'static, u8>) -> KP effects[alloc, state] =
+  let n: i64 = len(s) in
+  let buf: string = string_with_capacity(n) in
+  let out: string = push_lit(buf, s) in
+  let r: KP = { payload: out, len: n } in r
+
+// The payload for type code `tyc` (a conditional of whole mk_kp calls — no
+// string-building inside the `if`, so no v0 record-return SIGTRAP).
+fn type_kind_payload(tyc: i64) -> KP effects[alloc, state] =
+  if tyc == 1 then mk_kp(b"{\"type_kind\":\"Bool\"}")
+  else if tyc == 2 then mk_kp(b"{\"type_kind\":\"U8\"}")
+  else if tyc == 3 then mk_kp(b"{\"type_kind\":\"U16\"}")
+  else if tyc == 4 then mk_kp(b"{\"type_kind\":\"U32\"}")
+  else if tyc == 5 then mk_kp(b"{\"type_kind\":\"U64\"}")
+  else if tyc == 6 then mk_kp(b"{\"type_kind\":\"I8\"}")
+  else if tyc == 7 then mk_kp(b"{\"type_kind\":\"I16\"}")
+  else if tyc == 8 then mk_kp(b"{\"type_kind\":\"I32\"}")
+  else mk_kp(b"{\"type_kind\":\"I64\"}")
+
+// The content hash of the scalar Type for `tyc` (== a real emit-objects Type hash).
+fn build_type(tyc: i64) -> string effects[alloc, state] =
+  let kp: KP = type_kind_payload(tyc) in
+  let plen: i64 = kp.len in
+  hash_object(b"Type", 1, kp.payload, plen)
+
+// ---------------------------------------------------------------------------
+// gate entry: tyc = string_len(stdin); print build_type(tyc) (tests/selfhost_frontend.rs
+// feeds 0..8 bytes and diffs against the real emit-objects Type hashes)
+// ---------------------------------------------------------------------------
+fn tobj<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let tyc: i64 = string_len(raw) in
+  let h: string = build_type(tyc) in
+  let printed: i64 = write_str(h) in
+  0
