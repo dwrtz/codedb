@@ -78,6 +78,19 @@ record EscR {
   out: string
 }
 
+// json_int_len's digit-count loop accumulator (Copy): the remaining value and
+// the running digit count.
+record DigC {
+  m: i64
+  c: i64
+}
+
+// the `jint` test entry's decimal-parse accumulator (Copy).
+record PI {
+  acc: i64
+  i: i64
+}
+
 // ---------------------------------------------------------------------------
 // string escaping: measure then emit (serde_json::to_string semantics)
 // ---------------------------------------------------------------------------
@@ -174,6 +187,82 @@ fn json_str(mem: string, s: i64, e: i64) -> EscR effects[alloc, state] =
   em
 
 // ---------------------------------------------------------------------------
+// scalar value leaves: bare integers, bools, and null
+//
+// canonical_json renders a Number bare (value.to_string()) and a Bool as
+// true/false, so these are the remaining JSON value kinds object.cdb needs
+// alongside json_str. json_int is scoped NON-NEGATIVE: every bare integer the
+// importer emits (depth, index, schema_version) is >= 0, and literal_i64 values
+// are emitted as JSON strings (the raw source slice), not bare numbers. Negative
+// / i64::MIN support is a deliberate deferral (add when a payload needs it).
+// ---------------------------------------------------------------------------
+
+// The exact decimal byte length of a non-negative i64 (its digit count).
+fn json_int_len(n: i64) -> i64 =
+  if n == 0 then 1
+  else
+    let seed: DigC = { m: n, c: 0 } in
+    let done: DigC =
+      loop a = seed while a.m != 0 do
+        let r: DigC = { m: a.m / 10, c: a.c + 1 } in r
+    in
+    done.c
+
+// Append the decimal digits of a non-negative i64 to `out` (most significant
+// first); the push_dec recurrence, threading the move-only buffer back.
+fn json_int_emit(out: string, n: i64) -> string effects[state] =
+  if n < 10 then
+    let p: unit = string_push(out, to_u8(48 + n)) in out
+  else
+    let hi: string = json_int_emit(out, n / 10) in
+    let p: unit = string_push(hi, to_u8(48 + n % 10)) in hi
+
+// A bare non-negative integer into a freshly, exactly sized buffer.
+fn json_int(n: i64) -> string effects[alloc, state] =
+  let len: i64 = json_int_len(n) in
+  let buf: string = string_with_capacity(len) in
+  json_int_emit(buf, n)
+
+// Append the literal bytes of `true` / `false` / `null` (each its own function
+// so the bool emit is a conditional of two WHOLE calls, never string-building
+// inside an `if` — the v0 aggregate-return SIGTRAP rule).
+fn push_true(out: string) -> string effects[state] =
+  let p0: unit = string_push(out, to_u8(0x74)) in
+  let p1: unit = string_push(out, to_u8(0x72)) in
+  let p2: unit = string_push(out, to_u8(0x75)) in
+  let p3: unit = string_push(out, to_u8(0x65)) in
+  out
+
+fn push_false(out: string) -> string effects[state] =
+  let p0: unit = string_push(out, to_u8(0x66)) in
+  let p1: unit = string_push(out, to_u8(0x61)) in
+  let p2: unit = string_push(out, to_u8(0x6c)) in
+  let p3: unit = string_push(out, to_u8(0x73)) in
+  let p4: unit = string_push(out, to_u8(0x65)) in
+  out
+
+fn push_null_bytes(out: string) -> string effects[state] =
+  let p0: unit = string_push(out, to_u8(0x6e)) in
+  let p1: unit = string_push(out, to_u8(0x75)) in
+  let p2: unit = string_push(out, to_u8(0x6c)) in
+  let p3: unit = string_push(out, to_u8(0x6c)) in
+  out
+
+fn json_bool_len(b: bool) -> i64 = if b then 4 else 5
+
+fn json_bool_emit(out: string, b: bool) -> string effects[state] =
+  if b then push_true(out) else push_false(out)
+
+fn json_bool(b: bool) -> string effects[alloc, state] =
+  let len: i64 = json_bool_len(b) in
+  let buf: string = string_with_capacity(len) in
+  json_bool_emit(buf, b)
+
+fn json_null() -> string effects[alloc, state] =
+  let buf: string = string_with_capacity(4) in
+  push_null_bytes(buf)
+
+// ---------------------------------------------------------------------------
 // standalone `esc` entry: read stdin, print its canonical JSON string encoding
 // (the byte-for-byte gate against codedb's canonical_json — tests/selfhost_frontend.rs)
 // ---------------------------------------------------------------------------
@@ -196,5 +285,40 @@ fn esc<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
   let n: i64 = string_len(raw) in
   let j: EscR = json_str(raw, 0, n) in
   let out: string = j.out in
+  let printed: i64 = write_str(out) in
+  0
+
+// ---------------------------------------------------------------------------
+// scalar-leaf gate entries (tests/selfhost_frontend.rs feeds each, diffs stdout
+// against serde_json::to_string of the same value)
+// ---------------------------------------------------------------------------
+
+// `jint`: parse stdin as a non-negative decimal, print json_int of it. The
+// parse is test scaffolding (a Copy accumulator reading the owned stdin); a
+// parse bug surfaces as a wrong digit vs the serde oracle, so it is not masked.
+fn jint<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let n: i64 = string_len(raw) in
+  let seed: PI = { acc: 0, i: 0 } in
+  let parsed: PI =
+    loop a = seed while a.i < n do
+      let d: i64 = to_i64(string_get(raw, a.i)) - 48 in
+      let r: PI = { acc: a.acc * 10 + d, i: a.i + 1 } in r
+  in
+  let out: string = json_int(parsed.acc) in
+  let printed: i64 = write_str(out) in
+  0
+
+// `jbool`: nonempty stdin -> true, empty -> false.
+fn jbool<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let b: bool = string_len(raw) > 0 in
+  let out: string = json_bool(b) in
+  let printed: i64 = write_str(out) in
+  0
+
+// `jnull`: always emits null (stdin ignored).
+fn jnull<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let out: string = json_null() in
   let printed: i64 = write_str(out) in
   0

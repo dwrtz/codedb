@@ -410,6 +410,65 @@ fn json_escaper_matches_canonical_json_string_encoding() {
     assert_esc(exe, "smørrebrød");
 }
 
+/// Import + verify + build json.cdb's scalar-leaf gate entries (jint/jbool/jnull)
+/// — once per test process.
+fn json_scalar_bins() -> &'static (TempDir, PathBuf, PathBuf, PathBuf) {
+    static JSON_SCALARS: OnceLock<(TempDir, PathBuf, PathBuf, PathBuf)> = OnceLock::new();
+    JSON_SCALARS.get_or_init(|| {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("selfhost-json-scalars.sqlite");
+        run(&["init", path(&db)]);
+        run(&["import", path(&db), "compiler/front/lib.cdb"]);
+        run(&["import", path(&db), "compiler/front/json.cdb"]);
+        run(&["verify", path(&db)]);
+        let jint = temp.path().join("jint-bin");
+        let jbool = temp.path().join("jbool-bin");
+        let jnull = temp.path().join("jnull-bin");
+        run(&["build", path(&db), "jint", "--out", path(&jint)]);
+        run(&["build", path(&db), "jbool", "--out", path(&jbool)]);
+        run(&["build", path(&db), "jnull", "--out", path(&jnull)]);
+        (temp, jint, jbool, jnull)
+    })
+}
+
+#[test]
+fn json_scalars_match_canonical_json() {
+    // json.cdb's bare-integer / bool / null leaves must reproduce canonical_json's
+    // rendering (serde_json::to_string of the value): a Number bare, a Bool as
+    // true/false, null as null. json_int is scoped non-negative (the only bare-int
+    // domain the importer emits); jint parses stdin then emits, so the exactly-sized
+    // string_with_capacity(json_int_len) is exercised across digit-count boundaries.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let bins = json_scalar_bins();
+    let (jint, jbool, jnull) = (&bins.1, &bins.2, &bins.3);
+    for s in [
+        "0", "1", "9", "10", "11", "42", "99", "100", "101", "999", "1000",
+        "1000000", "123456789", "9999999999", "9223372036854775807",
+    ] {
+        let n: i64 = s.parse().unwrap();
+        let got = run_esc(jint, s.as_bytes());
+        assert_eq!(
+            got.as_slice(),
+            serde_json::to_string(&n).unwrap().as_bytes(),
+            "jint mismatch for {s}"
+        );
+    }
+    assert_eq!(
+        run_esc(jbool, b"x").as_slice(),
+        serde_json::to_string(&true).unwrap().as_bytes()
+    );
+    assert_eq!(
+        run_esc(jbool, b"").as_slice(),
+        serde_json::to_string(&false).unwrap().as_bytes()
+    );
+    assert_eq!(
+        run_esc(jnull, b"").as_slice(),
+        serde_json::to_string(&()).unwrap().as_bytes()
+    );
+}
+
 /// Import + verify + build the self-hosted importer (lib.cdb + import.cdb) once per
 /// test process; the shared `(TempDir, db, exe)` is reused by `importer()` (the native
 /// binary) and `importer_db()` (the database, for inspecting the importer's compiled form).
