@@ -432,6 +432,29 @@ record EntAcc { buf: string  src: string  syms: string }
 // symbol's offset, the scan cursor, and the threaded memory.
 record XC { hit: bool  off: i64  pos: i64  mem: string }
 
+// --- Phase 15a record/enum type definitions (a single type def, genesis birth) ---
+// The member-parse loop accumulator (carries the move-only memory): the packed member
+// table (each entry (name_start * 2000000 + name_end) * 16 + type_code), the member count,
+// the cursor, and the keep-going flag.
+record MAcc { mem: string  ids: array<i64, 16>  nf: i64  pos: i64  go: bool }
+// One scanned member: the threaded memory, its packed (name range + type code), and the
+// cursor just past its type name.
+record MemR { mem: string  packed: i64  next: i64 }
+// A type symbol birth result: the threaded memory and the type SymbolBirth hash (= the
+// type_symbol referenced by every member birth, the RecordDef/EnumDef, the TypeDef, the root).
+record TB { mem: string  hash: string }
+// The Copy context threaded through the member-defs recursion (bundled to stay under the
+// 8-machine-param cap): the packed member table, the member count, the type name's byte
+// range [ns, ne), and the kind (0 = record, 1 = enum).
+record TdCtx { ids: array<i64, 16>  nf: i64  ns: i64  ne: i64  kind: i64 }
+// A single member's genesis SymbolBirth: its hash, the threaded memory, and the kept type_symbol.
+record MBirth { hash: string  mem: string  ts: string }
+// The member-defs builder result: the fields/variants array BODY, the threaded memory, and the
+// kept type_symbol (reused by the RecordDef/EnumDef, the TypeDef, and the root).
+record TdMemOut { out: string  mem: string  ts: string }
+// A def-wrap result: the built object hash (RecordDef/EnumDef, then TypeDef) and the kept type_symbol.
+record DW { hash: string  ts: string }
+
 // ---------------------------------------------------------------------------
 // byte classifiers (ASCII; + - * / and whitespace)
 // ---------------------------------------------------------------------------
@@ -4457,9 +4480,223 @@ fn single3scc(mask: i64) -> bool =
 // TEMP PROBE (Inc 4 debugging): individualize member `member` on the seed colours, run the full
 // preserve_own refine to convergence, sort -> leaf order, and append " L<member>=<p0><p1><p2> c=<
 // last12 of converged colour for local 0,1,2>" to `out`. Threads mem + the (unconsumed) seed cols.
+// Kind-parameterized VALUE emitters (record vs enum). These sit at a FIXED position in
+// their payload (the birth nonce's tag, the symbol_kind value, the TypeDef type_kind
+// value), so only the word changes — unlike the record/enum KEYS (`fields`/`field_symbol`
+// vs `variants`/`variant_symbol`), which sort to DIFFERENT canonical positions (f early,
+// v late) and so require distinct payload LAYOUTS, handled by emit_record_entry/
+// emit_enum_entry and wrap_record_def/wrap_enum_def. Each is a conditional of two whole
+// push_lit calls — `buf` is consumed exactly once on each path (a conditional move), never
+// built inside the `if` (which would hit the v0 aggregate-return SIGTRAP).
+fn push_mkind(buf: string, kind: i64) -> string effects[state] =
+  if kind == 1 then push_lit(buf, b"enum_variant") else push_lit(buf, b"record_field")
+fn push_mtag(buf: string, kind: i64) -> string effects[state] =
+  if kind == 1 then push_lit(buf, b"variant") else push_lit(buf, b"field")
+fn push_typekind(buf: string, kind: i64) -> string effects[state] =
+  if kind == 1 then push_lit(buf, b"enum") else push_lit(buf, b"record")
+
+// Scan one `name : type` member starting at the member NAME byte `p`; pack its name range
+// and resolved type code, returning the cursor just past its type name. `:` and the
+// surrounding whitespace are skipped. (No `&&` over byte reads — every scan/skip helper is
+// internally bounds-checked.)
+fn scan_one_member(mem: string, p: i64, len: i64) -> MemR =
+  let ni: MI = scan_ident(mem, p, len) in
+  let me: i64 = ni.i in
+  let sw2: MI = skip_ws(ni.mem, me, len) in
+  let sw3: MI = skip_ws(sw2.mem, sw2.i + 1, len) in
+  let ts: i64 = sw3.i in
+  let ty: MI = scan_ident(sw3.mem, ts, len) in
+  let te: i64 = ty.i in
+  let tc: TC = type_code_of(ty.mem, ts, te) in
+  let packed: i64 = (p * 2000000 + me) * 16 + tc.code in
+  let r: MemR = { mem: tc.mem, packed: packed, next: te } in r
+
+// Parse the `{ name: type ... }` member list starting just past `{` at `pos`; collect the
+// packed members until `}`. The move-only memory threads through the loop accumulator (the
+// parse_all pattern: `let cur = a in ...`), and the result is rebuilt into a FRESH MAcc
+// before returning (the v0 rule: returning a move-only loop accumulator whose body called an
+// aggregate-returning helper directly miscompiles to a SIGTRAP).
+fn parse_members(mem: string, pos: i64, len: i64) -> MAcc effects[alloc, state] =
+  let seed: MAcc = { mem: mem, ids: [0x0; 16], nf: 0, pos: pos, go: true } in
+  let done: MAcc =
+    loop a = seed while a.go do
+      let cur: MAcc = a in
+      let sk: MI = skip_ws(cur.mem, cur.pos, len) in
+      let p: i64 = sk.i in
+      if p >= len then (let r: MAcc = { mem: sk.mem, ids: cur.ids, nf: cur.nf, pos: p, go: false } in r)
+      else if to_i64(string_get(sk.mem, p)) == 125 then
+        (let r: MAcc = { mem: sk.mem, ids: cur.ids, nf: cur.nf, pos: p + 1, go: false } in r)
+      else
+        let mr: MemR = scan_one_member(sk.mem, p, len) in
+        let nx: array<i64, 16> = array_set(cur.ids, cur.nf, mr.packed) in
+        (let r: MAcc = { mem: mr.mem, ids: nx, nf: cur.nf + 1, pos: mr.next, go: true } in r)
+  in
+  let r: MAcc = { mem: done.mem, ids: done.ids, nf: done.nf, pos: done.pos, go: done.go } in r
+
+// The type symbol's genesis SymbolBirth: local_nonce "import:type:main:<Name>:0", kind "type".
+fn build_type_birth(mem: string, ns: i64, ne: i64) -> TB effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(256), b"{\"birth_history_hash\":\"genesis\",\"local_nonce\":\"import:type:main:") in
+  let pr: PRR = push_range(p0, mem, ns, ne) in
+  let p1: string = push_lit(pr.out, b":0\",\"symbol_kind\":\"type\"}") in
+  let h: string = hash_object(b"SymbolBirth", 1, p1) in
+  let r: TB = { mem: pr.mem, hash: h } in r
+
+// One member's genesis SymbolBirth: local_nonce "import:type:main:<Name>:0:<tag>:<idx>:<member>"
+// (tag = field/variant), owner_type_symbol the type symbol, kind record_field/enum_variant.
+// Threads the memory and keeps `typesym` (reused by every member + the def/typedef/root).
+fn build_member_birth(mem: string, ctx: TdCtx, idx: i64, ms: i64, me: i64, typesym: string) -> MBirth effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(384), b"{\"birth_history_hash\":\"genesis\",\"local_nonce\":\"import:type:main:") in
+  let r1: PRR = push_range(p0, mem, ctx.ns, ctx.ne) in
+  let p1: string = push_lit(r1.out, b":0:") in
+  let p2: string = push_mtag(p1, ctx.kind) in
+  let p3: string = push_byte(p2, to_u8(58)) in
+  let p4: string = push_dec(p3, idx) in
+  let p5: string = push_byte(p4, to_u8(58)) in
+  let r2: PRR = push_range(p5, r1.mem, ms, me) in
+  let p6: string = push_lit(r2.out, b"\",\"owner_type_symbol\":\"") in
+  let k0: OS = push_kept(p6, typesym) in
+  let p7: string = push_lit(k0.out, b"\",\"symbol_kind\":\"") in
+  let p8: string = push_mkind(p7, ctx.kind) in
+  let p9: string = push_lit(p8, b"\"}") in
+  let h: string = hash_object(b"SymbolBirth", 1, p9) in
+  let r: MBirth = { hash: h, mem: r2.mem, ts: k0.s } in r
+
+// One record FIELD entry: {"field_symbol":"<msym>","name":"<name>","type":"<typehash>"} — keys
+// field_symbol/name/type (alphabetical, since `field_symbol` sorts first). Threads memory; the
+// member symbol + type hash are consumed.
+fn emit_record_entry(buf: string, mem: string, msym: string, th: string, ms: i64, me: i64) -> PRR effects[state] =
+  let e0: string = push_lit(buf, b"{\"field_symbol\":\"") in
+  let e1: string = push_str(e0, msym) in
+  let e2: string = push_lit(e1, b"\",\"name\":\"") in
+  let r: PRR = push_range(e2, mem, ms, me) in
+  let e3: string = push_lit(r.out, b"\",\"type\":\"") in
+  let e4: string = push_str(e3, th) in
+  let e5: string = push_lit(e4, b"\"}") in
+  let res: PRR = { out: e5, mem: r.mem } in res
+
+// One enum VARIANT entry: {"name":"<name>","type":"<typehash>","variant_symbol":"<msym>"} — keys
+// name/type/variant_symbol (alphabetical, since `variant_symbol` sorts LAST, unlike a record's
+// `field_symbol`); this distinct LAYOUT is the whole reason record/enum entries can't share one
+// emitter. Threads memory; the member symbol + type hash are consumed.
+fn emit_enum_entry(buf: string, mem: string, msym: string, th: string, ms: i64, me: i64) -> PRR effects[state] =
+  let e0: string = push_lit(buf, b"{\"name\":\"") in
+  let r: PRR = push_range(e0, mem, ms, me) in
+  let e1: string = push_lit(r.out, b"\",\"type\":\"") in
+  let e2: string = push_str(e1, th) in
+  let e3: string = push_lit(e2, b"\",\"variant_symbol\":\"") in
+  let e4: string = push_str(e3, msym) in
+  let e5: string = push_lit(e4, b"\"}") in
+  let res: PRR = { out: e5, mem: r.mem } in res
+
+// Build the fields/variants array BODY (comma-separated member-def entries) AND each member's
+// SymbolBirth, recursively (threading the buffer, the memory, and the kept type_symbol). For
+// member idx: build its birth -> member symbol; emit its record/enum entry (kind selects the
+// distinct key LAYOUT — a conditional of two whole calls, never string-building inside the `if`).
+// Members stay in SOURCE (declaration) order; their type objects (type_hash) dedup by content hash.
+fn push_member_defs(buf: string, mem: string, typesym: string, ctx: TdCtx, idx: i64) -> TdMemOut effects[alloc, state] =
+  if idx >= ctx.nf then (let r: TdMemOut = { out: buf, mem: mem, ts: typesym } in r)
+  else
+    let packed: i64 = ctx.ids[idx] in
+    let tc: i64 = packed % 16 in
+    let rest: i64 = packed / 16 in
+    let me: i64 = rest % 2000000 in
+    let ms: i64 = rest / 2000000 in
+    let th: string = type_hash(tc) in
+    let mb: MBirth = build_member_birth(mem, ctx, idx, ms, me, typesym) in
+    let pre: string = if idx == 0 then buf else push_byte(buf, to_u8(44)) in
+    let ent: PRR = if ctx.kind == 0 then emit_record_entry(pre, mb.mem, mb.hash, th, ms, me)
+                   else emit_enum_entry(pre, mb.mem, mb.hash, th, ms, me) in
+    push_member_defs(ent.out, ent.mem, mb.ts, ctx, idx + 1)
+
+// Wrap the fields/variants array body into a RecordDef/EnumDef object; keep type_symbol. Record
+// and enum have DIFFERENT canonical key LAYOUTS — `fields` sorts FIRST (f < region_params <
+// type_symbol) but `variants` sorts LAST (region_params < type_symbol < v) — so each kind has its
+// own builder, selected as a conditional of two whole calls (never string-building inside the
+// `if`). The payload buffers are generously sized (heap, not frame) since they cannot be sized
+// from string_len (a borrow-before-move of a move-only string runtime-traps in v0).
+fn wrap_def(body: string, kind: i64, typesym: string) -> DW effects[alloc, state] =
+  if kind == 0 then wrap_record_def(body, typesym) else wrap_enum_def(body, typesym)
+
+// RecordDef: {"fields":[<body>],"region_params":[],"type_symbol":"<ts>"} (fields FIRST).
+fn wrap_record_def(body: string, typesym: string) -> DW effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(8192), b"{\"fields\":[") in
+  let p1: string = push_str(p0, body) in
+  let p2: string = push_lit(p1, b"],\"region_params\":[],\"type_symbol\":\"") in
+  let k0: OS = push_kept(p2, typesym) in
+  let p3: string = push_lit(k0.out, b"\"}") in
+  let h: string = hash_object(b"RecordDef", 1, p3) in
+  let r: DW = { hash: h, ts: k0.s } in r
+
+// EnumDef: {"region_params":[],"type_symbol":"<ts>","variants":[<body>]} (variants LAST).
+fn wrap_enum_def(body: string, typesym: string) -> DW effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(8192), b"{\"region_params\":[],\"type_symbol\":\"") in
+  let k0: OS = push_kept(p0, typesym) in
+  let p1: string = push_lit(k0.out, b"\",\"variants\":[") in
+  let p2: string = push_str(p1, body) in
+  let p3: string = push_lit(p2, b"]}") in
+  let h: string = hash_object(b"EnumDef", 1, p3) in
+  let r: DW = { hash: h, ts: k0.s } in r
+
+// Wrap a RecordDef/EnumDef hash into a TypeDef object; keep type_symbol.
+fn wrap_typedef(defhash: string, kind: i64, typesym: string) -> DW effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(256), b"{\"definition\":\"") in
+  let p1: string = push_str(p0, defhash) in
+  let p2: string = push_lit(p1, b"\",\"type_kind\":\"") in
+  let p3: string = push_typekind(p2, kind) in
+  let p4: string = push_lit(p3, b"\",\"type_symbol\":\"") in
+  let k0: OS = push_kept(p4, typesym) in
+  let p5: string = push_lit(k0.out, b"\"}") in
+  let h: string = hash_object(b"TypeDef", 1, p5) in
+  let r: DW = { hash: h, ts: k0.s } in r
+
+// The type-only ProgramRoot: empty symbols/names/param_names; populated type_names + types
+// (keys alphabetical: metadata, names, param_names, symbols, type_names, types). type_symbol
+// appears in both type_names and types, so it is kept once then consumed.
+fn build_td_root_obj(mem: string, ns: i64, ne: i64, typesym: string, tdhash: string) -> string effects[alloc, state] =
+  let p0: string = push_lit(string_with_capacity(1024), b"{\"metadata\":{},\"names\":[],\"param_names\":[],\"symbols\":[],\"type_names\":[{\"display_name\":\"") in
+  let r1: PRR = push_range(p0, mem, ns, ne) in
+  let p1: string = push_lit(r1.out, b"\",\"is_preferred\":true,\"module\":\"main\",\"type_symbol\":\"") in
+  let k0: OS = push_kept(p1, typesym) in
+  let p2: string = push_lit(k0.out, b"\"}],\"types\":[{\"type_def\":\"") in
+  let p3: string = push_str(p2, tdhash) in
+  let p4: string = push_lit(p3, b"\",\"type_symbol\":\"") in
+  let p5: string = push_str(p4, k0.s) in
+  let p6: string = push_lit(p5, b"\"}]}") in
+  hash_object(b"ProgramRoot", 1, p6)
+
+// A single record/enum type definition (no functions): parse `record|enum <Name> { f: T ... }`
+// and build the genesis-born objects — the type SymbolBirth, each field/variant SymbolBirth +
+// its scalar Type, the RecordDef/EnumDef, the TypeDef — and the type-only ProgramRoot, returning
+// its hash. Genesis births => the root is built from objects ALONE (no migration/history chain),
+// exactly like a single function or a single-member recursion group. `kind`: 0 = record, 1 = enum.
+fn build_typedef_root(mem: string, len: i64, kind: i64) -> string effects[alloc, state] =
+  let sk0: MI = skip_ws(mem, 0, len) in
+  let kwe: MI = scan_ident(sk0.mem, sk0.i, len) in
+  let sk1: MI = skip_ws(kwe.mem, kwe.i, len) in
+  let ns: i64 = sk1.i in
+  let nm: MI = scan_ident(sk1.mem, ns, len) in
+  let ne: i64 = nm.i in
+  let sk2: MI = skip_ws(nm.mem, ne, len) in
+  let parsed: MAcc = parse_members(sk2.mem, sk2.i + 1, len) in
+  let tb: TB = build_type_birth(parsed.mem, ns, ne) in
+  let ctx: TdCtx = { ids: parsed.ids, nf: parsed.nf, ns: ns, ne: ne, kind: kind } in
+  let md: TdMemOut = push_member_defs(string_with_capacity(8192), tb.mem, tb.hash, ctx, 0) in
+  let dw: DW = wrap_def(md.out, kind, md.ts) in
+  let tw: DW = wrap_typedef(dw.hash, kind, dw.ts) in
+  build_td_root_obj(md.mem, ns, ne, tw.ts, tw.hash)
+
 fn import_root(mem: string) -> string effects[alloc, state] =
   let len: i64 = string_len(mem) in
-  let prog: Prog = parse_all(mem, len) in
+  // Top-level dispatch: peek the first non-whitespace byte. A program that begins with the
+  // `record` (114) or `enum` (101) keyword is a single type definition (this increment);
+  // anything else (a `fn`, 102) takes the existing function path. Reading via string_get
+  // borrows `mem` (skip_ws threads it back), so the chosen branch still owns it.
+  let pk: MI = skip_ws(mem, 0, len) in
+  let b0: i64 = if pk.i < len then to_i64(string_get(pk.mem, pk.i)) else 0 in
+  if b0 == 114 then build_typedef_root(pk.mem, len, 0)
+  else if b0 == 101 then build_typedef_root(pk.mem, len, 1)
+  else
+  let prog: Prog = parse_all(pk.mem, len) in
   if prog.n >= 3 then
     let topo: Topo3 = toposortN(prog.mem, prog.spans, prog.n, len) in
     if topo.ok then

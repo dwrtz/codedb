@@ -1614,6 +1614,96 @@ fn importer_reproduces_the_root_hash_for_symmetric_cliques() {
 }
 
 #[test]
+fn importer_reproduces_the_root_hash_for_single_record() {
+    // 15a (object-kind breadth): a single `record` type definition — the first non-function
+    // object kind. A type-only program (no functions) has empty symbols/names/param_names and
+    // populates the root's `types` + `type_names` arrays. The type symbol's birth is genesis
+    // (local_nonce "import:type:main:<Name>:0") and each field is a `record_field` SymbolBirth
+    // OWNED by the type (nonce "<seed>:field:<idx>:<name>"); the RecordDef carries the fields in
+    // DECLARATION order with their scalar field-type hashes, and the TypeDef wraps it. Every
+    // birth is genesis, so the root is built from objects ALONE — no migration/history chain,
+    // exactly like a single function or a single-member recursion group. Root-hash equality is
+    // an exact gate: any field order, birth seed, key order, or canonical-payload error changes
+    // a child object hash and so the root. Covers 1..8 fields and the i64/bool/sized scalars.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        "record Point {\n  x: i64\n  y: i64\n}\n",
+        "record W {\n  v: i64\n}\n",
+        "record Three {\n  a: i64\n  b: i64\n  c: i64\n}\n",
+        "record Mixed {\n  flag: bool\n  n: i64\n}\n",
+        "record Sized {\n  b: u8\n  w: u32\n  big: u64\n}\n",
+        "record Bools {\n  p: bool\n  q: bool\n}\n",
+        "record LongName {\n  the_first_field: i64\n  another: bool\n}\n",
+        "record R {\n  only_bool: bool\n}\n",
+        "record AllInts {\n  a: i8\n  b: i16\n  c: i32\n  d: i64\n  e: u8\n  f: u16\n  g: u32\n  h: u64\n}\n",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        let db = temp.path().join(format!("ref-rec-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-rec-{i}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer single-record root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
+fn importer_reproduces_the_root_hash_for_single_enum() {
+    // 15a (object-kind breadth): a single `enum` type definition — structurally identical to a
+    // record (the same `name: type` member grammar; this grammar has no payload-free variants),
+    // differing only in the object framing: EnumDef vs RecordDef, `variants`/`variant_symbol`
+    // vs `fields`/`field_symbol`, the `enum_variant` member-symbol kind, the `:variant:` birth-
+    // seed tag, and the TypeDef `type_kind` "enum". Same genesis-birth / no-chain root from
+    // objects alone. One kind-parameterized builder produces both; this gate pins the enum
+    // strings (a wrong tag/key/kind would reproduce records but not enums).
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = importer();
+    let temp = tempdir().unwrap();
+    let sources = [
+        "enum Sign {\n  neg: i64\n  pos: bool\n}\n",
+        "enum IoResult {\n  ok: i64\n  err: i64\n}\n",
+        "enum One {\n  only: i64\n}\n",
+        "enum Many {\n  a: u8\n  b: u16\n  c: u32\n  d: u64\n}\n",
+        "enum Choice {\n  left: bool\n  right: bool\n  middle: i64\n}\n",
+        "enum E {\n  just_one_variant: u64\n}\n",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        let db = temp.path().join(format!("ref-enum-{i}.sqlite"));
+        let src = temp.path().join(format!("ref-enum-{i}.cdb"));
+        std::fs::write(&src, source).unwrap();
+        run(&["init", path(&db)]);
+        let report = run(&["import", path(&db), path(&src)]);
+        let want = report
+            .lines()
+            .find_map(|line| line.strip_prefix("root "))
+            .expect("import reports a root");
+        let got = run_hasher(exe, source.as_bytes());
+        assert_eq!(
+            got,
+            want,
+            "self-hosted importer single-enum root mismatch for `{}`",
+            source.trim()
+        );
+    }
+}
+
+#[test]
 fn the_committed_lexer_view_passes_the_checked_view_gate() {
     // SPEC_V3 §11: the committed .cdb is a checked view. The lexer's build is a
     // two-import bootstrap (std/fmt.cdb + compiler/front/lex.cdb), so the gate

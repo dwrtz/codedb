@@ -1831,6 +1831,38 @@ source-order permutations), local smoke 24/24, every function under the v0 frame
 `parse_all` 4048). With increment 4 the recursion-clique surface — any single n-member SCC, n in
 [1, 8], discretising OR fully-symmetric — is COMPLETE.
 
+Landed 2026-06-17 (step 4, object-kind breadth — record + enum type definitions): the first
+NON-FUNCTION object kinds. `import.cdb` now dispatches on the leading keyword (peek the first
+non-whitespace byte: `record` → 114, `enum` → 101, else the existing `fn` path) and, for a single
+type definition, builds the genesis-born objects directly — the type `SymbolBirth` (local_nonce
+`import:type:<module>:<name>:<ordinal>`, kind `type`), one `record_field`/`enum_variant`
+`SymbolBirth` per member (OWNED by the type, nonce `<seed>:<field|variant>:<idx>:<name>`), each
+member's scalar `Type`, the `RecordDef`/`EnumDef`, and the `TypeDef`, then the type-only
+`ProgramRoot` (empty symbols/names/param_names; populated `types` + `type_names`). Like a single
+function or a single-member recursion group, every birth is genesis, so the root is built from
+objects ALONE — no migration/history chain. Record and enum share ONE kind-parameterized builder;
+they differ only in VALUE strings (the birth-nonce tag, the member symbol_kind, the TypeDef
+type_kind) and — the subtle part — in canonical KEY LAYOUT: `fields`/`field_symbol` sort EARLY
+(so RecordDef is `{fields, region_params, type_symbol}` and a field entry `{field_symbol, name,
+type}`) but `variants`/`variant_symbol` sort LATE (so EnumDef is `{region_params, type_symbol,
+variants}` and a variant entry `{name, type, variant_symbol}`) — handled by distinct
+`emit_record_entry`/`emit_enum_entry` and `wrap_record_def`/`wrap_enum_def`, selected as a
+conditional of two whole calls (never string-building inside the `if`, the v0 aggregate-return
+SIGTRAP rule). The member list is parsed by a move-only-memory loop accumulator rebuilt into a
+FRESH record before return (the v0 loop-accumulator-return rule), packing each member's name range
++ scalar type code into one i64. The full shape was de-risked in Python against the oracle
+(`codedb import` + `emit-objects`) before any `.cdb`. The enum KEY-ORDER bug — the `.cdb` first
+hardcoded the record array-first layout for both kinds (records passed, ALL enums failed), masked
+by the auto-sorting (`sort_keys`) blueprint — was caught in smoke and pinpointed by a FAITHFUL
+byte-order Python model that emits the explicit per-kind key orders; the fix is the per-kind
+layout above. Two new gate tests — `importer_reproduces_the_root_hash_for_single_record` (1…8
+fields; i64/bool/sized scalars) and `importer_reproduces_the_root_hash_for_single_enum` — pass;
+local smoke 16/16; every function under the v0 frame budget (max `parse_all` 4048). Next
+object-kind-breadth steps: n type definitions (canonical type ordering + the create_type migration
+chain), then named-type references in signatures / record construction / `case`, then
+mutually-recursive type cliques (reusing `canonical_clique_order`, already self-hosted for
+function cliques).
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text
