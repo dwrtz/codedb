@@ -102,6 +102,53 @@ typed semantic DAG -> lowered IR -> native object -> link plan -> executable
     The authoritative program is the content-addressed object DAG, stored in git
     as a deterministic export and reproducible on rebuild because identities are
     deterministic (see §10 and §11).
+14. The Rung-A front-end spine is load-bearing infrastructure. The self-hosted
+    importer/front-end may not grow by hand-transcribing every Rust importer case
+    into one monolithic `.cdb`. Rung A requires a reusable internal
+    compiler-construction spine — source bytes → token stream → parsed item
+    table/AST → item dependency graph and canonical grouping → typed semantic
+    object constructors → canonical object writer → root/migration/history hash
+    builder (see §5A). The spine is implementation infrastructure; it does not make
+    source text authoritative — source stays a checked projection, the
+    authoritative result is still the content-addressed object DAG and its
+    migration history.
+15. Canonical serialization is a stage, not string glue. Every canonical payload
+    used by Rung A is emitted through a shared canonical writer + object-builder
+    library that owns canonical key layout, JSON escaping, payload size
+    measurement, emission, object-domain framing, schema versioning, and object
+    hashing. Once that library exists, stage code may not hand-assemble ad hoc JSON
+    for a new object kind; a new object kind is accepted only with an
+    object-builder path, a Rust-oracle fixture, and a malformed-object verification
+    test.
+16. Raw migration serialization and typed object serialization share one AST. Rung
+    A has two real serializations — raw operation serialization (→ migration_hash /
+    history_hash) and typed object serialization (→ Expression / FunctionDef / root
+    hash). Both must derive from one parsed item/AST representation. Duplicate
+    raw-vs-typed parser logic may exist temporarily during migration, but a
+    sub-stage is not complete until that duplication is retired or mechanically
+    checked for equivalence.
+17. Unsupported importer shapes fail closed. The importer may be intentionally
+    incomplete during Phase 15, but it must never route an unsupported program
+    through an unrelated fallback that can produce a plausible-but-wrong root. Every
+    unsupported grammar or item-graph shape must instead emit a deterministic
+    unsupported diagnostic, trap deterministically under a native-required fixture,
+    or return a sentinel the harness treats as expected-unsupported. A wrong root is
+    never an acceptable fallback.
+18. Performance artifacts are part of self-hosting evidence. Rung A and later rungs
+    must preserve deterministic artifact caching (lowered IR, type layout,
+    dependency sets, interface/implementation hashes, native objects, link plans,
+    executables). A self-hosted stage is checked not only for semantic equality but
+    for enough artifact identity to avoid rebuilding unchanged work; the mixed
+    compiler must not pay avoidable repeated work such as lowering the same function
+    once during planning and again during object emission.
+19. Backend health is a self-hosting prerequisite. When backend limitations force
+    systematic source-level contortions in the self-hosted compiler, they become
+    self-hosting blockers — large aggregate stack-frame addressing, aggregate-return
+    / hidden-return-slot correctness, loop-accumulator return correctness, move-only
+    borrow-before-move correctness, and stack-slot reuse/liveness for large compiler
+    functions are correctness/progress gates, not incidental polish. Conservative
+    codegen is fine; depending on undocumented source-shaping idioms to dodge native
+    SIGTRAPs is not.
 
 ## 4. Two completion rules
 
@@ -168,6 +215,123 @@ language can compute SHA-256 — the content-addressing core literally cannot ho
 itself until R4/R5/R6 land. Native emission (Rung B) is the largest and least
 thesis-novel rung; it is staged last but it is not optional, because in CodeDB's
 sense of "compiler" the native path is the compilation path.
+
+## 5A. Rung A internal compiler spine
+
+Rung A is the front end to lowered IR. Its output oracle remains lowered-IR hash
+equality, and its earlier importer sub-stage uses object/root-hash equality.
+Internally, Rung A is divided into a spine of reusable compiler libraries — it is
+not a monolithic transcription of the Rust importer.
+
+```text
+compiler/front/io.cdb          buffered source ingestion
+compiler/front/json.cdb        canonical JSON measurement + emission + escaping
+compiler/front/object.cdb      typed CodeDB object builders + object hashing
+compiler/front/ast.cdb         parsed item table and AST arena
+compiler/front/graph.cdb       dependency graph, Kahn order, SCCs, recursion ordering
+compiler/front/migration.cdb   birth seeds, migration JSON, history hashing
+compiler/front/import.cdb      orchestration: source -> root hash / object DAG
+```
+
+The exact file split may evolve, but the responsibilities must remain separated.
+`import.cdb` orchestrates these libraries; it is not a monolithic copy of the Rust
+importer.
+
+### 5A.1 Parsed item table and AST
+
+The importer first constructs an item table. Each top-level definition records:
+
+```text
+kind: function | extern | record | enum | generic | recursion_group_member | type_group_member
+module
+name span and canonical display name
+signature/type header information
+parameter/member spans and type names
+body AST root, when present
+source span bounds
+```
+
+Expression and type syntax are represented as compact AST nodes or arena records.
+The representation may be transient compiler data rather than committed CodeDB
+program objects, but it must have a deterministic debug/probe projection for oracle
+localization. The AST is the shared input to (1) raw operation serialization for
+migration/history hashes and (2) typed semantic-object construction for CodeDB
+object hashes.
+
+### 5A.2 Item graph and canonical ordering
+
+The importer computes a dependency graph over the item table before creating
+symbols. Canonical import order is source-order independent:
+
+```text
+DAG items: Kahn topological sort, callee/dependency before dependent, alphabetical tie-break
+recursive function SCCs: one RecursionGroup per strongly-connected component
+recursive type SCCs: one TypeRecursionGroup per strongly-connected component
+root arrays: sorted by the root normalizer's own per-array keys
+```
+
+The graph library, not ad hoc importer branches, owns these rules. It must support
+mixed programs — type definitions, functions, externals, recursion groups, and
+eventually generic instances in one root — and fail closed on graph shapes it
+cannot yet lower.
+
+### 5A.3 Canonical object writer and object builders
+
+The canonical writer exposes a two-pass discipline:
+
+```text
+measure(payload) -> exact or conservative capacity
+emit(payload, buffer) -> canonical bytes
+hash(kind, schema, payload) -> content hash
+```
+
+All object builders use this writer. Builders include at least: Type, SymbolBirth,
+FunctionSignature, Expression, FunctionDef, ExternalFunctionDef, RecordDef, EnumDef,
+TypeDef, RecursionGroup, TypeRecursionGroup, ProgramRoot, Migration, History.
+Canonical key order must be explicit in builder code and tested per object kind. No
+builder may rely on a host-side `sort_keys` mental model unless the emitted bytes
+are proven identical to the Rust canonical-JSON oracle.
+
+### 5A.4 Dual emitters from one AST
+
+For every expression form accepted by the importer, the AST library provides
+`emit_raw_operation_ast(node)` (migration operation / postcondition body) and
+`build_typed_expression(node)` (Expression objects and type hashes). The test gate
+for a new expression form must include a fixture where the raw AST contributes to a
+migration hash AND a fixture where the typed expression contributes to a ProgramRoot
+hash.
+
+### 5A.5 Unsupported shapes
+
+Unsupported input must be classified before object construction (mixed SCC+DAG
+shapes not yet supported; programs above current fixed item-count limits; forward
+references not representable yet; named-type forms not yet implemented; ill-typed
+programs when the sub-stage only claims valid-program root equality). These cases
+fail closed (§ design principle 17); they may not fall through to a smaller importer
+path.
+
+### 5A.6 Diagnostics and localization artifacts
+
+Each Rung-A sub-stage exposes deterministic probes — token, AST/item-table,
+item-graph/order, object dump / per-object hash, migration/history, typed-object,
+layout JSON, lowered-IR hash. The probes are development artifacts for localizing
+oracle divergence, not compilation paths.
+
+### 5A.7 Rung A acceptance rule
+
+Rung A is accepted only when:
+
+```text
+1. the front-end stage is expressed as CodeDB semantic objects and compiles natively;
+2. source import produces object/root hashes identical to the Rust importer on the acceptance corpus;
+3. type checking, borrow/effect/move/drop checking, layout, and lowering produce artifacts identical to Rust at their seams;
+4. raw migration serialization and typed object construction derive from one parsed AST/item representation;
+5. canonical payloads are emitted through the shared object-builder/canonical-writer layer;
+6. unsupported source or graph shapes fail closed;
+7. replay/export/import round-trips the self-hosted stage and its checked projection;
+8. artifact caching avoids known repeated work, especially duplicate lowering between planning and object emission;
+9. backend-health gates pass on all supported native targets.
+```
 
 ## 6. Cyclic content-addressing (the keystone)
 
@@ -323,6 +487,15 @@ Because identity is a pure function of history, a program's identities and its
 root hash reproduce exactly on rebuild. This is what lets the committed source be
 a checked view (§11) rather than the authoritative form.
 
+The migration/history builder owns all birth-seed strings and deterministic
+birth-history selection. Individual importer cases may *request* a birth for a
+symbol, type, field, variant, recursion-group member, or generic instance, but may
+not hand-assemble the final seed string outside the builder. This keeps provenance,
+blame, and root reproducibility tied to one implementation of the identity rules.
+For recursion groups and type-recursion groups, the graph/order library owns member
+ordinals — the symbol builder receives the chosen ordinal; it does not recompute
+canonical clique order locally.
+
 ## 11. Source representation and durable storage
 
 A CodeDB program — including the self-hosted compiler — is authoritatively the
@@ -348,6 +521,15 @@ import the committed source -> verify -> re-export
   the rebuilt root_hash matches the committed pin
 deterministic birth seeds (§10) make this rebuild reproducible
 ```
+
+The checked-view gate depends on canonical importer order over the parsed item set.
+Importing a source projection, exporting it, and importing it again must reproduce
+the same root because the importer canonicalizes the semantic item graph (§5A.2),
+not because the source text happened to appear in the projection's order. This
+applies to mixed roots containing types, functions, externals, recursion groups,
+and eventually generic instances. The parsed AST/item table is not an alternative
+source of truth; it is an internal compiler artifact used to reproduce the
+authoritative object DAG and migration history.
 
 Review and history:
 
@@ -412,6 +594,55 @@ deleting the Rust compiler — it remains trusted stage-0 and the oracle
 Some of these arrive later. They are not required before CodeDB can compile
 itself.
 
+## 13A. Performance and backend-health gates
+
+Phase 15 has shown that self-hosting is gated not only by semantic correctness but
+by build performance and native-backend health. V3 therefore has these gates in
+addition to the determinism oracles (see design principles 18 and 19).
+
+### 13A.1 Performance gates
+
+Self-hosting must remain practical enough that agents can iterate on compiler
+objects. Required artifact-cache behavior:
+
+```text
+interface_hash changes recompile dependents
+implementation_hash/body changes recompile the changed symbol and implementation-dependent users
+unchanged lowered IR is reused between link planning and object emission
+unchanged type layouts are reused across functions and build invocations
+native object and link-plan cache keys include all relevant semantic and backend dependencies
+```
+
+The mixed compiler computes lowered IR for a function once per root/target/cache
+key, then reuses that prepared artifact when emitting objects; link planning may
+inspect lowered-IR metadata but must not force a second lowering pass before
+object-cache lookup. Required developer diagnostics:
+
+```text
+frame-report: per-function frame size, aggregate locals, machine parameter count, max offset
+artifact-plan: planned vs cached vs rebuilt compiler artifacts
+oracle-localize: first divergent object/migration/history/IR artifact
+```
+
+Buffered source ingestion is required once self-hosted tools operate on full source
+files; one-byte stdin pumps are allowed only as early probes.
+
+### 13A.2 Backend-health gates
+
+Before extending Rung A much farther, V3 must harden the native backend where
+self-hosted compiler code has already exposed correctness hazards. Acceptance gates:
+
+```text
+large-frame test: a compiler-shaped function with aggregate locals compiles and runs on supported targets
+aggregate-return test: record-returning conditionals and loop accumulators return correctly
+hidden-return-slot test: aggregate-returning calls inside loops do not alias loop accumulators or return slots
+move-only-sizing test: measuring a move-only string before moving it into a builder is native-equal to evaluator behavior
+slot-reuse smoke: liveness-based stack-slot reuse reduces frame size without changing lowered IR semantics
+```
+
+Until these pass, source workarounds may remain, but every workaround must be
+documented as temporary and covered by a backend bug fixture.
+
 ## 14. Open design questions
 
 To settle during v3 implementation, through native acceptance programs:
@@ -431,6 +662,20 @@ do recursion groups and generic instances become first-class object kinds, and
   how does verify recompute and validate them?
 what is the minimum semantic-merge fidelity that supports N concurrent agents
   building the compiler (v3 sets the floor; v4 sets the ceiling)?
+front-end spine: which AST/item-table representation is stable enough for probes,
+  and does any part become a content-addressed compiler artifact?
+canonical writer: what is the minimal object-builder API that expresses all current
+  object kinds without falling back to ad hoc payload strings?
+dual serialization: how is raw migration serialization mechanically tied to typed
+  expression construction from the same AST?
+graph canonicalization: how are mixed type/function/extern/recursion groups ordered
+  as one source-order-independent item set?
+unsupported input: what deterministic unsupported artifact/diagnostic shape should
+  the native self-hosted importer emit?
+performance: which artifacts are cached before Rung A is complete, and how does the
+  cache avoid double lowering during link planning and object emission?
+backend health: which v0 backend limitations must be fixed before more compiler
+  breadth is accepted?
 ```
 
 The implementation plan (a future `PLAN_V3.md`, the phase-plan counterpart to

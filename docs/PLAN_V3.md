@@ -1891,6 +1891,367 @@ both source orders, sized fields); local smoke 10/10 (+ record/enum 16/16, cliqu
 every function under the v0 frame budget (max `parse_all` 4048). Next object-kind-breadth steps:
 named-type references in signatures / record construction / `case`, then mutually-recursive type cliques.
 
+### Draft 1.1 continuation — front-end spine and revised object-kind sequence
+
+This subsection revises the forward plan after the current landed importer work above,
+inserting a front-end infrastructure/paydown cut before resuming object-kind breadth.
+Phase 15 has proven the V3 thesis, but the implementation is now paying too much for
+hand-coded canonical JSON, duplicate raw/typed parsers, ad hoc graph ordering, fixed
+buffer guesses, and backend-shaped source workarounds. The next milestone is a short
+infrastructure cut, and only after it should Phase 15 resume object-kind breadth:
+
+```text
+15a.5 Front-end spine and performance paydown
+  -> json/object builder library
+  -> shared AST/item table
+  -> graph/order library
+  -> migration/history builder
+  -> fail-closed unsupported-shape handling
+  -> frame report + backend bug fixtures
+  -> prepared/cached LoweredIr path
+  -> buffered source ingestion
+```
+
+### Phase 15a.5 — Front-End Spine and Performance Paydown
+
+Goal: turn the successful importer prototype into reusable compiler infrastructure before adding more object kinds. `import.cdb` becomes orchestration; canonical serialization, object construction, graph ordering, and migration/history construction move into shared libraries.
+
+Status: proposed, next.
+
+Depends on:
+
+```text
+Phase 15a current landed work: lexer, SHA/object hash, expression importer,
+n-function create_function chains, recursion groups, and single record/enum type roots.
+```
+
+Rationale:
+
+```text
+The current importer has repeatedly found bugs in canonical key order, root-array ordering,
+recursion-group member ordering, buffer sizing, frame size, and native aggregate-return paths.
+Those are not isolated bugs; they are symptoms that the self-hosted front end needs a real
+compiler-construction layer.
+```
+
+Deliverables:
+
+```text
+compiler/front/json.cdb
+  canonical JSON escaping, key-order-aware emission, and a measure/emit discipline
+
+compiler/front/object.cdb
+  object builders for Type, SymbolBirth, Expression, FunctionSignature, FunctionDef,
+  RecordDef, EnumDef, TypeDef, RecursionGroup, ProgramRoot, Migration, and History
+
+compiler/front/ast.cdb
+  parsed item table and expression/type AST arena or compact node representation
+
+compiler/front/graph.cdb
+  Kahn topological ordering, SCC detection, canonical recursion-group ordering wrappers,
+  source-order-independent mixed item ordering
+
+compiler/front/migration.cdb
+  birth-seed construction, precondition/postcondition templates, migration hashing,
+  history hashing
+
+compiler/front/io.cdb or std/io.cdb update
+  buffered stdin/source-file ingestion; one-byte pumps remain only for tiny probes
+
+Rust-side build performance path
+  prepared/cached LoweredIr artifacts reused between link planning and object emission
+
+Rust-side diagnostics
+  frame-report command or emit-ir summary: frame size, aggregate locals, parameter count,
+  max stack offset, functions near backend limits
+
+backend bug fixtures
+  large-frame addressing, aggregate-return conditionals, loop-accumulator returns,
+  hidden-return-slot aliasing, move-only borrow-before-move sizing
+```
+
+Files likely touched:
+
+```text
+compiler/front/json.cdb
+compiler/front/object.cdb
+compiler/front/ast.cdb
+compiler/front/graph.cdb
+compiler/front/migration.cdb
+compiler/front/import.cdb
+compiler/front/README.md
+std/io.cdb or compiler/front/io.cdb
+src/link.rs
+src/backend/native.rs
+src/lowering.rs
+src/artifact.rs
+src/main.rs
+tests/selfhost_frontend.rs
+tests/backend_frame_report.rs
+tests/backend_aggregate_return.rs
+tests/build_cache.rs
+```
+
+Acceptance checks:
+
+```text
+existing selfhost_frontend root-hash tests remain green with no oracle regressions
+import.cdb no longer owns ad hoc payload builders for object kinds covered by object.cdb
+raw migration serialization and typed Expression construction derive from the same AST representation for the covered expression surface
+a representative rich two-function program exercises both raw and typed emitters from the shared AST and root-hash-equals Rust
+record and enum roots are emitted through object.cdb builders and reproduce Rust roots
+unsupported graph shapes fail closed with a deterministic unsupported result, not a smaller-path fallback
+frame-report identifies the current largest compiler/front functions and fails CI if a supported target exceeds the backend limit
+native backend aggregate-return and large-frame fixtures pass on supported targets
+build planning and object emission do not lower the same function twice on a cache-warm build
+buffered ingestion matches read_all behavior and is used by importer-sized tools
+compiler/front/README.md and import.cdb top comments are updated to match current Phase 15 reality
+```
+
+Suggested implementation order:
+
+```text
+15a.5.1 docs and comments
+  update compiler/front/README.md and import.cdb header so agents no longer follow stale constraints
+
+15a.5.2 frame-report and backend bug fixtures
+  make the recurring offline frame sweep a first-class command/test before refactoring more source
+
+15a.5.3 canonical JSON writer
+  implement measure/emit for strings, arrays, objects, hashes, raw byte escaping, and fixed key layouts
+
+15a.5.4 object builders
+  port Type, SymbolBirth, FunctionSignature, FunctionDef, Expression, ProgramRoot first;
+  then RecordDef/EnumDef/TypeDef; then RecursionGroup; then Migration/History
+
+15a.5.5 shared AST/item table
+  parse function headers, params, expressions, record/enum members into one representation;
+  keep current parser path behind tests until the new path reproduces identical roots
+
+15a.5.6 dual emitters from AST
+  replace duplicate raw parser and typed parser logic with raw-operation and typed-object emitters
+  over the same AST
+
+15a.5.7 graph library
+  move Kahn ordering, SCC detection, root array sorting inputs, and recursion-group ordering wrappers
+  out of import.cdb branches
+
+15a.5.8 migration/history library
+  centralize birth seeds, root pre/post templates, migration JSON, and history hashing
+
+15a.5.9 build-cache paydown
+  prepare/cached LoweredIr once per symbol/root/target and reuse it in link planning and object emission
+
+15a.5.10 buffered IO
+  replace importer-sized one-byte stdin reads with chunked reads while keeping byte-identical behavior
+```
+
+### Phase 15a.6 — N Type Definitions and Mixed Item Roots
+
+Goal: resume object-kind breadth on top of the new spine. Support multiple record/enum type definitions and mixed type/function roots through the shared item table and graph library.
+
+Status: planned; depends on 15a.5. (Reality-reconciliation: the basic N independent-type create_type chain already landed — see the Landed notes above — so 15a.6 here is the re-statement under the new spine plus mixed type+function roots, not a not-yet-started item.)
+
+Deliverables:
+
+```text
+multiple record/enum definitions in one source
+canonical type ordering and create_type migration/history chain
+mixed roots containing types and functions
+root arrays emitted through shared object builders
+source-order-independent import/export/import fixpoint for mixed roots
+```
+
+Acceptance checks:
+
+```text
+root-hash equality for two to eight type definitions in different source orders
+root-hash equality for mixed type + function programs where functions do not yet construct named records/enums
+checked-view gate: import -> export -> import reaches the same root for a non-canonical source order
+unsupported named-type uses fail closed until Phase 15a.7
+```
+
+### Phase 15a.7 — Named Type References, Record Construction, and Case
+
+Goal: add the object-kind surface required for real compiler data structures: named record/enum types in signatures and bodies, record literals, field projection, enum construction, and `case`.
+
+Status: planned; depends on 15a.6.
+
+Deliverables:
+
+```text
+named type resolution in signatures and local annotations
+record construction and field projection in typed Expression objects
+array/slice/string-relevant type references where already native-complete
+enum construction and case over enum variants
+raw-operation serialization for the same forms, derived from the shared AST
+```
+
+Acceptance checks:
+
+```text
+per-object hash equality for record/enum constructors and case fixtures
+root-hash equality for functions using named record and enum types
+raw migration body fixture where named-type expression syntax affects migration_hash
+unsupported generic/nested/recursive type forms fail closed until later phases
+```
+
+### Phase 15a.8 — Externals, Modules, and Stdlib Import Surface
+
+Goal: import the stdlib/platform surface needed by the front end without special casing.
+
+Status: planned; depends on 15a.7.
+
+Deliverables:
+
+```text
+external function definitions and link metadata
+module-qualified names where the current Rust importer accepts them
+platform externs used by std.io/std.string/std.alloc
+root metadata/modules emitted through object builders
+```
+
+Acceptance checks:
+
+```text
+root-hash equality for std/platform fragments
+root-hash equality for a front-end source that imports the shared compiler/front libraries
+export/import checked-view gate over multi-module front-end files
+```
+
+### Phase 15a.9 — Type Recursion Groups
+
+Goal: support mutually-recursive type cliques using the same graph/order machinery as function recursion groups, but producing TypeRecursionGroup objects and type births.
+
+Status: planned; depends on 15a.8.
+
+Deliverables:
+
+```text
+SCC detection over type definitions
+canonical type-clique member ordering
+TypeRecursionGroup object builder
+field/variant/member symbol births owned by recursive type members
+verify checks for malformed recursive type cliques
+```
+
+Acceptance checks:
+
+```text
+root-hash equality for self/mutually recursive type definitions accepted by the Rust importer
+fail-closed fixtures for recursive type shapes that still require indirection or generic threading
+type-recursion groups round-trip through export/import/replay
+```
+
+### Phase 15a.10 — Full-Corpus Importer Root Equality
+
+Goal: the self-hosted importer reproduces the Rust importer root for the committed front-end acceptance corpus.
+
+Status: planned; depends on 15a.9.
+
+Deliverables:
+
+```text
+full committed corpus accepted or explicitly classified unsupported
+object/root-hash equality for all accepted files
+first-divergence localizer: token, AST, graph order, object, migration/history, root
+```
+
+Acceptance checks:
+
+```text
+compiler/front/*.cdb accepted by the self-hosted importer
+compiler/eval/eval.cdb accepted or has a documented unsupported blocker
+std/* accepted where required for the mixed compiler
+all unsupported cases produce deterministic unsupported diagnostics, never wrong roots
+```
+
+The cross-cutting performance phases below run alongside the 15a.5–15a.10 spine work.
+
+### Phase P1 — Prepared LoweredIr and no double lowering
+
+Goal: avoid lowering the same function during link planning and again during object emission.
+
+Deliverables:
+
+```text
+LoweredIr cache key and artifact metadata are used in the build hot path
+plan_link_jobs stores or references prepared LoweredIr per symbol
+emit_objects_for_symbols_parallel consumes prepared object inputs where possible
+cache-warm builds skip lowering before object-cache lookup
+```
+
+Acceptance checks:
+
+```text
+instrumented build-cache test proves each reachable symbol is lowered at most once on a cold build
+cache-warm build performs zero lowerings for unchanged symbols
+link-plan JSON remains byte-identical
+native object bytes remain byte-identical
+```
+
+### Phase P2 — Frame report and native backend visibility
+
+Goal: turn recurring offline frame sweeps into a normal compiler diagnostic.
+
+Deliverables:
+
+```text
+codedb frame-report <db> <entry> --target <triple> --json
+per-function frame size, max stack offset, aggregate locals, machine params, hidden return slot
+CI threshold for supported targets
+```
+
+Acceptance checks:
+
+```text
+compiler/front/import.cdb frame report is generated in selfhost_frontend tests
+functions within 256 bytes of the target limit are reported
+known over-limit fixture fails with an actionable diagnostic before native SIGTRAP
+```
+
+### Phase P3 — Backend correctness paydown
+
+Goal: remove source-level workarounds that are currently shaping compiler/front code.
+
+Deliverables:
+
+```text
+large-offset stack addressing on arm64 and x86_64 where needed
+aggregate-returning conditional correctness
+loop-accumulator aggregate-return correctness
+hidden return slot / loop accumulator aliasing fix
+move-only borrow-before-move codegen fix for size-then-move builder patterns
+simple stack-slot reuse / liveness for aggregate temporaries
+```
+
+Acceptance checks:
+
+```text
+minimal native repros for each current workaround pass evaluator == native
+compiler/front can replace at least one workaround with the natural source shape
+frame report shows lower max frames after slot reuse
+```
+
+### Phase P4 — Faster oracle harness
+
+Goal: keep root-hash oracle coverage broad without making every fixture pay full CLI + SQLite setup cost.
+
+Deliverables:
+
+```text
+in-process Rust helper: import source string -> root hash
+batched root oracle fixtures where isolation is not required
+existing CLI smoke tests retained for end-to-end coverage
+```
+
+Acceptance checks:
+
+```text
+selfhost_frontend test wall time drops significantly on the same host
+CLI end-to-end coverage still includes lexer, SHA, object hash, importer, and checked-view gates
+```
+
 Sub-stages (each independently oracle-checked at its artifact):
 
 ```text
@@ -1899,6 +2260,30 @@ Sub-stages (each independently oracle-checked at its artifact):
 15c borrow/effect/move/drop check                 oracle: same accept/reject + diag
 15d layout                                         oracle: layout-JSON equality
 15e lowering -> lowered IR                         oracle: IR-hash equality
+```
+
+Draft 1.1 infrastructure dependencies (each sub-stage keeps its oracle above and gains
+a dependency on the 15a.5 spine libraries):
+
+```text
+15b type check -> typed expressions
+  depends on ast.cdb and object.cdb; typed-object equality oracle
+
+15c borrow/effect/move/drop check
+  depends on shared AST/item table plus typed objects; same accept/reject + diagnostic oracle
+
+15d layout
+  depends on cached TypeLayout artifacts and object/type graph; layout-JSON equality oracle
+
+15e lowering -> lowered IR
+  depends on cached LoweredIr path; IR-hash equality oracle
+```
+
+New acceptance addition for 15e:
+
+```text
+the mixed compiler reuses prepared/cached LoweredIr between link planning and object emission;
+IR-hash equality remains the semantic oracle, but duplicate lowering is a performance failure.
 ```
 
 Files likely touched:
@@ -1910,10 +2295,21 @@ tests/selfhost_frontend.rs
 
 Acceptance fixture and oracle:
 
+The 15a importer sub-stage already meets root-hash equality with the Rust importer on
+the grammar landed so far (the minimal-grammar, expression, recursion-group, and
+record/enum/N-type roots — see the Landed notes above). The Draft 1.1 acceptance
+fixture tightens the full-phase target to a multi-stage mixed compiler plus performance
+gates:
+
 ```text
-the CodeDB front-end lowers the acceptance corpus to IR that is hash-identical to
-  the Rust front-end's; the Rust native backend then builds it to identical
-  binaries (mixed compiler)
+compiler/front/import.cdb imports the acceptance corpus into semantic objects with root hashes equal to Rust;
+compiler/front/typecheck.cdb reproduces typed-object equality;
+compiler/front/check.cdb reproduces borrow/effect/move/drop verdicts;
+compiler/front/layout.cdb reproduces layout JSON;
+compiler/front/lower.cdb reproduces lowered IR hashes;
+the Rust native backend builds the resulting IR to native objects in the mixed compiler;
+verify and replay/export/import pass;
+performance gates show no duplicate lowering and no backend-frame-limit workarounds hidden from diagnostics.
 ```
 
 ## Phase 16 — Process Arguments / argv (R12)
@@ -2067,6 +2463,29 @@ byte-stable. The source is always already a valid topological order (the importe
 fails to resolve a forward reference otherwise), so canonicalizing it never violates
 a dependency. `tests/import_order.rs` pins order-independence (two source orderings of
 one program reach the same root) and the non-canonical-source round-trip fixpoint.
+
+### Draft 1.1 additions
+
+Add these to the V3 cross-cutting policy.
+
+Allowed conservative choices:
+
+```text
+transient AST/item tables that are compiler data rather than committed program objects
+fixed item-count caps during early importer sub-stages, if fail-closed and tested
+conservative buffer over-allocation when exact measure/emit is not yet available, if documented and bounded
+```
+
+Not allowed:
+
+```text
+unsupported input falling through to a smaller importer path and producing a plausible root
+new object kinds with ad hoc canonical payload construction after object.cdb covers that family
+duplicate raw and typed parsers without an equivalence gate
+performance claims that ignore repeated lowering or avoidable artifact-cache misses
+source-shaping workarounds for backend bugs without a failing native fixture and a removal plan
+stale compiler/front documentation that contradicts the accepted importer surface
+```
 
 ## Suggested milestone cuts
 
