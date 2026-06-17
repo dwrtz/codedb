@@ -1,0 +1,200 @@
+// compiler/front/json.cdb - the canonical JSON writer for the self-hosted
+// front end (Phase 15a.5.3, the front-end spine). Imported after lib.cdb; the
+// later object builders (15a.5.4 object.cdb) and import.cdb compose these.
+//
+// WHY THIS FILE EXISTS. import.cdb has repeatedly been bitten by two bug
+// classes that a real serialization layer removes:
+//   (1) canonical key order / escaping done ad hoc per call site, and
+//   (2) `string_with_capacity(N)` buffers sized by a GUESS that under-shoots
+//       and SIGTRAPs (e.g. a ProgramRoot payload needing 1024, not 512).
+// json.cdb replaces both with a measure/emit discipline: a `measure` pass
+// computes the EXACT encoded byte length, the caller allocates a buffer of
+// exactly that size, and an `emit` pass fills it. A measured size can never
+// under-shoot, so the trap class is gone, and there is no over-allocation.
+//
+// THE ORACLE (src/store.rs:1164 canonical_json). Objects = byte-sorted keys,
+// compact `{"k":v,...}`; arrays = compact `[a,b,c]`; numbers/bools bare; and
+// crucially STRINGS = serde_json::to_string(value), i.e.:
+//   0x22 "  -> \"     0x5c \  -> \\
+//   0x08 -> \b  0x09 -> \t  0x0a -> \n  0x0c -> \f  0x0d -> \r
+//   other byte < 0x20            -> \u00xx   (lowercase hex)
+//   0x2f '/', 0x7f, and bytes >= 0x80 (UTF-8) -> emitted RAW.
+// The current importer corpus is escape-free ASCII (idents, hashes, operators,
+// type names, literal slices), so escaping is UNEXERCISED by root-hash tests;
+// it is validated directly (the `esc` entry below + tests/selfhost_frontend.rs
+// against codedb's own canonical_json).
+//
+// EXACT CAPACITY IS EXACTLY RIGHT. The arm64 buffer push (src/backend/native.rs
+// emit_buffer_push_arm64, ~6295) compares len vs capacity and traps unless
+// len < cap, so `string_with_capacity(n)` holds EXACTLY n bytes and the (n+1)th
+// push traps. esc_str_len returns n INCLUDING the two quotes, so json_str does
+// `string_with_capacity(n)` with no slack.
+//
+// THIS INCREMENT (15a.5.3, first commit) = the STRING leaf only: canonical
+// string escaping with the measure/emit split, `json_str`, and a standalone
+// `esc` entry (read stdin -> print its canonical JSON encoding) for the gate.
+// Arrays/objects/bare-ints/key-layout framing and the import.cdb integration
+// are the following increments.
+//
+// v0 DISCIPLINE honored here:
+//   - move-only `string` buffers thread by return (the lib.cdb pattern); a
+//     helper taking `mem: string` and returning a non-string would DROP the
+//     buffer the caller still needs, so esc_str_len/esc_str_emit return it.
+//   - string_get/string_len BORROW (do not consume), and reject a &string
+//     param (gotcha #8) -> read the owned `mem` directly inside a loop whose
+//     accumulator is Copy (the schedule_at pattern), never thread it as &.
+//   - Copy loop accumulators (LenC, EmAcc holds only the move-only out buffer +
+//     a Copy index) keep us clear of the move-only-loop-accumulator return
+//     SIGTRAP; results are rebuilt into fresh records, never returned raw.
+
+// ---------------------------------------------------------------------------
+// records
+// ---------------------------------------------------------------------------
+
+// esc_str_len's Copy loop accumulator: source index + running byte count.
+record LenC {
+  i: i64
+  n: i64
+}
+
+// esc_str_len's result: the threaded source buffer + the exact encoded length
+// (including the two surrounding quotes).
+record EscLen {
+  mem: string
+  n: i64
+}
+
+// esc_str_emit's loop accumulator: the move-only output buffer being filled and
+// the Copy source index. The source `mem` is read from the enclosing param.
+record EmAcc {
+  out: string
+  i: i64
+}
+
+// A measure/emit result: the threaded source buffer and the built output. Used
+// by esc_str_emit and json_str so callers (import.cdb) get `mem` back.
+record EscR {
+  mem: string
+  out: string
+}
+
+// ---------------------------------------------------------------------------
+// string escaping: measure then emit (serde_json::to_string semantics)
+// ---------------------------------------------------------------------------
+
+// Bytes one source byte contributes INSIDE the quotes: 2 for the named escapes
+// (" \ \b \t \n \f \r), 6 for any other control byte (\u00xx), else 1 (raw).
+fn esc_byte_len(b: i64) -> i64 =
+  if b == 0x22 then 2
+  else if b == 0x5c then 2
+  else if b == 0x08 then 2
+  else if b == 0x09 then 2
+  else if b == 0x0a then 2
+  else if b == 0x0c then 2
+  else if b == 0x0d then 2
+  else if b < 0x20 then 6
+  else 1
+
+// Measure: the EXACT byte length of the canonical JSON encoding of mem[s, e),
+// including the two surrounding quotes. Reads the owned `mem` (Copy
+// accumulator), threads it back so the caller can still emit from it.
+fn esc_str_len(mem: string, s: i64, e: i64) -> EscLen =
+  let seed: LenC = { i: s, n: 0 } in
+  let done: LenC =
+    loop a = seed while a.i < e do
+      let b: i64 = to_i64(string_get(mem, a.i)) in
+      let add: i64 = esc_byte_len(b) in
+      let r: LenC = { i: a.i + 1, n: a.n + add } in r
+  in
+  let res: EscLen = { mem: mem, n: done.n + 2 } in res
+
+// Emit: append the canonical JSON string ("..." with escaping) of mem[s, e) to
+// `out`, threading both buffers back. `out` must have room for esc_str_len's
+// count (json_str sizes it exactly).
+fn esc_str_emit(out: string, mem: string, s: i64, e: i64) -> EscR effects[state] =
+  let q0: unit = string_push(out, to_u8(0x22)) in
+  let seed: EmAcc = { out: out, i: s } in
+  let done: EmAcc =
+    loop a = seed while a.i < e do
+      let cur: EmAcc = a in
+      let oo: string = cur.out in
+      let b: i64 = to_i64(string_get(mem, cur.i)) in
+      if b == 0x22 then
+        let p1: unit = string_push(oo, to_u8(0x5c)) in
+        let p2: unit = string_push(oo, to_u8(0x22)) in
+        let x: EmAcc = { out: oo, i: cur.i + 1 } in x
+      else if b == 0x5c then
+        let p1: unit = string_push(oo, to_u8(0x5c)) in
+        let p2: unit = string_push(oo, to_u8(0x5c)) in
+        let x: EmAcc = { out: oo, i: cur.i + 1 } in x
+      else if b == 0x08 then
+        let p1: unit = string_push(oo, to_u8(0x5c)) in
+        let p2: unit = string_push(oo, to_u8(0x62)) in
+        let x: EmAcc = { out: oo, i: cur.i + 1 } in x
+      else if b == 0x09 then
+        let p1: unit = string_push(oo, to_u8(0x5c)) in
+        let p2: unit = string_push(oo, to_u8(0x74)) in
+        let x: EmAcc = { out: oo, i: cur.i + 1 } in x
+      else if b == 0x0a then
+        let p1: unit = string_push(oo, to_u8(0x5c)) in
+        let p2: unit = string_push(oo, to_u8(0x6e)) in
+        let x: EmAcc = { out: oo, i: cur.i + 1 } in x
+      else if b == 0x0c then
+        let p1: unit = string_push(oo, to_u8(0x5c)) in
+        let p2: unit = string_push(oo, to_u8(0x66)) in
+        let x: EmAcc = { out: oo, i: cur.i + 1 } in x
+      else if b == 0x0d then
+        let p1: unit = string_push(oo, to_u8(0x5c)) in
+        let p2: unit = string_push(oo, to_u8(0x72)) in
+        let x: EmAcc = { out: oo, i: cur.i + 1 } in x
+      else if b < 0x20 then
+        let p1: unit = string_push(oo, to_u8(0x5c)) in
+        let p2: unit = string_push(oo, to_u8(0x75)) in
+        let p3: unit = string_push(oo, to_u8(0x30)) in
+        let p4: unit = string_push(oo, to_u8(0x30)) in
+        let p5: unit = string_push(oo, to_u8(hex_nibble((b >> 4) & 0xf))) in
+        let p6: unit = string_push(oo, to_u8(hex_nibble(b & 0xf))) in
+        let x: EmAcc = { out: oo, i: cur.i + 1 } in x
+      else
+        let p1: unit = string_push(oo, to_u8(b)) in
+        let x: EmAcc = { out: oo, i: cur.i + 1 } in x
+  in
+  let oo2: string = done.out in
+  let q1: unit = string_push(oo2, to_u8(0x22)) in
+  let res: EscR = { mem: mem, out: oo2 } in res
+
+// The convenience entry point: encode mem[s, e) as a canonical JSON string into
+// a freshly, EXACTLY sized buffer. Threads `mem` back (caller may keep parsing).
+fn json_str(mem: string, s: i64, e: i64) -> EscR effects[alloc, state] =
+  let ml: EscLen = esc_str_len(mem, s, e) in
+  let n: i64 = ml.n in
+  let m1: string = ml.mem in
+  let buf: string = string_with_capacity(n) in
+  let em: EscR = esc_str_emit(buf, m1, s, e) in
+  em
+
+// ---------------------------------------------------------------------------
+// standalone `esc` entry: read stdin, print its canonical JSON string encoding
+// (the byte-for-byte gate against codedb's canonical_json — tests/selfhost_frontend.rs)
+// ---------------------------------------------------------------------------
+
+// Write the bytes of a move-only string to stdout one byte at a time (frame-
+// tiny: the accumulator is a Copy index, the byte rides a 1-element stack array).
+fn write_str<'r>(s: string) -> i64 effects[io, ffi, unsafe] =
+  let n: i64 = string_len(s) in
+  let done: i64 =
+    loop i = 0 while i < n do
+      let b: u8 = string_get(s, i) in
+      let one: array<u8, 1> = [b; 1] in
+      let w: i64 = std.platform.write(1, raw_ptr(&'r one[0]), 1) in
+      i + 1
+  in
+  0
+
+fn esc<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let n: i64 = string_len(raw) in
+  let j: EscR = json_str(raw, 0, n) in
+  let out: string = j.out in
+  let printed: i64 = write_str(out) in
+  0

@@ -312,6 +312,104 @@ fn obj_hash_reproduces_hash_object_canonical_for_real_objects() {
     );
 }
 
+/// Import + verify + build the `esc` entry of compiler/front/json.cdb (the
+/// canonical JSON string writer) — once per test process. lib.cdb supplies
+/// read_all and the byte plumbing; json.cdb adds the measure/emit escaper.
+fn json_escaper() -> &'static Path {
+    static JSON_ESCAPER: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    JSON_ESCAPER
+        .get_or_init(|| {
+            let temp = tempdir().unwrap();
+            let db = temp.path().join("selfhost-json.sqlite");
+            run(&["init", path(&db)]);
+            run(&["import", path(&db), "compiler/front/lib.cdb"]);
+            run(&["import", path(&db), "compiler/front/json.cdb"]);
+            run(&["verify", path(&db)]);
+            let exe = temp.path().join("esc-bin");
+            run(&["build", path(&db), "esc", "--out", path(&exe)]);
+            (temp, exe)
+        })
+        .1
+        .as_path()
+}
+
+/// Run the `esc` binary with `bytes` on stdin; return its raw stdout bytes.
+fn run_esc(exe: &Path, bytes: &[u8]) -> Vec<u8> {
+    let mut child = StdCommand::new(exe)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn esc");
+    child
+        .stdin
+        .take()
+        .expect("esc stdin")
+        .write_all(bytes)
+        .expect("write esc stdin");
+    let output = child.wait_with_output().expect("wait esc");
+    assert!(output.status.success(), "esc exited non-zero: {output:?}");
+    output.stdout
+}
+
+/// Assert the .cdb escaper's output equals codedb's canonical JSON string
+/// encoding. canonical_json (src/store.rs:1164) serializes a String via
+/// serde_json::to_string, so that call IS the authoritative oracle.
+fn assert_esc(exe: &Path, s: &str) {
+    let got = run_esc(exe, s.as_bytes());
+    let want = serde_json::to_string(s).expect("serde canonical string");
+    assert_eq!(
+        got.as_slice(),
+        want.as_bytes(),
+        "json.cdb escaping mismatch for {s:?} (got {got:?}, want {want:?})"
+    );
+}
+
+#[test]
+fn json_escaper_matches_canonical_json_string_encoding() {
+    // json.cdb's measure/emit string writer must reproduce codedb's canonical
+    // JSON string encoding (serde_json::to_string) byte for byte. The importer
+    // corpus is escape-free, so this is the ONLY gate that exercises escaping;
+    // it also proves the exactly-sized string_with_capacity(measure) buffer
+    // never under-shoots (e.g. the all-escape runs below fill it to capacity).
+    if !can_build_default_native_target() {
+        return;
+    }
+    let exe = json_escaper();
+    // Escape-free values the importer actually emits (idents, hashes, operators,
+    // type names, nonces): the common path, unchanged by escaping.
+    assert_esc(exe, "");
+    assert_esc(exe, "main");
+    assert_esc(exe, "sha256:5aa0031cafebabedeadbeef0123456789");
+    assert_esc(exe, "i64");
+    assert_esc(exe, "import:main:foo:0");
+    assert_esc(exe, "recursion_group:0");
+    assert_esc(exe, "<<");
+    assert_esc(exe, "&&");
+    assert_esc(exe, "/"); // '/' is NOT escaped by serde
+    // The seven named escapes.
+    assert_esc(exe, "\"");
+    assert_esc(exe, "\\");
+    assert_esc(exe, "\u{8}");
+    assert_esc(exe, "\t");
+    assert_esc(exe, "\n");
+    assert_esc(exe, "\u{c}");
+    assert_esc(exe, "\r");
+    // Other control bytes -> \u00xx (lowercase); DEL (0x7f) stays raw.
+    assert_esc(exe, "\u{0}");
+    assert_esc(exe, "\u{1}");
+    assert_esc(exe, "\u{1f}");
+    assert_esc(exe, "\u{7f}");
+    // Mixed, embedded NUL, and long all-escape / escape-free runs (buffer sizing).
+    assert_esc(exe, "tab\there\nquote\" back\\slash");
+    assert_esc(exe, "a\u{0}b\u{1}c");
+    assert_esc(exe, "\"\\\u{8}\t\n\u{c}\r\u{0}\u{1f}\u{7f}");
+    assert_esc(exe, &"x".repeat(200));
+    assert_esc(exe, &"\t".repeat(64));
+    // Non-ASCII passes through as raw UTF-8 bytes (byte machine, byte-faithful).
+    assert_esc(exe, "café");
+    assert_esc(exe, "smørrebrød");
+}
+
 /// Import + verify + build the self-hosted importer (lib.cdb + import.cdb) once per
 /// test process; the shared `(TempDir, db, exe)` is reused by `importer()` (the native
 /// binary) and `importer_db()` (the database, for inspecting the importer's compiled form).
