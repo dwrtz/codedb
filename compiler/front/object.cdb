@@ -259,6 +259,60 @@ fn build_funcdef(sig: string, sym: string, body: string) -> string effects[alloc
   hash_object(b"FunctionDef", 1, p7, 275)
 
 // ---------------------------------------------------------------------------
+// Expression objects (typed nodes; keys byte-sorted). Composites reference their
+// CHILD Expression hashes, so they compose bottom-up. This increment: the leaf
+// literals (literal_i64 with a quoted string value; literal_bool with a BARE
+// value) and the first recursive composite (binary). unary/if/let/refs/call/cast
+// follow.
+// ---------------------------------------------------------------------------
+
+// literal_i64: {"expr_kind":"literal_i64","type":"<type hash>","value":"<value>"}.
+// value is the raw source text (escape-free). type = build_type(tyc) (71 bytes).
+// Skeleton 48 (35 + 11 + 2). value consumed via push_str (length passed).
+fn build_literal_i64(tyc: i64, value: string, valuelen: i64) -> string effects[alloc, state] =
+  let total: i64 = 48 + 71 + valuelen in
+  let p0: string = string_with_capacity(total) in
+  let p1: string = push_lit(p0, b"{\"expr_kind\":\"literal_i64\",\"type\":\"") in
+  let th: string = build_type(tyc) in
+  let p2: string = push_str(p1, th) in
+  let p3: string = push_lit(p2, b"\",\"value\":\"") in
+  let p4: string = push_str(p3, value) in
+  let p5: string = push_lit(p4, b"\"}") in
+  hash_object(b"Expression", 1, p5, total)
+
+// literal_bool: {"expr_kind":"literal_bool","type":"<bool hash>","value":<true|false>}.
+// value is a BARE JSON bool (reusing json.cdb's push_true/push_false as a conditional
+// of two whole calls). type is always the Bool type. Skeleton 47 (36 + 10 + 1).
+fn build_literal_bool(b: bool) -> string effects[alloc, state] =
+  let vlen: i64 = if b then 4 else 5 in
+  let total: i64 = 47 + 71 + vlen in
+  let p0: string = string_with_capacity(total) in
+  let p1: string = push_lit(p0, b"{\"expr_kind\":\"literal_bool\",\"type\":\"") in
+  let th: string = build_type(1) in
+  let p2: string = push_str(p1, th) in
+  let p3: string = push_lit(p2, b"\",\"value\":") in
+  let p4: string = if b then push_true(p3) else push_false(p3) in
+  let p5: string = push_lit(p4, b"}") in
+  hash_object(b"Expression", 1, p5, total)
+
+// binary: {"expr_kind":"binary","left":"<h>","op":"<op>","right":"<h>","type":"<th>"}.
+// left/right/type are object hashes (71 bytes each); op is the operator string.
+// Skeleton 61 (30 + 8 + 11 + 10 + 2); op consumed via push_str (length passed).
+fn build_binary(left: string, op: string, oplen: i64, right: string, typeh: string) -> string effects[alloc, state] =
+  let total: i64 = 61 + 71 + oplen + 71 + 71 in
+  let p0: string = string_with_capacity(total) in
+  let p1: string = push_lit(p0, b"{\"expr_kind\":\"binary\",\"left\":\"") in
+  let p2: string = push_str(p1, left) in
+  let p3: string = push_lit(p2, b"\",\"op\":\"") in
+  let p4: string = push_str(p3, op) in
+  let p5: string = push_lit(p4, b"\",\"right\":\"") in
+  let p6: string = push_str(p5, right) in
+  let p7: string = push_lit(p6, b"\",\"type\":\"") in
+  let p8: string = push_str(p7, typeh) in
+  let p9: string = push_lit(p8, b"\"}") in
+  hash_object(b"Expression", 1, p9, total)
+
+// ---------------------------------------------------------------------------
 // gate entry: tyc = string_len(stdin); print build_type(tyc) (tests/selfhost_frontend.rs
 // feeds 0..8 bytes and diffs against the real emit-objects Type hashes)
 // ---------------------------------------------------------------------------
@@ -357,4 +411,50 @@ fn fdobj<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
   let s3: EscR = substr(r3, nl2 + 1, len) in
   let body: string = s3.out in
   let h: string = build_funcdef(sig, sym, body) in
+  write_str(h)
+
+// `exlit`: stdin byte[0] = the literal's type code, byte[1..] = its raw value text.
+// Print the literal_i64 Expression hash.
+fn exlit<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let len: i64 = string_len(raw) in
+  let tyc: i64 = to_i64(string_get(raw, 0)) in
+  let s1: EscR = substr(raw, 1, len) in
+  let value: string = s1.out in
+  let h: string = build_literal_i64(tyc, value, len - 1) in
+  write_str(h)
+
+// `exbool`: nonempty stdin -> true, empty -> false. Print the literal_bool hash.
+fn exbool<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let b: bool = string_len(raw) > 0 in
+  let h: string = build_literal_bool(b) in
+  write_str(h)
+
+// `exbin`: read "left\nop\nright\ntype" from stdin (two child Expression hashes, the
+// operator string, and the result type hash). Print the binary Expression hash.
+fn exbin<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let len: i64 = string_len(raw) in
+  let f1: NL = find_nl(raw, 0, len) in
+  let nl1: i64 = f1.p in
+  let r0: string = f1.mem in
+  let f2: NL = find_nl(r0, nl1 + 1, len) in
+  let nl2: i64 = f2.p in
+  let r1: string = f2.mem in
+  let f3: NL = find_nl(r1, nl2 + 1, len) in
+  let nl3: i64 = f3.p in
+  let r2: string = f3.mem in
+  let s1: EscR = substr(r2, 0, nl1) in
+  let left: string = s1.out in
+  let r3: string = s1.mem in
+  let s2: EscR = substr(r3, nl1 + 1, nl2) in
+  let op: string = s2.out in
+  let r4: string = s2.mem in
+  let s3: EscR = substr(r4, nl2 + 1, nl3) in
+  let right: string = s3.out in
+  let r5: string = s3.mem in
+  let s4: EscR = substr(r5, nl3 + 1, len) in
+  let typeh: string = s4.out in
+  let h: string = build_binary(left, op, nl2 - nl1 - 1, right, typeh) in
   write_str(h)

@@ -834,6 +834,120 @@ fn object_build_funcdef_matches_emit_objects() {
     assert!(checked >= 2, "expected several FunctionDefs; checked {checked}");
 }
 
+/// Import + verify + build object.cdb's Expression gate entries (exlit/exbool/exbin).
+fn expression_bins() -> &'static (TempDir, PathBuf, PathBuf, PathBuf) {
+    static EX: OnceLock<(TempDir, PathBuf, PathBuf, PathBuf)> = OnceLock::new();
+    EX.get_or_init(|| {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("selfhost-expression.sqlite");
+        run(&["init", path(&db)]);
+        run(&["import", path(&db), "compiler/front/lib.cdb"]);
+        run(&["import", path(&db), "compiler/front/json.cdb"]);
+        run(&["import", path(&db), "compiler/front/object.cdb"]);
+        run(&["verify", path(&db)]);
+        let exlit = temp.path().join("exlit-bin");
+        let exbool = temp.path().join("exbool-bin");
+        let exbin = temp.path().join("exbin-bin");
+        run(&["build", path(&db), "exlit", "--out", path(&exlit)]);
+        run(&["build", path(&db), "exbool", "--out", path(&exbool)]);
+        run(&["build", path(&db), "exbin", "--out", path(&exbin)]);
+        (temp, exlit, exbool, exbin)
+    })
+}
+
+#[test]
+fn object_build_expression_matches_emit_objects() {
+    // object.cdb's Expression builders (this increment: literal_i64, literal_bool,
+    // binary) must reproduce the real Expression hashes. Oracle: emit-objects a
+    // program with int/bool literals and binary expressions; map Type hashes to
+    // codes via the Type objects in the dump, then for each Expression of a covered
+    // kind feed its fields to the matching entry and diff. Other kinds (param_ref,
+    // ...) are skipped (later increments). A binary's child hashes come straight
+    // from its payload, so nested binaries reproduce without rebuilding children.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("prog.sqlite");
+    let src = temp.path().join("prog.cdb");
+    std::fs::write(
+        &src,
+        "fn main() -> i64 = 1 + 2\n\
+         fn g(a: i64) -> i64 = a * 3 - 4\n\
+         fn t() -> bool = true\n\
+         fn f() -> bool = false\n\
+         fn cmp(a: i64) -> bool = a < 10\n\
+         fn s() -> u8 = 5\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+    let dump_path = temp.path().join("dump.txt");
+    run(&["emit-objects", path(&db), "--out", path(&dump_path)]);
+    let dump = std::fs::read_to_string(&dump_path).unwrap();
+
+    let kind_code = |k: &str| -> u8 {
+        match k {
+            "I64" => 0, "Bool" => 1, "U8" => 2, "U16" => 3, "U32" => 4,
+            "U64" => 5, "I8" => 6, "I16" => 7, "I32" => 8,
+            other => panic!("unexpected type_kind {other}"),
+        }
+    };
+    let mut hash_to_code: std::collections::BTreeMap<String, u8> =
+        std::collections::BTreeMap::new();
+    for line in dump.lines() {
+        let cols: Vec<&str> = line.splitn(4, '\t').collect();
+        if cols.len() == 4 && cols[1] == "Type" {
+            let v: serde_json::Value = serde_json::from_str(cols[3]).unwrap();
+            hash_to_code.insert(cols[0].to_string(), kind_code(v["type_kind"].as_str().unwrap()));
+        }
+    }
+
+    let bins = expression_bins();
+    let (exlit, exbool, exbin) = (&bins.1, &bins.2, &bins.3);
+    let mut checked = 0usize;
+    for line in dump.lines() {
+        let cols: Vec<&str> = line.splitn(4, '\t').collect();
+        if cols.len() != 4 || cols[1] != "Expression" {
+            continue;
+        }
+        let (hash, payload) = (cols[0], cols[3]);
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let got = match v["expr_kind"].as_str().unwrap() {
+            "literal_i64" => {
+                let mut input = vec![hash_to_code[v["type"].as_str().unwrap()]];
+                input.extend_from_slice(v["value"].as_str().unwrap().as_bytes());
+                run_esc(exlit, &input)
+            }
+            "literal_bool" => {
+                let b = v["value"].as_bool().unwrap();
+                run_esc(exbool, (if b { "x" } else { "" }).as_bytes())
+            }
+            "binary" => {
+                let s = format!(
+                    "{}\n{}\n{}\n{}",
+                    v["left"].as_str().unwrap(),
+                    v["op"].as_str().unwrap(),
+                    v["right"].as_str().unwrap(),
+                    v["type"].as_str().unwrap()
+                );
+                run_esc(exbin, s.as_bytes())
+            }
+            _ => continue, // param_ref / unary / if / let / call / cast — later
+        };
+        assert_eq!(
+            got.as_slice(),
+            hash.as_bytes(),
+            "Expression mismatch for {payload}"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 5,
+        "expected several Expressions (literals + binaries); checked {checked}"
+    );
+}
+
 /// Import + verify + build the self-hosted importer (lib.cdb + import.cdb) once per
 /// test process; the shared `(TempDir, db, exe)` is reused by `importer()` (the native
 /// binary) and `importer_db()` (the database, for inspecting the importer's compiled form).
