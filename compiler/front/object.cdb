@@ -397,6 +397,23 @@ fn build_let(name: string, namelen: i64, binding_type: string, body: string, val
   let p11: string = push_lit(p10, b"\"}") in
   hash_object(b"Expression", 1, p11, total)
 
+// call: {"args":[<arg hashes>],"expr_kind":"call","symbol":"<symh>","type":"<th>"}.
+// `args_body` is the pre-framed array body (`"h0","h1",...`, or empty for no args —
+// the element-splice + comma framing is the proven FunctionSignature push_sig_params
+// pattern); build_call frames the brackets + symbol + type. Skeleton 52 (9+31+10+2);
+// total = 52 + args_body_len + 71 (symbol) + 71 (type).
+fn build_call(args_body: string, args_body_len: i64, symbol: string, typeh: string) -> string effects[alloc, state] =
+  let total: i64 = 52 + args_body_len + 71 + 71 in
+  let p0: string = string_with_capacity(total) in
+  let p1: string = push_lit(p0, b"{\"args\":[") in
+  let p2: string = push_str(p1, args_body) in
+  let p3: string = push_lit(p2, b"],\"expr_kind\":\"call\",\"symbol\":\"") in
+  let p4: string = push_str(p3, symbol) in
+  let p5: string = push_lit(p4, b"\",\"type\":\"") in
+  let p6: string = push_str(p5, typeh) in
+  let p7: string = push_lit(p6, b"\"}") in
+  hash_object(b"Expression", 1, p7, total)
+
 // ---------------------------------------------------------------------------
 // gate entry: tyc = string_len(stdin); print build_type(tyc) (tests/selfhost_frontend.rs
 // feeds 0..8 bytes and diffs against the real emit-objects Type hashes)
@@ -666,4 +683,26 @@ fn exlet<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
   let s5: EscR = substr(r7, nl4 + 1, len) in
   let typeh: string = s5.out in
   let h: string = build_let(name, nl1, bt, body, value, typeh) in
+  write_str(h)
+
+// `excall`: read "args_body\nsymbol\ntype" from stdin (args_body = the pre-framed
+// array body, possibly empty). Print the call Expression hash.
+fn excall<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let len: i64 = string_len(raw) in
+  let f1: NL = find_nl(raw, 0, len) in
+  let nl1: i64 = f1.p in
+  let r0: string = f1.mem in
+  let f2: NL = find_nl(r0, nl1 + 1, len) in
+  let nl2: i64 = f2.p in
+  let r1: string = f2.mem in
+  let s1: EscR = substr(r1, 0, nl1) in
+  let args_body: string = s1.out in
+  let r2: string = s1.mem in
+  let s2: EscR = substr(r2, nl1 + 1, nl2) in
+  let symbol: string = s2.out in
+  let r3: string = s2.mem in
+  let s3: EscR = substr(r3, nl2 + 1, len) in
+  let typeh: string = s3.out in
+  let h: string = build_call(args_body, nl1, symbol, typeh) in
   write_str(h)

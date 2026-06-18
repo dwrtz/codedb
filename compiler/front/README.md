@@ -14,7 +14,7 @@ Landed so far:
 | `lib.cdb` | shared SHA-256 core, object-hash framing, hex + stdin plumbing (imported first) | (composed into the others) |
 | `import.cdb` | the importer: source to the ProgramRoot hash CodeDB would assign it | `codedb import` to `root`, byte-equal |
 | `json.cdb` | the canonical JSON writer (front-end spine): measure/emit for the JSON value leaves (serde-faithful string escaping, bare integers, bools, null) plus the append substrate (`push_lit`/`push_byte`/`push_str`/`push_range`) and literal-skeleton object framing with exact measure for `{"k":v,...}` — array element splices to follow | `serde_json::to_string` / canonical object form, byte-equal |
-| `object.cdb` | per-object-kind builders on `json.cdb` + `lib.cdb`'s SHA-256: Type (9 scalar kinds), SymbolBirth (3-key function/type + 4-key owned record_field/enum_variant), FunctionSignature (the first array — `params` of Type hashes), FunctionDef, and Expression (every form except call — literals, binary, unary, if, param_ref/local_ref, int_cast, let, recursively composing child hashes) so far — exact-measured payloads and an exactly-sized `hash_object` preimage; more kinds + importer integration to follow | real `emit-objects` hashes, byte-equal |
+| `object.cdb` | per-object-kind builders on `json.cdb` + `lib.cdb`'s SHA-256: Type (9 scalar kinds), SymbolBirth (3-key function/type + 4-key owned record_field/enum_variant), FunctionSignature (the first array — `params` of Type hashes), FunctionDef, and Expression (all ten typed-node forms — literals, binary, unary, if, param_ref/local_ref, int_cast, let, call — recursively composing child hashes) so far — exact-measured payloads and an exactly-sized `hash_object` preimage; more kinds + importer integration to follow | real `emit-objects` hashes, byte-equal |
 
 `import.cdb` is the largest piece and reproduces the Rust importer's root hash across
 a wide surface:
@@ -66,9 +66,10 @@ SPEC_V3 §5A / §13A / design principles 14-19):
   function/type + 4-key owned record_field/enum_variant), FunctionSignature (the first
   array — `params` of Type hashes), FunctionDef, Expression (every form except let/call —
   literals, binary, unary, if, param_ref/local_ref, int_cast, recursively composing child
-  hashes), and the content-addressing `hash_object` (exactly-sized preimage) — all
-  content-hash byte-equal to `emit-objects` — have landed, then Expression's call
-  (the args array), record/enum/type defs, RecursionGroup, ProgramRoot, Migration, History
+  hashes), Expression's let + call (call's `args` array), and the content-addressing
+  `hash_object` (exactly-sized preimage) — all content-hash byte-equal to `emit-objects` —
+  have landed (Expression is now structurally complete), then record/enum/type defs,
+  RecordDef/EnumDef/TypeDef, RecursionGroup, ProgramRoot, Migration, History
 - `ast.cdb` — shared parsed item table / AST, one representation behind both serializers
 - `graph.cdb` — Kahn ordering, SCC detection, canonical recursion-group ordering
 - `migration.cdb` — birth seeds, pre/post templates, migration + history hashing

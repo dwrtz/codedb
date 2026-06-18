@@ -839,6 +839,7 @@ fn object_build_funcdef_matches_emit_objects() {
 /// local_ref/unary/if/int_cast).
 type ExprBins = (
     TempDir, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf,
+    PathBuf,
 );
 fn expression_bins() -> &'static ExprBins {
     static EX: OnceLock<ExprBins> = OnceLock::new();
@@ -858,7 +859,8 @@ fn expression_bins() -> &'static ExprBins {
         let (exlit, exbool, exbin) = (bin("exlit"), bin("exbool"), bin("exbin"));
         let (exprm, exlr, exun) = (bin("exprm"), bin("exlr"), bin("exun"));
         let (exif, exic, exlet) = (bin("exif"), bin("exic"), bin("exlet"));
-        (temp, exlit, exbool, exbin, exprm, exlr, exun, exif, exic, exlet)
+        let excall = bin("excall");
+        (temp, exlit, exbool, exbin, exprm, exlr, exun, exif, exic, exlet, excall)
     })
 }
 
@@ -884,6 +886,7 @@ fn object_build_expression_matches_emit_objects() {
          fn h(a: i64) -> i64 = let x: i64 = a + 1 in x + a\n\
          fn c(a: i64) -> u8 = to_u8(a)\n\
          fn t() -> bool = true\n\
+         fn caller() -> i64 = h(7)\n\
          fn main() -> i64 = 1 + 2\n",
     )
     .unwrap();
@@ -913,7 +916,7 @@ fn object_build_expression_matches_emit_objects() {
     let bins = expression_bins();
     let (exlit, exbool, exbin) = (&bins.1, &bins.2, &bins.3);
     let (exprm, exlr, exun, exif, exic) = (&bins.4, &bins.5, &bins.6, &bins.7, &bins.8);
-    let exlet = &bins.9;
+    let (exlet, excall) = (&bins.9, &bins.10);
     let mut checked = 0usize;
     for line in dump.lines() {
         let cols: Vec<&str> = line.splitn(4, '\t').collect();
@@ -991,7 +994,23 @@ fn object_build_expression_matches_emit_objects() {
                 );
                 run_esc(exlet, s.as_bytes())
             }
-            _ => continue, // call (args array) — the final Expression form
+            "call" => {
+                let args_body = v["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|a| format!("\"{}\"", a.as_str().unwrap()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let s = format!(
+                    "{}\n{}\n{}",
+                    args_body,
+                    v["symbol"].as_str().unwrap(),
+                    v["type"].as_str().unwrap()
+                );
+                run_esc(excall, s.as_bytes())
+            }
+            _ => continue, // any other Expression kind
         };
         assert_eq!(
             got.as_slice(),
