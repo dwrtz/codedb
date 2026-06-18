@@ -378,6 +378,25 @@ fn build_int_cast(source: string, target: string, value: string) -> string effec
   let p7: string = push_lit(p6, b"\"}") in
   hash_object(b"Expression", 1, p7, 275)
 
+// let: {"binding_name":"<n>","binding_type":"<th>","body":"<h>","expr_kind":"let",
+// "type":"<th>","value":"<h>"}. name is an escape-free identifier; binding_type/body/
+// type/value are object hashes (71 each). Skeleton 86; total = 86 + namelen + 4 x 71.
+fn build_let(name: string, namelen: i64, binding_type: string, body: string, value: string, typeh: string) -> string effects[alloc, state] =
+  let total: i64 = 86 + namelen + 71 + 71 + 71 + 71 in
+  let p0: string = string_with_capacity(total) in
+  let p1: string = push_lit(p0, b"{\"binding_name\":\"") in
+  let p2: string = push_str(p1, name) in
+  let p3: string = push_lit(p2, b"\",\"binding_type\":\"") in
+  let p4: string = push_str(p3, binding_type) in
+  let p5: string = push_lit(p4, b"\",\"body\":\"") in
+  let p6: string = push_str(p5, body) in
+  let p7: string = push_lit(p6, b"\",\"expr_kind\":\"let\",\"type\":\"") in
+  let p8: string = push_str(p7, typeh) in
+  let p9: string = push_lit(p8, b"\",\"value\":\"") in
+  let p10: string = push_str(p9, value) in
+  let p11: string = push_lit(p10, b"\"}") in
+  hash_object(b"Expression", 1, p11, total)
+
 // ---------------------------------------------------------------------------
 // gate entry: tyc = string_len(stdin); print build_type(tyc) (tests/selfhost_frontend.rs
 // feeds 0..8 bytes and diffs against the real emit-objects Type hashes)
@@ -614,4 +633,37 @@ fn exif<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
   let s4: EscR = substr(r5, nl3 + 1, len) in
   let typeh: string = s4.out in
   let h: string = build_if(condh, elseh, thenh, typeh) in
+  write_str(h)
+
+// `exlet`: read "name\nbinding_type\nbody\nvalue\ntype" from stdin. Print the let hash.
+fn exlet<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let len: i64 = string_len(raw) in
+  let f1: NL = find_nl(raw, 0, len) in
+  let nl1: i64 = f1.p in
+  let r0: string = f1.mem in
+  let f2: NL = find_nl(r0, nl1 + 1, len) in
+  let nl2: i64 = f2.p in
+  let r1: string = f2.mem in
+  let f3: NL = find_nl(r1, nl2 + 1, len) in
+  let nl3: i64 = f3.p in
+  let r2: string = f3.mem in
+  let f4: NL = find_nl(r2, nl3 + 1, len) in
+  let nl4: i64 = f4.p in
+  let r3: string = f4.mem in
+  let s1: EscR = substr(r3, 0, nl1) in
+  let name: string = s1.out in
+  let r4: string = s1.mem in
+  let s2: EscR = substr(r4, nl1 + 1, nl2) in
+  let bt: string = s2.out in
+  let r5: string = s2.mem in
+  let s3: EscR = substr(r5, nl2 + 1, nl3) in
+  let body: string = s3.out in
+  let r6: string = s3.mem in
+  let s4: EscR = substr(r6, nl3 + 1, nl4) in
+  let value: string = s4.out in
+  let r7: string = s4.mem in
+  let s5: EscR = substr(r7, nl4 + 1, len) in
+  let typeh: string = s5.out in
+  let h: string = build_let(name, nl1, bt, body, value, typeh) in
   write_str(h)

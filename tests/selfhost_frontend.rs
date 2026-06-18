@@ -838,7 +838,7 @@ fn object_build_funcdef_matches_emit_objects() {
 /// (literal_i64/literal_bool/binary) and exprm/exlr/exun/exif/exic (param_ref/
 /// local_ref/unary/if/int_cast).
 type ExprBins = (
-    TempDir, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf,
+    TempDir, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf,
 );
 fn expression_bins() -> &'static ExprBins {
     static EX: OnceLock<ExprBins> = OnceLock::new();
@@ -857,8 +857,8 @@ fn expression_bins() -> &'static ExprBins {
         };
         let (exlit, exbool, exbin) = (bin("exlit"), bin("exbool"), bin("exbin"));
         let (exprm, exlr, exun) = (bin("exprm"), bin("exlr"), bin("exun"));
-        let (exif, exic) = (bin("exif"), bin("exic"));
-        (temp, exlit, exbool, exbin, exprm, exlr, exun, exif, exic)
+        let (exif, exic, exlet) = (bin("exif"), bin("exic"), bin("exlet"));
+        (temp, exlit, exbool, exbin, exprm, exlr, exun, exif, exic, exlet)
     })
 }
 
@@ -913,6 +913,7 @@ fn object_build_expression_matches_emit_objects() {
     let bins = expression_bins();
     let (exlit, exbool, exbin) = (&bins.1, &bins.2, &bins.3);
     let (exprm, exlr, exun, exif, exic) = (&bins.4, &bins.5, &bins.6, &bins.7, &bins.8);
+    let exlet = &bins.9;
     let mut checked = 0usize;
     for line in dump.lines() {
         let cols: Vec<&str> = line.splitn(4, '\t').collect();
@@ -979,7 +980,18 @@ fn object_build_expression_matches_emit_objects() {
                 );
                 run_esc(exic, s.as_bytes())
             }
-            _ => continue, // let / call — a later increment
+            "let" => {
+                let s = format!(
+                    "{}\n{}\n{}\n{}\n{}",
+                    v["binding_name"].as_str().unwrap(),
+                    v["binding_type"].as_str().unwrap(),
+                    v["body"].as_str().unwrap(),
+                    v["value"].as_str().unwrap(),
+                    v["type"].as_str().unwrap()
+                );
+                run_esc(exlet, s.as_bytes())
+            }
+            _ => continue, // call (args array) — the final Expression form
         };
         assert_eq!(
             got.as_slice(),
