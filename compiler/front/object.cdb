@@ -195,6 +195,51 @@ fn build_owned_symbol_birth(bh: string, bhlen: i64, nonce: string, noncelen: i64
   hash_object(b"SymbolBirth", 1, p9, total)
 
 // ---------------------------------------------------------------------------
+// FunctionSignature objects (the FIRST array kind)
+//   {"abi":"codedb-v0-internal","effects":[],"params":[<type hashes>],"return":"<type hash>"}
+// keys byte-sorted (abi < effects < params < return). `params` is a JSON array of
+// the parameter Type hashes (each build_type, 71 chars). Every type hash is exactly
+// 71 bytes, so the array's exact length is known from the count without building the
+// hashes: a quoted element is 73 (71 + 2 quotes), n elements + (n-1) commas = 74n-1.
+// ---------------------------------------------------------------------------
+
+// The sigobj entry's param-code array (Copy): up to 8 parameter type codes + index.
+record SigAcc {
+  a: array<i64, 8>
+  i: i64
+}
+
+// Append the params array BODY (without brackets): for each of the n type codes,
+// a comma (before all but the first) then the quoted Type hash. RECURSIVE (the
+// push_sig_params_at pattern) so the move-only buffer threads through the call,
+// not a loop accumulator that returns while the body calls build_type (the v0
+// aggregate-return SIGTRAP).
+fn push_sig_params(out: string, tycs: array<i64, 8>, n: i64, i: i64) -> string effects[alloc, state] =
+  if i >= n then out
+  else
+    let pre: string = if i == 0 then out else push_byte(out, to_u8(44)) in
+    let q1: string = push_byte(pre, to_u8(34)) in
+    let h: string = build_type(tycs[i]) in
+    let q2: string = push_str(q1, h) in
+    let q3: string = push_byte(q2, to_u8(34)) in
+    push_sig_params(q3, tycs, n, i + 1)
+
+// The content hash of a FunctionSignature with the given param type codes and
+// return type code. The payload is sized EXACTLY: 136 (the 65-byte skeleton +
+// the 71-byte return hash) + the params array (74n-1 for n>0, else 0).
+fn build_signature(tycs: array<i64, 8>, n: i64, rettyc: i64) -> string effects[alloc, state] =
+  let arrlen: i64 = if n > 0 then 74 * n - 1 else 0 in
+  let total: i64 = 136 + arrlen in
+  let p0: string = string_with_capacity(total) in
+  let p1: string = push_lit(p0, b"{\"abi\":\"codedb-v0-internal\",\"effects\":[],\"params\":[") in
+  let p2: string = push_sig_params(p1, tycs, n, 0) in
+  let p3: string = push_lit(p2, b"],\"return\":\"") in
+  let rh: string = build_type(rettyc) in
+  let p4: string = push_str(p3, rh) in
+  let p5: string = push_lit(p4, b"\"}") in
+  hash_object(b"FunctionSignature", 1, p5, total)
+
+// ---------------------------------------------------------------------------
 // gate entry: tyc = string_len(stdin); print build_type(tyc) (tests/selfhost_frontend.rs
 // feeds 0..8 bytes and diffs against the real emit-objects Type hashes)
 // ---------------------------------------------------------------------------
@@ -254,3 +299,21 @@ fn sbrf<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
 
 fn sbev<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
   run_owned(read_all(string_with_capacity(mem_cap())), 1)
+
+// `sigobj`: stdin byte[0] = return type code, byte[1..] = the param type codes (raw
+// bytes 0..8). Print the FunctionSignature hash. The gate maps a real signature's
+// param/return Type hashes back to codes via the Type objects in the same dump.
+fn sigobj<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let len: i64 = string_len(raw) in
+  let rettyc: i64 = to_i64(string_get(raw, 0)) in
+  let n: i64 = len - 1 in
+  let seed: SigAcc = { a: [0; 8], i: 0 } in
+  let filled: SigAcc =
+    loop s = seed while s.i < n do
+      let nx: SigAcc = { a: array_set(s.a, s.i, to_i64(string_get(raw, 1 + s.i))), i: s.i + 1 } in nx
+  in
+  let tycs: array<i64, 8> = filled.a in
+  let h: string = build_signature(tycs, n, rettyc) in
+  let printed: i64 = write_str(h) in
+  0
