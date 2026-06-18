@@ -110,6 +110,67 @@ fn build_type(tyc: i64) -> string effects[alloc, state] =
   hash_object(b"Type", 1, kp.payload, plen)
 
 // ---------------------------------------------------------------------------
+// SymbolBirth objects (3-key form): function / type
+//   {"birth_history_hash":"<H>","local_nonce":"<N>","symbol_kind":"<K>"}
+// keys byte-sorted (birth_history_hash < local_nonce < symbol_kind); the values
+// are escape-free strings (H = "genesis" or a sha256: hash), so they splice raw.
+// The owned form (record_field / enum_variant, + owner_type_symbol) follows.
+// ---------------------------------------------------------------------------
+
+// A forward scan position (Copy): index + keep-going flag.
+record Scan {
+  p: i64
+  go: bool
+}
+
+// find_nl's result: the threaded source and the '\n' index.
+record NL {
+  mem: string
+  p: i64
+}
+
+// Index of the first '\n' at or after 0 (or `len` if none), THREADING mem back
+// (find_nl takes mem by value, so it must return it or the caller loses the
+// buffer). Byte reads are guarded by nested `if` (strict && would read OOB).
+fn find_nl(mem: string, len: i64) -> NL =
+  let seed: Scan = { p: 0, go: true } in
+  let done: Scan =
+    loop a = seed while a.go do
+      if a.p >= len then (let s: Scan = { p: a.p, go: false } in s)
+      else if string_get(mem, a.p) == to_u8(10) then (let s: Scan = { p: a.p, go: false } in s)
+      else (let s: Scan = { p: a.p + 1, go: true } in s)
+  in
+  let res: NL = { mem: mem, p: done.p } in res
+
+// Copy mem[s, e) into a fresh, exactly sized owned string; threads mem back (EscR
+// {mem, out}, out = the substring). Gate-entry scaffolding for manufacturing the
+// bh/nonce strings build_symbol_birth consumes.
+fn substr(mem: string, s: i64, e: i64) -> EscR effects[alloc, state] =
+  let buf: string = string_with_capacity(e - s) in
+  push_range(buf, mem, s, e)
+
+// symbol_kind value length / emit: 1 -> "type" (4), else "function" (8).
+fn symbol_kind_len(kindcode: i64) -> i64 = if kindcode == 1 then 4 else 8
+fn push_symbol_kind(out: string, kindcode: i64) -> string effects[state] =
+  if kindcode == 1 then push_lit(out, b"type") else push_lit(out, b"function")
+
+// The content hash of a 3-key SymbolBirth. bh/nonce are consumed; their lengths
+// are PASSED (the caller measured them) so the exact payload buffer is sized
+// without string_len-then-push_str (the v0 borrow-before-move trap). The literal
+// skeleton is 59 bytes (23 + 17 + 17 + 2).
+fn build_symbol_birth(bh: string, bhlen: i64, nonce: string, noncelen: i64, kindcode: i64) -> string effects[alloc, state] =
+  let total: i64 = 59 + bhlen + noncelen + symbol_kind_len(kindcode) in
+  let p0: string = string_with_capacity(total) in
+  let p1: string = push_lit(p0, b"{\"birth_history_hash\":\"") in
+  let p2: string = push_str(p1, bh) in
+  let p3: string = push_lit(p2, b"\",\"local_nonce\":\"") in
+  let p4: string = push_str(p3, nonce) in
+  let p5: string = push_lit(p4, b"\",\"symbol_kind\":\"") in
+  let p6: string = push_symbol_kind(p5, kindcode) in
+  let p7: string = push_lit(p6, b"\"}") in
+  hash_object(b"SymbolBirth", 1, p7, total)
+
+// ---------------------------------------------------------------------------
 // gate entry: tyc = string_len(stdin); print build_type(tyc) (tests/selfhost_frontend.rs
 // feeds 0..8 bytes and diffs against the real emit-objects Type hashes)
 // ---------------------------------------------------------------------------
@@ -119,3 +180,25 @@ fn tobj<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
   let h: string = build_type(tyc) in
   let printed: i64 = write_str(h) in
   0
+
+// `sbfn` / `sbty`: read "bh\nnonce" from stdin, print the function / type
+// SymbolBirth hash. The gate feeds the (bh, nonce) of real emit-objects 3-key
+// SymbolBirths. (substr threads the source; each EscR's leftover .mem drops.)
+fn run_sb<'r>(raw: string, kindcode: i64) -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let len: i64 = string_len(raw) in
+  let f: NL = find_nl(raw, len) in
+  let nl: i64 = f.p in
+  let r0: string = f.mem in
+  let s1: EscR = substr(r0, 0, nl) in
+  let bh: string = s1.out in
+  let r1: string = s1.mem in
+  let s2: EscR = substr(r1, nl + 1, len) in
+  let nonce: string = s2.out in
+  let h: string = build_symbol_birth(bh, nl, nonce, len - nl - 1, kindcode) in
+  write_str(h)
+
+fn sbfn<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  run_sb(read_all(string_with_capacity(mem_cap())), 0)
+
+fn sbty<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  run_sb(read_all(string_with_capacity(mem_cap())), 1)

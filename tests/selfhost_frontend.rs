@@ -590,6 +590,83 @@ fn object_build_type_matches_emit_objects() {
     }
 }
 
+/// Import + verify + build object.cdb's `sbfn`/`sbty` SymbolBirth gate entries.
+fn symbol_birth_bins() -> &'static (TempDir, PathBuf, PathBuf) {
+    static SB: OnceLock<(TempDir, PathBuf, PathBuf)> = OnceLock::new();
+    SB.get_or_init(|| {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("selfhost-symbolbirth.sqlite");
+        run(&["init", path(&db)]);
+        run(&["import", path(&db), "compiler/front/lib.cdb"]);
+        run(&["import", path(&db), "compiler/front/json.cdb"]);
+        run(&["import", path(&db), "compiler/front/object.cdb"]);
+        run(&["verify", path(&db)]);
+        let sbfn = temp.path().join("sbfn-bin");
+        let sbty = temp.path().join("sbty-bin");
+        run(&["build", path(&db), "sbfn", "--out", path(&sbfn)]);
+        run(&["build", path(&db), "sbty", "--out", path(&sbty)]);
+        (temp, sbfn, sbty)
+    })
+}
+
+#[test]
+fn object_build_symbol_birth_matches_emit_objects() {
+    // object.cdb's build_symbol_birth (3-key function/type form) must reproduce the
+    // real SymbolBirth hashes. Oracle: emit-objects on a program with functions and
+    // type defs; for each 3-key SymbolBirth (no owner_type_symbol), feed "bh\nnonce"
+    // to sbfn/sbty and diff the hash. Covers bh = "genesis" and bh = a history hash.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("prog.sqlite");
+    let src = temp.path().join("prog.cdb");
+    std::fs::write(
+        &src,
+        "record R { x: i64  y: i64 }\n\
+         enum E { a: i64  b: bool }\n\
+         fn helper() -> i64 = 1\n\
+         fn main() -> i64 = helper()\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+    let dump_path = temp.path().join("dump.txt");
+    run(&["emit-objects", path(&db), "--out", path(&dump_path)]);
+    let dump = std::fs::read_to_string(&dump_path).unwrap();
+
+    let bins = symbol_birth_bins();
+    let (sbfn, sbty) = (&bins.1, &bins.2);
+    let mut checked = 0usize;
+    for line in dump.lines() {
+        let cols: Vec<&str> = line.splitn(4, '\t').collect();
+        if cols.len() != 4 || cols[1] != "SymbolBirth" {
+            continue;
+        }
+        let (hash, payload) = (cols[0], cols[3]);
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        if v.get("owner_type_symbol").is_some() {
+            continue; // owned form (record_field / enum_variant) — a later increment
+        }
+        let bh = v["birth_history_hash"].as_str().unwrap();
+        let nonce = v["local_nonce"].as_str().unwrap();
+        let kind = v["symbol_kind"].as_str().unwrap();
+        let exe = if kind == "function" { sbfn } else { sbty };
+        let input = format!("{bh}\n{nonce}");
+        let got = run_esc(exe, input.as_bytes());
+        assert_eq!(
+            got.as_slice(),
+            hash.as_bytes(),
+            "SymbolBirth mismatch for {kind} {nonce}"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 3,
+        "expected several 3-key SymbolBirths; checked {checked}"
+    );
+}
+
 /// Import + verify + build the self-hosted importer (lib.cdb + import.cdb) once per
 /// test process; the shared `(TempDir, db, exe)` is reused by `importer()` (the native
 /// binary) and `importer_db()` (the database, for inspecting the importer's compiled form).
