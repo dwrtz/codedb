@@ -768,6 +768,72 @@ fn object_build_signature_matches_emit_objects() {
     );
 }
 
+/// Import + verify + build object.cdb's `fdobj` FunctionDef gate entry.
+fn funcdef_builder() -> &'static Path {
+    static FD: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    FD.get_or_init(|| {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("selfhost-funcdef.sqlite");
+        run(&["init", path(&db)]);
+        run(&["import", path(&db), "compiler/front/lib.cdb"]);
+        run(&["import", path(&db), "compiler/front/json.cdb"]);
+        run(&["import", path(&db), "compiler/front/object.cdb"]);
+        run(&["verify", path(&db)]);
+        let exe = temp.path().join("fdobj-bin");
+        run(&["build", path(&db), "fdobj", "--out", path(&exe)]);
+        (temp, exe)
+    })
+    .1
+    .as_path()
+}
+
+#[test]
+fn object_build_funcdef_matches_emit_objects() {
+    // object.cdb's build_funcdef frames a FunctionDef from its three referenced
+    // child hashes (signature, symbol, body Expression). Oracle: emit-objects a
+    // two-function program; for each FunctionDef feed "sig\nsym\nbody" to fdobj and
+    // diff the hash.
+    if !can_build_default_native_target() {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("prog.sqlite");
+    let src = temp.path().join("prog.cdb");
+    std::fs::write(
+        &src,
+        "fn helper(a: i64) -> i64 = a + 1\n\
+         fn main() -> i64 = helper(41)\n",
+    )
+    .unwrap();
+    run(&["init", path(&db)]);
+    run(&["import", path(&db), path(&src)]);
+    let dump_path = temp.path().join("dump.txt");
+    run(&["emit-objects", path(&db), "--out", path(&dump_path)]);
+    let dump = std::fs::read_to_string(&dump_path).unwrap();
+
+    let exe = funcdef_builder();
+    let mut checked = 0usize;
+    for line in dump.lines() {
+        let cols: Vec<&str> = line.splitn(4, '\t').collect();
+        if cols.len() != 4 || cols[1] != "FunctionDef" {
+            continue;
+        }
+        let (hash, payload) = (cols[0], cols[3]);
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let sig = v["function_sig_hash"].as_str().unwrap();
+        let sym = v["symbol"].as_str().unwrap();
+        let body = v["typed_body_expr_hash"].as_str().unwrap();
+        let got = run_esc(exe, format!("{sig}\n{sym}\n{body}").as_bytes());
+        assert_eq!(
+            got.as_slice(),
+            hash.as_bytes(),
+            "FunctionDef mismatch for {payload}"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 2, "expected several FunctionDefs; checked {checked}");
+}
+
 /// Import + verify + build the self-hosted importer (lib.cdb + import.cdb) once per
 /// test process; the shared `(TempDir, db, exe)` is reused by `importer()` (the native
 /// binary) and `importer_db()` (the database, for inspecting the importer's compiled form).

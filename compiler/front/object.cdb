@@ -240,6 +240,25 @@ fn build_signature(tycs: array<i64, 8>, n: i64, rettyc: i64) -> string effects[a
   hash_object(b"FunctionSignature", 1, p5, total)
 
 // ---------------------------------------------------------------------------
+// FunctionDef objects
+//   {"function_sig_hash":"<sig>","symbol":"<sym>","typed_body_expr_hash":"<body>"}
+// keys byte-sorted (function_sig_hash < symbol < typed_body_expr_hash). All three
+// values are object hashes (71 bytes), so the payload is a CONSTANT 275 bytes
+// (the 62-byte skeleton + 3 x 71). Inputs consumed via push_str (no string_len of
+// the move-only hashes).
+// ---------------------------------------------------------------------------
+fn build_funcdef(sig: string, sym: string, body: string) -> string effects[alloc, state] =
+  let p0: string = string_with_capacity(275) in
+  let p1: string = push_lit(p0, b"{\"function_sig_hash\":\"") in
+  let p2: string = push_str(p1, sig) in
+  let p3: string = push_lit(p2, b"\",\"symbol\":\"") in
+  let p4: string = push_str(p3, sym) in
+  let p5: string = push_lit(p4, b"\",\"typed_body_expr_hash\":\"") in
+  let p6: string = push_str(p5, body) in
+  let p7: string = push_lit(p6, b"\"}") in
+  hash_object(b"FunctionDef", 1, p7, 275)
+
+// ---------------------------------------------------------------------------
 // gate entry: tyc = string_len(stdin); print build_type(tyc) (tests/selfhost_frontend.rs
 // feeds 0..8 bytes and diffs against the real emit-objects Type hashes)
 // ---------------------------------------------------------------------------
@@ -317,3 +336,25 @@ fn sigobj<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
   let h: string = build_signature(tycs, n, rettyc) in
   let printed: i64 = write_str(h) in
   0
+
+// `fdobj`: read "sig\nsym\nbody" (three object hashes) from stdin, print the
+// FunctionDef hash. The gate feeds a real FunctionDef's three referenced hashes.
+fn fdobj<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let len: i64 = string_len(raw) in
+  let f1: NL = find_nl(raw, 0, len) in
+  let nl1: i64 = f1.p in
+  let r0: string = f1.mem in
+  let f2: NL = find_nl(r0, nl1 + 1, len) in
+  let nl2: i64 = f2.p in
+  let r1: string = f2.mem in
+  let s1: EscR = substr(r1, 0, nl1) in
+  let sig: string = s1.out in
+  let r2: string = s1.mem in
+  let s2: EscR = substr(r2, nl1 + 1, nl2) in
+  let sym: string = s2.out in
+  let r3: string = s2.mem in
+  let s3: EscR = substr(r3, nl2 + 1, len) in
+  let body: string = s3.out in
+  let h: string = build_funcdef(sig, sym, body) in
+  write_str(h)
