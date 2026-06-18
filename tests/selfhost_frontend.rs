@@ -590,9 +590,10 @@ fn object_build_type_matches_emit_objects() {
     }
 }
 
-/// Import + verify + build object.cdb's `sbfn`/`sbty` SymbolBirth gate entries.
-fn symbol_birth_bins() -> &'static (TempDir, PathBuf, PathBuf) {
-    static SB: OnceLock<(TempDir, PathBuf, PathBuf)> = OnceLock::new();
+/// Import + verify + build object.cdb's SymbolBirth gate entries: sbfn/sbty (3-key
+/// function/type) and sbrf/sbev (4-key owned record_field/enum_variant).
+fn symbol_birth_bins() -> &'static (TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
+    static SB: OnceLock<(TempDir, PathBuf, PathBuf, PathBuf, PathBuf)> = OnceLock::new();
     SB.get_or_init(|| {
         let temp = tempdir().unwrap();
         let db = temp.path().join("selfhost-symbolbirth.sqlite");
@@ -603,18 +604,23 @@ fn symbol_birth_bins() -> &'static (TempDir, PathBuf, PathBuf) {
         run(&["verify", path(&db)]);
         let sbfn = temp.path().join("sbfn-bin");
         let sbty = temp.path().join("sbty-bin");
+        let sbrf = temp.path().join("sbrf-bin");
+        let sbev = temp.path().join("sbev-bin");
         run(&["build", path(&db), "sbfn", "--out", path(&sbfn)]);
         run(&["build", path(&db), "sbty", "--out", path(&sbty)]);
-        (temp, sbfn, sbty)
+        run(&["build", path(&db), "sbrf", "--out", path(&sbrf)]);
+        run(&["build", path(&db), "sbev", "--out", path(&sbev)]);
+        (temp, sbfn, sbty, sbrf, sbev)
     })
 }
 
 #[test]
 fn object_build_symbol_birth_matches_emit_objects() {
-    // object.cdb's build_symbol_birth (3-key function/type form) must reproduce the
-    // real SymbolBirth hashes. Oracle: emit-objects on a program with functions and
-    // type defs; for each 3-key SymbolBirth (no owner_type_symbol), feed "bh\nnonce"
-    // to sbfn/sbty and diff the hash. Covers bh = "genesis" and bh = a history hash.
+    // object.cdb's SymbolBirth builders must reproduce the real hashes. Oracle:
+    // emit-objects on a program with functions, types, a record, and an enum; for
+    // each SymbolBirth, feed its fields to the matching entry (3-key function/type
+    // via sbfn/sbty; 4-key owned record_field/enum_variant via sbrf/sbev) and diff
+    // the hash. Covers bh = "genesis" and bh = a history hash.
     if !can_build_default_native_target() {
         return;
     }
@@ -636,7 +642,7 @@ fn object_build_symbol_birth_matches_emit_objects() {
     let dump = std::fs::read_to_string(&dump_path).unwrap();
 
     let bins = symbol_birth_bins();
-    let (sbfn, sbty) = (&bins.1, &bins.2);
+    let (sbfn, sbty, sbrf, sbev) = (&bins.1, &bins.2, &bins.3, &bins.4);
     let mut checked = 0usize;
     for line in dump.lines() {
         let cols: Vec<&str> = line.splitn(4, '\t').collect();
@@ -645,15 +651,19 @@ fn object_build_symbol_birth_matches_emit_objects() {
         }
         let (hash, payload) = (cols[0], cols[3]);
         let v: serde_json::Value = serde_json::from_str(payload).unwrap();
-        if v.get("owner_type_symbol").is_some() {
-            continue; // owned form (record_field / enum_variant) — a later increment
-        }
         let bh = v["birth_history_hash"].as_str().unwrap();
         let nonce = v["local_nonce"].as_str().unwrap();
         let kind = v["symbol_kind"].as_str().unwrap();
-        let exe = if kind == "function" { sbfn } else { sbty };
-        let input = format!("{bh}\n{nonce}");
-        let got = run_esc(exe, input.as_bytes());
+        let got = if let Some(owner) = v.get("owner_type_symbol") {
+            // 4-key owned form: record_field / enum_variant.
+            let owner = owner.as_str().unwrap();
+            let exe = if kind == "enum_variant" { sbev } else { sbrf };
+            run_esc(exe, format!("{bh}\n{nonce}\n{owner}").as_bytes())
+        } else {
+            // 3-key form: function / type.
+            let exe = if kind == "function" { sbfn } else { sbty };
+            run_esc(exe, format!("{bh}\n{nonce}").as_bytes())
+        };
         assert_eq!(
             got.as_slice(),
             hash.as_bytes(),
@@ -662,8 +672,8 @@ fn object_build_symbol_birth_matches_emit_objects() {
         checked += 1;
     }
     assert!(
-        checked >= 3,
-        "expected several 3-key SymbolBirths; checked {checked}"
+        checked >= 6,
+        "expected several SymbolBirths (3-key + owned); checked {checked}"
     );
 }
 

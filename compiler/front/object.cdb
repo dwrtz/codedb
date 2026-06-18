@@ -129,11 +129,11 @@ record NL {
   p: i64
 }
 
-// Index of the first '\n' at or after 0 (or `len` if none), THREADING mem back
-// (find_nl takes mem by value, so it must return it or the caller loses the
+// Index of the first '\n' at or after `start` (or `len` if none), THREADING mem
+// back (find_nl takes mem by value, so it must return it or the caller loses the
 // buffer). Byte reads are guarded by nested `if` (strict && would read OOB).
-fn find_nl(mem: string, len: i64) -> NL =
-  let seed: Scan = { p: 0, go: true } in
+fn find_nl(mem: string, start: i64, len: i64) -> NL =
+  let seed: Scan = { p: start, go: true } in
   let done: Scan =
     loop a = seed while a.go do
       if a.p >= len then (let s: Scan = { p: a.p, go: false } in s)
@@ -170,6 +170,30 @@ fn build_symbol_birth(bh: string, bhlen: i64, nonce: string, noncelen: i64, kind
   let p7: string = push_lit(p6, b"\"}") in
   hash_object(b"SymbolBirth", 1, p7, total)
 
+// The OWNED SymbolBirth (4-key): a record_field / enum_variant, with the owning
+// type's symbol hash. {"birth_history_hash":"<H>","local_nonce":"<N>",
+// "owner_type_symbol":"<S>","symbol_kind":"<K>"} (keys byte-sorted; owner_type_symbol
+// sorts between local_nonce and symbol_kind). Both kind values are 12 bytes. The
+// literal skeleton is 82 bytes (23 + 17 + 23 + 17 + 2). bh/nonce/owner are consumed
+// via push_str with PASSED lengths (no borrow-before-move).
+fn owned_kind_len(kindcode: i64) -> i64 = 12
+fn push_owned_kind(out: string, kindcode: i64) -> string effects[state] =
+  if kindcode == 1 then push_lit(out, b"enum_variant") else push_lit(out, b"record_field")
+
+fn build_owned_symbol_birth(bh: string, bhlen: i64, nonce: string, noncelen: i64, owner: string, ownerlen: i64, kindcode: i64) -> string effects[alloc, state] =
+  let total: i64 = 82 + bhlen + noncelen + ownerlen + owned_kind_len(kindcode) in
+  let p0: string = string_with_capacity(total) in
+  let p1: string = push_lit(p0, b"{\"birth_history_hash\":\"") in
+  let p2: string = push_str(p1, bh) in
+  let p3: string = push_lit(p2, b"\",\"local_nonce\":\"") in
+  let p4: string = push_str(p3, nonce) in
+  let p5: string = push_lit(p4, b"\",\"owner_type_symbol\":\"") in
+  let p6: string = push_str(p5, owner) in
+  let p7: string = push_lit(p6, b"\",\"symbol_kind\":\"") in
+  let p8: string = push_owned_kind(p7, kindcode) in
+  let p9: string = push_lit(p8, b"\"}") in
+  hash_object(b"SymbolBirth", 1, p9, total)
+
 // ---------------------------------------------------------------------------
 // gate entry: tyc = string_len(stdin); print build_type(tyc) (tests/selfhost_frontend.rs
 // feeds 0..8 bytes and diffs against the real emit-objects Type hashes)
@@ -186,7 +210,7 @@ fn tobj<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
 // SymbolBirths. (substr threads the source; each EscR's leftover .mem drops.)
 fn run_sb<'r>(raw: string, kindcode: i64) -> i64 effects[io, alloc, state, ffi, unsafe] =
   let len: i64 = string_len(raw) in
-  let f: NL = find_nl(raw, len) in
+  let f: NL = find_nl(raw, 0, len) in
   let nl: i64 = f.p in
   let r0: string = f.mem in
   let s1: EscR = substr(r0, 0, nl) in
@@ -202,3 +226,31 @@ fn sbfn<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
 
 fn sbty<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
   run_sb(read_all(string_with_capacity(mem_cap())), 1)
+
+// `sbrf` / `sbev`: read "bh\nnonce\nowner" from stdin, print the record_field /
+// enum_variant (owned) SymbolBirth hash. The gate feeds the (bh, nonce, owner) of
+// real emit-objects owned SymbolBirths.
+fn run_owned<'r>(raw: string, kindcode: i64) -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let len: i64 = string_len(raw) in
+  let f1: NL = find_nl(raw, 0, len) in
+  let nl1: i64 = f1.p in
+  let r0: string = f1.mem in
+  let f2: NL = find_nl(r0, nl1 + 1, len) in
+  let nl2: i64 = f2.p in
+  let r1: string = f2.mem in
+  let s1: EscR = substr(r1, 0, nl1) in
+  let bh: string = s1.out in
+  let r2: string = s1.mem in
+  let s2: EscR = substr(r2, nl1 + 1, nl2) in
+  let nonce: string = s2.out in
+  let r3: string = s2.mem in
+  let s3: EscR = substr(r3, nl2 + 1, len) in
+  let owner: string = s3.out in
+  let h: string = build_owned_symbol_birth(bh, nl1, nonce, nl2 - nl1 - 1, owner, len - nl2 - 1, kindcode) in
+  write_str(h)
+
+fn sbrf<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  run_owned(read_all(string_with_capacity(mem_cap())), 0)
+
+fn sbev<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  run_owned(read_all(string_with_capacity(mem_cap())), 1)
