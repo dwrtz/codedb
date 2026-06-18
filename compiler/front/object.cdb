@@ -312,6 +312,72 @@ fn build_binary(left: string, op: string, oplen: i64, right: string, typeh: stri
   let p9: string = push_lit(p8, b"\"}") in
   hash_object(b"Expression", 1, p9, total)
 
+// param_ref: {"expr_kind":"param_ref","index":<bare N>,"type":"<th>"}. Skeleton 44.
+fn build_param_ref(index: i64, typeh: string) -> string effects[alloc, state] =
+  let total: i64 = 44 + json_int_len(index) + 71 in
+  let p0: string = string_with_capacity(total) in
+  let p1: string = push_lit(p0, b"{\"expr_kind\":\"param_ref\",\"index\":") in
+  let p2: string = json_int_emit(p1, index) in
+  let p3: string = push_lit(p2, b",\"type\":\"") in
+  let p4: string = push_str(p3, typeh) in
+  let p5: string = push_lit(p4, b"\"}") in
+  hash_object(b"Expression", 1, p5, total)
+
+// local_ref: {"depth":<bare N>,"expr_kind":"local_ref","type":"<th>"} (depth sorts
+// before expr_kind). Skeleton 44.
+fn build_local_ref(depth: i64, typeh: string) -> string effects[alloc, state] =
+  let total: i64 = 44 + json_int_len(depth) + 71 in
+  let p0: string = string_with_capacity(total) in
+  let p1: string = push_lit(p0, b"{\"depth\":") in
+  let p2: string = json_int_emit(p1, depth) in
+  let p3: string = push_lit(p2, b",\"expr_kind\":\"local_ref\",\"type\":\"") in
+  let p4: string = push_str(p3, typeh) in
+  let p5: string = push_lit(p4, b"\"}") in
+  hash_object(b"Expression", 1, p5, total)
+
+// unary: {"expr":"<h>","expr_kind":"unary","op":"<op>","type":"<th>"}. Skeleton 49;
+// expr/type 71 each, op consumed via push_str (length passed).
+fn build_unary(expr: string, op: string, oplen: i64, typeh: string) -> string effects[alloc, state] =
+  let total: i64 = 49 + 71 + oplen + 71 in
+  let p0: string = string_with_capacity(total) in
+  let p1: string = push_lit(p0, b"{\"expr\":\"") in
+  let p2: string = push_str(p1, expr) in
+  let p3: string = push_lit(p2, b"\",\"expr_kind\":\"unary\",\"op\":\"") in
+  let p4: string = push_str(p3, op) in
+  let p5: string = push_lit(p4, b"\",\"type\":\"") in
+  let p6: string = push_str(p5, typeh) in
+  let p7: string = push_lit(p6, b"\"}") in
+  hash_object(b"Expression", 1, p7, total)
+
+// if: {"cond":"<h>","else":"<h>","expr_kind":"if","then":"<h>","type":"<th>"}. Four
+// object hashes (71 each), so the payload is a CONSTANT 342 (58 + 4 x 71). (Params
+// named condh/elseh/thenh — then/else are keywords.)
+fn build_if(condh: string, elseh: string, thenh: string, typeh: string) -> string effects[alloc, state] =
+  let p0: string = string_with_capacity(342) in
+  let p1: string = push_lit(p0, b"{\"cond\":\"") in
+  let p2: string = push_str(p1, condh) in
+  let p3: string = push_lit(p2, b"\",\"else\":\"") in
+  let p4: string = push_str(p3, elseh) in
+  let p5: string = push_lit(p4, b"\",\"expr_kind\":\"if\",\"then\":\"") in
+  let p6: string = push_str(p5, thenh) in
+  let p7: string = push_lit(p6, b"\",\"type\":\"") in
+  let p8: string = push_str(p7, typeh) in
+  let p9: string = push_lit(p8, b"\"}") in
+  hash_object(b"Expression", 1, p9, 342)
+
+// int_cast: {"expr_kind":"int_cast","source_type":"<th>","type":"<th>","value":"<h>"}.
+// Three object hashes (71 each) -> CONSTANT 275 (62 + 3 x 71).
+fn build_int_cast(source: string, target: string, value: string) -> string effects[alloc, state] =
+  let p0: string = string_with_capacity(275) in
+  let p1: string = push_lit(p0, b"{\"expr_kind\":\"int_cast\",\"source_type\":\"") in
+  let p2: string = push_str(p1, source) in
+  let p3: string = push_lit(p2, b"\",\"type\":\"") in
+  let p4: string = push_str(p3, target) in
+  let p5: string = push_lit(p4, b"\",\"value\":\"") in
+  let p6: string = push_str(p5, value) in
+  let p7: string = push_lit(p6, b"\"}") in
+  hash_object(b"Expression", 1, p7, 275)
+
 // ---------------------------------------------------------------------------
 // gate entry: tyc = string_len(stdin); print build_type(tyc) (tests/selfhost_frontend.rs
 // feeds 0..8 bytes and diffs against the real emit-objects Type hashes)
@@ -457,4 +523,95 @@ fn exbin<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
   let s4: EscR = substr(r5, nl3 + 1, len) in
   let typeh: string = s4.out in
   let h: string = build_binary(left, op, nl2 - nl1 - 1, right, typeh) in
+  write_str(h)
+
+// `exprm`/`exlr`: stdin byte[0] = the index/depth, byte[1..] = the type hash.
+// Print the param_ref / local_ref Expression hash.
+fn exprm<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let len: i64 = string_len(raw) in
+  let index: i64 = to_i64(string_get(raw, 0)) in
+  let s1: EscR = substr(raw, 1, len) in
+  let typeh: string = s1.out in
+  let h: string = build_param_ref(index, typeh) in
+  write_str(h)
+
+fn exlr<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let len: i64 = string_len(raw) in
+  let depth: i64 = to_i64(string_get(raw, 0)) in
+  let s1: EscR = substr(raw, 1, len) in
+  let typeh: string = s1.out in
+  let h: string = build_local_ref(depth, typeh) in
+  write_str(h)
+
+// `exun`: read "expr\nop\ntype" (child hash, operator, type hash). Print the unary hash.
+fn exun<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let len: i64 = string_len(raw) in
+  let f1: NL = find_nl(raw, 0, len) in
+  let nl1: i64 = f1.p in
+  let r0: string = f1.mem in
+  let f2: NL = find_nl(r0, nl1 + 1, len) in
+  let nl2: i64 = f2.p in
+  let r1: string = f2.mem in
+  let s1: EscR = substr(r1, 0, nl1) in
+  let expr: string = s1.out in
+  let r2: string = s1.mem in
+  let s2: EscR = substr(r2, nl1 + 1, nl2) in
+  let op: string = s2.out in
+  let r3: string = s2.mem in
+  let s3: EscR = substr(r3, nl2 + 1, len) in
+  let typeh: string = s3.out in
+  let h: string = build_unary(expr, op, nl2 - nl1 - 1, typeh) in
+  write_str(h)
+
+// `exic`: read "source\ntarget\nvalue" (two type hashes, the operand hash). Print
+// the int_cast Expression hash.
+fn exic<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let len: i64 = string_len(raw) in
+  let f1: NL = find_nl(raw, 0, len) in
+  let nl1: i64 = f1.p in
+  let r0: string = f1.mem in
+  let f2: NL = find_nl(r0, nl1 + 1, len) in
+  let nl2: i64 = f2.p in
+  let r1: string = f2.mem in
+  let s1: EscR = substr(r1, 0, nl1) in
+  let source: string = s1.out in
+  let r2: string = s1.mem in
+  let s2: EscR = substr(r2, nl1 + 1, nl2) in
+  let target: string = s2.out in
+  let r3: string = s2.mem in
+  let s3: EscR = substr(r3, nl2 + 1, len) in
+  let value: string = s3.out in
+  let h: string = build_int_cast(source, target, value) in
+  write_str(h)
+
+// `exif`: read "cond\nelse\nthen\ntype" (three child hashes, the result type hash).
+// Print the if Expression hash.
+fn exif<'r>() -> i64 effects[io, alloc, state, ffi, unsafe] =
+  let raw: string = read_all(string_with_capacity(mem_cap())) in
+  let len: i64 = string_len(raw) in
+  let f1: NL = find_nl(raw, 0, len) in
+  let nl1: i64 = f1.p in
+  let r0: string = f1.mem in
+  let f2: NL = find_nl(r0, nl1 + 1, len) in
+  let nl2: i64 = f2.p in
+  let r1: string = f2.mem in
+  let f3: NL = find_nl(r1, nl2 + 1, len) in
+  let nl3: i64 = f3.p in
+  let r2: string = f3.mem in
+  let s1: EscR = substr(r2, 0, nl1) in
+  let condh: string = s1.out in
+  let r3: string = s1.mem in
+  let s2: EscR = substr(r3, nl1 + 1, nl2) in
+  let elseh: string = s2.out in
+  let r4: string = s2.mem in
+  let s3: EscR = substr(r4, nl2 + 1, nl3) in
+  let thenh: string = s3.out in
+  let r5: string = s3.mem in
+  let s4: EscR = substr(r5, nl3 + 1, len) in
+  let typeh: string = s4.out in
+  let h: string = build_if(condh, elseh, thenh, typeh) in
   write_str(h)

@@ -834,9 +834,14 @@ fn object_build_funcdef_matches_emit_objects() {
     assert!(checked >= 2, "expected several FunctionDefs; checked {checked}");
 }
 
-/// Import + verify + build object.cdb's Expression gate entries (exlit/exbool/exbin).
-fn expression_bins() -> &'static (TempDir, PathBuf, PathBuf, PathBuf) {
-    static EX: OnceLock<(TempDir, PathBuf, PathBuf, PathBuf)> = OnceLock::new();
+/// Import + verify + build object.cdb's Expression gate entries: exlit/exbool/exbin
+/// (literal_i64/literal_bool/binary) and exprm/exlr/exun/exif/exic (param_ref/
+/// local_ref/unary/if/int_cast).
+type ExprBins = (
+    TempDir, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf,
+);
+fn expression_bins() -> &'static ExprBins {
+    static EX: OnceLock<ExprBins> = OnceLock::new();
     EX.get_or_init(|| {
         let temp = tempdir().unwrap();
         let db = temp.path().join("selfhost-expression.sqlite");
@@ -845,13 +850,15 @@ fn expression_bins() -> &'static (TempDir, PathBuf, PathBuf, PathBuf) {
         run(&["import", path(&db), "compiler/front/json.cdb"]);
         run(&["import", path(&db), "compiler/front/object.cdb"]);
         run(&["verify", path(&db)]);
-        let exlit = temp.path().join("exlit-bin");
-        let exbool = temp.path().join("exbool-bin");
-        let exbin = temp.path().join("exbin-bin");
-        run(&["build", path(&db), "exlit", "--out", path(&exlit)]);
-        run(&["build", path(&db), "exbool", "--out", path(&exbool)]);
-        run(&["build", path(&db), "exbin", "--out", path(&exbin)]);
-        (temp, exlit, exbool, exbin)
+        let bin = |name: &str| -> PathBuf {
+            let exe = temp.path().join(format!("{name}-bin"));
+            run(&["build", path(&db), name, "--out", path(&exe)]);
+            exe
+        };
+        let (exlit, exbool, exbin) = (bin("exlit"), bin("exbool"), bin("exbin"));
+        let (exprm, exlr, exun) = (bin("exprm"), bin("exlr"), bin("exun"));
+        let (exif, exic) = (bin("exif"), bin("exic"));
+        (temp, exlit, exbool, exbin, exprm, exlr, exun, exif, exic)
     })
 }
 
@@ -872,12 +879,12 @@ fn object_build_expression_matches_emit_objects() {
     let src = temp.path().join("prog.cdb");
     std::fs::write(
         &src,
-        "fn main() -> i64 = 1 + 2\n\
-         fn g(a: i64) -> i64 = a * 3 - 4\n\
+        "fn f(a: i64) -> i64 = -a\n\
+         fn g(a: i64) -> i64 = if a < 0 then 1 else a\n\
+         fn h(a: i64) -> i64 = let x: i64 = a + 1 in x + a\n\
+         fn c(a: i64) -> u8 = to_u8(a)\n\
          fn t() -> bool = true\n\
-         fn f() -> bool = false\n\
-         fn cmp(a: i64) -> bool = a < 10\n\
-         fn s() -> u8 = 5\n",
+         fn main() -> i64 = 1 + 2\n",
     )
     .unwrap();
     run(&["init", path(&db)]);
@@ -905,6 +912,7 @@ fn object_build_expression_matches_emit_objects() {
 
     let bins = expression_bins();
     let (exlit, exbool, exbin) = (&bins.1, &bins.2, &bins.3);
+    let (exprm, exlr, exun, exif, exic) = (&bins.4, &bins.5, &bins.6, &bins.7, &bins.8);
     let mut checked = 0usize;
     for line in dump.lines() {
         let cols: Vec<&str> = line.splitn(4, '\t').collect();
@@ -933,7 +941,45 @@ fn object_build_expression_matches_emit_objects() {
                 );
                 run_esc(exbin, s.as_bytes())
             }
-            _ => continue, // param_ref / unary / if / let / call / cast — later
+            "param_ref" => {
+                let mut input = vec![v["index"].as_u64().unwrap() as u8];
+                input.extend_from_slice(v["type"].as_str().unwrap().as_bytes());
+                run_esc(exprm, &input)
+            }
+            "local_ref" => {
+                let mut input = vec![v["depth"].as_u64().unwrap() as u8];
+                input.extend_from_slice(v["type"].as_str().unwrap().as_bytes());
+                run_esc(exlr, &input)
+            }
+            "unary" => {
+                let s = format!(
+                    "{}\n{}\n{}",
+                    v["expr"].as_str().unwrap(),
+                    v["op"].as_str().unwrap(),
+                    v["type"].as_str().unwrap()
+                );
+                run_esc(exun, s.as_bytes())
+            }
+            "if" => {
+                let s = format!(
+                    "{}\n{}\n{}\n{}",
+                    v["cond"].as_str().unwrap(),
+                    v["else"].as_str().unwrap(),
+                    v["then"].as_str().unwrap(),
+                    v["type"].as_str().unwrap()
+                );
+                run_esc(exif, s.as_bytes())
+            }
+            "int_cast" => {
+                let s = format!(
+                    "{}\n{}\n{}",
+                    v["source_type"].as_str().unwrap(),
+                    v["type"].as_str().unwrap(),
+                    v["value"].as_str().unwrap()
+                );
+                run_esc(exic, s.as_bytes())
+            }
+            _ => continue, // let / call — a later increment
         };
         assert_eq!(
             got.as_slice(),
@@ -943,8 +989,8 @@ fn object_build_expression_matches_emit_objects() {
         checked += 1;
     }
     assert!(
-        checked >= 5,
-        "expected several Expressions (literals + binaries); checked {checked}"
+        checked >= 8,
+        "expected several Expressions across kinds; checked {checked}"
     );
 }
 
